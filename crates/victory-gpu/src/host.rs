@@ -1063,6 +1063,79 @@ enum Step {
 type VramRead = (ID3D12Resource, u64, usize, u64);
 type VramProbe = Box<dyn Fn(&mut Vec<VramRead>) + Send>;
 
+/// A direct list of ours copying between copies in video memory and system
+/// memory around a submission's own lists (`Host::run`), with its
+/// allocator: one per submission in flight, back in [`COPY_LISTS`] once it
+/// has completed.
+struct CopyList {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+}
+
+/// Copy lists whose submission has completed.
+static COPY_LISTS: Mutex<Vec<CopyList>> = Mutex::new(Vec::new());
+
+/// A mapped buffer that a submission's copies in video memory take their
+/// bytes from (upload) or put them in (read-back): one per submission and
+/// direction, back in [`STAGING`] once it has completed.
+struct Staging {
+    buffer: ID3D12Resource,
+    data: usize,
+    size: u64,
+}
+
+/// Staging buffers whose submission has completed: uploads, read-backs.
+static STAGING: Mutex<[Vec<Staging>; 2]> = Mutex::new([Vec::new(), Vec::new()]);
+
+/// Bytes of one submission's uploads or read-backs that go through its own
+/// staging: past them, a burst (copies made in video memory are filled
+/// whole) goes through #3312's ring, waited for.
+const STAGED_MAX: u64 = 256 << 20;
+
+/// Bytes of staging kept in [`STAGING`] per direction; more is let go.
+const STAGING_KEPT: u64 = 512 << 20;
+
+/// What a submission's copies in video memory need once it has run: the
+/// copy lists run before and after its own lists and their staging, held
+/// until then, and what the list after read back into staging, which goes
+/// into the copies' system-memory mirrors first thing on completion
+/// (`Host::finish`).
+#[derive(Default)]
+struct VramSync {
+    lists: Vec<CopyList>,
+    /// `(readback, buffer)`.
+    staging: Vec<(bool, Staging)>,
+    /// Read back: from (in read-back staging), to (a mirror), bytes.
+    reads: Vec<(usize, usize, usize)>,
+    /// Ranges past [`STAGED_MAX`]: read back on completion, waited for.
+    later: Vec<VramRead>,
+}
+
+/// How many of `lens` (in order) are staged at 16-byte offsets within
+/// `max` bytes, and those bytes.
+fn staged(lens: impl IntoIterator<Item = u64>, max: u64) -> (usize, u64) {
+    let (mut n, mut at) = (0, 0u64);
+    for len in lens {
+        let end = at + len;
+        if end > max {
+            break;
+        }
+        at = end.next_multiple_of(16);
+        n += 1;
+    }
+    (n, at)
+}
+
+/// Of staging buffers of `sizes`, the smallest that holds `bytes`.
+fn smallest_fitting(sizes: impl IntoIterator<Item = u64>, bytes: u64) -> Option<usize> {
+    sizes
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, size)| size >= bytes)
+        .min_by_key(|&(_, size)| size)
+        .map(|(i, _)| i)
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1148,6 +1221,9 @@ struct InFlight {
     signals: Vec<(usize, u64)>,
     /// Host objects given up before it was submitted ([`retire`]).
     retired: Vec<Box<dyn std::any::Any + Send>>,
+    /// What its copies in video memory need once it has run: the copy lists
+    /// run around its own, and what they read back ([`VramSync`]).
+    vram: VramSync,
     /// A frame `crate::capture` lists.
     #[cfg(feature = "diagnostics")]
     traced: bool,
@@ -1781,7 +1857,18 @@ impl Host {
                 }
             }
         }
-        self.upload_vram_copies(&vram_uploads, &vram_bitmaps);
+        // Out of overlap nothing else is in flight: the bitmaps are this
+        // submission's whatever marked them (tests bind them directly).
+        let marks = !overlap || all.iter().any(|l| l.marks.load(Ordering::Relaxed));
+        // Copies in video memory: brought up to date by a list run before the
+        // submission's own, read back by one run after them, before its fence
+        // value; the read-back is taken on completion (`Host::finish`), so the
+        // submission stays in flight like any other. The views' bitmaps go
+        // with a submission that marks only: one that does not would copy them
+        // back over what the CPU cleared meanwhile (`crate::shadow`).
+        let mut vram = VramSync::default();
+        let before = self.vram_before(vram_uploads, &vram_bitmaps, marks, &mut vram);
+        let after = self.vram_after(runs, &vram_bitmaps, marks, &mut vram);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1812,7 +1899,13 @@ impl Host {
             }
             // SAFETY: closed lists; the fence is ours.
             unsafe {
+                if i == 0 && before.is_some() {
+                    self.queue.ExecuteCommandLists(std::slice::from_ref(&before));
+                }
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len() && after.is_some() {
+                    self.queue.ExecuteCommandLists(std::slice::from_ref(&after));
+                }
                 if let Err(e) = self.queue.Signal(&self.fence, submitted.value) {
                     tracing::warn!(error = %e, "host submission not signalled");
                 }
@@ -1860,40 +1953,6 @@ impl Host {
                 removed_during(all, removed_in)
             ));
         }
-        {
-            let mut seen = std::collections::HashSet::new();
-            let mut reads = Vec::new();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::GpuWrite(shadow, address, len, _, _) = step
-                        && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
-                        && let Some((cpu_ptr, base, start, buf_len)) = shadow.vram_readback()
-                    {
-                        let s = (*address as u64).max(start);
-                        let e = ((*address + *len) as u64).min(start + buf_len);
-                        if e > s {
-                            let off_in_shadow = s - start;
-                            reads.push((
-                                shadow.buffer.clone(),
-                                base + off_in_shadow,
-                                cpu_ptr + off_in_shadow as usize,
-                                e - s,
-                            ));
-                        }
-                    }
-                }
-            }
-            self.readback_vram_copies(&reads, &vram_bitmaps, true);
-            let mut extra_reads = crate::shadow::vram_marked_reads();
-            for list in runs {
-                for probe in &list.deferred().vram_probes {
-                    probe(&mut extra_reads);
-                }
-            }
-            if !extra_reads.is_empty() {
-                self.readback_vram_copies(&extra_reads, &[], false);
-            }
-        }
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(prepared.elapsed().as_micros() as u64, Ordering::Relaxed);
         InFlight {
@@ -1902,15 +1961,14 @@ impl Host {
             lists: Vec::new(),
             heavy: runs.iter().any(|l| l.heavy()),
             uploads: uploads.is_some(),
-            // Out of overlap nothing else is in flight: the bitmaps are this
-            // submission's whatever marked them (tests bind them directly).
-            marks: !overlap || all.iter().any(|l| l.marks.load(Ordering::Relaxed)),
+            marks,
             sync: !overlap,
             prepared,
             batch,
             heaps,
             signals: Vec::new(),
             retired: std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner())),
+            vram,
             #[cfg(feature = "diagnostics")]
             traced,
         }
@@ -1922,7 +1980,7 @@ impl Host {
     /// then the title fences signalled behind it. `runs`: its lists, but
     /// our upload list; `quiet`: no submission whose shaders mark reads is
     /// in flight after it (`crate::shadow::take_reads`).
-    fn finish(&self, record: InFlight, runs: &[&HostList], quiet: bool) {
+    fn finish(&self, mut record: InFlight, runs: &[&HostList], quiet: bool) {
         let waiting = std::time::Instant::now();
         self.wait_for(record.value);
         SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1959,6 +2017,10 @@ impl Host {
         let copying = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
+        // Copies in video memory first: their mirrors are what goes back. The
+        // views' written pages are read back when their marks are taken below.
+        let marks_taken = record.marks && (record.heavy || record.sync);
+        self.vram_completed(std::mem::take(&mut record.vram), runs, marks_taken);
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
@@ -2015,7 +2077,7 @@ impl Host {
         // Write marks are this submission's alone if it is heavy (the next
         // waits for it) or waited for: those of a later one still running
         // would go back early and be lost to it.
-        if record.marks && (record.heavy || record.sync) {
+        if marks_taken {
             // Pages shaders marked first: the copy-backs below end what the
             // copies keep for them.
             crate::shadow::copy_back_marks(&withheld, withholding);
@@ -3476,17 +3538,11 @@ impl Host {
         made.ok().and(buffer)
     }
 
-    /// Streams dirty CPU shadow ranges into VRAM via a reusable 64 MiB upload ring
-    /// and syncs dirty page-table/bitmap metadata before GPU lists run.
-    fn upload_vram_copies(
-        &self,
-        uploads: &[crate::shadow::VramCopy],
-        vram_bitmaps: &[(ID3D12Resource, ID3D12Resource)],
-    ) {
-        if uploads.is_empty()
-            && !crate::memory::needs_vram_pre(vram_bitmaps)
-            && !crate::shadow::has_vram_bitmaps()
-        {
+    /// Streams CPU shadow ranges into VRAM via a reusable 64 MiB upload ring,
+    /// waited for: a submission's uploads past [`STAGED_MAX`] (they go
+    /// before its own, [`Host::vram_before`]), and tests.
+    fn upload_vram_copies(&self, uploads: &[crate::shadow::VramCopy]) {
+        if uploads.is_empty() {
             return;
         }
         const RING_BYTES: u64 = 64 << 20;
@@ -3502,8 +3558,8 @@ impl Host {
 
         let mut offset = 0u64;
         let mut batch: Vec<(ID3D12Resource, u64, u64, u64)> = Vec::new();
-        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, u64)>, sync_meta: bool| {
-            if batch.is_empty() && !sync_meta {
+        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, u64)>| {
+            if batch.is_empty() {
                 return;
             }
             self.run_copy_list(
@@ -3511,10 +3567,6 @@ impl Host {
                     for (dst, dst_off, src_off, len) in batch.iter() {
                         // SAFETY: valid upload ring and destination VRAM buffer regions.
                         unsafe { list.CopyBufferRegion(dst, *dst_off, &ring_buf, *src_off, *len) };
-                    }
-                    if sync_meta {
-                        crate::memory::sync_vram_pre(list, vram_bitmaps);
-                        crate::shadow::sync_bitmaps_pre(list);
                     }
                 },
                 true,
@@ -3527,7 +3579,7 @@ impl Host {
             while done < u.len {
                 let mut avail = RING_BYTES - offset;
                 if avail == 0 {
-                    flush(&mut batch, false);
+                    flush(&mut batch);
                     offset = 0;
                     avail = RING_BYTES;
                 }
@@ -3545,19 +3597,15 @@ impl Host {
                 done += chunk;
             }
         }
-        flush(&mut batch, true);
+        flush(&mut batch);
     }
 
-    /// Copies GPU-written VRAM ranges and dirty bitmaps back to CPU memory via a
-    /// reusable 32 MiB readback ring after GPU lists finish.
-    fn readback_vram_copies(
-        &self,
-        reads: &[(ID3D12Resource, u64, usize, u64)],
-        vram_bitmaps: &[(ID3D12Resource, ID3D12Resource)],
-        sync_meta: bool,
-    ) {
-        let do_meta = sync_meta && (!vram_bitmaps.is_empty() || crate::shadow::has_vram_bitmaps());
-        if reads.is_empty() && !do_meta {
+    /// Copies GPU-written VRAM ranges back to their CPU mirrors via a reusable
+    /// 32 MiB readback ring, waited for: on a submission's completion
+    /// (`Host::finish`), the ranges known only then and those past
+    /// [`STAGED_MAX`].
+    fn readback_vram_copies(&self, reads: &[VramRead]) {
+        if reads.is_empty() {
             return;
         }
         const RING_BYTES: u64 = 32 << 20;
@@ -3573,8 +3621,8 @@ impl Host {
 
         let mut offset = 0u64;
         let mut batch: Vec<(ID3D12Resource, u64, u64, usize, u64)> = Vec::new();
-        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, usize, u64)>, sync_meta: bool| {
-            if batch.is_empty() && !sync_meta {
+        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, usize, u64)>| {
+            if batch.is_empty() {
                 return;
             }
             self.run_copy_list(
@@ -3582,10 +3630,6 @@ impl Host {
                     for (src, src_off, dst_off, _, len) in batch.iter() {
                         // SAFETY: valid VRAM buffer and readback ring regions.
                         unsafe { list.CopyBufferRegion(&ring_buf, *dst_off, src, *src_off, *len) };
-                    }
-                    if sync_meta {
-                        crate::memory::sync_vram_post(list, vram_bitmaps);
-                        crate::shadow::sync_bitmaps_post(list);
                     }
                 },
                 true,
@@ -3607,7 +3651,7 @@ impl Host {
             while done < *total_len {
                 let mut avail = RING_BYTES - offset;
                 if avail == 0 {
-                    flush(&mut batch, false);
+                    flush(&mut batch);
                     offset = 0;
                     avail = RING_BYTES;
                 }
@@ -3617,7 +3661,202 @@ impl Host {
                 done += chunk;
             }
         }
-        flush(&mut batch, do_meta);
+        flush(&mut batch);
+    }
+
+    /// A copy list of ours, open (`COPY_LISTS`, or a new one).
+    fn copy_list(&self) -> CopyList {
+        let spare = COPY_LISTS.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        // SAFETY: a list back in the pool has completed: its allocator and
+        // the list are free to reset; or plain creation.
+        unsafe {
+            if let Some(c) = spare {
+                c.alloc.Reset().expect("reset copy allocator");
+                c.list.Reset(&c.alloc, None).expect("reset copy list");
+                return c;
+            }
+            let alloc: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("a copy allocator");
+            let list: ID3D12GraphicsCommandList = self
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                .expect("a copy list");
+            name(&list, || "copies in video memory".into());
+            CopyList { alloc, list }
+        }
+    }
+
+    /// A staging buffer of at least `bytes` (`readback`: read-back memory):
+    /// the smallest of `STAGING` that holds them, or a new one.
+    fn staging(&self, readback: bool, bytes: u64) -> Option<Staging> {
+        {
+            let mut pool = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+            let pool = &mut pool[usize::from(readback)];
+            if let Some(i) = smallest_fitting(pool.iter().map(|s| s.size), bytes) {
+                return Some(pool.swap_remove(i));
+            }
+        }
+        let size = bytes.next_power_of_two().max(1 << 20);
+        let (buffer, data) = self.mapped_buffer(size, readback)?;
+        name(&buffer, || {
+            format!("copies in video memory, {}", if readback { "read back" } else { "uploads" })
+        });
+        Some(Staging {
+            buffer,
+            data: data as usize,
+            size,
+        })
+    }
+
+    /// Records, closed, the list that runs before a submission's own: the
+    /// copies in video memory brought up to date from their mirrors (through
+    /// staging held in `sync`), page tables, the lists' page bitmaps zeroed,
+    /// and (`marks`: its shaders mark) the views' bitmaps as the CPU left
+    /// them. Uploads past [`STAGED_MAX`] go first, waited for.
+    fn vram_before(
+        &self,
+        uploads: Vec<crate::shadow::VramCopy>,
+        bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+        marks: bool,
+        sync: &mut VramSync,
+    ) -> Option<ID3D12CommandList> {
+        let views = marks && crate::shadow::has_vram_bitmaps();
+        if uploads.is_empty() && !crate::memory::needs_vram_pre(bitmaps) && !views {
+            return None;
+        }
+        let (n, bytes) = staged(uploads.iter().map(|u| u.len), STAGED_MAX);
+        let staging = (bytes > 0).then(|| self.staging(false, bytes)).flatten();
+        let n = if staging.is_some() { n } else { 0 };
+        self.upload_vram_copies(&uploads[n..]);
+        let c = self.copy_list();
+        if let Some(s) = &staging {
+            let mut at = 0u64;
+            for u in &uploads[..n] {
+                // SAFETY: `u.src_ptr` is live for `u.len` bytes (held by
+                // `u._cpu`); the staging is mapped for `bytes`; the GPU copy
+                // reads it after this, and it is held until it has run.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        u.src_ptr as *const u8,
+                        (s.data as *mut u8).add(at as usize),
+                        u.len as usize,
+                    );
+                    c.list.CopyBufferRegion(&u.dst, u.dst_off, &s.buffer, at, u.len);
+                }
+                at = (at + u.len).next_multiple_of(16);
+            }
+        }
+        crate::memory::sync_vram_pre(&c.list, bitmaps);
+        if views {
+            crate::shadow::sync_bitmaps_pre(&c.list);
+        }
+        // SAFETY: our open list.
+        unsafe { c.list.Close() }.expect("close copy list");
+        let run = c.list.cast().ok();
+        sync.lists.push(c);
+        sync.staging.extend(staging.map(|s| (false, s)));
+        run
+    }
+
+    /// Records, closed, the list that runs after a submission's own and
+    /// before its fence value: what its shaders wrote of copies in video
+    /// memory (declared ranges) into read-back staging, the lists' page
+    /// bitmaps and (`marks`) the views' bitmaps into system memory. On
+    /// completion the staged bytes go into the mirrors ([`Host::vram_completed`]);
+    /// ranges past [`STAGED_MAX`] are read back then.
+    fn vram_after(
+        &self,
+        runs: &[&HostList],
+        bitmaps: &[(ID3D12Resource, ID3D12Resource)],
+        marks: bool,
+        sync: &mut VramSync,
+    ) -> Option<ID3D12CommandList> {
+        let mut seen = std::collections::HashSet::new();
+        let mut reads: Vec<VramRead> = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::GpuWrite(shadow, address, len, _, _) = step
+                    && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
+                    && let Some((cpu_ptr, base, start, buf_len)) = shadow.vram_readback()
+                {
+                    let s = (*address as u64).max(start);
+                    let e = ((*address + *len) as u64).min(start + buf_len);
+                    if e > s {
+                        let off_in_shadow = s - start;
+                        reads.push((shadow.buffer.clone(), base + off_in_shadow, cpu_ptr + off_in_shadow as usize, e - s));
+                    }
+                }
+            }
+        }
+        let views = marks && crate::shadow::has_vram_bitmaps();
+        if reads.is_empty() && bitmaps.is_empty() && !views {
+            return None;
+        }
+        let (n, bytes) = staged(reads.iter().map(|r| r.3), STAGED_MAX);
+        let staging = (bytes > 0).then(|| self.staging(true, bytes)).flatten();
+        let n = if staging.is_some() { n } else { 0 };
+        sync.later.extend(reads.drain(n..));
+        let c = self.copy_list();
+        if let Some(s) = &staging {
+            let mut at = 0u64;
+            for (src, src_off, cpu_ptr, len) in &reads {
+                // SAFETY: our open list; live buffers, `at + len` inside the staging.
+                unsafe { c.list.CopyBufferRegion(&s.buffer, at, src, *src_off, *len) };
+                sync.reads.push((s.data + at as usize, *cpu_ptr, *len as usize));
+                at = (at + len).next_multiple_of(16);
+            }
+        }
+        crate::memory::sync_vram_post(&c.list, bitmaps);
+        if views {
+            crate::shadow::sync_bitmaps_post(&c.list);
+        }
+        // SAFETY: our open list.
+        unsafe { c.list.Close() }.expect("close copy list");
+        let run = c.list.cast().ok();
+        sync.lists.push(c);
+        sync.staging.extend(staging.map(|s| (true, s)));
+        run
+    }
+
+    /// First thing once a submission has run (`Host::finish`): what the list
+    /// after it read back goes into the copies' mirrors; then the pages that
+    /// only the bitmaps read back name, waited for: the views' written pages
+    /// (`marked`: their marks are taken now, `crate::shadow::copy_back_marks`)
+    /// and those the lists' page bitmaps name (`crate::memory::bind`). Those
+    /// submissions are heavy or waited for, so nothing runs after them and the
+    /// wait is for these copies alone. The lists and staging go back to their
+    /// pools.
+    fn vram_completed(&self, sync: VramSync, runs: &[&HostList], marked: bool) {
+        let VramSync {
+            lists,
+            staging,
+            reads,
+            mut later,
+        } = sync;
+        for (from, to, len) in reads {
+            // SAFETY: the submission has run: the staging holds the bytes;
+            // the mirror lives while the lists that declared the range do.
+            unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, len) };
+        }
+        if marked {
+            later.extend(crate::shadow::vram_marked_reads());
+        }
+        for list in runs {
+            for probe in &list.deferred().vram_probes {
+                probe(&mut later);
+            }
+        }
+        self.readback_vram_copies(&later);
+        COPY_LISTS.lock().unwrap_or_else(|e| e.into_inner()).extend(lists);
+        let mut pool = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        for (readback, s) in staging {
+            let pool = &mut pool[usize::from(readback)];
+            if pool.iter().map(|s| s.size).sum::<u64>() + s.size <= STAGING_KEPT {
+                pool.push(s);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -3654,7 +3893,7 @@ impl Host {
     pub(crate) fn flush_test_vram_uploads(&self) {
         let uploads = crate::shadow::take_vram_uploads();
         if !uploads.is_empty() {
-            self.upload_vram_copies(&uploads, &[]);
+            self.upload_vram_copies(&uploads);
         }
     }
 
@@ -5004,6 +5243,86 @@ mod batch {   // `mod tests` is already taken at the top of this file
         batch.title_written();
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+}
+
+#[cfg(test)]
+mod vram_async {
+    use super::*;
+
+    /// A submission's uploads and read-backs are staged in order, each at
+    /// a 16-byte offset, while they fit; the rest goes through the ring.
+    #[test]
+    fn staging_takes_what_fits_in_order_at_16_byte_offsets() {
+        assert_eq!(staged([], 64), (0, 0));
+        assert_eq!(staged([5, 16, 3], 64), (3, 48));
+        assert_eq!(staged([40, 30], 64), (1, 48), "past the cap: left");
+        assert_eq!(staged([40, 30, 8], 64), (1, 48), "in order: none after one left");
+        assert_eq!(staged([64], 64), (1, 64));
+        assert_eq!(staged([65], 64), (0, 0));
+    }
+
+    /// A staging buffer is the smallest in the pool that holds the bytes.
+    #[test]
+    fn the_smallest_staging_that_fits_is_taken() {
+        assert_eq!(smallest_fitting([4, 1, 2, 8], 2), Some(2));
+        assert_eq!(smallest_fitting([4, 1, 2, 8], 3), Some(0));
+        assert_eq!(smallest_fitting([4, 1, 2, 8], 9), None);
+        assert_eq!(smallest_fitting([], 1), None);
+    }
+
+    /// Overlapping, a submission whose shaders write a copy in video memory
+    /// returns with the host GPU held: a list of its own reads the write
+    /// back before its fence value, and it goes back to title memory once
+    /// the submission has completed. (#3312 alone waited for the read-back
+    /// inside the submission.)
+    #[test]
+    fn a_vram_copy_is_read_back_after_its_submission_returns() {
+        use crate::watch::PAGE;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !overlap() {
+            return; // VICTORY_GPU_OVERLAP=0
+        }
+        let _queues = crate::queue::tests::TITLE_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::watch::tests::pool(1);
+        let at = p + 16;
+        // SAFETY: our pool, not guarded yet.
+        unsafe { (at as *mut u32).write_volatile(0x11) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let found = crate::shadow::find(p as u64, PAGE as u64).and_then(|c| c.vram_readback().map(|v| (c, v)));
+        let Some((copy, (_, base, start, _))) = found else {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no copies in video memory here
+        };
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, PAGE as u64);
+        copy.gpu_writes(&list, at as u64, 4, false);
+        // The shader's write: a copy into the copy in video memory.
+        let (up, data) = host.upload_buffer(4).expect("an upload buffer");
+        // SAFETY: a mapped upload buffer of 4 bytes; an open list, live buffers.
+        unsafe {
+            data.cast::<u32>().write_volatile(0xcafe_f00d);
+            list.list.CopyBufferRegion(&copy.buffer, base + (at as u64 - start), &up, 0, 4);
+        }
+        list.keep(&up);
+        list.close();
+        // SAFETY: a word of our pool.
+        let title = || unsafe { (at as *const u32).read_volatile() };
+        let gate = host.hold_gpu();
+        let submitted = Instant::now();
+        host.submit(0, vec![std::sync::Arc::new(list)]);
+        let returned = submitted.elapsed();
+        assert!(returned < Duration::from_secs(5), "back with the host GPU held ({returned:?})");
+        assert_eq!(title(), 0x11, "nothing went back before the GPU ran");
+        drop(gate);
+        host.complete_all();
+        assert_eq!(title(), 0xcafe_f00d, "read back and gone back once completed");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
