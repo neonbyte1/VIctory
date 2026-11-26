@@ -74,15 +74,19 @@ uint clamped(uint at, uint record) {
             dest[at + 4] = args[at + 4];
         }
     } else if (kind == 2) {
-        uint3 g = load3(at);
+        uint3 requested = load3(at);
+        uint3 g = min(requested, uint3(65535, 65535, 65535));
         uint row = 0;
-        uint asked = g.x;
-        if (spread != 0 && g.x > 65535 && g.y >= 1 && g.z == 1) {
-            uint z = (g.x + 65534) / 65535;
-            row = (g.x + z - 1) / z;
-            g = uint3(row, g.y, z);
-        } else {
-            g = min(g, uint3(65535, 65535, 65535));
+        uint asked = requested.x;
+        if (spread != 0 && asked > 65535 && requested.y != 0 && requested.z == 1) {
+            // Drop records over the per-dispatch budget before rounding up.
+            if (asked > GROUPS) {
+                g = uint3(0, 0, 0);
+            } else {
+                uint rows = (asked + 65534) / 65535;
+                row = (asked + rows - 1) / rows;
+                g = uint3(row, g.y, rows);
+            }
         }
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
@@ -1673,58 +1677,53 @@ void main() { title.Store(at, value); }
     #[test]
     fn spread_records_split_large_x_and_keep_small_unspread() {
         let Some(host) = super::host() else {
-            return; // no host GPU here
+            eprintln!("no host GPU; skipped");
+            return;
         };
-        let records = 7u32;
-        let (title, in_ptr) = host.shared_buffer(u64::from(records) * 12).unwrap();
-        let list = host.new_list().unwrap();
-        // Record 0: 115,200 x 1 x 1 -> [57600, 115200, 57600, 1, 2] (spread)
-        // Record 1: 65,537 x 1 x 1  -> [32769, 65537, 32769, 1, 2]  (spread)
-        // Record 2: 70,000 x 2 x 1  -> [35000, 70000, 35000, 2, 2]  (spread with y >= 1)
-        // Record 3: 100 x 2 x 1     -> [0, 100, 100, 2, 1]          (unspread, small)
-        // Record 4: 80,000 x 1 x 2  -> [0, 80000, 65535, 1, 2]      (unspread, z > 1, clamped)
-        // Record 5: 65,536 x 0 x 1  -> [0, 65536, 65535, 0, 1]      (unspread, y < 1, clamped)
-        // Record 6: 10 x 70,000 x 1 -> [0, 10, 10, 65535, 1]        (unspread, y > 65535 clamped)
-        let input = [
-            115_200u32, 1, 1,
-            65_537, 1, 1,
-            70_000, 2, 1,
-            100, 2, 1,
-            80_000, 1, 2,
-            65_536, 0, 1,
-            10, 70_000, 1,
+        let cases = [
+            ([115_200, 1, 1], [57_600, 115_200, 57_600, 1, 2]),
+            ([65_535, 1, 1], [0, 65_535, 65_535, 1, 1]),
+            ([65_536, 1, 1], [32_768, 65_536, 32_768, 1, 2]),
+            ([65_537, 1, 1], [32_769, 65_537, 32_769, 1, 2]),
+            ([70_000, 2, 1], [35_000, 70_000, 35_000, 2, 2]),
+            ([100, 2, 1], [0, 100, 100, 2, 1]),
+            ([65_537, 0, 1], [0, 65_537, 65_535, 0, 1]),
+            ([65_537, 1, 0], [0, 65_537, 65_535, 1, 0]),
+            ([80_000, 1, 2], [0, 80_000, 65_535, 1, 2]),
+            ([10, 70_000, 1], [0, 10, 10, 65_535, 1]),
+            ([70_000, 131_072, 1], [35_000, 70_000, 0, 0, 0]),
+            ([65_536, 131_072, 1], [32_768, 65_536, 0, 0, 0]),
+            ([u32::MAX, 1, 1], [0, u32::MAX, 0, 0, 0]),
         ];
-        // SAFETY: mapped buffers kept alive until execute finishes.
+        let records = cases.len() as u32;
+        let (title, data) = host.shared_buffer(u64::from(records) * 12).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the mapping covers one triple for each synthetic record.
         unsafe {
-            let in_u32 = in_ptr.cast::<u32>();
-            for (i, &w) in input.iter().enumerate() {
-                in_u32.add(i).write_volatile(w);
+            for (i, (input, _)) in cases.iter().enumerate() {
+                data.cast::<[u32; 3]>().add(i).write(*input);
             }
-            let out = super::bound(
-                &list,
-                title.GetGPUVirtualAddress(),
-                (2, 12, records),
-                true,
-            ).unwrap();
-            super::done(&list, &out);
-            list.close();
-            host.execute(&[&list]);
-            let mut p = std::ptr::null_mut();
-            out.Map(0, None, Some(&mut p)).unwrap();
-            let out_u32 = p.cast::<u32>();
-            let got: Vec<u32> = (0..35).map(|i| out_u32.add(i).read_volatile()).collect();
-            assert_eq!(
-                got,
-                [
-                    57_600, 115_200, 57_600, 1, 2, // record 0 (spread)
-                    32_769, 65_537, 32_769, 1, 2,  // record 1 (spread)
-                    35_000, 70_000, 35_000, 2, 2,  // record 2 (spread with y >= 1)
-                    0, 100, 100, 2, 1,             // record 3 (small unspread)
-                    0, 80_000, 65_535, 1, 2,       // record 4 (z > 1 clamped)
-                    0, 65_536, 65_535, 0, 1,       // record 5 (y < 1 clamped)
-                    0, 10, 10, 65_535, 1,          // record 6 (y > 65535 clamped)
-                ]
-            );
+        }
+        // SAFETY: title is a live D3D12 buffer.
+        let address = unsafe { title.GetGPUVirtualAddress() };
+        let out = super::bound(&list, address, (2, 12, records), true).unwrap();
+        super::done(&list, &out);
+        list.close();
+        // Read back the clamp output. The original records are never dispatched.
+        host.execute(&[&list]);
+        // SAFETY: the output mapping covers five words per completed record.
+        let got = unsafe {
+            let mut mapped = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut mapped)).unwrap();
+            let got = std::slice::from_raw_parts(mapped.cast::<[u32; 5]>(), cases.len()).to_vec();
+            out.Unmap(0, None);
+            got
+        };
+        for ((input, _), output) in cases.iter().zip(&got) {
+            println!("spread record {input:?} -> {output:?}");
+        }
+        for ((input, expected), output) in cases.iter().zip(got) {
+            assert_eq!(output, *expected, "spread record for {input:?}");
         }
     }
 

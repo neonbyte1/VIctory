@@ -1196,13 +1196,11 @@ impl State {
                 .host
                 .user_data
                 .iter()
-                .any(|u| u.slot == victory_shader::emit::DISPATCH_SLOT)
+                .any(|u| u.slot == victory_shader::emit::DISPATCH_SLOT && u.dword == 0)
         });
         let (row, asked, gx, gy, gz) = spread_groups(x, y, z, can_spread);
-        if gx > 65_535 || gy > 65_535 || gz > 65_535 {
-            once!(
-                "dispatch groups ({gx}, {gy}, {gz}) exceed D3D12 limit 65,535 (spread: {can_spread})"
-            );
+        if gy != y || (row == 0 && (gx != x || gz != z)) {
+            once!(x, y, z, "dispatch dimensions clamped to the D3D12 group limit (65,535)");
         }
         self.dispatch_spread = [row, asked];
         let bound = self.bind(list, p, true);
@@ -2035,7 +2033,10 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, clamped_at), count, (kind, stride, max), name, always);
+                let (record_stride, prefix) = if is_spread { (20, 8) } else { (stride, 0) };
+                crate::capture::read_indirect(
+                    list, (&clamped, clamped_at), count, (kind, record_stride, max, prefix), name, always,
+                );
             }
         }
         if !kept {
@@ -2088,25 +2089,37 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     Some(signature)
 }
 
-/// A command signature for compute dispatches whose group count was spread across z:
-/// 4 bytes groups per row (root constant at `row_index`),
-/// 4 bytes asked x groups (root constant at `row_index + 1`),
-/// 12 bytes dispatch arguments (x, y, z).
-/// Command signature for spread indirect dispatches: 2 root constants
-/// (`row`, `asked_x`) followed by `DISPATCH` (`gx, gy, gz`), stride 20 bytes.
+struct SpreadSignature {
+    root: ID3D12RootSignature,
+    param: u32,
+    row_index: u32,
+    signature: ID3D12CommandSignature,
+}
+
+/// Caches the 20-byte signature for spread indirect dispatches. Each entry
+/// holds its root signature alive for as long as its address is a cache key.
 fn host_spread_signature(
     root: &ID3D12RootSignature,
     param: u32,
     row_index: u32,
 ) -> Option<ID3D12CommandSignature> {
-    type SpreadKey = (usize, u32, u32);
-    static MADE: std::sync::Mutex<Vec<(SpreadKey, ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
-    let key = (root.as_raw() as usize, param, row_index);
+    static MADE: std::sync::Mutex<Vec<SpreadSignature>> = std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
-        return Some(s.clone());
+    if let Some(entry) = made.iter().find(|entry| {
+        entry.root.as_raw() == root.as_raw() && entry.param == param && entry.row_index == row_index
+    }) {
+        return Some(entry.signature.clone());
     }
+    let signature = create_spread_signature(root, param, row_index)?;
+    made.push(SpreadSignature { root: root.clone(), param, row_index, signature: signature.clone() });
+    Some(signature)
+}
+
+fn create_spread_signature(
+    root: &ID3D12RootSignature,
+    param: u32,
+    row_index: u32,
+) -> Option<ID3D12CommandSignature> {
     let args = [
         D3D12_INDIRECT_ARGUMENT_DESC {
             Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
@@ -2142,10 +2155,9 @@ fn host_spread_signature(
         once!(error = %e, param, row_index, "spread command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push((key, signature.clone()));
-    Some(signature)
+    signature
 }
+
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need. `marked`: a shader's
@@ -4430,7 +4442,29 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         // SAFETY: the device is live and root signature bytes are valid.
         let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, bytes) }.unwrap();
-        let sig = super::host_spread_signature(&root, 0, 0);
-        assert!(sig.is_some());
+        let references = |root: &ID3D12RootSignature| {
+            // SAFETY: `root` is live. Balance the temporary COM reference.
+            unsafe {
+                let raw = root.as_raw();
+                let vtable = &**raw.cast::<*const windows::core::IUnknown_Vtbl>();
+                (vtable.AddRef)(raw);
+                (vtable.Release)(raw)
+            }
+        };
+        let initial = references(&root);
+        let uncached = super::create_spread_signature(&root, 0, 0).expect("uncached signature");
+        let native = references(&root);
+        drop(uncached);
+        assert_eq!(references(&root), initial);
+
+        let sig = super::host_spread_signature(&root, 0, 0).expect("cached signature");
+        let cached = references(&root);
+        let hit = super::host_spread_signature(&root, 0, 0).expect("cache hit");
+        assert_eq!(hit.as_raw(), sig.as_raw());
+        assert_eq!(references(&root), cached, "a hit retains only one root reference");
+        drop((sig, hit));
+        assert_eq!(references(&root), cached, "the cache keeps its references");
+        println!("root references: initial={initial}, uncached={native}, cached={cached}");
+        assert_eq!(cached, native + 1, "the cache owns one root reference");
     }
 }
