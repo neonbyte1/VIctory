@@ -1109,15 +1109,22 @@ fn cs_spread_prologue_remaps_group_ids_and_bounds_groups() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
+        if force_warp && !warp {
             continue;
+        }
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) if force_warp => panic!("could not create the requested SM 6.6 WARP device: {e}"),
+            Err(e) => {
+                eprintln!("no SM 6.6 {label} device ({e}), skipped");
+                continue;
+            }
         };
-        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            eprintln!("{label}: no pipeline; skipped");
-            continue;
-        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute pipeline creation failed: {e}"));
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             if u.slot == super::DISPATCH_SLOT {
@@ -1145,5 +1152,6 @@ fn cs_spread_prologue_remaps_group_ids_and_bounds_groups() {
         for (i, &val) in out[0].iter().enumerate() {
             assert_eq!(val, i as u32, "{label}: element {i} mismatch");
         }
+        eprintln!("{label}: verified {ASKED} group IDs");
     }
 }
