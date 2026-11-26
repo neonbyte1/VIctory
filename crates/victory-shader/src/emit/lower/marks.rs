@@ -5,6 +5,25 @@ use super::super::bitcode::{Attr, Bin, V, pred};
 use super::super::shader::flags;
 use super::Lower;
 
+// Test-only: lower the shipped per-lane marks, with no leader election,
+// so a GPU test can compare both paths bit for bit. Thread-local because
+// lowering runs on the test's thread and tests run concurrently.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MARK_LEAD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lower `f` with per-lane marks and restore the setting afterwards.
+#[cfg(test)]
+pub(crate) fn per_lane_marks<T>(f: impl FnOnce() -> T) -> T {
+    MARK_LEAD_OFF.with(|off| {
+        let old = off.replace(true);
+        let result = f();
+        off.set(old);
+        result
+    })
+}
+
 impl Lower<'_> {
     /// Whether this lane sets mark bit `n` (its load and atomic go to the
     /// bitmap in system memory): lanes with the first active lane's bit
@@ -13,6 +32,10 @@ impl Lower<'_> {
     /// that leads is the first that is no helper: a helper's writes are
     /// dropped.
     pub(super) fn mark_lead(&mut self, n: V) -> Option<V> {
+        #[cfg(test)]
+        if MARK_LEAD_OFF.with(|off| off.get()) {
+            return None;
+        }
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
         let (i1, i32t) = (self.s.t.i1, self.s.t.i32);

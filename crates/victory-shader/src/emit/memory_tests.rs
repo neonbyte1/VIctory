@@ -924,3 +924,211 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// A compute program that stores through four marked views: one word and
+/// one bit; one word, two bits, lanes < 40 in a branch; one word per lane,
+/// `t % 4 == 0` in a branch; and one word per 32 lanes.
+///
+/// `per_lane` lowers with the leader election disabled (test-only), which
+/// emits the original per-lane mark path. The bitmap starts with bits 5,
+/// 11 and 320 set.
+fn lower_coalescing_program(per_lane: bool) -> Result<lower::Lowered, String> {
+    const fn store_offen(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0xE070_1000,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    // s_or_b32 exec, exec, s14; s_and_saveexec_b32 s14, vcc;
+    // s_cbranch_execz past one store.
+    let (or_exec, and_saveexec) = (0x887E_0E7E, 0xBE8E_3C6A);
+    const SKIP_STORE: u32 = 0xBF88_0002;
+    let mut w = vec![v_mov_b32(4, 128 + 63)];
+    w.push(s_mov_b32(5, ZERO as u8));
+    for (k, sdata) in [8u8, 16, 20, 24].into_iter().enumerate() {
+        w.extend(s_load(2, sdata, 4, 32 * k as u32));
+    }
+    w.extend([
+        S_WAITCNT_ALL,
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x4A10_0081, // v_add_nc_u32 v8, 1, v0
+        0x340A_0095, // v_lshlrev_b32 v5, 21, v0
+        0x2C0E_0085, // v_lshrrev_b32 v7, 5, v0
+        0x340E_0E95, // v_lshlrev_b32 v7, 21, v7
+        0x4A0E_0707, // v_add_nc_u32 v7, v7, v3
+        0x360C_0083, // v_and_b32 v6, 3, v0
+    ]);
+    w.extend(store_offen(4, 3, 8));
+    w.extend([0x7D88_00A8, and_saveexec, SKIP_STORE]); // v_cmp_gt_u32 vcc, 40, v0
+    w.extend(store_offen(8, 3, 16));
+    w.extend([or_exec, 0x7D84_0C80, and_saveexec, SKIP_STORE]); // v_cmp_eq_u32 vcc, 0, v6
+    w.extend(store_offen(8, 5, 20));
+    w.push(or_exec);
+    w.extend(store_offen(8, 7, 24));
+    w.push(S_ENDPGM);
+    let param = |root, user_data, sgprs, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let uav = |k: u32| UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 8 * k,
+        lower_bound: k,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 10,
+        layout: vec![
+            param(RootType::Constants, 0, 4, 0),
+            param(RootType::Table, 4, 1, 1),
+        ],
+        used: (0..4).map(uav).collect(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).map_err(|e| e.to_string())?;
+    let st = structure::structure(&p).map_err(|e| e.to_string())?;
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).map_err(|e| e.to_string())?;
+    let io = io::raise(&p, &native).map_err(|e| e.to_string())?;
+    let parts = lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: true,
+    };
+    let result = if per_lane {
+        lower::per_lane_marks(|| lower::lower(&parts))
+    } else {
+        lower::lower(&parts)
+    };
+    result.map_err(|e| e.to_string())
+}
+
+/// The leader-based coalescing of PR #2958 sets exactly the bits the
+/// per-lane path sets, and leaves the program's own results alone, on the
+/// hardware adapter and WARP: [`lower_coalescing_program`] run both ways
+/// and compared word for word, and against the bits and values the
+/// program means.
+#[test]
+fn wave_coalesced_marks_equal_per_lane_marks_on_the_gpu() {
+    // Per heap index: the first bit of its pages and the byte offset of
+    // its first byte in its first page.
+    let marks = vec![3, 0, 10, 0xFFF0, 64, 0, 4096, 0];
+    let mut preset = vec![0u32; 256];
+    for bit in [5usize, 11, 320] {
+        preset[bit / 32] |= 1 << (bit % 32);
+    }
+    let mut want_bits: Vec<usize> = vec![3, 5, 10, 11, 4096, 4128];
+    want_bits.extend((0..64).step_by(4).map(|t| 64 + 32 * t));
+    want_bits.sort_unstable();
+    let want_out: [Vec<u32>; 4] = [
+        vec![63; 64],
+        (0..64).map(|t| if t < 40 { t + 1 } else { 0 }).collect(),
+        (0..64).map(|t| u32::from(t == 0)).collect(),
+        (0..64).map(|t| if t < 32 { t + 1 } else { 0 }).collect(),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let mut results = Vec::new();
+        for per_lane in [true, false] {
+            let label = &format!("{label}, coalesced={}", !per_lane);
+            let l = lower_coalescing_program(per_lane).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil: l.dxil,
+                user_data: l.user_data,
+                samplers: l.samplers,
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                memory: l.memory,
+                memory_writes: l.memory_writes,
+                view_addresses: l.view_addresses,
+                heap: l.heap,
+                heap_writes: l.heap_writes,
+                view_marks: l.view_marks,
+            };
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut shader.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{label}: DXIL validation: {e}"));
+            }
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: pipeline: {e}"));
+            let ud = vec![0u32; shader.user_data_dwords() as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: marks.clone(),
+                                },
+                            ),
+                            (2, Root::UavData(preset.clone())),
+                        ],
+                        views: &[
+                            View::RawUav(64),
+                            View::RawUav(64),
+                            View::RawUav(64),
+                            View::RawUav(64),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            for (k, want) in want_out.iter().enumerate() {
+                assert_eq!(&out[k], want, "{label}: view {k}");
+            }
+            let bits = &out[4];
+            let marked: Vec<usize> = (0..bits.len() * 32)
+                .filter(|&b| bits[b / 32] >> (b % 32) & 1 != 0)
+                .collect();
+            assert_eq!(marked, want_bits, "{label}: marked pages");
+            results.push(out);
+        }
+        assert_eq!(
+            results[0], results[1],
+            "{label}: per-lane and coalesced runs differ"
+        );
+        eprintln!("{label}: coalesced marks and results equal the per-lane ones");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

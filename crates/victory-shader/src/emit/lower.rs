@@ -23,6 +23,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 mod bvh;
 mod marks;
 
+#[cfg(test)]
+pub(crate) use marks::per_lane_marks;
+
 type Why = &'static str;
 
 #[derive(Debug, Clone, Copy)]

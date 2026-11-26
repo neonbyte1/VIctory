@@ -934,6 +934,8 @@ pub enum Root {
     /// A root raw UAV of this many dwords, zeroed, read back after the
     /// heap's UAVs ([`Host::dispatch`] only).
     Uav(u32),
+    /// [`Root::Uav`] holding these dwords at the start.
+    UavData(Vec<u32>),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -1172,7 +1174,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) | Root::UavData(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1945,7 +1947,12 @@ impl Host {
                         }
                         keep.push(b);
                     }
-                    &Root::Uav(n) => {
+                    Root::Uav(_) | Root::UavData(_) => {
+                        let (n, init) = match arg {
+                            &Root::Uav(n) => (n, None),
+                            Root::UavData(data) => (data.len() as u32, Some(data)),
+                            _ => unreachable!(),
+                        };
                         let bytes = u64::from(n) * 4;
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
@@ -1953,7 +1960,19 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
-                        keep.push(zero(&b, None, n)?);
+                        keep.push(match init {
+                            None => zero(&b, None, n)?,
+                            Some(data) => {
+                                let from = upload(data)?;
+                                list.CopyBufferRegion(&b, 0, &from, 0, bytes);
+                                list.ResourceBarrier(&[transition(
+                                    &b,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                )]);
+                                from
+                            }
+                        });
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
