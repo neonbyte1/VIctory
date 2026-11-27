@@ -324,6 +324,135 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     }
 }
 
+fn global_store_barrier_shader(wave32: bool) -> HostShader {
+    let mut w = if wave32 {
+        // Use the wave lane index to require wave32. v1 = 1 + wave lane + wave base.
+        vec![
+            0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 1
+            0x0001_02C1,
+            0x3606_00A0, // v_and_b32 v3, 32, v0
+            0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+        ]
+    } else {
+        vec![0x4A02_0081] // v_add_nc_u32 v1, 1, v0
+    };
+    w.push(0x3404_0082); // v_lshlrev_b32 v2, 2, v0
+    w.extend(global(28, 0, 2, 1, 0, 0)); // global_store_dword v2, v1, s[0:1]
+    w.extend([S_WAITCNT_ALL, 0xBF8A_0000]); // s_waitcnt; s_barrier
+    w.extend([
+        0x3A06_00A0, // v_xor_b32 v3, 32, v0
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+    ]);
+    w.extend(global(12, 3, 3, 0, 0, 0)); // global_load_dword v3, v3, s[0:1]
+    w.push(S_WAITCNT_ALL);
+    // Keep the results after the source values so the reads cannot race the stores.
+    w.extend(global(28, 0, 2, 3, 0, 64 * 4)); // global_store_dword v2, v3, s[0:1] offset:256
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let container = crate::Container {
+        digest: [0; 16],
+        version: (1, 0),
+        parts: vec![],
+    };
+    let mut shader = super::emit(&container, &native, &p, &st, &io, &res).expect("emit");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil)
+            .expect("DXIL validation failed");
+    }
+    shader
+}
+
+#[test]
+fn global_store_values_are_visible_across_waves_after_a_barrier() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let values: Vec<u32> = (1..=64).collect();
+    let swapped: Vec<u32> = (0..64).map(|lane| (lane ^ 32) + 1).collect();
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        if warp_only && !warp {
+            continue;
+        }
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .expect("wave size limits");
+        if options.WaveLaneCountMin > 32 {
+            eprintln!("no wave size of 32 or less on {label}; skipped");
+            continue;
+        }
+        let shader = global_store_barrier_shader(options.WaveLaneCountMax > 32);
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        // User data selects the root UAV's copy at heap index and byte offset 0.
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[0][..64], values, "{label}: source values");
+        assert_eq!(out[0][64..], swapped, "{label}: swapped values");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// A root SRV in a program that does not use title memory is read through
 /// the host's view of its host copy (`emit`, "Root SRVs and root UAVs"): the
 /// view's index and the root address's offset in it come as user data, and

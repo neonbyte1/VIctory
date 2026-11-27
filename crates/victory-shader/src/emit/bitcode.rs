@@ -622,15 +622,18 @@ impl Module {
         }
     }
 
-    /// Calls of functions named `name` that [`Module::write`] writes.
+    /// Arguments of calls to `name` that [`Module::write`] writes.
     #[cfg(test)]
-    pub fn written_calls(&self, name: &str) -> usize {
+    pub fn written_calls<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a [V]> {
         let plan = self.plan();
-        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
-        calls
-            .filter(|&&i| plan.live[i as usize])
-            .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name))
-            .count()
+        plan.layout
+            .into_iter()
+            .flat_map(|b| &self.blocks[b].body)
+            .filter(move |&&i| plan.live[i as usize])
+            .filter_map(move |&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => Some(args.as_slice()),
+                _ => None,
+            })
     }
 
     /// The globals and functions [`Module::write`] declares, each kept

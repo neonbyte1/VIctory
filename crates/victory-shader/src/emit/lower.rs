@@ -63,6 +63,8 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    #[cfg(test)]
+    barrier_modes: Vec<Option<i64>>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -570,8 +572,10 @@ impl<'a> Lower<'a> {
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
+            let name = i.name();
+            (matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
+                || matches!(i.fields, Fields::Flat { .. }) && name.starts_with("global_"))
+                && (name.contains("store") || name.contains("atomic"))
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
@@ -1419,7 +1423,14 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
-            heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap").count() as u32,
+            #[cfg(test)]
+            barrier_modes: self
+                .s
+                .m
+                .written_calls("dx.op.barrier")
+                .map(|args| self.s.m.int_value(args[1]))
+                .collect(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -11574,6 +11585,36 @@ mod tests {
             base_register: 0,
             user_data,
             slot,
+        }
+    }
+
+    #[test]
+    fn global_writes_add_a_uav_fence_to_barriers() {
+        let uav = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        };
+        for (name, op, mode) in [
+            ("global_store_dword", 0x1C, 11),
+            ("global_atomic_add", 0x32, 11),
+            ("global_load_dword", 0x0C, 9),
+        ] {
+            let words = [
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xDC00_8000 | op << 18,
+                0x0200_0001, // address v1 + s[0:1], store data v0 or load result v2
+                0xBF8A_0000, // s_barrier
+                S_ENDPGM,
+            ];
+            let shader = lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], vec![uav])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(shader.barrier_modes, [Some(mode)], "{name}");
         }
     }
 
