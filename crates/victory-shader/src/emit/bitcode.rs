@@ -526,6 +526,18 @@ impl Module {
         }
     }
 
+    /// The first word of the resource properties on an annotated handle.
+    fn resource_props0(&self, handle: V) -> Option<i64> {
+        let V::Inst(i) = handle else { return None };
+        let Op::Call(f, args) = &self.insts[i as usize].op else { return None };
+        if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
+            return None;
+        }
+        let [_, _, V::Const(props)] = args[..] else { return None };
+        let Const::Aggregate(fields) = &self.consts[props as usize].1 else { return None };
+        self.int_value(V::Const(*fields.first()?))
+    }
+
     /// What the instructions [`Module::write`] writes use, of what the
     /// shader flags declare (which must match it, or the validator refuses
     /// the module: "Flags must match usage").
@@ -547,6 +559,18 @@ impl Module {
                     u.sampler_heap |= sampler;
                 }
                 u.wave |= name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad");
+                if name == "dx.op.annotateHandle" {
+                    u.rovs |= self.resource_props0(V::Inst(i)).is_some_and(|p| p & 0x2000 != 0);
+                } else if !u.typed_uav_loads
+                    && (name.starts_with("dx.op.bufferLoad.") || name.starts_with("dx.op.textureLoad."))
+                {
+                    // Lowering chooses the descriptor index before creating and
+                    // annotating the handle, so the load reads the annotation directly.
+                    u.typed_uav_loads = args
+                        .get(1)
+                        .and_then(|&h| self.resource_props0(h))
+                        .is_some_and(|p| p & 0x1000 != 0 && (1..=10).contains(&(p & 0xFF)));
+                }
             }
         }
         u
@@ -1042,6 +1066,10 @@ pub struct Uses {
     pub wave: bool,
     /// 64-bit integers.
     pub int64: bool,
+    /// Loads from typed unordered access views.
+    pub typed_uav_loads: bool,
+    /// Rasterizer-ordered view annotations.
+    pub rovs: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).

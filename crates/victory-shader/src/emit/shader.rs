@@ -641,6 +641,8 @@ impl Shader {
             (flags::SAMPLER_HEAP, uses.sampler_heap),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
+            (flags::TYPED_UAV_LOADS, uses.typed_uav_loads),
+            (flags::ROVS, uses.rovs),
         ] {
             self.flags = if used { self.flags | flag } else { self.flags & !flag };
         }
@@ -1130,7 +1132,69 @@ impl Shader {
 #[cfg(all(test, windows))]
 mod tests {
     use super::super::bitcode::Term;
+    use super::super::validator::Validator;
     use super::*;
+    use crate::dxbc::{Container, FourCC};
+
+    fn check_uav_load_flags(texture: bool, rov: bool) {
+        let path = Validator::default_path();
+        let mut validator = path.as_deref().map(|path| Validator::load(Some(path)).unwrap());
+        for (store, read) in [(false, false), (true, false), (true, true)] {
+            let mut s = Shader::new(rov);
+            if !rov {
+                s.threads = Some([1, 1, 1]);
+            }
+            // Seed the flags lowering used to set before DCE could drop the load.
+            if !read {
+                s.flags |= flags::TYPED_UAV_LOADS;
+            }
+            if rov && !store {
+                s.flags |= flags::ROVS;
+            }
+            let b = s.entry;
+            let zero = s.m.i32(0);
+            let iu = s.m.undef(s.t.i32);
+            let kind = if texture { 2 } else { 10 };
+            let props0 = kind | 0x1000 | if rov { 0x2000 } else { 0 };
+            let h = s.heap_handle(b, zero, false, false, (props0, 0x409));
+            let (load, load_op, load_args) = if texture {
+                ("textureLoad.f32", 66, vec![h, iu, zero, zero, iu, iu, iu, iu])
+            } else {
+                ("bufferLoad.f32", 68, vec![h, zero, iu])
+            };
+            let r = s.op(b, load, Attr::ReadOnly, s.t.res_ret, load_op, &load_args);
+            if store {
+                // A store keeps the annotation alive even if it ignores the load.
+                let v = if read { s.m.extract(b, r, 0) } else { s.m.f32(0) };
+                let mask = s.m.i8(0xF);
+                let (name, op, args) = if texture {
+                    ("textureStore.f32", 67, vec![h, zero, zero, iu, v, v, v, v, mask])
+                } else {
+                    ("bufferStore.f32", 69, vec![h, zero, iu, v, v, v, v, mask])
+                };
+                s.op(b, name, Attr::NoUnwind, s.t.void, op, &args);
+            }
+            s.m.terminate(b, Term::Ret);
+            let case = format!("{load}, ROV={rov}, store={store}, read={read}");
+            assert_eq!(s.m.written_calls(&format!("dx.op.{load}")), usize::from(read), "{case}");
+            let mut dxil = s.finish();
+            let container = Container::parse(&dxil).unwrap();
+            let part = container.part(FourCC::SFI0).unwrap();
+            let features = u64::from_le_bytes(part.data.try_into().unwrap());
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut dxil).unwrap_or_else(|e| panic!("{case}: {e}"));
+            }
+            assert_eq!(features & 0x800 != 0, read, "{case}: typed UAV loads");
+            assert_eq!(features & 0x1000 != 0, rov && store, "{case}: ROVs");
+        }
+    }
+
+    #[test]
+    fn typed_uav_load_flags_follow_dce() {
+        check_uav_load_flags(false, false);
+        check_uav_load_flags(true, false);
+        check_uav_load_flags(true, true);
+    }
 
     /// A program that sets a bit through the write marks' UAV, or (`heap`)
     /// through a UAV indexed from the heap: a vertex (`pixel` false, no
