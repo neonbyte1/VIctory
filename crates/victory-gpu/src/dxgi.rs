@@ -8,8 +8,15 @@ use crate::object::{
     Object, S_OK, Table, This, guid,
 };
 
-/// The DXGI device interfaces, base first (as on PC).
-pub(crate) const DEVICE_IIDS: [Iid; 3] = [
+const IDXGI_OBJECT_IID: Iid = guid(
+    0xaec22fb8,
+    0x76f3,
+    0x4639,
+    [0x9b, 0xe0, 0x28, 0xeb, 0x43, 0xa6, 0x7a, 0x2e],
+);
+
+/// The DXGI device interfaces, with IDXGIObject appended to preserve their indices.
+pub(crate) const DEVICE_IIDS: [Iid; 4] = [
     guid(
         0x54ec77fa,
         0x1377,
@@ -28,8 +35,9 @@ pub(crate) const DEVICE_IIDS: [Iid; 3] = [
         0x4051,
         [0xa7, 0x90, 0x14, 0x48, 0x84, 0xb4, 0xf6, 0xa9],
     ),
+    IDXGI_OBJECT_IID,
 ];
-const ADAPTER_IIDS: [Iid; 3] = [
+const ADAPTER_IIDS: [Iid; 4] = [
     guid(
         0x2411e7e1,
         0x12ac,
@@ -48,8 +56,9 @@ const ADAPTER_IIDS: [Iid; 3] = [
         0x4b84,
         [0x86, 0x44, 0xe0, 0x5f, 0xf8, 0xe5, 0xac, 0xb5],
     ),
+    IDXGI_OBJECT_IID,
 ];
-const FACTORY_IIDS: [Iid; 3] = [
+const FACTORY_IIDS: [Iid; 4] = [
     guid(
         0x7b7166ec,
         0x21c7,
@@ -68,13 +77,17 @@ const FACTORY_IIDS: [Iid; 3] = [
         0x4c48,
         [0x87, 0xb0, 0x36, 0x30, 0xfa, 0x36, 0xa6, 0xd0],
     ),
+    IDXGI_OBJECT_IID,
 ];
-const OUTPUT_IIDS: [Iid; 1] = [guid(
-    0xae02eedb,
-    0xc735,
-    0x4690,
-    [0x8d, 0x52, 0x5a, 0x8d, 0xc2, 0x02, 0x13, 0xaa],
-)];
+const OUTPUT_IIDS: [Iid; 2] = [
+    guid(
+        0xae02eedb,
+        0xc735,
+        0x4690,
+        [0x8d, 0x52, 0x5a, 0x8d, 0xc2, 0x02, 0x13, 0xaa],
+    ),
+    IDXGI_OBJECT_IID,
+];
 
 static DEVICE: Object = Object::new(&DEVICE_FUNCTIONS);
 static ADAPTER_OBJECT: Object = Object::new(&ADAPTER_FUNCTIONS);
@@ -344,6 +357,115 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
+
+    #[test]
+    fn dxgi_interfaces_expose_their_base_object() {
+        use crate::object::IUNKNOWN;
+
+        const BASE: Iid = [
+            0xb8, 0x2f, 0xc2, 0xae, 0xf3, 0x76, 0x39, 0x46, 0x9b, 0xe0, 0x28, 0xeb, 0x43, 0xa6,
+            0x7a, 0x2e,
+        ];
+        const UNSUPPORTED: Iid = [0xcc; 16];
+
+        struct Interface(This);
+
+        impl Interface {
+            fn acquire(call: impl FnOnce(*mut This) -> HRESULT) -> Self {
+                let mut out = std::ptr::null();
+                assert_eq!(call(&mut out), S_OK);
+                assert!(!out.is_null());
+                Self(out)
+            }
+
+            fn query(&self, iid: &Iid) -> Self {
+                Self::acquire(|out| slot::<Query>(self.0, 0)(self.0, iid, out))
+            }
+
+            fn parent(&self, iid: &Iid) -> Self {
+                Self::acquire(|out| slot::<Query>(self.0, 0x30)(self.0, iid, out))
+            }
+        }
+
+        impl Drop for Interface {
+            fn drop(&mut self) {
+                slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+            }
+        }
+
+        let d3d = Interface::acquire(|out| {
+            crate::device::create(
+                std::ptr::null(),
+                &crate::device::CHECKED_VERSION,
+                &IUNKNOWN,
+                out,
+            )
+        });
+        let dxgi = d3d.query(&DEVICE_IIDS[0]);
+        let adapter = Interface::acquire(|out| slot::<Get>(dxgi.0, 0x38)(dxgi.0, out));
+        let factory = adapter.parent(&FACTORY_IIDS[0]);
+        let output = Interface::acquire(|out| slot::<Indexed>(adapter.0, 0x38)(adapter.0, 0, out));
+
+        let mut failures = Vec::new();
+        for (name, derived, iid, canonical, parent) in [
+            ("device", &dxgi, &DEVICE_IIDS[0], d3d.0, Some(&adapter)),
+            (
+                "adapter",
+                &adapter,
+                &ADAPTER_IIDS[0],
+                adapter.0,
+                Some(&factory),
+            ),
+            ("factory", &factory, &FACTORY_IIDS[0], factory.0, None),
+            ("output", &output, &OUTPUT_IIDS[0], output.0, Some(&adapter)),
+        ] {
+            assert_eq!(
+                derived.query(&IUNKNOWN).0,
+                canonical,
+                "{name}: derived identity"
+            );
+
+            let sentinel = std::ptr::dangling();
+            let mut rejected = sentinel;
+            let hr = slot::<Query>(derived.0, 0)(derived.0, &UNSUPPORTED, &mut rejected);
+            if hr == S_OK && !rejected.is_null() && rejected != sentinel {
+                drop(Interface(rejected));
+            }
+            assert_eq!(hr, E_NOINTERFACE, "{name}: unsupported query");
+            assert!(
+                rejected.is_null(),
+                "{name}: unsupported query left a pointer"
+            );
+
+            let mut out = std::ptr::null();
+            let hr = slot::<Query>(derived.0, 0)(derived.0, &BASE, &mut out);
+            if hr != S_OK || out.is_null() {
+                failures.push(format!(
+                    "{name}: HRESULT {:#010x}, null={}",
+                    hr as u32,
+                    out.is_null()
+                ));
+                continue;
+            }
+            let base = Interface(out);
+            assert_eq!(base.0, derived.0, "{name}: base vtable");
+            assert_eq!(base.query(&IUNKNOWN).0, canonical, "{name}: base identity");
+            assert_eq!(base.query(iid).0, derived.0, "{name}: round-trip interface");
+            if let Some(parent) = parent {
+                assert_eq!(
+                    base.parent(&BASE).query(&IUNKNOWN).0,
+                    parent.query(&IUNKNOWN).0,
+                    "{name}: parent identity"
+                );
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "IDXGIObject queries failed: {}",
+            failures.join("; ")
+        );
+        assert_eq!(d3d.query(&BASE).0, dxgi.0);
     }
 
     #[test]
