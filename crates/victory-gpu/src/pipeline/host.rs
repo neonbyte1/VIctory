@@ -1048,6 +1048,7 @@ mod tests {
             crate::pipeline::hand_out(
                 vec![Arc::new(shader)],
                 Some(Box::new(graphics)),
+                &[],
                 &crate::pipeline::PIPELINE_IIDS[0],
                 &mut pipeline
             ),

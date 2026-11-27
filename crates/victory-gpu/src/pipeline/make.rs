@@ -510,7 +510,7 @@ mod tests {
             // independent of timing and the driver's graphics pipeline cache.
             assert_eq!(
                 crate::pipeline::hand_out(
-                    vec![], None, &crate::pipeline::PIPELINE_IIDS[0], &mut pipeline,
+                    vec![], None, &[], &crate::pipeline::PIPELINE_IIDS[0], &mut pipeline,
                 ),
                 S_OK
             );
@@ -740,6 +740,7 @@ mod tests {
             crate::pipeline::hand_out(
                 Vec::new(),
                 None,
+                &[],
                 &crate::pipeline::PIPELINE_IIDS[0],
                 &mut title,
             ),
