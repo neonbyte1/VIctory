@@ -1056,13 +1056,18 @@ impl Shader {
         } else {
             self.outputs.iter().any(|o| o.kind == 3)
         };
+        let mesh_shared = if self.lds.is_some() {
+            self.lds_dwords * 4
+        } else {
+            0
+        };
         let psv0 = container::psv(&Psv {
             stage: kind as u8,
             flag: flag && self.threads.is_none(),
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            mesh: self.mesh.map(|m| (m, mesh_shared)),
             gs: self.gs,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),

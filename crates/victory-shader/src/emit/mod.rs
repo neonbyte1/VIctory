@@ -1331,6 +1331,10 @@ mod tests {
     /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
     /// covers the whole target.
     fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
+        triangle_mesh_with_lds(prim, 0)
+    }
+
+    fn triangle_mesh_with_lds(prim: u32, lds_bytes: u32) -> Result<HostShader, ShaderError> {
         let words = [
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -1365,7 +1369,7 @@ mod tests {
                 max_vertices: 32,
                 max_primitives: 32,
                 topology: 2,
-                lds_bytes: 0,
+                lds_bytes,
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -1416,6 +1420,30 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             }
         }
+    }
+
+    /// A mesh program whose console state declares shared memory, but whose
+    /// code never accesses it. DXC counts group-shared bytes from the module's
+    /// globals; with no access there is no such global.
+    #[test]
+    #[cfg(windows)]
+    fn unused_mesh_lds_is_not_counted_in_psv0() {
+        let path = super::validator::Validator::default_path();
+        let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        let mut control = triangle_mesh_with_lds(TRIANGLE, 0).unwrap().dxil;
+        v.validate(&mut control)
+            .unwrap_or_else(|e| panic!("control: {e}"));
+        eprintln!("mesh lds control validated bytes={}", control.len());
+        let mut experimental = triangle_mesh_with_lds(TRIANGLE, 16).unwrap().dxil;
+        v.validate(&mut experimental)
+            .unwrap_or_else(|e| panic!("unused mesh lds: {e}"));
+        eprintln!(
+            "unused mesh lds validated bytes={}",
+            experimental.len()
+        );
     }
 
     /// A triangle mesh program on the host GPU and on WARP (where they have
