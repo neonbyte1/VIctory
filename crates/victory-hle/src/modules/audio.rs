@@ -918,10 +918,9 @@ extern "system" fn submit(
         state.post(COMMAND_COMPLETED, &done);
     }
     if notification != 0
-        && let Some(word) = heap_unmap(notification)
+        && let Some(bytes) = heap_bytes(notification, 4)
     {
-        // SAFETY: a u32 in a heap block, which the title reads as volatile.
-        unsafe { word.cast::<u32>().write_volatile(1) };
+        bytes.copy_from_slice(&1u32.to_le_bytes());
     }
     S_OK
 }
@@ -1545,5 +1544,50 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn acp_notification_checks_all_four_bytes_and_allows_unaligned() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut mem, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut mem, &mut apu, 16, 16, 1), S_OK);
+
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 16, 16), S_OK);
+
+        // Tail-overflowing notifications must not write past the block.
+        for bad in [apu + 13, apu + 14, apu + 15] {
+            assert_eq!(
+                (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), bad),
+                S_OK
+            );
+        }
+        // SAFETY: 16 bytes allocated by `ApuAlloc`.
+        let bytes = unsafe { std::slice::from_raw_parts(mem.cast::<u8>(), 16) };
+        assert_eq!(bytes, &[0u8; 16]);
+
+        // An unaligned, in-bounds notification writes 1 safely.
+        assert_eq!(
+            (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), apu + 1),
+            S_OK
+        );
+        // SAFETY: 16 bytes allocated by `ApuAlloc`.
+        let bytes = unsafe { std::slice::from_raw_parts(mem.cast::<u8>(), 16) };
+        assert_eq!(&bytes[1..5], &1u32.to_le_bytes());
+
+        // An aligned, in-bounds notification at the tail writes 1.
+        assert_eq!(
+            (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), apu + 12),
+            S_OK
+        );
+        // SAFETY: 16 bytes allocated by `ApuAlloc`, 4-byte aligned at +12.
+        let word = unsafe { mem.cast::<u32>().add(3).read_volatile() };
+        assert_eq!(word, 1);
+
+        (m.release)(acp);
+        ApuFree(mem);
     }
 }
