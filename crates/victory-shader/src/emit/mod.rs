@@ -595,7 +595,7 @@ pub fn emit_with(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.make_comparison();
                 }
                 s
             })
@@ -1083,10 +1083,8 @@ mod tests {
         let out = emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap();
 
         let sampler = StaticSampler::from_words([0; 4]);
-        let comparison = StaticSampler {
-            filter: sampler.filter | 0x80,
-            ..sampler
-        };
+        let mut comparison = sampler;
+        comparison.make_comparison();
         assert_eq!(out.samplers, [[0; 4]; 2]);
         assert_eq!(out.static_samplers, [sampler, comparison]);
         #[cfg(windows)]
