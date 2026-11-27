@@ -912,18 +912,89 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
-            let mut p = std::ptr::null_mut();
-            readback.Map(0, None, Some(&mut p)).map_err(err)?;
-            let bits = p.cast::<u32>().read();
-            readback.Unmap(0, None);
-            Ok(bits != 0)
+            read_fmad_after_wait(
+                || fence.GetCompletedValue(),
+                || dev.GetDeviceRemovedReason(),
+                || {
+                    let mut p = std::ptr::null_mut();
+                    readback.Map(0, None, Some(&mut p)).map_err(err)?;
+                    let bits = p.cast::<u32>().read();
+                    readback.Unmap(0, None);
+                    Ok(bits != 0)
+                },
+            )
         }
+    }
+}
+
+fn read_fmad_after_wait(
+    mut completed_value: impl FnMut() -> u64,
+    mut device_status: impl FnMut() -> windows::core::Result<()>,
+    readback: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    while completed_value() < 1 {
+        if let Err(e) = device_status() {
+            return Err(format!("device removed: {}", err(e)));
+        }
+        std::thread::yield_now();
+    }
+    // A removed device reports u64::MAX, which also exits the wait.
+    if let Err(e) = device_status() {
+        return Err(format!("device removed: {}", err(e)));
+    }
+    readback()
+}
+
+#[cfg(test)]
+mod fmad_wait_tests {
+    use super::{err, read_fmad_after_wait};
+    use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+    use windows::core::Error;
+
+    fn check_readback(
+        completed_values: &[u64],
+        statuses: impl IntoIterator<Item = windows::core::Result<()>>,
+        readback_value: bool,
+        expected_calls: usize,
+        expected_result: Result<bool, String>,
+    ) {
+        let mut completed_values = completed_values.iter().copied();
+        let mut statuses = statuses.into_iter();
+        let mut readback_calls = 0;
+        let result = read_fmad_after_wait(
+            || completed_values.next().expect("unexpected fence poll"),
+            || statuses.next().expect("unexpected device status check"),
+            || {
+                readback_calls += 1;
+                Ok(readback_value)
+            },
+        );
+        assert_eq!(readback_calls, expected_calls, "unexpected readback count");
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn immediate_removal_skips_readback() {
+        let removed = Error::from_hresult(DXGI_ERROR_DEVICE_REMOVED);
+        let expected = format!("device removed: {}", err(removed.clone()));
+        check_readback(&[u64::MAX], [Err(removed)], true, 0, Err(expected));
+    }
+
+    #[test]
+    fn ordinary_completion_reads_back_once() {
+        check_readback(&[0, 1], [Ok(()), Ok(())], true, 1, Ok(true));
+    }
+
+    #[test]
+    fn removal_during_polling_skips_readback() {
+        let removed = Error::from_hresult(DXGI_ERROR_DEVICE_REMOVED);
+        let expected = format!("device removed: {}", err(removed.clone()));
+        check_readback(&[0], [Err(removed)], true, 0, Err(expected));
+    }
+
+    #[test]
+    fn immediate_healthy_completion_reads_back_once() {
+        check_readback(&[1], [Ok(())], false, 1, Ok(false));
     }
 }
 
