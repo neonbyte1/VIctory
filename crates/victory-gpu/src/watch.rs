@@ -437,13 +437,26 @@ impl Drop for Tracked {
                 }
             }
         }
+        // A page also stays guarded for a tracker of a mapping showing the
+        // same memory (`guard_aliases`); its aliases need no guard any more
+        // once no tracker is left on any mapping.
         for page in free {
-            let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
-            if !watched_elsewhere {
-                open(&mut g, page);
+            let others = g.alias_of.get(&page).cloned().unwrap_or_default();
+            for p in std::iter::once(page).chain(others) {
+                if !watched(&g, p) {
+                    open(&mut g, p);
+                }
             }
         }
     }
+}
+
+/// Whether a tracker holds `page` or a page showing the same memory.
+fn watched(g: &Guards, page: usize) -> bool {
+    g.holders.contains_key(&page)
+        || g.alias_of
+            .get(&page)
+            .is_some_and(|others| others.iter().any(|o| g.holders.contains_key(o)))
 }
 
 /// Gives write access back to page `page` if we guarded it.
@@ -1469,6 +1482,22 @@ pub(crate) mod tests {
             "aliasing a busy page marks the tracked one"
         );
         drop(busy_c);
+    }
+
+    /// With no tracker left on either mapping, neither stays guarded.
+    #[test]
+    fn dropping_the_last_tracker_opens_both_mappings() {
+        let (a, b) = twin_views(1);
+        let t = track(b, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(b, b + PAGE), [(b, b + PAGE)]);
+        {
+            let g = guards();
+            assert!(g.protected.contains(&(a / PAGE)) && g.protected.contains(&(b / PAGE)));
+        }
+        drop(t);
+        let g = guards();
+        assert!(!g.protected.contains(&(a / PAGE)), "the alias is open again");
+        assert!(!g.protected.contains(&(b / PAGE)));
     }
 
     /// A write or mapping that runs past the end of the address space (a
