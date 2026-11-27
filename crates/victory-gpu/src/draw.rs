@@ -666,7 +666,7 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        if compute || pipeline_writes_uav(p) {
+        if compute || may_write_arguments(p) {
             list.end_hoisted_indirect();
         }
         // What its shaders write is withheld only if the program uses title
@@ -1888,14 +1888,15 @@ impl State {
         let spec = (kind, stride, max);
         let args_gpu = args.gpu(arguments);
         // Hoistable (#2472): a call that is not a dispatch and whose
-        // pipeline writes no unordered-access view can be clamped in the
+        // pipeline writes nothing a later execution could read as
+        // arguments or counts ([`may_write_arguments`]) can be clamped in the
         // list's prelude together with the list's other hoisted clamps, so
         // its pipeline is bound before the clamp is known and the clamp
         // pass is recorded once per submission instead of dispatched here.
         // `kept`: the clamped records stay readable as arguments after the
         // execution (hoisted, or in a window), so no transition back.
         let (clamped, clamped_at, kept) = if kind != DISPATCH
-            && !pipeline_writes_uav(p)
+            && !may_write_arguments(p)
             && crate::indirect::can_hoist(list, args_gpu, spec)
         {
             let ran = match kind {
@@ -1919,6 +1920,8 @@ impl State {
                 return false;
             }
             if let Some((buf, at)) = crate::indirect::hoist(list, &args.buffer, args_gpu, spec) {
+                #[cfg(feature = "diagnostics")]
+                joined(p, true);
                 (buf, at, true)
             } else {
                 list.end_hoisted_indirect();
@@ -1941,11 +1944,12 @@ impl State {
             }
         } else {
             list.end_hoisted_indirect();
-            // Draws whose shaders store to no buffer may be clamped in a
+            // Draws whose shaders write nothing a later execution could read
+            // as arguments ([`may_write_arguments`]) may be clamped in a
             // window with the indirect draws next to them (#3197,
             // `crate::indirect::windowed`).
             let joins = crate::indirect::windows_on() && kind != DISPATCH && {
-                let stores = may_store(p);
+                let stores = may_write_arguments(p);
                 #[cfg(feature = "diagnostics")]
                 if stores {
                     crate::copystat::add(crate::copystat::C::ClampStoring, 1);
@@ -1965,6 +1969,8 @@ impl State {
                         self.host_pipeline = 0;
                         self.host_roots[1] = 0;
                     }
+                    #[cfg(feature = "diagnostics")]
+                    joined(p, false);
                     (out, at, true)
                 }
                 None => {
@@ -2042,24 +2048,6 @@ impl State {
         }
         true
     }
-}
-
-/// Whether a pipeline's shaders may store to memory (buffers among it):
-/// unordered views, in tables, roots or the heap, marked view writes, or
-/// title memory through the page table. Such a draw ends a window of
-/// clamped indirect draws (`crate::indirect::windowed`).
-fn may_store(p: &crate::pipeline::host::HostPipeline) -> bool {
-    p.marks.is_some()
-        || p.stages.iter().any(|s| {
-            let t = s.translated();
-            !s.root_uavs.is_empty()
-                || s.memory_dirty.is_some()
-                || t.host.heap_writes
-                || t.host.view_marks
-                || t.host.memory_writes
-                || !t.host.root_uavs.is_empty()
-                || t.used.iter().any(|u| u.kind == ResourceType::Uav)
-        })
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -2239,23 +2227,57 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     }
 }
 
-/// Whether any stage of `p` may write to GPU memory (root UAV, table UAV,
-/// bindless heap write, view write-mark, or title memory store).
-fn pipeline_writes_uav(p: &HostPipeline) -> bool {
-    p.marks.is_some()
-        || p.stages.iter().any(|s| {
-            !s.root_uavs.is_empty()
-                || s.memory.is_some()
-                || s.translated().host.heap_writes
-                || s.translated()
-                    .used
-                    .iter()
-                    .any(|u| u.kind == ResourceType::Uav)
-                || s.translated().host.user_data.iter().any(|u| {
-                    u.root == RootType::Descriptor
-                        && u.dword == victory_shader::emit::ROOT_UAV_VIEW
-                })
+/// Whether anything `p`'s shaders write may be read as indirect arguments
+/// or counts by a later execution: whether its draw or dispatch ends a
+/// list's prefix of hoisted clamps (#2472) and a window of clamped indirect
+/// draws (#3197), and is clamped on its own if indirect.
+fn may_write_arguments(p: &HostPipeline) -> bool {
+    p.stages.iter().any(stage_may_write_arguments)
+}
+
+/// [`may_write_arguments`] for one stage, from its write flags: unordered
+/// views in its tables (`used`), taken from the heap itself
+/// (`heap_writes`), or root UAVs, bound as root descriptors (`root_uavs`)
+/// or as their heap views (`ROOT_UAV_VIEW` user data), all views of title
+/// buffers' host copies, which arguments and counts are read from; and
+/// title memory at computed addresses (`memory`, its page bitmap
+/// `memory_writes`), any title buffer.
+///
+/// View marks (`view_marks`, the pipeline's `marks`) are not among them.
+/// Every write mark is set beside a store or atomic through an unordered
+/// buffer view from the heap (`victory_shader::emit`, "Write marks": only
+/// handles the heap makes are marked, and those are a table's, the heap's
+/// own or a root UAV's view), so a stage writing marks has one of the flags
+/// above anyway. A stage with marks and none of them only sets read marks
+/// ("Read marks"): bits in our own bitmap, `u1` (`VIEW_WRITES`) in
+/// `MEMORY_SPACE`, a host buffer that is never title memory, so never an
+/// argument or count buffer. Its draws may join a hoist or a window: the
+/// G-buffer's pixel shaders read-mark the textures they take from the heap.
+fn stage_may_write_arguments(s: &crate::pipeline::host::Stage) -> bool {
+    let t = s.translated();
+    !s.root_uavs.is_empty()
+        || !t.host.root_uavs.is_empty()
+        || t.host.user_data.iter().any(|u| {
+            u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_UAV_VIEW
         })
+        || t.used.iter().any(|u| u.kind == ResourceType::Uav)
+        || t.host.heap_writes
+        || s.memory.is_some()
+        || s.memory_dirty.is_some()
+        || t.host.memory
+        || t.host.memory_writes
+}
+
+/// Counts an indirect draw whose clamp was hoisted or joined a window, and
+/// of those the ones only the read-mark rule let in ([`may_write_arguments`]).
+#[cfg(feature = "diagnostics")]
+fn joined(p: &HostPipeline, hoisted: bool) {
+    if hoisted {
+        crate::copystat::add(crate::copystat::C::ClampHoisted, 1);
+    }
+    if p.marks.is_some() {
+        crate::copystat::add(crate::copystat::C::ClampReadMarked, 1);
+    }
 }
 
 /// A view in a few words (diagnostics builds).
@@ -2363,6 +2385,118 @@ mod tests {
         );
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
+    }
+
+    /// A pixel stage as the G-buffer's are: it reads a table's textures
+    /// and textures it takes from the heap itself, read-marking those
+    /// (`view_marks`), and writes nothing else. `edit` changes its facts.
+    fn read_marking(
+        edit: impl FnOnce(&mut victory_shader::emit::HostShader, &mut Vec<UsedResource>),
+    ) -> crate::pipeline::host::Stage {
+        let mut host = victory_shader::emit::HostShader {
+            stage: victory_shader::HwStage::Ps,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: true,
+            heap_writes: false,
+            view_marks: true,
+        };
+        let table = |kind| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let mut used = vec![table(ResourceType::Srv), table(ResourceType::Sampler)];
+        edit(&mut host, &mut used);
+        let translated = crate::pipeline::Translated { host, used };
+        crate::pipeline::host::Stage {
+            shader: crate::pipeline::Shader::for_test("pixel", translated),
+            user_data: Some((0, 4)),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: None,
+            memory_dirty: None,
+            view_addresses: None,
+        }
+    }
+
+    /// The read-mark rule: a stage whose only unordered-access writes are
+    /// read marks, into our own bitmap, writes nothing a later indirect
+    /// execution reads as arguments or counts, so its draws may join a
+    /// hoist or a clamp window.
+    #[test]
+    fn a_stage_that_only_read_marks_may_join_a_clamp_batch() {
+        assert!(!stage_may_write_arguments(&read_marking(|_, _| {})));
+    }
+
+    /// A store through a table's unordered view may write arguments.
+    #[test]
+    fn a_table_uav_store_ends_a_clamp_batch() {
+        let s = read_marking(|_, used| {
+            used.push(UsedResource { kind: ResourceType::Uav, ..used[0] });
+        });
+        assert!(stage_may_write_arguments(&s));
+    }
+
+    /// A store through an unordered view taken from the heap itself may
+    /// write any view's buffer.
+    #[test]
+    fn a_heap_store_ends_a_clamp_batch() {
+        assert!(stage_may_write_arguments(&read_marking(|h, _| h.heap_writes = true)));
+    }
+
+    /// A root UAV, bound as a root descriptor or as its heap view.
+    #[test]
+    fn a_root_uav_ends_a_clamp_batch() {
+        let mut descriptor = read_marking(|h, _| h.root_uavs = vec![2]);
+        assert!(stage_may_write_arguments(&descriptor));
+        descriptor = read_marking(|_, _| {});
+        descriptor.root_uavs = vec![(2, 5)];
+        assert!(stage_may_write_arguments(&descriptor));
+        let view = read_marking(|h, _| {
+            h.user_data.push(victory_shader::emit::UserData {
+                index: 4,
+                slot: 2,
+                root: RootType::Descriptor,
+                dword: victory_shader::emit::ROOT_UAV_VIEW,
+            });
+        });
+        assert!(stage_may_write_arguments(&view));
+        // A root SRV's view is only read.
+        let read = read_marking(|h, _| {
+            h.user_data.push(victory_shader::emit::UserData {
+                index: 4,
+                slot: 2,
+                root: RootType::Descriptor,
+                dword: victory_shader::emit::ROOT_SRV_VIEW,
+            });
+        });
+        assert!(!stage_may_write_arguments(&read));
+    }
+
+    /// Title memory at computed addresses: any title buffer, arguments
+    /// among them.
+    #[test]
+    fn title_memory_ends_a_clamp_batch() {
+        let shader = read_marking(|h, _| (h.memory, h.memory_writes) = (true, true));
+        assert!(stage_may_write_arguments(&shader));
+        let mut bound = read_marking(|_, _| {});
+        (bound.memory, bound.memory_dirty) = (Some(6), Some(7));
+        assert!(stage_may_write_arguments(&bound));
     }
 
     /// A dropped pass reads no descriptor it cannot name: a null root table
