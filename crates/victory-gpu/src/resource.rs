@@ -797,6 +797,30 @@ struct Resource {
 /// One per texture memory (decision 0007, "One host texture per texture
 /// memory"): title textures at the same address with the same shape and
 /// element size share it, each viewing it in its own format.
+/// Sentinel values for [`HostTexture::staging_dirty_bit`]: staging has not been
+/// created yet, or has no `watch::DIRTY` bit (untracked memory or bit pool full).
+#[cfg(windows)]
+pub(crate) const STAGING_UNINIT: u32 = u32::MAX;
+#[cfg(windows)]
+pub(crate) const STAGING_ALWAYS_DIRTY: u32 = u32::MAX - 1;
+
+/// Monotonic counter bumped whenever any texture gains a host copy or advances
+/// its `last` frame stamp, so [`crate::bindless::uploads`] can skip rescanning
+/// idle textures that had no host copy or were not recently used within the
+/// same epoch. Starts at 1 so `0` is never a valid cached epoch.
+#[cfg(windows)]
+static STAMP_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(windows)]
+pub(crate) fn stamp_epoch() -> u64 {
+    STAMP_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(windows)]
+fn bump_stamp_epoch() {
+    STAMP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -809,6 +833,9 @@ pub(crate) struct HostTexture {
     pub(crate) host_written: std::sync::atomic::AtomicBool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
+    /// Cached `watch::Tracked::bit()` of `staging`, once created
+    /// (`STAGING_UNINIT` before, `STAGING_ALWAYS_DIRTY` if untracked/no bit).
+    pub(crate) staging_dirty_bit: std::sync::atomic::AtomicU32,
     /// A depth texture's writable twin (`crate::twin`), made with its first
     /// unordered access view; `None` inside if it has none.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
@@ -848,6 +875,7 @@ impl HostTexture {
             castable,
             host_written: false.into(),
             staging: std::sync::Mutex::new(None),
+            staging_dirty_bit: STAGING_UNINIT.into(),
             twin: std::sync::OnceLock::new(),
             bytes,
             used: false.into(),
@@ -867,8 +895,11 @@ impl HostTexture {
     /// Used at presented frame `frame`, `ms` milliseconds in.
     fn stamp_at(&self, frame: u64, ms: u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        self.last[0].store(frame, Relaxed);
+        let prev = self.last[0].swap(frame, Relaxed);
         self.last[1].store(ms, Relaxed);
+        if prev != frame {
+            bump_stamp_epoch();
+        }
     }
 
     /// When the title last used it: presented frame and milliseconds
@@ -885,12 +916,12 @@ impl HostTexture {
         self.stamp_at(NEVER, 0);
     }
 
-    /// Whether the title used it in this presented frame or the last one
+    /// Whether the title used it in `presented` or the frame before it
     /// (made then, named by a list of its own, or read through the heap as
     /// the last pass found).
-    pub(crate) fn used_recently(&self) -> bool {
+    pub(crate) fn used_recently_at(&self, presented: u64) -> bool {
         let frame = self.last[0].load(std::sync::atomic::Ordering::Relaxed);
-        frame != NEVER && frame.saturating_add(1) >= crate::queue::presented()
+        frame != NEVER && frame.saturating_add(1) >= presented
     }
 
     /// A list uses it: counted the first time (diagnostics of how much of
@@ -1089,6 +1120,36 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     resource(this).host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
+}
+
+/// Checks whether a bindless-viewed title texture may need an upload at
+/// `presented`, returning its cached `watch::DIRTY` bit (if its staging is
+/// tracked) and cloning the [`HostTexture`] only when it is recent, not
+/// host-written, and either uninitialized, untracked, or dirty.
+#[cfg(windows)]
+pub(crate) fn bindless_upload_check(
+    this: This,
+    presented: u64,
+) -> (Option<u32>, Option<std::sync::Arc<HostTexture>>) {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    if this.is_null() {
+        return (None, None);
+    }
+    let host = resource(this).host.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Some(t)) = host.as_ref() else {
+        return (None, None);
+    };
+    let raw_bit = t.staging_dirty_bit.load(Acquire);
+    let bit = (raw_bit < STAGING_ALWAYS_DIRTY).then_some(raw_bit);
+    if let Some(b) = bit
+        && crate::watch::clean_bit(Some(b))
+    {
+        return (Some(b), None);
+    }
+    if !t.used_recently_at(presented) || t.host_written.load(Relaxed) {
+        return (bit, None);
+    }
+    (bit, Some(t.clone()))
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1523,7 +1584,14 @@ impl Resource {
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
         let made = shared_texture(self.data() as u64, &self.desc, state, clear);
         // A texture made meanwhile by another thread is the memory's too.
-        self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
+        let mut guard = self.host.lock().unwrap_or_else(|e| e.into_inner());
+        let newly_attached = guard.is_none() && made.is_some();
+        let out = guard.get_or_insert(made).clone();
+        drop(guard);
+        if newly_attached {
+            bump_stamp_epoch();
+        }
+        out
     }
 
     fn data(&self) -> *mut u8 {
@@ -1748,22 +1816,32 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
         let raws = gone.iter().map(|(t, _)| t.texture.as_raw() as usize).collect();
         crate::descriptor::evict(&raws);
     }
-    let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let live: std::collections::HashSet<usize> = at.values().flatten().copied().collect();
-    let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
-    let given = given.get_or_insert_with(Default::default);
-    given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
-    let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
-    for (t, owners) in gone {
-        for &r in owners.iter().filter(|r| live.contains(r)) {
-            let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
-            if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
-                *h = None;
+    let mut cleared = Vec::new();
+    let bytes: u64;
+    {
+        let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let live: std::collections::HashSet<usize> = at.values().flatten().copied().collect();
+        let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
+        let given = given.get_or_insert_with(Default::default);
+        given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
+        bytes = gone.iter().map(|(t, _)| t.bytes).sum();
+        for (t, owners) in gone {
+            for &r in owners.iter().filter(|r| live.contains(r)) {
+                let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
+                    *h = None;
+                    cleared.push(r);
+                }
+            }
+            if let Some(k) = t.key {
+                given.insert(k, frame);
             }
         }
-        if let Some(k) = t.key {
-            given.insert(k, frame);
-        }
+    }
+    // Clear cached dirty bits while `gone` still holds each evicted HostTexture
+    // alive, so none of their watch dirty bits can be recycled beforehand.
+    if !cleared.is_empty() {
+        crate::bindless::clear_texture_bits(&cleared);
     }
     // Submissions in flight may still read them through views made before.
     crate::host::retire_any(Box::new(
