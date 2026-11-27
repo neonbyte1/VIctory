@@ -1139,6 +1139,24 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// Keep held keys in press order: "New keys are added at the end of the array,
+/// and when a key is released, everything shifts down to fill in the gap."
+#[cfg(any(windows, test))]
+fn press_order(previous: &[u8], down: &[u8]) -> Vec<u8> {
+    let mut held: Vec<u8> = previous
+        .iter()
+        .copied()
+        .filter(|vk| down.contains(vk))
+        .collect();
+    // Each key once, even if a reading lists it twice.
+    for &vk in down {
+        if !held.contains(&vk) {
+            held.push(vk);
+        }
+    }
+    held
+}
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1202,6 +1220,7 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        held_keys: Vec<u8>,
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1245,7 +1264,8 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter().map(key_state).collect()
+            self.held_keys = press_order(&self.held_keys, &down);
+            self.held_keys.iter().copied().map(key_state).collect()
         }
 
         #[cfg(any(test, feature = "diagnostics"))]
@@ -1884,5 +1904,31 @@ mod tests {
         let back = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(back).buttons, A);
         release(back);
+    }
+
+    #[test]
+    fn held_keys_keep_their_press_order() {
+        let held = press_order(&[], b"Z");
+        assert_eq!(held, b"Z");
+
+        // A has a lower virtual-key code than Z, but Z was already held.
+        let held = press_order(&held, b"AZ");
+        assert_eq!(held, b"ZA");
+
+        // Adding B appends at the end while keeping existing order.
+        let with_b = press_order(&held, b"ABZ");
+        assert_eq!(with_b, b"ZAB");
+
+        // Releasing a key in the middle shifts the later ones down.
+        assert_eq!(press_order(&with_b, b"BZ"), b"ZB");
+
+        // Releasing Z shifts remaining keys down; re-pressing Z puts it at the end.
+        let held = press_order(&with_b, b"AB");
+        assert_eq!(held, b"AB");
+        let held = press_order(&held, b"ABZ");
+        assert_eq!(held, b"ABZ");
+
+        // A key listed twice in one reading is held once.
+        assert_eq!(press_order(&[], b"AA"), b"A");
     }
 }
