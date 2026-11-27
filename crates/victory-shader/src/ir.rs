@@ -266,6 +266,9 @@ pub fn build_decoded(
     for &b in &order {
         current.fill(NONE);
         let block = &mut blocks[b];
+        // `members` goes up in register order, as does `outs`: one walk
+        // along a predecessor's `outs` finds every register.
+        let mut walk = 0;
         for reg in members(&live_in[b]) {
             current[index(reg)] = match block.preds[..] {
                 [] => {
@@ -274,7 +277,7 @@ pub fn build_decoded(
                     v
                 }
                 // A single predecessor comes earlier in reverse postorder.
-                [p] => lookup(&outs[p], reg),
+                [p] => lookup_from(&outs[p], &mut walk, reg),
                 _ => {
                     let value = new_value();
                     block.phis.push(Phi {
@@ -296,19 +299,24 @@ pub fn build_decoded(
                 current[index(*reg)] = *v;
             }
         }
-        outs[b] = members(&live_out[b])
-            .map(|reg| (reg, current[index(reg)]))
-            .collect();
+        let live = live_out[b].iter().map(|w| w.count_ones() as usize).sum();
+        let mut out = Vec::with_capacity(live);
+        out.extend(members(&live_out[b]).map(|reg| (reg, current[index(reg)])));
+        outs[b] = out;
     }
     for block in &mut blocks {
+        // The phis are in register order (they were pushed by `members`):
+        // one walk along each predecessor's `outs` serves them all.
         for phi in &mut block.phis {
-            phi.args = block
-                .preds
-                .iter()
-                .map(|&p| lookup(&outs[p], phi.reg))
-                .collect();
-            debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
+            phi.args = Vec::with_capacity(block.preds.len());
         }
+        for &p in &block.preds {
+            let mut walk = 0;
+            for phi in &mut block.phis {
+                phi.args.push(lookup_from(&outs[p], &mut walk, phi.reg));
+            }
+        }
+        debug_assert!(block.phis.iter().all(|phi| !phi.args.contains(&NONE)));
     }
     remove_trivial_phis(&mut blocks, values);
     Ok(Program {
@@ -369,9 +377,16 @@ fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
 }
 
 /// `outs` is sorted by register, and holds every register live out.
-fn lookup(outs: &[(Reg, Value)], reg: Reg) -> Value {
-    outs.binary_search_by_key(&reg, |&(r, _)| r)
-        .map_or(NONE, |i| outs[i].1)
+/// `at` is where the walk is along it: ask for registers in rising order
+/// and every one costs a step, not a search.
+fn lookup_from(outs: &[(Reg, Value)], at: &mut usize, reg: Reg) -> Value {
+    while outs.get(*at).is_some_and(|&(r, _)| r < reg) {
+        *at += 1;
+    }
+    match outs.get(*at) {
+        Some(&(r, v)) if r == reg => v,
+        _ => NONE,
+    }
 }
 
 pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
