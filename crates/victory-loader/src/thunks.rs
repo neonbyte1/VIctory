@@ -30,7 +30,8 @@ pub enum UnimplementedPolicy {
     /// silently continuing usually crashes later and further from the cause.
     #[default]
     Trap,
-    /// Log once per import and return 0. Useful to push through bring-up.
+    /// Log once per import and return 0. On Windows x86-64 this clears both
+    /// integer and floating-point return registers. Useful during bring-up.
     ReturnZero,
 }
 
@@ -50,7 +51,7 @@ pub fn unimplemented_call_count() -> u64 {
     UNIMPLEMENTED_CALLS.load(Ordering::Relaxed)
 }
 
-extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
+extern "system" fn handle_unimplemented_import(site: &'static ImportSite) -> u64 {
     UNIMPLEMENTED_CALLS.fetch_add(1, Ordering::Relaxed);
     let previous = site.calls.fetch_add(1, Ordering::Relaxed);
     match site.policy {
@@ -76,6 +77,31 @@ extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
             std::process::abort();
         }
     }
+}
+
+// Reserve 32 bytes of Win64 shadow space and 8 bytes to align RSP before the
+// call. The handler returns zero in RAX, and XORPS clears XMM0 without touching it.
+#[cfg(all(windows, target_arch = "x86_64"))]
+std::arch::global_asm!(
+    ".text",
+    ".globl victory_loader_return_zero",
+    ".seh_proc victory_loader_return_zero",
+    "victory_loader_return_zero:",
+    "sub rsp, 40",
+    ".seh_stackalloc 40",
+    ".seh_endprologue",
+    "call {handler}",
+    "xorps xmm0, xmm0",
+    "add rsp, 40",
+    "ret",
+    ".seh_endproc",
+    handler = sym handle_unimplemented_import,
+);
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe extern "system" {
+    #[link_name = "victory_loader_return_zero"]
+    fn unimplemented_import(site: *const std::ffi::c_void) -> u64;
 }
 
 const THUNK_SIZE: usize = 32;
@@ -118,8 +144,14 @@ impl ThunkBlock {
         code[0..2].copy_from_slice(&[0x48, 0xB9]);
         code[2..10].copy_from_slice(&(site as *const ImportSite as u64).to_le_bytes());
         code[10..12].copy_from_slice(&[0x48, 0xB8]);
-        let handler = unimplemented_import as extern "system" fn(&'static ImportSite) -> u64;
-        code[12..20].copy_from_slice(&(handler as *const () as u64).to_le_bytes());
+        let handler = handle_unimplemented_import as *const ();
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        let handler = if site.policy == UnimplementedPolicy::ReturnZero {
+            unimplemented_import as *const ()
+        } else {
+            handler
+        };
+        code[12..20].copy_from_slice(&(handler as u64).to_le_bytes());
         code[20..22].copy_from_slice(&[0xFF, 0xE0]);
         // SAFETY: `used + THUNK_SIZE <= len`, and the block is still writable.
         let at = unsafe {
@@ -167,7 +199,7 @@ mod tests {
             policy: UnimplementedPolicy::Trap,
             calls: AtomicU64::new(0),
         }));
-        unimplemented_import(site);
+        handle_unimplemented_import(site);
     }
 
     #[test]
@@ -183,5 +215,65 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
         let named = text.contains("VIctory: unimplemented import probe.dll!Missing called");
         assert!(named, "crash log: {text:?}");
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn return_zero_clears_integer_and_float_returns() {
+        // Isolate the process-wide counter from other tests that call thunks.
+        const CHILD: &str = "VICTORY_THUNK_RETURN_ZERO_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "thunks::tests::return_zero_clears_integer_and_float_returns",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child exited with {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let site = Box::leak(Box::new(ImportSite {
+            dll: "probe.dll".into(),
+            symbol: "ReturnZero".into(),
+            policy: UnimplementedPolicy::ReturnZero,
+            calls: AtomicU64::new(0),
+        }));
+        let mut block = ThunkBlock::new(1).unwrap();
+        let address = block.emit(site).unwrap();
+        block.seal().unwrap();
+
+        // SAFETY: `address` points to the sealed Win64 thunk. It ignores its
+        // caller's arguments and provides zero in both scalar return registers.
+        let (call_u64, call_f64, call_f32) = unsafe {
+            (
+                std::mem::transmute::<usize, extern "system" fn(u64) -> u64>(address),
+                std::mem::transmute::<usize, extern "system" fn(f64) -> f64>(address),
+                std::mem::transmute::<usize, extern "system" fn(f32) -> f32>(address),
+            )
+        };
+
+        // The first call takes the logging path. Both float calls then enter
+        // the handler with a nonzero value in XMM0.
+        assert_eq!(call_u64(u64::MAX), 0);
+        assert_eq!(site.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(unimplemented_call_count(), 1);
+
+        let f64_bits = call_f64(1.25).to_bits();
+        assert_eq!(site.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(unimplemented_call_count(), 2);
+
+        let f32_bits = call_f32(-2.5).to_bits();
+        assert_eq!(site.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(unimplemented_call_count(), 3);
+        assert_eq!((f64_bits, f32_bits), (0, 0));
     }
 }
