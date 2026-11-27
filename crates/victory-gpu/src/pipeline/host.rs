@@ -618,15 +618,14 @@ impl HostPipeline {
                 return None;
             }
         };
-        let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+        let stage_dxil = |i: usize| {
+            stages
+                .get(i)
+                .and_then(|(s, _)| s.translated())
+                .map(|t| t.host.dxil.as_slice())
         };
+        let code = |i: usize| shader_bytecode(stage_dxil(i));
+        let stage_bytes = |i: usize| stage_dxil(i).unwrap_or(&[]);
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
@@ -634,7 +633,7 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[stage_bytes(0)], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -674,7 +673,7 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[stage_bytes(0), stage_bytes(1)],
                 &state,
             );
             let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
@@ -755,7 +754,7 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs],
+            &[stage_bytes(0), stage_bytes(1), &gs],
             &state,
         );
         let started = std::time::Instant::now();
@@ -895,13 +894,15 @@ fn stream_pipeline<S, D>(
     )
 }
 
-/// The bytes of shader code (none for an absent stage).
-fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
-    if code.pShaderBytecode.is_null() {
-        return Vec::new();
-    }
-    // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+/// Shader bytecode referencing a translated DXIL slice (default for an absent stage).
+fn shader_bytecode(dxil: Option<&[u8]>) -> D3D12_SHADER_BYTECODE {
+    dxil.map_or(
+        D3D12_SHADER_BYTECODE::default(),
+        |bytes| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        },
+    )
 }
 
 fn root_signature(
@@ -1067,5 +1068,75 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[test]
+    fn stage_bytes_matches_code_bytes_for_pipeline_names() {
+        fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
+            if code.pShaderBytecode.is_null() {
+                return Vec::new();
+            }
+            // SAFETY: test slice lives for the duration of this call.
+            unsafe {
+                std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength)
+            }
+            .to_vec()
+        }
+
+        let root_blob = b"root-blob";
+        let s0 = b"DXBC-stage0";
+        let s1 = b"DXBC-stage1";
+        let gs = b"DXBC-rect-gs";
+
+        for dx0 in [None, Some(&[][..]), Some(&s0[..])] {
+            let n_old = super::super::library::name(
+                "compute",
+                root_blob,
+                &[&code_bytes(&shader_bytecode(dx0))],
+                "",
+            );
+            let n_new =
+                super::super::library::name("compute", root_blob, &[dx0.unwrap_or(&[])], "");
+            assert_eq!(n_new, n_old);
+
+            for dx1 in [None, Some(&[][..]), Some(&s1[..])] {
+                let mesh_old = super::super::library::name(
+                    "mesh",
+                    root_blob,
+                    &[
+                        &code_bytes(&shader_bytecode(dx0)),
+                        &code_bytes(&shader_bytecode(dx1)),
+                    ],
+                    "mesh-state",
+                );
+                let mesh_new = super::super::library::name(
+                    "mesh",
+                    root_blob,
+                    &[dx0.unwrap_or(&[]), dx1.unwrap_or(&[])],
+                    "mesh-state",
+                );
+                assert_eq!(mesh_new, mesh_old);
+
+                for gs_bytes in [&[][..], &gs[..]] {
+                    let gfx_old = super::super::library::name(
+                        "graphics",
+                        root_blob,
+                        &[
+                            &code_bytes(&shader_bytecode(dx0)),
+                            &code_bytes(&shader_bytecode(dx1)),
+                            gs_bytes,
+                        ],
+                        "gfx-state",
+                    );
+                    let gfx_new = super::super::library::name(
+                        "graphics",
+                        root_blob,
+                        &[dx0.unwrap_or(&[]), dx1.unwrap_or(&[]), gs_bytes],
+                        "gfx-state",
+                    );
+                    assert_eq!(gfx_new, gfx_old);
+                }
+            }
+        }
     }
 }
