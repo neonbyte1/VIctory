@@ -2757,6 +2757,11 @@ fn scalar_probes() -> Vec<Probe> {
             (if a == 0 { u32::MAX } else { a.trailing_zeros() }, None)
         }),
         sop1_probe(0x15, unary(U32_EDGES), |a| (ffbh(a), None)),
+        // First bit that differs from the sign bit; -1 for 0 and -1.
+        sop1_probe(0x17, unary(U32_EDGES), |a| {
+            let x = if a >> 31 != 0 { !a } else { a };
+            (if x == 0 { u32::MAX } else { x.leading_zeros() }, None)
+        }),
         sop1_probe(0x0F, unary(U32_EDGES), |a| (a.count_ones(), Some(a != 0))),
         sop1_probe(0x0B, unary(U32_EDGES), |a| (a.reverse_bits(), None)),
         sop1_probe(0x34, unary(U32_EDGES), |a| {
