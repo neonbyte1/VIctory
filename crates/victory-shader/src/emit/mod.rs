@@ -232,6 +232,8 @@ pub use rect::{rectangle_gs, right_angle};
 mod memory_tests;
 mod sampler;
 #[cfg(all(test, windows))]
+mod quad_tests;
+#[cfg(all(test, windows))]
 mod semantics_tests;
 mod shader;
 #[cfg(all(test, windows))]
