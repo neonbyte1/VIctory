@@ -791,6 +791,34 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn host_window_limit_and_work_area_fitting() {
+        assert_eq!(parse_window_limit("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_window_limit(" 1280 X 720 "), Some((1280, 720)));
+        for bad in ["", "1920", "0x1080", "1920x0", "-1x1080", "2147483648x1080"] {
+            assert_eq!(parse_window_limit(bad), None, "{bad}");
+        }
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        // Already fits with no limit: left at CW_USEDEFAULT.
+        assert_eq!(fit_window_rect(&area, 1280, 720, None), None);
+        // Oversized 4K window shrinks proportionally to fit the work area and centers.
+        let (left, top, w, h) = fit_window_rect(&area, 3840, 2160, None).unwrap();
+        assert_eq!((w, h), (1848, 1040));
+        assert_eq!((left, top), ((1920 - 1848) / 2, 0));
+        // VICTORY_WINDOW_MAX applies a smaller limit even when the work area is larger.
+        let (left, top, w, h) = fit_window_rect(&area, 1920, 1080, Some((1280, 720))).unwrap();
+        assert_eq!((w, h), (1280, 720));
+        assert_eq!((left, top), ((1920 - 1280) / 2, (1040 - 720) / 2));
+        // A limit larger than the work area still respects the work area.
+        let (_, _, w, h) = fit_window_rect(&area, 3840, 2160, Some((2560, 1440))).unwrap();
+        assert_eq!((w, h), (1848, 1040));
+    }
+
     /// A node as the runtime gives it, built by hand: `HostList::is_node`
     /// reads the pointer and the copied name, and the name alone finds a
     /// list the runtime records under another object.
@@ -4431,6 +4459,75 @@ extern "system" fn window_proc(
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+/// Parses `VICTORY_WINDOW_MAX=WIDTHxHEIGHT`, matching `victory-hle`'s
+/// `lifecycle::parse_window_limit`.
+fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
+    let (width, height) = value.trim().split_once(['x', 'X'])?;
+    let (width, height) = (width.trim().parse().ok()?, height.trim().parse().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn window_limit() -> Option<(i32, i32)> {
+    static LIMIT: OnceLock<Option<(i32, i32)>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var_os("VICTORY_WINDOW_MAX")?;
+        let parsed = value.to_str().and_then(parse_window_limit);
+        if parsed.is_none() {
+            tracing::warn!(
+                ?value,
+                "ignoring invalid VICTORY_WINDOW_MAX; expected positive WIDTHxHEIGHT"
+            );
+        }
+        parsed
+    })
+}
+
+/// `width` x `height` scaled down proportionally to fit `area`, or unchanged
+/// if it already fits.
+fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
+    let (aw, ah) = (area.right - area.left, area.bottom - area.top);
+    if width <= 0 || height <= 0 || aw <= 0 || ah <= 0 || (width <= aw && height <= ah) {
+        return (width, height);
+    }
+    let scale = f64::min(
+        f64::from(aw) / f64::from(width),
+        f64::from(ah) / f64::from(height),
+    );
+    (
+        (f64::from(width) * scale) as i32,
+        (f64::from(height) * scale) as i32,
+    )
+}
+
+/// Fits `width` x `height` into `area` and optional `limit`, returning centered
+/// `(left, top, width, height)` when shrunk or `None` when unchanged.
+fn fit_window_rect(
+    area: &RECT,
+    width: i32,
+    height: i32,
+    limit: Option<(i32, i32)>,
+) -> Option<(i32, i32, i32, i32)> {
+    let fitted = match limit {
+        Some((max_width, max_height)) => {
+            let bounded = RECT {
+                left: 0,
+                top: 0,
+                right: (area.right - area.left).min(max_width),
+                bottom: (area.bottom - area.top).min(max_height),
+            };
+            fit_into(&bounded, width, height)
+        }
+        None => fit_into(area, width, height),
+    };
+    if fitted == (width, height) {
+        return None;
+    }
+    let (w, h) = fitted;
+    let left = area.left + (area.right - area.left - w) / 2;
+    let top = area.top + (area.bottom - area.top - h) / 2;
+    Some((left, top, w, h))
+}
+
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
     // SAFETY: registers our class once and creates a window of it.
@@ -4452,15 +4549,38 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        let (outer_w, outer_h) = (rect.right - rect.left, rect.bottom - rect.top);
+        let mut area = RECT::default();
+        let limit = window_limit();
+        let (x, y, win_w, win_h) = if SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some((&raw mut area).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+            && let Some((left, top, w, h)) = fit_window_rect(&area, outer_w, outer_h, limit)
+        {
+            tracing::info!(
+                width = outer_w,
+                height = outer_h,
+                to = ?(w, h),
+                ?limit,
+                "host window fitted to the screen"
+            );
+            (left, top, w, h)
+        } else {
+            (CW_USEDEFAULT, CW_USEDEFAULT, outer_w, outer_h)
+        };
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            x,
+            y,
+            win_w,
+            win_h,
             None,
             None,
             Some(instance.into()),
