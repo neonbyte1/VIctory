@@ -1392,7 +1392,7 @@ impl State {
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         self.depth_sampled |=
@@ -2368,6 +2368,93 @@ void main() {
         let title_heap = crate::descriptor::heap(heap);
         let heap_host = title_heap.host().expect("a host view heap");
         (heap, title_heap, heap_host)
+    }
+
+    #[test]
+    fn fresh_table_cache_hit_refreshes_cbv_after_copy_and_partial_first_use() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (heap, title_heap, heap_host) = view_heap(1_500_000);
+        let table_slot = heap_host.count();
+        if table_slot + 3 > 1_500_000 {
+            crate::object::release(heap);
+            return;
+        }
+        let table1 = title_heap.start + u64::from(table_slot) * 32;
+        let table2 = table1 + 32;
+        let _ = host.log_messages();
+
+        let page = crate::watch::PAGE;
+        let pool = crate::watch::tests::pool(3);
+        let [cb1_addr, cb2_addr, srv_addr] = [pool, pool + page, pool + 2 * page];
+        // SAFETY: the addresses are aligned and inside the committed pool.
+        unsafe {
+            (cb1_addr as *mut u32).write(0x1111_1111);
+            (cb2_addr as *mut u32).write(0x3333_3333);
+        }
+        let [cb1, cb2, srv] = [cb1_addr, cb2_addr, srv_addr]
+            .map(|address| buffer_at_address(address as u64, page as u64));
+        for (address, table) in [(cb1_addr, table1), (cb2_addr, table2)] {
+            let address = address as u64;
+            let desc = [address as u32, (address >> 32) as u32, 256, 0];
+            crate::descriptor::create_cbv(std::ptr::null(), &desc, table);
+        }
+        let srv_desc = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        crate::descriptor::create_srv(std::ptr::null(), srv, &srv_desc, table2 + 32);
+        let cbv_slot0 = used(ResourceType::Cbv);
+        let srv_slot1 = UsedResource {
+            table_offset_dwords: 8,
+            ..used(ResourceType::Srv)
+        };
+
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, table1);
+        let copy_src = 0x2222_2222u32.to_le_bytes();
+        let list = host.new_list().unwrap();
+        let first = state.tables(&list, std::slice::from_ref(&cbv_slot0), true);
+        assert_eq!(first.len(), 1);
+        list.defer_copy(cb1_addr as *mut u8, copy_src.as_ptr(), copy_src.len());
+        assert_eq!(
+            state.tables(&list, std::slice::from_ref(&cbv_slot0), true),
+            first
+        );
+        list.close();
+        host.execute(&[&list]);
+        drop(list);
+        let after_copy = crate::shadow::find(cb1_addr as u64, 256)
+            .expect("first CBV shadow")
+            .read_host(cb1_addr as u64, 1)[0];
+
+        let list = host.new_list().unwrap();
+        state.cut(&list);
+        state.set_table(true, 0, table2);
+        // Both uses span two descriptors, so they share a cache entry.
+        let first = state.tables(&list, std::slice::from_ref(&srv_slot1), true);
+        assert_eq!(first.len(), 1);
+        assert_eq!(state.tables(&list, &[cbv_slot0, srv_slot1], true), first);
+        list.close();
+        host.execute(&[&list]);
+        drop(list);
+        let after_partial_use = crate::shadow::find(cb2_addr as u64, 256)
+            .expect("second CBV shadow")
+            .read_host(cb2_addr as u64, 1)[0];
+
+        drop(state);
+        crate::object::release(heap);
+        for (buffer, address) in [(cb1, cb1_addr), (cb2, cb2_addr), (srv, srv_addr)] {
+            crate::shadow::unregister(buffer as usize, address as u64);
+            crate::object::release(buffer);
+        }
+        crate::watch::tests::free(pool);
+
+        assert_eq!(host.log_messages(), None);
+        assert_eq!(
+            (after_copy, after_partial_use),
+            (0x2222_2222, 0x3333_3333),
+            "CBV shadow after a copy and after partial first use"
+        );
     }
 
     fn dispatch_marked_uav(
