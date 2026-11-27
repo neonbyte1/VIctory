@@ -382,7 +382,7 @@ fn flags(out: &mut String, cache: &Cache, dlc_first: bool) {
 }
 
 fn label(inst: &Instruction, imm: u16) -> String {
-    let target = inst.offset as i64 + 4 * inst.words.len() as i64 + 4 * i64::from(imm as i16);
+    let target = inst.offset as i64 + 4 * inst.words().len() as i64 + 4 * i64::from(imm as i16);
     format!("label_{target:04X}")
 }
 

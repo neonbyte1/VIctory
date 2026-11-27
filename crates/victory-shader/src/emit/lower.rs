@@ -541,7 +541,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
         .blocks
         .iter()
         .flat_map(|b| &b.insts)
-        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .map(|i| i.machine.offset + 4 * i.machine.words().len())
         .max()
         .unwrap_or(0) as u32;
     let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);

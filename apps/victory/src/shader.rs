@@ -394,7 +394,7 @@ fn list_effects(path: &std::path::Path, data: &[u8]) {
 }
 
 fn format_instruction(i: &Instruction, wave64: bool) -> String {
-    let words: Vec<_> = i.words.iter().map(|w| format!("{w:08X}")).collect();
+    let words: Vec<_> = i.words().iter().map(|w| format!("{w:08X}")).collect();
     let text = match i.name() {
         Some(_) => i.text(wave64),
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
