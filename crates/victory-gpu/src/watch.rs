@@ -1005,7 +1005,8 @@ impl Drop for Timed {
 pub(crate) mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
@@ -1025,9 +1026,15 @@ pub(crate) mod tests {
         p
     }
 
+    /// Gives back a [`pool`]'s memory but keeps its addresses, so that no
+    /// later allocation lands there. A test can leave a tracker of its pool
+    /// behind (a host copy or a texture's staging that something global
+    /// still holds), and its pages stay in the guard set; a pool another
+    /// test got at those addresses would count as guarded already and never
+    /// fault (shadow and watch tests failing now and then, run in parallel).
     pub(crate) fn free(p: usize) {
-        // SAFETY: an allocation of ours.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: an allocation of ours, decommitted whole; still reserved.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_DECOMMIT) };
     }
 
     /// Everything is changed at first; after taking, only what is written

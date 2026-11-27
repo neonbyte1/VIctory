@@ -392,6 +392,15 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// Keeps submissions off while held: for tests of what one takes from
+    /// state all share, such as the shaders' marks in the bitmaps
+    /// (`crate::shadow::copy_back_marks` takes every mark set), which a
+    /// test submitting alongside would otherwise take first. `None` with no
+    /// host GPU.
+    pub(crate) fn no_submissions() -> Option<std::sync::MutexGuard<'static, u64>> {
+        super::host().map(|h| h.submitted.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     thread_local! {
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
