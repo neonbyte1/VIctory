@@ -158,6 +158,39 @@ fn mirror(handle: u64) {
     }
 }
 
+/// One 64 KiB page of a heap's dirty ranges to sync: the heap (its registry
+/// address and start), the slots of that page, and their step.
+#[cfg(windows)]
+struct PageJob {
+    heap: usize,
+    start: u64,
+    step: u64,
+    first: u32,
+    last: u32,
+}
+
+/// The pages to sync of a heap's dirty byte `runs`, clipped to the `count`
+/// slots the host heap has: one job a 64 KiB page, in order (a page two
+/// runs touch is synced twice, harmlessly).
+#[cfg(windows)]
+fn page_jobs(heap: usize, start: u64, step: u64, count: u32, runs: &[(usize, usize)]) -> Vec<PageJob> {
+    let mut jobs: Vec<PageJob> = Vec::new();
+    let page_size = crate::watch::PAGE;
+    for &(from, to) in runs {
+        for page in (from & !(page_size - 1)..to).step_by(page_size) {
+            let (page, end) = (page.max(from), (page + page_size).min(to));
+            let (first, last) =
+                ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+            let (first, last) = (first.min(u64::from(count)) as u32, last.min(u64::from(count)) as u32);
+            if first >= last {
+                continue;
+            }
+            jobs.push(PageJob { heap, start, step, first, last });
+        }
+    }
+    jobs
+}
+
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
@@ -165,39 +198,57 @@ fn mirror(handle: u64) {
 /// world 1,300-14,400 slots a frame, against a few hundred views made by
 /// calls). Called before each submission: shaders take descriptors from the
 /// heap at indices in their data, where a slot never mirrored reads nothing.
+///
+/// `SHADER_HEAPS` is what a title thread writing a view waits on
+/// (`descriptor.rs`'s `mirror`, `C::MirrorWaitUs`): the sync holds it for a
+/// chunk of pages, not for the whole sync, because title threads queued
+/// behind one 16 ms hold for 74.6 ms a frame (run heapdirty2, 222 pages a
+/// frame); a writer now waits for at most one chunk.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    // Held throughout: a heap is not dropped while its slots are made.
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    for &(start, _, at) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
-            continue;
-        };
-        let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
-            // By page: one with nothing mapped (the title unmaps heap pages
-            // too) holds no records.
-            let page_size = crate::watch::PAGE;
-            for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
-                    continue;
-                }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                // Slots past the host heap's count (the host's limit, on
-                // NVIDIA) have no host slot: the title writes ~96 pages of
-                // them a world frame (6 MB, 44 % of the pages the watch
-                // marks), and mirroring one made nothing. Left out of the
-                // scan here, which is where the waste was.
-                let last = last.min(u64::from(host.count()));
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::SyncSlots, last.saturating_sub(first));
-                host.sync_slots(first as u32, last as u32, start, step);
+    const CHUNK: usize = 16;
+    // The heap and its dirty pages are collected under the lock, the pages
+    // are synced under it a chunk at a time. `written.take` empties the
+    // heap's changed set, so a page is not synced twice.
+    let mut jobs: Vec<PageJob> = Vec::new();
+    {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        for &(start, _, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed when dropped).
+            let heap = unsafe { &*(at as *const Heap) };
+            let (Some(Some(host)), Some(written), Some(step)) =
+                (heap.host.get(), &heap.written, increment(heap.desc.kind))
+            else {
+                continue;
+            };
+            let runs = written.take(start as usize, usize::MAX);
+            jobs.extend(page_jobs(at, start, u64::from(step), host.count(), &runs));
+        }
+    }
+    for chunk in jobs.chunks(CHUNK) {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        for job in chunk {
+            // The heap may have been released while the lock was free.
+            if !heaps.iter().any(|&(_, _, at)| at == job.heap) {
+                continue;
             }
+            // SAFETY: registered heaps are live (removed when dropped).
+            let heap = unsafe { &*(job.heap as *const Heap) };
+            let Some(Some(host)) = heap.host.get() else {
+                continue;
+            };
+            // A page with nothing mapped (the title unmaps heap pages too)
+            // holds no records.
+            let at = job.start + u64::from(job.first) * job.step;
+            if !crate::host::read_into(at as *const u8, &mut [0u8; 4]) {
+                continue;
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::SyncSlots,
+                u64::from(job.last - job.first),
+            );
+            host.sync_slots(job.first, job.last, job.start, job.step);
         }
     }
 }
@@ -1026,6 +1077,36 @@ pub(crate) mod tests {
         forget(resource);
         assert_ne!(with_generations(|gens| gens[i as usize]), generation, "the release moves it on");
         assert!(view_deaths() > deaths, "and counts as a death for the synced pages");
+    }
+
+    /// A heap sync's pages: one job a 64 KiB page of the written ranges, in
+    /// order, clipped to the slots the host heap has (the title's heap is
+    /// larger than the host's).
+    #[test]
+    fn a_sync_covers_each_written_page_once_and_only_the_hosts_slots() {
+        let page = crate::watch::PAGE;
+        let (start, step, count) = (0x1000_0000usize, 32u64, 4096u32); // 128 KiB, two pages
+        let jobs = page_jobs(7, start as u64, step, count, &[(start, start + 4096 * 32)]);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!((jobs[0].heap, jobs[0].first, jobs[0].last), (7, 0, 2048));
+        assert_eq!((jobs[1].first, jobs[1].last), (2048, 4096));
+        // Two runs in one page are two jobs for it, each clipped honestly.
+        let jobs = page_jobs(7, start as u64, step, count, &[
+            (start + 64, start + 128),
+            (start + 1024, start + 2048),
+        ]);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!((jobs[0].first, jobs[0].last), (2, 4));
+        assert_eq!((jobs[1].first, jobs[1].last), (32, 64));
+        // A page half past the host's slots is clipped, one wholly past it
+        // is left out, and a heap with no host slots has no jobs.
+        let count = 3000;
+        let jobs = page_jobs(7, start as u64, step, count, &[(start + 62000, start + 100000)]);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!((jobs[0].first, jobs[0].last), (1937, 2048));
+        assert_eq!((jobs[1].first, jobs[1].last), (2048, 3000));
+        assert!(page_jobs(7, start as u64, step, count, &[(start + 2 * page, start + 3 * page)]).is_empty());
+        assert!(page_jobs(7, start as u64, step, 0, &[(start, start + 4096 * 32)]).is_empty());
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no
