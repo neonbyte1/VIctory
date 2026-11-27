@@ -3230,6 +3230,57 @@ impl<'a> Lower<'a> {
             Some(Operand::Vector { reg, .. }) => Some(*reg),
             _ => None,
         };
+        if name == "ds_nop" {
+            return Ok(());
+        }
+        if name == "ds_permute_b32" {
+            // Each active lane sends `data` to the lane its address plus the
+            // offset names in dwords, within its 32-lane half (RDNA2 ISA
+            // §10.4.4 "LDS Lane-permute Ops": in Wave64 mode the permute
+            // executes as two independent 32-lane halves 0..31 and 32..63);
+            // 0 where no active lane sends.
+            self.cross_lane(false)?;
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let me = self.lane_index();
+            let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+            let (o, two, k31, z) = (k(self, offset), k(self, 2), k(self, 31), k(self, 0));
+            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let to = self.s.m.bin(c, Bin::LShr, at, two);
+            let mut to = self.s.m.bin(c, Bin::And, to, k31);
+            if self.x.p.wave64 {
+                let hi = k(self, !31);
+                let base = self.s.m.bin(c, Bin::And, me, hi);
+                to = self.s.m.bin(c, Bin::Or, base, to);
+            }
+            let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+            let (lo, hi) = (
+                self.s.m.extract(c, ballot, 0),
+                self.s.m.extract(c, ballot, 1),
+            );
+            let off = self.s.m.bool(false);
+            let mut r = z;
+            for src in 0..self.wave() {
+                let ks = k(self, src);
+                let word = if src < 32 { lo } else { hi };
+                let bit = k(self, 1u32 << (src & 31));
+                let m = self.s.m.bin(c, Bin::And, word, bit);
+                let running = self.s.m.cmp(c, pred::NE, m, z);
+                let t = self.read_lane(to, ks);
+                let v = self.read_lane(x, ks);
+                let eq = self.s.m.cmp(c, pred::EQ, t, me);
+                let hit = self.s.m.select(c, running, eq, off);
+                r = self.s.m.select(c, hit, v, r);
+            }
+            let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if name == "ds_swizzle_b32" {
             // Bit 15 set: each lane of a quad picks a lane of it; else lanes
             // of each group of 32 combine their index with and/or/xor masks.
@@ -3569,7 +3620,8 @@ impl<'a> Lower<'a> {
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
-                    || name.contains("permute"));
+                    || name.contains("permute")
+                    || name == "ds_nop");
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
