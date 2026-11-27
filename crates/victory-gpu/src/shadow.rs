@@ -77,7 +77,7 @@ pub(crate) struct Shadow {
     tracked: Option<crate::watch::Tracked>,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    pending: Mutex<crate::fx::Set<(usize, usize)>>,
     /// The copy's bytes before the submission ran where its shaders write:
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
@@ -97,7 +97,7 @@ pub(crate) struct Shadow {
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
-type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
+type Snapshot = (Vec<(usize, Vec<u8>)>, crate::fx::Set<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());

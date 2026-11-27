@@ -2800,6 +2800,176 @@ uint ps() : SV_Target { return 1; }
         }
     }
 
+    /// The CPU cost of binding a dispatch (`State::bind` and recording it)
+    /// with a world-like compute shader: four descriptor tables of four
+    /// buffer views each, through user data, the tables moving between
+    /// dispatches as a frame's materials do. The host code is a shader with
+    /// no resources (any root signature takes it), so the host pipeline and
+    /// its root signature are the ones the translation defines. Also times
+    /// submitting the lists. Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture dispatch_binding_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn dispatch_binding_cost() {
+        use victory_shader::HwStage;
+        use victory_shader::emit::{HostShader, UserData};
+        const SLOTS: u32 = 4096;
+        const BUFFERS: u32 = 32;
+        const TABLES: u8 = 4;
+        const PER_TABLE: u32 = 4;
+        const DISPATCHES: usize = 2000;
+        const LISTS: usize = 8;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, SLOTS, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // Raw views of 64 KiB buffers in every slot, buffers round robin.
+        let buffers: Vec<This> = (0..BUFFERS).map(|_| buffer(64 << 10)).collect();
+        // Raw (R32 typeless) buffer views: the UAV and SRV descriptions.
+        let raw: [u32; 10] = [39, 1, 0, 0, (64 << 10) / 4, 0, 0, 0, 1, 0];
+        let raw_srv: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, (64 << 10) / 4, 0, 1, 0];
+        for slot in 0..SLOTS {
+            let b = buffers[(slot % BUFFERS) as usize];
+            let at = title_heap.start + u64::from(slot) * 32;
+            if slot % 2 == 0 {
+                crate::descriptor::create_srv(null, b, &raw_srv, at);
+            } else {
+                crate::descriptor::create_uav(null, b, null, &raw, at);
+            }
+        }
+        // A shader with no resources: the host code.
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        let source = "[numthreads(1, 1, 1)] void main() {}";
+        // SAFETY: the source and names outlive the call.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("none"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob's own bytes.
+        let dxil = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        }
+        .to_vec();
+        let user_data = (0..TABLES)
+            .map(|t| UserData {
+                index: u32::from(t),
+                slot: t,
+                root: RootType::Table,
+                dword: 0,
+            })
+            .collect();
+        let used = (0..TABLES)
+            .flat_map(|t| {
+                (0..PER_TABLE).map(move |k| UsedResource {
+                    kind: if k % 2 == 0 { ResourceType::Srv } else { ResourceType::Uav },
+                    root: RootType::Table,
+                    table_offset_dwords: k * 8,
+                    lower_bound: k,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: t,
+                    slot: t,
+                })
+            })
+            .collect();
+        let shader = crate::pipeline::translated_for_test(
+            "compute",
+            crate::pipeline::Translated {
+                host: HostShader {
+                    stage: HwStage::Cs,
+                    dxil,
+                    user_data,
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    memory: false,
+                    memory_writes: false,
+                    view_addresses: false,
+                    heap: false,
+                    heap_writes: false,
+                    view_marks: false,
+                },
+                used,
+            },
+        );
+        let p = crate::pipeline::host::HostPipeline::new(&[shader], None).expect("a host pipeline");
+        // Closed, as recorded lists are before the frame resets them.
+        let lists: Vec<HostList> = (0..LISTS)
+            .map(|_| {
+                let list = host.new_list().unwrap();
+                list.close();
+                list
+            })
+            .collect();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u32
+        };
+        let mut frame = || -> (std::time::Duration, std::time::Duration) {
+            let mut bind = std::time::Duration::ZERO;
+            for list in &lists {
+                list.reset();
+                let mut state = State::default();
+                state.set_heaps(&[heap]);
+                for _ in 0..DISPATCHES / LISTS {
+                    for t in 0..u32::from(TABLES) {
+                        // 512 materials' tables, 8 slots each.
+                        let at = next(512) * 8;
+                        state.set_table(true, t, title_heap.start + u64::from(at) * 32);
+                    }
+                    let started = std::time::Instant::now();
+                    assert!(state.bind(list, &p, true), "bound");
+                    // SAFETY: an open list with everything set.
+                    unsafe { list.list.Dispatch(1, 1, 1) };
+                    bind += started.elapsed();
+                }
+                list.close();
+            }
+            let started = std::time::Instant::now();
+            let runs: Vec<&HostList> = lists.iter().collect();
+            host.execute(&runs);
+            (bind, started.elapsed())
+        };
+        frame();
+        let mut times: Vec<(f64, f64)> = (0..7)
+            .map(|_| {
+                let (bind, submit) = frame();
+                (
+                    bind.as_secs_f64() * 1e6 / DISPATCHES as f64,
+                    submit.as_secs_f64() * 1e3,
+                )
+            })
+            .collect();
+        times.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (us, ms) in &times {
+            println!("  bind {us:.2} us/dispatch, submit {ms:.2} ms ({DISPATCHES} dispatches)");
+        }
+        println!("bind per dispatch, median: {:.2} us", times[3].0);
+    }
+
     /// Title memory of `bytes` (64 KiB aligned) for textures at an address.
     fn title_memory(bytes: usize) -> u64 {
         let layout = std::alloc::Layout::from_size_align(bytes, 1 << 16).unwrap();

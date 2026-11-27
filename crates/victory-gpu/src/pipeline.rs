@@ -154,6 +154,18 @@ impl Shader {
     }
 }
 
+/// Tests: a shader whose translation is `translated` (its container is
+/// the host code), for host pipelines without a console program.
+#[cfg(all(test, windows))]
+pub(crate) fn translated_for_test(
+    stage: &'static str,
+    translated: Translated,
+) -> std::sync::Arc<Shader> {
+    let shader = Shader::new(stage, &translated.host.dxil);
+    let _ = shader.translated.set(Some(translated));
+    std::sync::Arc::new(shader)
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {

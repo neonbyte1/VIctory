@@ -38,6 +38,8 @@ pub mod fence;
 pub mod frame;
 mod hold;
 #[cfg(windows)]
+mod fx;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
