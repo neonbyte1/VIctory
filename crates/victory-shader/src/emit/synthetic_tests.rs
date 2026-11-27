@@ -141,6 +141,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
         view_marks: false,
     })
 }
@@ -889,6 +890,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             outputs,
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
             view_marks: false,
         })
         .expect("lower");

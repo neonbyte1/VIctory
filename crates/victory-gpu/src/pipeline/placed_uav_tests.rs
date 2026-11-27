@@ -74,7 +74,7 @@ fn store_shader() -> Arc<Shader> {
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+    let host = emit::emit(&c, &native, &p, &st, &io, &res, emit::Target::ANY).unwrap();
     Arc::new(Shader {
         stage: "compute",
         hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),

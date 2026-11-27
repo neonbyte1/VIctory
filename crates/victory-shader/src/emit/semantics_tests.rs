@@ -292,6 +292,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
         view_marks: false,
     })
     .map_err(e)?;

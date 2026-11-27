@@ -2829,7 +2829,7 @@ pub(crate) mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).unwrap();
+        let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
         assert!(!shader.memory);
         assert!(shader.user_data.contains(&crate::emit::UserData {
             index: 0,

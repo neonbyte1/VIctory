@@ -410,6 +410,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
         view_marks: false,
     })
     .expect("lower");
@@ -1001,7 +1002,7 @@ fn pixel_quad_swizzle_and_dpp_validate_and_create_pipeline() {
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    let ps = emit(&c, &native, &p, &st, &io, &res).unwrap();
+    let ps = emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).unwrap();
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut ps.dxil.clone())
