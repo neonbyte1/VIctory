@@ -109,13 +109,16 @@ pub fn hle_writes(what: HleWrite) -> AsKind {
 }
 
 /// An offered page: the copy (its address, title range) and the copy's
-/// bytes of it, and every page number showing it.
+/// bytes of it, every page number showing it, and whether a reader was
+/// served it already (then the entry lives on until a writer or the copy
+/// itself ends it, counted apart: who writes a page after it was served).
 #[derive(Clone)]
 struct Entry {
     copy: usize,
     range: (usize, usize),
     mirror: usize,
     shown: Vec<usize>,
+    served: bool,
 }
 
 #[derive(Default)]
@@ -131,6 +134,7 @@ struct State {
 /// One page's end, for the log.
 struct Sample {
     what: N,
+    after: bool,
     page: usize,
     range: (usize, usize),
     at: usize,
@@ -173,9 +177,16 @@ enum N {
 }
 const NS: usize = 23;
 static COUNTS: [AtomicU64; NS] = [const { AtomicU64::new(0) }; NS];
+/// The same, for pages ended after a served touch.
+static AFTER: [AtomicU64; NS] = [const { AtomicU64::new(0) }; NS];
 
 fn count(n: N) {
     COUNTS[n as usize].fetch_add(1, Relaxed);
+}
+
+/// Counts the end of entry `e` by `n`: apart once it was served.
+fn ended_by(n: N, e: &Entry) {
+    (if e.served { &AFTER } else { &COUNTS })[n as usize].fetch_add(1, Relaxed);
 }
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -199,6 +210,7 @@ impl State {
         if self.samples.len() < SAMPLES {
             self.samples.push(Sample {
                 what,
+                after: e.served,
                 page: home,
                 range: e.range,
                 at,
@@ -226,7 +238,7 @@ pub(crate) fn offer(page: usize, copy: usize, range: (usize, usize), mirror: usi
     for &p in std::iter::once(&page).chain(others) {
         if let Some((home, e, elsewhere)) = s.take(p) {
             let n = if e.copy == copy { N::Again } else if elsewhere { N::OtherCopyElsewhere } else { N::OtherCopy };
-            count(n);
+            ended_by(n, &e);
             if n != N::Again {
                 s.sample(n, home, &e, p, copy, range);
             }
@@ -243,6 +255,7 @@ pub(crate) fn offer(page: usize, copy: usize, range: (usize, usize), mirror: usi
             range,
             mirror,
             shown,
+            served: false,
         },
     );
     LIVE.fetch_add(1, Relaxed);
@@ -264,7 +277,7 @@ pub(crate) fn marked(page: usize, copy: usize, range: (usize, usize)) {
         } else {
             N::OtherCopy
         };
-        count(n);
+        ended_by(n, &e);
         if n != N::Again {
             s.sample(n, home, &e, page, copy, range);
         }
@@ -272,8 +285,9 @@ pub(crate) fn marked(page: usize, copy: usize, range: (usize, usize)) {
 }
 
 /// Title memory `[at, at + len)` is read by this thread's reader
-/// ([`as_kind`]): the offered pages there end, counted by reader, and their
-/// copy's bytes are compared with title memory.
+/// ([`as_kind`]): the offered pages there are counted by reader at their
+/// first read (their copy's bytes compared with title memory) and followed
+/// on; a refresh of the copy itself ends them.
 pub(crate) fn touch(at: usize, len: usize) {
     if LIVE.load(Relaxed) == 0 || len == 0 {
         return;
@@ -284,11 +298,25 @@ pub(crate) fn touch(at: usize, len: usize) {
     }
     let mut s = state();
     for page in s.found(at, len) {
-        let Some((home, e, elsewhere)) = s.take(page) else {
+        let Some(&home) = s.at.get(&page) else {
             continue;
         };
+        let Some(e) = s.entries.get(&home).cloned() else {
+            continue;
+        };
+        let elsewhere = page != home;
+        if kind == Kind::Refresh && e.copy == reader && !elsewhere {
+            // Something marked the copy's own page changed that nothing
+            // here saw.
+            s.take(page);
+            ended_by(N::RefreshOwn, &e);
+            s.sample(N::RefreshOwn, home, &e, page * PAGE, reader, (0, 0));
+            continue;
+        }
+        if e.served {
+            continue;
+        }
         let n = match kind {
-            Kind::Refresh if e.copy == reader && !elsewhere => N::RefreshOwn,
             Kind::Refresh if elsewhere => N::RefreshElsewhere,
             Kind::Refresh => N::Refresh,
             Kind::Texture => N::Texture,
@@ -297,12 +325,12 @@ pub(crate) fn touch(at: usize, len: usize) {
             _ => N::HostRead,
         };
         count(n);
-        if matches!(n, N::RefreshOwn | N::Elsewhere | N::RefreshElsewhere) {
-            s.sample(n, home, &e, page * PAGE, reader, (0, 0));
-        }
         // Under the lock: the copy's bytes live until `drop_copy` of it,
         // which waits for it.
         count(if same_as_title(home, e.mirror) { N::Equal } else { N::Differ });
+        if let Some(e) = s.entries.get_mut(&home) {
+            e.served = true;
+        }
     }
 }
 
@@ -359,7 +387,7 @@ pub(crate) fn written(at: usize, len: usize, writer: Writer) {
                 0,
             ),
         };
-        count(n);
+        ended_by(n, &e);
         s.sample(n, home, &e, page * PAGE, by, (0, 0));
     }
 }
@@ -371,8 +399,8 @@ pub(crate) fn gone(at: usize, len: usize) {
     }
     let mut s = state();
     for page in s.found(at, len) {
-        if s.take(page).is_some() {
-            count(N::Gone);
+        if let Some((_, e, _)) = s.take(page) {
+            ended_by(N::Gone, &e);
         }
     }
 }
@@ -403,8 +431,9 @@ pub(crate) fn drop_copy(copy: usize) {
     let mut s = state();
     let found: Vec<usize> = s.entries.iter().filter(|(_, e)| e.copy == copy).map(|(&k, _)| k).collect();
     for page in found {
-        s.take(page);
-        count(N::Gone);
+        if let Some((_, e, _)) = s.take(page) {
+            ended_by(N::Gone, &e);
+        }
     }
 }
 
@@ -489,6 +518,29 @@ pub(crate) fn lines(frames: f64) -> Vec<String> {
         n(N::Equal),
         n(N::Differ),
     )];
+    let a: Vec<f64> = AFTER.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let a = |k: N| a[k as usize];
+    out.push(format!(
+        "  owner census after a served read, per frame: ended by {:.1} marked again by the same copy, {:.1} another copy \
+         here, {:.1} another copy at another mapping; title write faults {:.1} here, {:.1} at another mapping; our \
+         copy-back writes {:.1} here, {:.1} at another mapping; HLE writes {:.1} file reads, {:.1} DirectStorage to \
+         addresses, {:.1} DirectStorage to pages; other kernel writes {:.1} here, {:.1} at another mapping; {:.1} gone; \
+         refresh of the same copy (unseen writer) {:.1}",
+        a(N::Again),
+        a(N::OtherCopy),
+        a(N::OtherCopyElsewhere),
+        a(N::TitleWrite),
+        a(N::TitleWriteElsewhere),
+        a(N::OwnWrite),
+        a(N::OwnWriteElsewhere),
+        a(N::FileWrite),
+        a(N::StorageAddress),
+        a(N::StoragePages),
+        a(N::KernelWrite),
+        a(N::KernelElsewhere),
+        a(N::Gone),
+        a(N::RefreshOwn),
+    ));
     let samples = std::mem::take(&mut state().samples);
     for s in samples {
         let by = match s.what {
@@ -498,8 +550,9 @@ pub(crate) fn lines(frames: f64) -> Vec<String> {
             _ => String::new(),
         };
         out.push(format!(
-            "  owner census sample: {:?} of page {:#x} (copy of {:#x}+{:#x}) at {} {by}",
+            "  owner census sample: {:?}{} of page {:#x} (copy of {:#x}+{:#x}) at {} {by}",
             s.what,
+            if s.after { " after a served read" } else { "" },
             s.page * PAGE,
             s.range.0,
             s.range.1,
@@ -518,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_touch_of_an_offered_page_is_counted_once_by_kind_and_mapping() {
+    fn the_first_touch_of_an_offered_page_is_counted_once_by_kind_and_mapping_and_followed_after_a_read() {
         let p = crate::watch::tests::pool(4);
         let (page, next, far) = (p / PAGE, p / PAGE + 1, p / PAGE + 3);
         // SAFETY: the pool's pages, ours.
@@ -581,12 +634,35 @@ mod tests {
         }
         assert_eq!((delta(N::OwnWriteElsewhere), delta(N::StoragePages)), (1, 1));
 
+        // Followed past a served read: what ends it then is counted apart.
+        let after = |n: N| AFTER[n as usize].load(Relaxed);
+        let (elsewhere, own) = (after(N::OtherCopyElsewhere), after(N::RefreshOwn));
+        offer(page, copy, range, mirror.as_ptr() as usize, &[far]);
+        {
+            let _k = as_kind(Kind::Refresh, reader);
+            touch(far * PAGE, PAGE);
+        }
+        marked(far, reader, (far * PAGE, PAGE));
+        offer(page, copy, range, mirror.as_ptr() as usize, &[far]);
+        {
+            let _k = as_kind(Kind::Refresh, reader);
+            touch(far * PAGE, PAGE);
+        }
+        {
+            let _k = as_kind(Kind::Refresh, copy);
+            touch(p, PAGE);
+        }
+        assert_eq!(
+            (delta(N::RefreshElsewhere), after(N::OtherCopyElsewhere) - elsewhere, after(N::RefreshOwn) - own),
+            (2, 1, 1)
+        );
+
         // A remap, the copy going.
         offer(page, copy, range, mirror.as_ptr() as usize, &[far]);
         gone(far * PAGE, PAGE);
         offer(next, copy, range, mirror.as_ptr() as usize, &[]);
         drop_copy(copy);
-        assert_eq!((delta(N::Gone), delta(N::Offered)), (2, 10));
+        assert_eq!((delta(N::Gone), delta(N::Offered)), (2, 12));
         assert!(state().at.range(page..far + 1).next().is_none());
         crate::watch::tests::free(p);
     }
