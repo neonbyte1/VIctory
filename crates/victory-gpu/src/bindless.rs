@@ -9,7 +9,7 @@
 //! such shaders first brings all of them up to date (what changed since,
 //! `crate::watch`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -52,7 +52,8 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
-    textures: BTreeMap<usize, u32>,
+    // Reverse index: release touches only slots viewing this texture.
+    textures: BTreeMap<usize, BTreeSet<u32>>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
@@ -79,7 +80,26 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
-    fn count(&mut self, seen: &Seen, add: bool) {
+    fn replace(&mut self, index: u32, seen: Option<Seen>) {
+        if let Some(old) = self.slots.remove(&index) {
+            self.count(index, &old, false);
+        }
+        if let Some(seen) = seen {
+            self.count(index, &seen, true);
+            self.slots.insert(index, seen);
+        }
+    }
+
+    fn forget_texture(&mut self, resource: usize) {
+        if let Some(slots) = self.textures.remove(&resource) {
+            for index in slots {
+                let old = self.slots.remove(&index);
+                debug_assert!(matches!(old, Some(Seen::Texture(r)) if r == resource));
+            }
+        }
+    }
+
+    fn count(&mut self, index: u32, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
@@ -115,10 +135,13 @@ impl Inner {
                 }
             }
             Seen::Texture(r) => {
-                let n = self.textures.entry(*r).or_insert(0);
-                step(n);
-                if *n == 0 {
-                    self.textures.remove(r);
+                if add {
+                    self.textures.entry(*r).or_default().insert(index);
+                } else if let Some(slots) = self.textures.get_mut(r) {
+                    slots.remove(&index);
+                    if slots.is_empty() {
+                        self.textures.remove(r);
+                    }
                 }
             }
             Seen::Left(_) => {}
@@ -132,13 +155,7 @@ impl Viewed {
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = inner.slots.remove(&index) {
-            inner.count(&old, false);
-        }
-        if let Some(seen) = seen {
-            inner.count(&seen, true);
-            inner.slots.insert(index, seen);
-        }
+        inner.replace(index, seen);
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
@@ -357,9 +374,7 @@ pub(crate) fn forget(resource: usize) {
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.textures.remove(&resource).is_some() {
-            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
-        }
+        inner.forget_texture(resource);
     }
 }
 
@@ -422,6 +437,9 @@ pub(crate) fn log(frames: f64) {
         );
     }
 }
+
+#[cfg(test)]
+mod slot_tests;
 
 #[cfg(test)]
 mod tests {
@@ -562,14 +580,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         let viewed = Viewed::default();
         let set = |slot: u32, range: Option<(u64, u64)>| {
             let mut inner = viewed.inner.lock().unwrap();
-            if let Some(old) = inner.slots.remove(&slot) {
-                inner.count(&old, false);
-            }
-            if let Some((from, len)) = range {
-                let seen = Seen::Buffer(copy.clone(), at + from, len, false);
-                inner.count(&seen, true);
-                inner.slots.insert(slot, seen);
-            }
+            let seen = range.map(|(from, len)| Seen::Buffer(copy.clone(), at + from, len, false));
+            inner.replace(slot, seen);
         };
         let hull = || viewed.ranges().iter().map(|h| (h.1 - at, h.2)).collect::<Vec<_>>();
         set(0, Some((0x100, 0x100)));
