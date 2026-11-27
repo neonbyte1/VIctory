@@ -122,14 +122,11 @@ pub fn run(
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
         victory_gpu::pipeline::note_title_dll(name, dll.base(), dll.info().size_of_image as usize);
     }
-    let imported: Vec<&str> = image
-        .info()
-        .imports
+    let mapped: Vec<_> = dlls
         .iter()
-        .map(|m| m.dll.as_str())
+        .map(|(name, dll)| (name.as_str(), dll.info().imports.as_slice()))
         .collect();
-    let mapped: Vec<&str> = dlls.iter().map(|(name, _)| name.as_str()).collect();
-    let absent = absent_title_dlls(&imported, &mapped, &wanted);
+    let absent = absent_title_dlls(&image.info().imports, &mapped, &wanted);
     if !absent.is_empty() {
         let message = format!(
             "{} not in {}, and neither the host nor VIctory provides {}: the package is \
@@ -311,19 +308,25 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
-/// The DLLs among `imported` (the main image's static imports) that must
-/// come from the title's folder (`wanted`) but were not mapped from it:
-/// none of their imports can be bound. Each named once, case ignored.
+/// The DLLs statically imported by the main image or a mapped title DLL that
+/// must come from the title's folder (`wanted`) but were not mapped from it.
+/// Each named once, case ignored.
 #[cfg(any(windows, test))]
 fn absent_title_dlls(
-    imported: &[&str],
-    mapped: &[&str],
+    main: &[victory_pe::ImportModule],
+    mapped: &[(&str, &[victory_pe::ImportModule])],
     wanted: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
+    let imported = main
+        .iter()
+        .chain(mapped.iter().flat_map(|(_, imports)| imports.iter()));
     let mut absent: Vec<String> = Vec::new();
-    for &dll in imported {
-        let known = |list: &[&str]| list.iter().any(|m| m.eq_ignore_ascii_case(dll));
-        if wanted(dll) && !known(mapped) && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll)) {
+    for module in imported {
+        let dll = module.dll.as_str();
+        if wanted(dll)
+            && !mapped.iter().any(|(name, _)| name.eq_ignore_ascii_case(dll))
+            && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll))
+        {
             absent.push(dll.to_owned());
         }
     }
@@ -462,35 +465,57 @@ impl LoaderLock {
 #[cfg(test)]
 mod absent_tests {
     use super::absent_title_dlls;
+    use victory_pe::ImportModule;
+
+    fn imports(dlls: &[&str]) -> Vec<ImportModule> {
+        dlls.iter()
+            .map(|&dll| ImportModule {
+                dll: dll.to_owned(),
+                entries: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn wanted(dll: &str) -> bool {
+        !["KERNEL32.dll", "d3d12_xs.dll"]
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(dll))
+    }
 
     #[test]
     fn title_dlls_missing_from_the_folder_are_named_once() {
         // The host provides kernel32, our runtime d3d12_xs; the rest are the
         // title's own (#930: the four DLLs beside the executable missing).
-        let wanted = |dll: &str| {
-            !["KERNEL32.dll", "d3d12_xs.dll"]
-                .iter()
-                .any(|h| h.eq_ignore_ascii_case(dll))
-        };
-        let imported = [
+        let imported = imports(&[
             "KERNEL32.dll",
             "d3d12_xs.dll",
             "XboxBvhBuilder.dll",
             "MSVCP140.dll",
             "Bink2Scarlett.dll",
             "xboxbvhbuilder.dll",
-        ];
-        let mapped = ["msvcp140.dll"];
+        ]);
         assert_eq!(
-            absent_title_dlls(&imported, &mapped, &wanted),
+            absent_title_dlls(&imported, &[("msvcp140.dll", &[])], &wanted),
             ["XboxBvhBuilder.dll", "Bink2Scarlett.dll"]
+        );
+    }
+
+    #[test]
+    fn missing_static_imports_of_mapped_title_dlls_are_named_once() {
+        let main = imports(&["A.dll"]);
+        let a = imports(&["B.dll", "MissingFromA.dll", "missingfromb.dll"]);
+        let b = imports(&["MissingFromB.dll", "KERNEL32.dll", "d3d12_xs.dll"]);
+        assert_eq!(
+            absent_title_dlls(&main, &[("b.dll", &b), ("a.dll", &a)], &wanted),
+            ["MissingFromB.dll", "MissingFromA.dll"]
         );
     }
 
     #[test]
     fn a_complete_package_has_nothing_absent() {
         let wanted = |dll: &str| dll.starts_with("Title");
-        assert!(absent_title_dlls(&["Title.dll", "Host.dll"], &["TITLE.DLL"], &wanted).is_empty());
+        let imported = imports(&["Title.dll", "Host.dll"]);
+        assert!(absent_title_dlls(&imported, &[("TITLE.DLL", &[])], &wanted).is_empty());
         assert!(absent_title_dlls(&[], &[], &wanted).is_empty());
     }
 }
