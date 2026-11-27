@@ -9035,6 +9035,10 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
+            // DXIL compares samples of every kind of texture but 3D.
+            if cmp && kind == 4 {
+                return Err("a comparison sample of a 3D image");
+            }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
@@ -9283,6 +9287,14 @@ impl<'a> Lower<'a> {
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
                     }
+                    // DXIL gathers from 2D textures, cubes and their arrays
+                    // (kinds 2, 5, 7, 9), with offsets only from the 2D ones.
+                    if !matches!(kind, 2 | 5 | 7 | 9) {
+                        return Err("a gather from a 1D or 3D image");
+                    }
+                    if offset_word && matches!(kind, 5 | 9) {
+                        return Err("a gather with offsets from a cube");
+                    }
                     if offset_word {
                         let w = addr_val(self, 0)?;
                         for (k, at) in [(0, 26), (1, 18)] {
@@ -9311,6 +9323,10 @@ impl<'a> Lower<'a> {
                 *slot = addr_val(self, k)?;
             }
             let mip = if name == "image_load_mip" {
+                // A UAV is one level of its resource; DXIL loads take none.
+                if uav {
+                    return Err("a load at a mip level from a UAV");
+                }
                 addr_val(self, coords)?
             } else if uav {
                 // Our declarations have four channels.
@@ -11787,6 +11803,8 @@ mod tests {
             assert!(!l.wave_ops);
         }
     }
+
+    mod image_refusals;
 
     #[test]
     fn an_address_half_set_where_only_lanes_that_never_run_skip_is_known() {
