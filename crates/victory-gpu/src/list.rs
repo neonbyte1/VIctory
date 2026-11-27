@@ -3087,6 +3087,8 @@ mod tests {
             #[cfg(windows)]
             segment: AtomicUsize::new(0),
             #[cfg(windows)]
+            lost: Default::default(),
+            #[cfg(windows)]
             state: Default::default(),
         });
         let hr = object::hand_out(LIST, list, &LIST_IIDS[1], &LIST_IIDS, &mut out);
