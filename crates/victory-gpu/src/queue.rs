@@ -496,6 +496,12 @@ fn system_timestamp() -> u64 {
     0
 }
 
+#[cfg(windows)]
+fn count_since(last: &AtomicU64, now: u64) -> u64 {
+    // A concurrent presenter may have already reported a newer snapshot.
+    now.saturating_sub(last.fetch_max(now, Ordering::Relaxed))
+}
+
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -528,10 +534,9 @@ extern "system" fn present(
         let (drawn, dispatched) = {
             static DRAWN: AtomicU64 = AtomicU64::new(0);
             static DISPATCHED: AtomicU64 = AtomicU64::new(0);
-            let since = |last: &AtomicU64, now: u64| now - last.swap(now, Ordering::Relaxed);
             (
-                since(&DRAWN, crate::draw::drawn()),
-                since(&DISPATCHED, crate::draw::dispatched()),
+                count_since(&DRAWN, crate::draw::drawn()),
+                count_since(&DISPATCHED, crate::draw::dispatched()),
             )
         };
         #[cfg(not(windows))]
@@ -1017,5 +1022,16 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_present_totals_do_not_move_the_reported_count_back() {
+        let last = AtomicU64::new(0);
+        // One presenter can read 6 and get descheduled while another one
+        // reads and reports 8. The first then reports the stale snapshot.
+        let deltas = [5, 8, 6, 8, 11].map(|total| count_since(&last, total));
+        assert_eq!(deltas, [5, 3, 0, 0, 3]);
+        assert_eq!(last.load(Ordering::Relaxed), 11);
     }
 }
