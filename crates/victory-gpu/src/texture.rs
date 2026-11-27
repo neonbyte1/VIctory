@@ -733,9 +733,10 @@ pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
 /// changed on several threads at once (reading title memory and detiling
 /// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
 pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
-    // Most find nothing changed (their trackers' clean bits say so): those
-    // are not handed to threads.
-    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
+    // Fewer still are due this frame (`VICTORY_TEXTURE_REFRESH_EVERY`), and
+    // most of the rest find nothing changed (their trackers' clean bits say
+    // so): neither kind is handed to a thread.
+    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.due() && work[i].0.maybe_changed()).collect();
     let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
     in_parallel(changed.len(), |k| {
         *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[changed[k]].0.refresh();
@@ -752,6 +753,31 @@ impl Staging {
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
         self.tracked.as_ref().is_none_or(|t| !t.clean())
+    }
+
+    /// `VICTORY_TEXTURE_REFRESH_EVERY`: a texture is read once every N frames
+    /// at most, round-robin by its own address, instead of every frame (0, 1 or
+    /// unset: every frame, as before). A title whose world is a frame a second
+    /// spends most of that frame reading title memory for textures; spreading
+    /// the reads costs at most N frames of staleness per texture and divides
+    /// the cost. Only in builds with diagnostics: it trades the picture for
+    /// frame time, which no build that ships should do.
+    fn due(&self) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let every = *EVERY.get_or_init(|| {
+                std::env::var("VICTORY_TEXTURE_REFRESH_EVERY")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(1)
+            });
+            if every > 1 {
+                return (crate::frame::current() + ((self.memory as usize >> 16) as u64)).is_multiple_of(every);
+            }
+        }
+        true
     }
 
     /// A staging buffer with the texture memory detiled into it if it
