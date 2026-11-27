@@ -36,9 +36,12 @@ enum Job {
     Graphics(usize),
 }
 
-pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
+pub fn run(paths: &[PathBuf], threads: usize, keys_only: Option<PathBuf>) -> Result<()> {
     let started = Instant::now();
-    pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
+    let listing = keys_only.is_some();
+    if !listing {
+        pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
+    }
     // The files that hold shaders (or the pack itself).
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
@@ -176,7 +179,6 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     // record's key (what a run lists pipelines by) with its shaders and
     // state as a run's `VICTORY_PIPELINE_LOG` has them, or why it is
     // skipped; and the records each source named states for.
-    let keys_only = std::env::var_os("VICTORY_PREBUILD_KEYS");
     if keys_only.is_some() {
         let mut by: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         for g in &graphics {
@@ -249,7 +251,9 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             format!("; {made} made, {loaded} found in the library")
         });
     });
-    pipeline::save_pipeline_cache();
+    if !listing {
+        pipeline::save_pipeline_cache();
+    }
     let (made, loaded) = counts();
     println!(
         "pipelines    {} in the pack, {:.1} s: {made} made, {} already in the library",

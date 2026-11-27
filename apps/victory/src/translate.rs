@@ -344,16 +344,16 @@ pub fn run(
 /// (`prebuild`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let threads =
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    // The pre-build's key listing reads the pack without warming the caches.
+    if pipelines && let Some(file) = std::env::var_os("VICTORY_PREBUILD_KEYS") {
+        return crate::prebuild::run(&paths, threads, Some(file.into()));
+    }
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());
     };
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
-    // The pre-build's key listing (diagnostics) translates nothing.
-    if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
-        return crate::prebuild::run(&paths, threads);
-    }
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     // Containers already cached, translated now, refused now.
@@ -448,7 +448,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         started.elapsed().as_secs_f64()
     );
     if pipelines {
-        crate::prebuild::run(&paths, threads)?;
+        crate::prebuild::run(&paths, threads, None)?;
     }
     Ok(())
 }
