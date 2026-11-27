@@ -8,7 +8,7 @@
 //! from the previous version), flushed to disk, and one directory rename
 //! commits it (`v<N>`); the highest committed version is the container.
 //! A crash leaves the old version or the new one, never a mix; leftovers
-//! are removed on sight. Deleting a container renames it away first.
+//! are cleaned up when possible. Deleting a container renames it away first.
 //!
 //! Names are exact: a version's `manifest` holds the container's name, its
 //! display name and the blob names (blob `i` is the file `i`), so case,
@@ -211,8 +211,8 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     Ok(Some((name, display, blobs)))
 }
 
-/// The container's newest readable committed version, if any. Removes what
-/// a crash left: unfinished versions, and versions older than that one.
+/// The container's newest readable committed version, if any. Tries to
+/// remove unfinished versions and versions older than that one.
 /// An unreadable newer folder (a stray, or a broken manifest) is neither
 /// taken nor removed, and never costs the version below it.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
@@ -222,7 +222,10 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            let staged = entry.path();
+            if let Err(e) = std::fs::remove_dir_all(&staged) {
+                tracing::warn!(dir = %staged.display(), %e, "could not remove unfinished save version");
+            }
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -240,7 +243,10 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             continue;
         };
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            let old = dir.join(format!("v{old}"));
+            if let Err(e) = std::fs::remove_dir_all(&old) {
+                tracing::warn!(dir = %old.display(), %e, "could not remove old save version");
+            }
         }
         return Ok(Some(Version {
             dir: version,
@@ -1204,6 +1210,80 @@ mod tests {
             }
             assert!(seen.0 > 0 && seen.1 > 1, "{op}: {seen:?}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_old_version_does_not_block_reads_or_updates() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let slot = container_dir(root, "Slot");
+        assert_eq!(update(root, "one", &[("a", Some("old a"))]), S_OK);
+        // Leave v1 behind as if the process stopped just after committing v2.
+        commit(&slot, 2, "Slot", "two", &[("a", Source::Data(b"new a"))]).unwrap();
+        let old = slot.join("v1");
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(old.join("0"))
+            .unwrap();
+
+        assert_eq!(
+            state(root),
+            Some(("two".into(), vec![("a".into(), "new a".into())]))
+        );
+        assert!(old.is_dir());
+
+        assert_eq!(update(root, "three", &[("a", Some("newest a"))]), S_OK);
+        let latest = Some(("three".into(), vec![("a".into(), "newest a".into())]));
+        assert_eq!(state(root), latest);
+        assert!(slot.join("v3").is_dir());
+        assert!(old.is_dir());
+
+        drop(locked);
+        assert_eq!(state(root), latest);
+        assert!(!old.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_unfinished_version_does_not_block_reads_or_updates() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let slot = container_dir(root, "Slot");
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let staged = slot.join("v99.new");
+        std::fs::create_dir(&staged).unwrap();
+        let blob = staged.join("0");
+        std::fs::write(&blob, b"unfinished").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(blob)
+            .unwrap();
+
+        assert_eq!(state(root), old_state());
+        assert!(staged.is_dir());
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        let latest = Some((
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+        ));
+        assert_eq!(state(root), latest);
+        assert!(slot.join("v2").is_dir());
+        assert!(staged.is_dir());
+
+        drop(locked);
+        assert_eq!(state(root), latest);
+        assert!(!staged.exists());
     }
 
     /// A kept blob that cannot be hard-linked (NTFS allows 1024 links to a
