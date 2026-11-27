@@ -7087,7 +7087,9 @@ impl<'a> Lower<'a> {
             }
             // A signed 64-bit operand sign-extends its 32-bit literal, as
             // the hardware does (LLVM's AMDGPU operand rules).
-            Operand::Literal(x) if inst.name().ends_with("_i64") => {
+            Operand::Literal(x)
+                if inst.name().ends_with("_i64") || inst.name() == "v_mad_i64_i32" =>
+            {
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             _ => {

@@ -1903,6 +1903,39 @@ fn signed_64_bit_operands_sign_extend_their_literal() {
     check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
 }
 
+/// `v_mad_i64_i32` sign-extends a 32-bit literal in `src2` (`S2.i64`), while
+/// `v_mad_u64_u32` zero-extends it (`S2.u64`).
+#[test]
+fn mad_i64_i32_sign_extends_literal_addend() {
+    const MINUS_100: u32 = -100_i32 as u32;
+    // VOP3B `v_mad_* v[5:6], s6, v1, v2, -100`; return the high dword `v6`.
+    let high_dword = |op: u16| {
+        let [a, b] = vop3(op, 5, vgpr(1), vgpr(2), 255);
+        [a | 6 << 8, b, MINUS_100, vop1(0x001, 0, vgpr(6))]
+    };
+    let check = |name: &str, op: u16, cases: &[([u32; 4], u32)]| {
+        let shader = build_valu_cs(&high_dword(op));
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            assert_eq!(got, cases[i].1, "{backend}: {name} {inp:x?}");
+        });
+    };
+    check(
+        "v_mad_i64_i32",
+        0x177,
+        &[
+            ([0, 0, 0, 0], u32::MAX),
+            ([10, 10, 0, 0], 0),
+            ([(-100_000_i32) as u32, 100_000, 0, 0], 0xFFFF_FFFD),
+        ],
+    );
+    check(
+        "v_mad_u64_u32",
+        0x176,
+        &[([0, 0, 0, 0], 0), ([10, 10, 0, 0], 1)],
+    );
+}
+
 #[test]
 fn bfe_signed_and_unsigned_match_rdna2() {
     // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
