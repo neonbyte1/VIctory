@@ -960,6 +960,193 @@ fn root_signature(
 mod tests {
     use super::*;
 
+    #[test]
+    fn direct_mesh_dispatch_uses_all_group_counts() {
+        use crate::object::{S_OK, This, guid, slot};
+        use victory_shader::native::{MeshIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, emit, io, ir, resource, structure,
+        };
+
+        let Some(host) = host().filter(|host| host.mesh_shaders()) else {
+            eprintln!("mesh shaders unavailable; skipped");
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        // SAFETY: the query writes one correctly sized options structure.
+        if unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS9,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_err()
+            || !options.MeshShaderPipelineStatsSupported.as_bool()
+        {
+            eprintln!("mesh pipeline statistics unavailable; skipped");
+            return;
+        }
+        // A one-thread mesh shader with no geometry. The query counts
+        // invocations, so one invocation is one dispatched workgroup.
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 1,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2, // Triangle
+                lds_bytes: 0,
+            }),
+            code: 0xbf81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+        };
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![],
+        };
+        let program = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        let resources =
+            resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+        let shader_io = io::raise(&program, &native).unwrap();
+        let host_shader =
+            emit::emit(&container, &native, &program, &structured, &shader_io, &resources).unwrap();
+        let shader = Shader::new("mesh", &host_shader.dxil);
+        assert!(
+            shader
+                .translated
+                .set(Some(Translated {
+                    host: host_shader,
+                    used: vec![],
+                }))
+                .is_ok()
+        );
+
+        let mut graphics = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
+        graphics.depth.DepthEnable = false.into();
+        let null = std::ptr::null();
+        let mut pipeline = null;
+        assert_eq!(
+            crate::pipeline::hand_out(
+                vec![Arc::new(shader)],
+                Some(Box::new(graphics)),
+                &crate::pipeline::PIPELINE_IIDS[0],
+                &mut pipeline
+            ),
+            S_OK
+        );
+        assert!(
+            crate::pipeline::host_pipeline(pipeline).is_some(),
+            "native mesh pipeline did not build"
+        );
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut alloc, mut list) = (null, null);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut alloc),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list),
+            S_OK
+        );
+        // Bind a guest view heap. The normal list path supplies the fallback
+        // sampler heap needed by the pipeline's directly indexed signature.
+        let desc: [u32; 8] = [0, 1, 1, 0, 0, 0, 0, 0];
+        let iid = ID3D12DescriptorHeap::IID;
+        let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(null, desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(
+            list, crate::list::slot_offset_for_test(list, 0x100),
+        )(list, 1, &heap);
+        let native = crate::list::host_list(list).unwrap();
+        slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
+        let mut queries: Option<ID3D12QueryHeap> = None;
+        let groups = [(2, 1, 1), (2, 3, 1), (2, 1, 4), (2, 3, 4), (2, 0, 4)];
+        // SAFETY: a live device and storage for the returned query heap.
+        unsafe {
+            host.device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1,
+                        Count: groups.len() as u32 + 1,
+                        NodeMask: 0,
+                    },
+                    &mut queries,
+                )
+                .unwrap();
+        }
+        let queries = queries.unwrap();
+        let count = groups.len() + 1;
+        let size = (count * size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>()) as u64;
+        let (readback, mapped) = native.readback(host, size).unwrap();
+        let kind = D3D12_QUERY_TYPE_PIPELINE_STATISTICS1;
+        let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(list, crate::list::slot_offset_for_test(list, 0x3f8));
+        for (index, (x, y, z)) in groups.into_iter().enumerate() {
+            // SAFETY: the open list and the indexed query belong to this fixture.
+            unsafe { native.list.BeginQuery(&queries, kind, index as u32) };
+            dispatch(list, x, y, z);
+            // SAFETY: ends the query begun above, of the same type and index.
+            unsafe { native.list.EndQuery(&queries, kind, index as u32) };
+        }
+        let last = groups.len() as u32;
+        // SAFETY: a live query heap with one more query and a live command list.
+        unsafe { native.list.BeginQuery(&queries, kind, last) };
+        slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, crate::list::slot_offset_for_test(list, 0x310))(list, 2, 0, 0, 0);
+        // SAFETY: every query has been begun and ended by this command list;
+        // readback holds one statistics record per query.
+        unsafe {
+            native.list.EndQuery(&queries, kind, last);
+            native
+                .list
+                .ResolveQueryData(&queries, kind, 0, count as u32, &readback, 0);
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> i32>(list, 0x48)(list),
+            S_OK
+        );
+        host.execute(&[native]);
+        // SAFETY: the completed resolve wrote count live mapped records.
+        let actual: Vec<_> = unsafe {
+            std::slice::from_raw_parts(
+                mapped.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>(),
+                count,
+            )
+        }
+        .iter()
+        .map(|s| s.MSInvocations)
+        .collect();
+        for object in [list, alloc, pipeline, heap] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        assert_eq!(actual, [2, 6, 8, 24, 0, 2]);
+    }
+
     fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
         let mut t = D3D12_RT_FORMAT_ARRAY {
             NumRenderTargets: formats.len() as u32,

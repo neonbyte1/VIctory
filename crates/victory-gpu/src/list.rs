@@ -1614,15 +1614,10 @@ mod state {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
-    /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
-    /// programs take `x` groups only.
+    /// `DispatchMesh(x, y, z)` (the PC method of List6).
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        if y * z != 1 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
-        }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_state(this, |list, s| s.dispatch_mesh(list, x, y, z));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1643,7 +1638,7 @@ mod state {
             }
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_state(this, |list, s| s.dispatch_mesh(list, x, 1, 1));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -2271,6 +2266,16 @@ pub(crate) fn has_newer_table(list: This) -> bool {
     // tests can switch layouts, so use this list's table.
     let table = unsafe { *list.cast::<*const *const ()>() };
     table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+}
+
+/// Resolves an original test slot against the list's actual table.
+#[cfg(all(test, windows))]
+pub(crate) fn slot_offset_for_test(list: This, offset: usize) -> usize {
+    if has_newer_table(list) {
+        newer_slot(offset / 8) * 8
+    } else {
+        offset
+    }
 }
 
 #[cfg(test)]
