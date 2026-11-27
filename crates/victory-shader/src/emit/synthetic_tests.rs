@@ -103,9 +103,13 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let lowered = lowered(&native)?;
+    build_native(&native)
+}
+
+fn build_native(native: &NativeProgram) -> Result<HostShader, crate::ShaderError> {
+    let lowered = lowered(native)?;
     Ok(HostShader {
-        stage: HwStage::Cs,
+        stage: native.stage,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         static_samplers: lowered
@@ -124,6 +128,96 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
     })
+}
+
+#[test]
+fn global_stores_keep_each_lanes_offset_after_exec_is_restored() {
+    // The first store covers lanes 0-15, which all add 128 to their
+    // offset. After restoring EXEC, lanes 16-31 still use lane * 4.
+    let words: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x4A04_0081, // v_add_nc_u32 v2, 1, v0
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0x4A02_02FF,
+        128, // v_add_nc_u32 v1, 128, v1
+        0xDC70_8100,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:256
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        0xDC70_8000,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 3,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let shader = build_native(&native).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let mut want = vec![0; 112];
+    for lane in 0..32 {
+        let value = lane as u32 + 1;
+        if lane < 16 {
+            want[96 + lane] = value;
+            want[32 + lane] = value;
+        } else {
+            want[lane] = value;
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let (host, label) = if !warp && let Ok(host) = Host::new(false) {
+        (host, "hardware")
+    } else {
+        (Host::new(true).expect("WARP SM 6.6 device"), "WARP")
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(
+                    0,
+                    Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                )],
+                views: &[View::RawUav(want.len() as u32)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    assert_eq!(out[0], want, "{label}");
+    eprintln!("{label}: verified narrowed and restored EXEC stores");
 }
 
 fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {

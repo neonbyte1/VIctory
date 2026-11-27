@@ -238,7 +238,9 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address = t
+                        .smem_address(inst, base, *offset, soffset, &t.site_known(site))
+                        .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -248,7 +250,14 @@ pub fn track(
                     ..
                 } if inst.name().starts_with("global_") => {
                     let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .flat_address(
+                            inst,
+                            addr.as_ref(),
+                            saddr.as_ref(),
+                            *offset,
+                            &t.site_known(site),
+                            &mut true,
+                        )
                         .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -339,7 +348,7 @@ struct Tracer<'a> {
     /// The loads from that memory by code offset, with their user-data byte
     /// offset.
     spill_at: std::collections::HashMap<usize, Result<u32, &'static str>>,
-    /// Address sums already traced, indexed by SSA value.
+    /// Address sums traced without relying on EXEC guards, indexed by SSA value.
     sums: std::cell::RefCell<Vec<Option<Sum>>>,
 }
 
@@ -352,7 +361,7 @@ type Known = Vec<(Bool, bool)>;
 /// before it gets to the branch conditions of the path, so those few small
 /// ones are tried alone first: if they cannot hold together, neither can
 /// all.
-fn meet(lanes: &Structured, known: &Known) -> bool {
+fn meet(lanes: &Structured, known: &[(Bool, bool)]) -> bool {
     let small: Known = known
         .iter()
         .copied()
@@ -612,6 +621,29 @@ impl<'a> Tracer<'a> {
         self.defs[v.0 as usize].map(|s| self.inst(s))
     }
 
+    /// The conditions every lane executing this instruction satisfies.
+    fn site_known(&self, site: Site) -> Known {
+        let Some(lanes) = self.lanes else {
+            return Vec::new();
+        };
+        let mut known = vec![(lanes.reach[site.0], true)];
+        known.extend(lanes.guards[site.0][site.1].map(|guard| (guard, true)));
+        known
+    }
+
+    /// Whether the definition can be followed for these lanes. Encountering a
+    /// guard makes the trace specific to this use, even if the guard holds.
+    fn runs_value(&self, v: Value, known: &[(Bool, bool)], unguarded: &mut bool) -> bool {
+        if let Some(lanes) = self.lanes
+            && let Some(site) = self.defs[v.0 as usize]
+            && lanes.guards[site.0][site.1].is_some()
+        {
+            *unguarded = false;
+            return self.runs(site, known).is_ok();
+        }
+        true
+    }
+
     fn origin(&self, v: Value) -> Term {
         self.origin[v.0 as usize]
     }
@@ -655,7 +687,7 @@ impl<'a> Tracer<'a> {
         ))
     }
 
-    fn sum(&self, t: Term) -> Sum {
+    fn sum(&self, t: Term, known: &[(Bool, bool)], unguarded: &mut bool) -> Sum {
         let v = match t {
             Term::Const(c) => {
                 return Sum {
@@ -666,10 +698,13 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
-        let index = v.0 as usize;
-        if let Some(&Some(sum)) = self.sums.borrow().get(index) {
+        if let Some(&Some(sum)) = self.sums.borrow().get(v.0 as usize) {
             return sum;
         }
+        self.sum_tracked(v, known, unguarded)
+    }
+
+    fn sum_tracked(&self, v: Value, known: &[(Bool, bool)], unguarded: &mut bool) -> Sum {
         let dynamic = Sum {
             base: None,
             offset: 0,
@@ -692,14 +727,17 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
+        let mut local = true;
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
-            .or_else(|| self.vadd(v))
+            .or_else(|| self.vadd(v, known, &mut local))
         else {
+            *unguarded &= local;
             return dynamic;
         };
-        let (x, y) = (self.sum(a), self.sum(b));
+        let (x, y) = (self.sum(a, known, &mut local), self.sum(b, known, &mut local));
+        *unguarded &= local;
         let sum =
             if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
                 dynamic
@@ -710,13 +748,16 @@ impl<'a> Tracer<'a> {
                     dynamic: x.dynamic.or(y.dynamic),
                 }
             };
-        // The operands' origins are settled before tracing starts. Every
-        // use of this value can reuse its sum, including an opaque result.
-        let mut sums = self.sums.borrow_mut();
-        if index >= sums.len() {
-            sums.resize(index + 1, None);
+        // A guarded definition may be followed for one use and opaque for
+        // another, so cache only sums traced without relying on EXEC.
+        if local {
+            let index = v.0 as usize;
+            let mut sums = self.sums.borrow_mut();
+            if index >= sums.len() {
+                sums.resize(index + 1, None);
+            }
+            sums[index] = Some(sum);
         }
-        sums[index] = Some(sum);
         sum
     }
 
@@ -729,7 +770,10 @@ impl<'a> Tracer<'a> {
 
     /// The operands of a VALU addition (`v_add_co_u32`, `v_add_nc_u32`)
     /// writing `v`, through VGPR copies of scalars.
-    fn vadd(&self, v: Value) -> Option<[Term; 2]> {
+    fn vadd(&self, v: Value, known: &[(Bool, bool)], unguarded: &mut bool) -> Option<[Term; 2]> {
+        if !self.runs_value(v, known, unguarded) {
+            return None;
+        }
         let inst = self.def(v)?;
         let Fields::Valu(f) = &inst.fields else {
             return None;
@@ -750,21 +794,29 @@ impl<'a> Tracer<'a> {
             return None;
         }
         Some([
-            self.vterm(inst, f.src.first()?)?,
-            self.vterm(inst, f.src.get(1)?)?,
+            self.vterm(inst, f.src.first()?, known, unguarded)?,
+            self.vterm(inst, f.src.get(1)?, known, unguarded)?,
         ])
     }
 
     /// The origin of a VALU operand.
-    fn vterm(&self, inst: &Inst, op: &Operand) -> Option<Term> {
+    fn vterm(
+        &self,
+        inst: &Inst,
+        op: &Operand,
+        known: &[(Bool, bool)],
+        unguarded: &mut bool,
+    ) -> Option<Term> {
         match *op {
-            Operand::Vector { reg, .. } => Some(self.vorigin(inst.read(Reg::V(reg))?)),
+            Operand::Vector { reg, .. } => {
+                Some(self.vorigin(inst.read(Reg::V(reg))?, known, unguarded))
+            }
             op => self.term(inst, &op),
         }
     }
 
     /// A VGPR value's origin through `v_mov_b32` copies.
-    fn vorigin(&self, v: Value) -> Term {
+    fn vorigin(&self, v: Value, known: &[(Bool, bool)], unguarded: &mut bool) -> Term {
         if let Some(inst) = self.def(v)
             && inst.name() == "v_mov_b32"
             && let Fields::Valu(f) = &inst.fields
@@ -774,7 +826,11 @@ impl<'a> Tracer<'a> {
             && f.omod == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
-            && let Some(t) = f.src.first().and_then(|s| self.vterm(inst, s))
+            && self.runs_value(v, known, unguarded)
+            && let Some(t) = f
+                .src
+                .first()
+                .and_then(|s| self.vterm(inst, s, known, unguarded))
         {
             return t;
         }
@@ -789,6 +845,8 @@ impl<'a> Tracer<'a> {
         addr: Option<&Operand>,
         saddr: Option<&Operand>,
         offset: i16,
+        known: &[(Bool, bool)],
+        unguarded: &mut bool,
     ) -> Result<Address, &'static str> {
         let Some(&Operand::Vector { reg, .. }) = addr else {
             return Err("a global address not in VGPRs");
@@ -801,15 +859,19 @@ impl<'a> Tracer<'a> {
                     return Err("an address not in SGPRs");
                 };
                 let v = inst.read(Reg::V(reg)).ok_or("a global address")?;
-                let mut extra = self.sum(self.vorigin(v));
+                let term = self.vorigin(v, known, unguarded);
+                let mut extra = self.sum(term, known, unguarded);
                 if extra.base.is_some() {
                     return Err("an offset from a root parameter");
                 }
                 extra.offset = extra.offset.wrapping_add(off);
-                self.address(lo, hi, extra)
+                self.address(lo, hi, extra, known, unguarded)
             }
             _ => {
-                let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
+                let mut word = |k| {
+                    inst.read(Reg::V(reg + k))
+                        .map(|v| self.vorigin(v, known, unguarded))
+                };
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("a global address");
                 };
@@ -821,6 +883,8 @@ impl<'a> Tracer<'a> {
                         offset: off,
                         dynamic: None,
                     },
+                    known,
+                    unguarded,
                 )
             }
         }
@@ -831,7 +895,14 @@ impl<'a> Tracer<'a> {
     /// program computes it from data. Addresses into descriptor heaps, the
     /// code or an SGPR the root signature does not fill are traced or
     /// refused.
-    fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+    fn address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: Sum,
+        known: &[(Bool, bool)],
+        unguarded: &mut bool,
+    ) -> Result<Address, &'static str> {
         const DATA: &[&str] = &[
             "an address not from a root parameter",
             "an address loaded from memory",
@@ -841,7 +912,7 @@ impl<'a> Tracer<'a> {
             "an address from a root parameter that is no address",
             "a constant address",
         ];
-        match self.traced_address(lo, hi, extra) {
+        match self.traced_address(lo, hi, extra, known, unguarded) {
             // The code's table at an offset the program computes from the
             // counter (made uniform with a first-lane read, say): lowering
             // gives the counter the code offset, so `lo` is the byte offset.
@@ -904,8 +975,15 @@ impl<'a> Tracer<'a> {
     }
 
     /// [`Self::address`] traced to a root parameter or the code.
-    fn traced_address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
-        let s = self.sum(lo);
+    fn traced_address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: Sum,
+        known: &[(Bool, bool)],
+        unguarded: &mut bool,
+    ) -> Result<Address, &'static str> {
+        let s = self.sum(lo, known, unguarded);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             if s.base.is_some_and(|b| self.heap_base(b)) {
                 return Err("an address into a descriptor heap with two computed terms");
@@ -916,7 +994,9 @@ impl<'a> Tracer<'a> {
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
-            if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
+            if !self.high_half(hi, high)
+                && !high.is_some_and(|h| self.carried(hi, h, known, unguarded))
+            {
                 return Err("an address with an untracked high half");
             }
             return Ok(Address {
@@ -942,7 +1022,7 @@ impl<'a> Tracer<'a> {
         // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
         if !self.high_half(hi, high)
-            && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
+            && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h, known, unguarded)))
         {
             return Err(if high.is_none() {
                 "an address into a descriptor heap with an untracked high half"
@@ -997,13 +1077,14 @@ impl<'a> Tracer<'a> {
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
     /// `v_add_co_ci_u32` with `high` as an operand.
-    fn carried(&self, hi: Term, high: Value) -> bool {
+    fn carried(&self, hi: Term, high: Value, known: &[(Bool, bool)], unguarded: &mut bool) -> bool {
         let Term::Value(v) = hi else { return false };
         if v == high {
             return true;
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
-            return self.carried(a, high) || self.carried(b, high);
+            return self.carried(a, high, known, unguarded)
+                || self.carried(b, high, known, unguarded);
         }
         let Some(inst) = self.def(v) else {
             return false;
@@ -1012,9 +1093,11 @@ impl<'a> Tracer<'a> {
             return false;
         };
         inst.name() == "v_add_co_ci_u32"
-            && f.src[..2.min(f.src.len())]
-                .iter()
-                .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
+            && self.runs_value(v, known, unguarded)
+            && f.src.iter().take(2).any(|o| {
+                self.vterm(inst, o, known, unguarded)
+                    .is_some_and(|t| self.carried(t, high, known, unguarded))
+            })
     }
 
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
@@ -1057,6 +1140,7 @@ impl<'a> Tracer<'a> {
         base: &Operand,
         offset: i32,
         soffset: &Operand,
+        known: &[(Bool, bool)],
     ) -> Result<Address, &'static str> {
         let Operand::Scalar { code, .. } = *base else {
             return Err("an address not in SGPRs");
@@ -1072,15 +1156,18 @@ impl<'a> Tracer<'a> {
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
         };
+        let mut unguarded = true;
         let mut extra = self.sum(
             self.term(inst, soffset)
                 .ok_or("an unknown offset operand")?,
+            known,
+            &mut unguarded,
         );
         if extra.base.is_some() {
             return Err("an offset from a root parameter");
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
-        self.address(lo, hi, extra)
+        self.address(lo, hi, extra, known, &mut unguarded)
     }
 
     /// The words of the descriptor operand `op` of `inst` that tracing
@@ -1166,6 +1253,8 @@ impl<'a> Tracer<'a> {
                     offset: 0,
                     dynamic: None,
                 },
+                known,
+                &mut true,
             )?;
             return Ok(Source::Built {
                 address,
@@ -1428,7 +1517,7 @@ impl<'a> Tracer<'a> {
             dynamic: None,
         };
         // A computed base (title memory) is read from the operand.
-        match self.address(lo, hi, at) {
+        match self.address(lo, hi, at, &[], &mut true) {
             Ok(address) if address.param != MEMORY => Ok(Some(Source::Built {
                 address,
                 bits: flags,
@@ -1531,10 +1620,10 @@ impl<'a> Tracer<'a> {
     }
 
     /// `t` through VGPR copies (of VGPRs or of scalars) and copies.
-    fn lane_term(&self, mut t: Term) -> Term {
+    fn lane_term(&self, mut t: Term, known: &[(Bool, bool)], unguarded: &mut bool) -> Term {
         for _ in 0..MAX_JOINS * 2 {
             let Term::Value(v) = t else { break };
-            let next = self.vorigin(v);
+            let next = self.vorigin(v, known, unguarded);
             if next == t {
                 break;
             }
@@ -1607,14 +1696,14 @@ impl<'a> Tracer<'a> {
     /// Fails unless every lane in `known` that reaches the vector
     /// instruction at `site` runs it: one with its EXEC bit clear there
     /// keeps what the registers held before.
-    fn runs(&self, site: Site, known: &Known) -> Result<(), &'static str> {
+    fn runs(&self, site: Site, known: &[(Bool, bool)]) -> Result<(), &'static str> {
         let Some(lanes) = self.lanes else {
             return Ok(());
         };
         let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1)) else {
             return Ok(());
         };
-        let mut skips = known.clone();
+        let mut skips = known.to_vec();
         skips.extend([(lanes.reach[site.0], true), (guard, false)]);
         if meet(lanes, &skips) {
             return Err("a per-lane descriptor written where some lanes may keep the old one");
@@ -1702,7 +1791,14 @@ impl<'a> Tracer<'a> {
             else {
                 return Err("a global load");
             };
-            self.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+            self.flat_address(
+                inst,
+                addr.as_ref(),
+                saddr.as_ref(),
+                *offset,
+                &self.site_known(site),
+                &mut true,
+            )
         };
         let (load, first) = sites[0];
         let a0 = address(load)?;
@@ -1980,7 +2076,7 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| self::meet(lanes, &conditions.to_vec());
+        let meet = |conditions: &[(Bool, bool)]| self::meet(lanes, conditions);
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -2004,6 +2100,7 @@ impl<'a> Tracer<'a> {
             }
             // The first lane's dwords on one side, the lane's own on the
             // other.
+            let compare_known = self.site_known((b, i));
             let pair = |first: &Operand, own: &Operand| -> Option<Vec<Value>> {
                 let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) = (first, own)
                 else {
@@ -2015,11 +2112,14 @@ impl<'a> Tracer<'a> {
                             return None;
                         };
                         let lane = inst.read(Reg::V(reg + k))?;
-                        let (_, read) = self.defs[x.0 as usize]?;
+                        let read = self.defs[x.0 as usize]?;
                         let same = reads.contains(&x)
-                            && read < i
-                            && self.lane_term(Term::Value(self.first_lane_source(x)?))
-                                == self.lane_term(Term::Value(lane));
+                            && read.1 < i
+                            && self.lane_term(
+                                Term::Value(self.first_lane_source(x)?),
+                                &self.site_known(read),
+                                &mut true,
+                            ) == self.lane_term(Term::Value(lane), &compare_known, &mut true);
                         same.then_some(x)
                     })
                     .collect()
@@ -2984,6 +3084,129 @@ pub(crate) mod tests {
             HwStage::Cs,
         );
         assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0)), ((0, 1), at(MEMORY, 0))]);
+    }
+
+    #[test]
+    fn a_guarded_move_is_folded_only_for_lanes_that_run_it() {
+        let words: &[u32] = &[
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xDC30_800C,
+            0x0300_0001, // global_load_dword v3, v1, s[0:1] offset:12
+            0x897E_147E, // s_xor_b32 exec_lo, exec_lo, s20
+            0xDC30_800C,
+            0x0400_0001, // global_load_dword v4, v1, s[0:1] offset:12
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0x7E04_0301, // v_mov_b32 v2, v1
+            0xDC30_800C,
+            0x0500_0002, // global_load_dword v5, v2, s[0:1] offset:12
+            S_ENDPGM,
+        ];
+        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 6).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = track(&p, &[param(Descriptor, 0, 2)], HwStage::Cs, Some(&st)).unwrap();
+        let guarded = p.blocks[0].insts[3].write(Reg::V(1)).unwrap();
+        let dynamic = Address {
+            dynamic: Some(guarded),
+            ..at(0, 12)
+        };
+        assert_eq!(
+            res.scalar,
+            [((0, 4), at(0, 16)), ((0, 6), dynamic), ((0, 9), dynamic)]
+        );
+    }
+
+    #[test]
+    fn sums_with_guarded_terms_are_not_cached_in_either_order() {
+        let words: &[u32] = &[
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0x4A04_0284, // v_add_nc_u32 v2, 4, v1
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0x4A06_0488, // v_add_nc_u32 v3, 8, v2
+            0x4A08_068C, // v_add_nc_u32 v4, 12, v3
+            0xDC30_8000,
+            0x0500_0004, // global_load_dword v5, v4, s[0:1]
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0xDC30_8000,
+            0x0600_0004, // global_load_dword v6, v4, s[0:1]
+            S_ENDPGM,
+        ];
+        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 7).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let layout = [param(Descriptor, 0, 2)];
+        let insts = &p.blocks[0].insts;
+        let guarded = insts[4].write(Reg::V(2)).unwrap();
+        let wide = Address {
+            dynamic: Some(guarded),
+            ..at(0, 20)
+        };
+        let uses = [(8, wide), (10, at(0, 24))];
+        for order in [uses, [uses[1], uses[0]]] {
+            let t = Tracer::new(&p, &layout, HwStage::Cs, Some(&st)).unwrap();
+            for (i, want) in order {
+                let inst = &insts[i];
+                let Fields::Flat {
+                    addr,
+                    saddr,
+                    offset,
+                    ..
+                } = &inst.fields
+                else {
+                    panic!("expected a global load");
+                };
+                let mut unguarded = true;
+                let actual = t.flat_address(
+                    inst,
+                    addr.as_ref(),
+                    saddr.as_ref(),
+                    *offset,
+                    &t.site_known((0, i)),
+                    &mut unguarded,
+                );
+                assert_eq!(actual, Ok(want));
+                assert!(!unguarded);
+            }
+            // The unguarded ancestors depend on the guarded add.
+            let sums = t.sums.borrow();
+            for (i, reg) in [(4, 2), (6, 3), (7, 4)] {
+                let v = insts[i].write(Reg::V(reg)).unwrap();
+                assert!(sums.get(v.0 as usize).is_none_or(Option::is_none));
+            }
+        }
+    }
+
+    #[test]
+    fn a_guarded_high_half_carry_requires_exec_coverage() {
+        let r = track_words(
+            &[
+                0xD70F_1601,
+                0x0002_0000, // v_add_co_u32 v1, s22, s0, v0
+                0x7E04_0201, // v_mov_b32 v2, s1
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+                0xD528_6A02,
+                0x005A_0601, // v_add_co_ci_u32 v2, vcc_lo, s1, v3, s22
+                0xDC30_8000,
+                0x037D_0001, // global_load_dword v3, v[1:2], off
+                0xBEFE_0314, // s_mov_b32 exec_lo, s20
+                0xDC30_8000,
+                0x047D_0001, // global_load_dword v4, v[1:2], off
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 0, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!((r.scalar[0].1.param, r.scalar[0].1.offset), (0, 0));
+        assert!(r.scalar[0].1.dynamic.is_some());
+        assert_eq!(r.scalar[1].1, at(MEMORY, 0));
     }
 
     #[test]
