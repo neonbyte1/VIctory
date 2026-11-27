@@ -345,19 +345,25 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// Bytes per element, texels per element side, and the unpadded row size.
+    fn row_layout(&self) -> Option<(u64, u64, u64)> {
+        let (element, block) = element(self.format)?;
+        let row = u64::from(self.width).div_ceil(block) * element;
+        (row <= u64::from(self.row_pitch)).then_some((element, block, row))
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
-        let (element, block) = element(self.format)?;
+        let (_, block, last) = self.row_layout()?;
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
     /// The byte ranges (from the footprint's start) that a `size` texel
     /// region at texel `at` covers: one per row of blocks; `None` if the
-    /// format has no size or the region leaves the footprint.
+    /// format has no size, a row does not fit its pitch, or the region leaves the footprint.
     pub(crate) fn rows(&self, at: [u32; 3], size: [u32; 3]) -> Option<Vec<(u64, u64)>> {
-        let (element, block) = element(self.format)?;
+        let (element, block, _) = self.row_layout()?;
         let blocks = |texels: u32| u64::from(texels).div_ceil(block);
         let [x, y, z] = at.map(u64::from);
         let (w, h, d) = (blocks(size[0]), blocks(size[1]), u64::from(size[2]));
@@ -2464,6 +2470,48 @@ pub(crate) mod tests {
     #[test]
     fn a_null_view_has_no_alias_source() {
         assert_eq!(alias_source(std::ptr::null()), None);
+    }
+
+    #[test]
+    fn a_placed_footprint_pitch_covers_a_complete_row() {
+        let mut accepted = Vec::new();
+        for (format, width, height, row_bytes) in [(28, 65, 2, 260), (71, 129, 5, 264)] {
+            let footprint = PlacedFootprint {
+                offset: 512,
+                format,
+                width,
+                height,
+                depth: 1,
+                row_pitch: 512,
+            };
+            assert_eq!(footprint.bytes(), Some(512 + row_bytes));
+            assert_eq!(
+                footprint.rows([0; 3], [width, height, 1]),
+                Some(vec![(0, row_bytes), (512, row_bytes)])
+            );
+
+            let short = PlacedFootprint {
+                row_pitch: 256,
+                ..footprint
+            };
+            let has_bytes = short.bytes().is_some();
+            let has_rows = short.rows([0; 3], [1, 1, 1]).is_some();
+            if has_bytes || has_rows {
+                accepted.push((format, has_bytes, has_rows));
+            }
+
+            // One fewer texel brings each row to exactly 256 bytes.
+            let exact = PlacedFootprint {
+                width: width - 1,
+                ..short
+            };
+            assert_eq!(exact.bytes(), Some(512));
+            assert_eq!(
+                exact.rows([0; 3], [exact.width, height, 1]),
+                Some(vec![(0, 256), (256, 256)])
+            );
+        }
+        assert!(accepted.is_empty(), "accepted short row pitches: {accepted:?}");
     }
 
     #[test]
