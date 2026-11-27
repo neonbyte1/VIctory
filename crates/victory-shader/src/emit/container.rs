@@ -341,31 +341,26 @@ pub(crate) fn build(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
 /// The container hash D3D12 checks: MD5 whose last block carries the bit
 /// count first and `2 × bytes + 1` last instead of standard padding.
 pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
-    let len = data.len();
-    let left = len % 64;
-    let mut tail = Vec::with_capacity(128);
-    if left < 56 {
-        tail.extend(((len as u32) << 3).to_le_bytes());
-        tail.extend(&data[len - left..]);
-        tail.push(0x80);
-        tail.resize(60, 0);
-    } else {
-        tail.extend(&data[len - left..]);
-        tail.push(0x80);
-        tail.resize(64, 0);
-        tail.extend(((len as u32) << 3).to_le_bytes());
-        tail.resize(124, 0);
-    }
-    tail.extend(((len as u32) << 1 | 1).to_le_bytes());
+    let (blocks, rest) = data.as_chunks::<64>();
     let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-    for block in data[..len - left]
-        .as_chunks::<64>()
-        .0
-        .iter()
-        .chain(tail.as_chunks::<64>().0)
-    {
+    for block in blocks {
         md5_block(&mut state, block);
     }
+
+    let len = data.len() as u32;
+    let mut tail = [0; 64];
+    if rest.len() < 56 {
+        tail[4..4 + rest.len()].copy_from_slice(rest);
+        tail[4 + rest.len()] = 0x80;
+    } else {
+        tail[..rest.len()].copy_from_slice(rest);
+        tail[rest.len()] = 0x80;
+        md5_block(&mut state, &tail);
+        tail = [0; 64];
+    }
+    tail[..4].copy_from_slice(&(len << 3).to_le_bytes());
+    tail[60..].copy_from_slice(&(len << 1 | 1).to_le_bytes());
+    md5_block(&mut state, &tail);
     let mut out = [0; 16];
     for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
         o.copy_from_slice(&s.to_le_bytes());
@@ -374,7 +369,6 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
 }
 
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
-    const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
     const K: [u32; 64] = [
         0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
         0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
@@ -393,30 +387,56 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
         0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
         0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
     ];
-    let x: [u32; 16] = std::array::from_fn(|i| {
-        u32::from_le_bytes([
-            block[4 * i],
-            block[4 * i + 1],
-            block[4 * i + 2],
-            block[4 * i + 3],
-        ])
-    });
-    let [mut a, mut b, mut c, mut d] = *state;
-    for (i, &k) in K.iter().enumerate() {
-        let (f, g) = match i / 16 {
-            0 => ((b & c) | (!b & d), i),
-            1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-            2 => (b ^ c ^ d, (3 * i + 5) % 16),
-            _ => (c ^ (b | !d), (7 * i) % 16),
+    // Four steps return the working registers to their original positions.
+    // Each round specializes to its own mix, word schedule and rotations.
+    #[inline]
+    fn round(
+        [mut a, mut b, mut c, mut d]: [u32; 4],
+        rotations: [u32; 4],
+        mix: impl Fn(u32, u32, u32) -> u32,
+        addend: impl Fn(usize) -> u32,
+    ) -> [u32; 4] {
+        let step = |a: u32, b, c, d, i, rot| {
+            let sum = a.wrapping_add(mix(b, c, d)).wrapping_add(addend(i));
+            b.wrapping_add(sum.rotate_left(rot))
         };
-        let rotated = a
-            .wrapping_add(f)
-            .wrapping_add(k)
-            .wrapping_add(x[g])
-            .rotate_left(S[(i / 16) * 4 + i % 4]);
-        (a, b, c, d) = (d, b.wrapping_add(rotated), b, c);
+        for i in [0, 4, 8, 12] {
+            a = step(a, b, c, d, i, rotations[0]);
+            d = step(d, a, b, c, i + 1, rotations[1]);
+            c = step(c, d, a, b, i + 2, rotations[2]);
+            b = step(b, c, d, a, i + 3, rotations[3]);
+        }
+        [a, b, c, d]
     }
-    for (s, v) in state.iter_mut().zip([a, b, c, d]) {
+
+    // Word indices repeat modulo 16, so each round can start its schedule at zero.
+    let words = block.as_chunks::<4>().0;
+    let add = |i: usize, word: usize| K[i].wrapping_add(u32::from_le_bytes(words[word]));
+    let work = round(
+        *state,
+        [7, 12, 17, 22],
+        |b, c, d| (b & c) | (!b & d),
+        |i| add(i, i),
+    );
+    let work = round(
+        work,
+        [5, 9, 14, 20],
+        |b, c, d| (d & b) | (!d & c),
+        |i| add(16 + i, (5 * i + 1) % 16),
+    );
+    let work = round(
+        work,
+        [4, 11, 16, 23],
+        |b, c, d| b ^ c ^ d,
+        |i| add(32 + i, (3 * i + 5) % 16),
+    );
+    let work = round(
+        work,
+        [6, 10, 15, 21],
+        |b, c, d| c ^ (b | !d),
+        |i| add(48 + i, (7 * i) % 16),
+    );
+    for (s, v) in state.iter_mut().zip(work) {
         *s = s.wrapping_add(v);
     }
 }
@@ -425,20 +445,111 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 mod tests {
     use super::*;
 
+    /// Run with `cargo test --release -p victory-shader container_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn container_throughput() {
+        use crate::dxbc::{Container, FourCC};
+        use crate::dxil::{DxilProgram, build_standard};
+        use std::{hint::black_box, time::Instant};
+
+        fn median_ns(iterations: u32, mut op: impl FnMut()) -> f64 {
+            let mut samples = [0.; 9];
+            for sample in &mut samples {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    op();
+                }
+                *sample = start.elapsed().as_secs_f64() * 1e9 / f64::from(iterations);
+            }
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        }
+
+        let mut bitcode: Vec<_> = (0..8192).map(|i| i as u8).collect();
+        bitcode[..4].copy_from_slice(b"BC\xc0\xde");
+        let program = build_standard(0, (6, 6), 0x106, &bitcode);
+        let parts: &[(&[u8; 4], &[u8])] = &[
+            (b"SFI0", &[0; 8]),
+            (b"ISG1", &[0; 112]),
+            (b"OSG1", &[0; 48]),
+            (b"PSV0", &[0; 176]),
+            (b"DXIL", &program),
+        ];
+        let container = build(parts);
+        let parse = median_ns(500_000, || {
+            let c = Container::parse(black_box(&container)).unwrap();
+            let p = c.part(FourCC::DXIL).unwrap();
+            black_box(DxilProgram::parse(p.data).unwrap());
+        });
+        let emit = median_ns(4096, || {
+            black_box(build(black_box(parts)));
+        });
+        eprintln!(
+            "{} bytes, digest {}: parse + find DXIL {parse:.2} ns/op, build + hash {emit:.2} ns/op",
+            container.len(),
+            hex(container[4..20].try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn odd_parts_match_wire_bytes() {
+        let bytes = build(&[(b"TEST", b"a"), (b"DATA", b"bb")]);
+        let expected = b"DXBC\xc2\xdb\x46\xa8\xd7\x6c\x02\xda\x6f\xb8\x1b\x41\x3c\xe3\x22\x8e\
+            \x01\0\0\0\x3b\0\0\0\x02\0\0\0\x28\0\0\0\x31\0\0\0\
+            TEST\x01\0\0\0aDATA\x02\0\0\0bb";
+        assert_eq!(&bytes, expected);
+        let parsed = crate::dxbc::Container::parse(&bytes).unwrap();
+        assert_eq!(parsed.parts[1].offset, 49);
+        assert_eq!(parsed.parts[1].data, b"bb");
+    }
+
+    #[test]
+    fn dxbc_hash_padding_boundaries() {
+        // Digests from the previous implementation, for ascending input bytes.
+        let bytes: Vec<u8> = (0..8192).map(|i| i as u8).collect();
+        for (len, expected) in [
+            (0, "140d60f6b775e2ba4e4abed401b2e9a1"),
+            (55, "842e55534ba93daa93e94bd5af9b0c03"),
+            (56, "00f9cc964ff2ec81959d4a3f092ce63f"),
+            (63, "4400d428a41d0e75dc98b936693f7bfb"),
+            (64, "f42eb06ca921c878e435e3b8d4f92b13"),
+            (65, "9ce1a374e3f259448f5777113a2edb57"),
+            (119, "ba3a67ecd4641ce4ed08f291896e1bc6"),
+            (120, "882fce4f4c95194392e7adefd53fe343"),
+            (128, "7f0468e3c7a668781a3d62e31d49bf72"),
+            (8192, "31987841a6cceb14d13ec19712590074"),
+        ] {
+            assert_eq!(hex(hash(&bytes[..len])), expected, "length {len}");
+        }
+    }
+
+    fn hex(digest: [u8; 16]) -> String {
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     #[test]
     fn md5_core_matches_the_standard() {
-        // Standard MD5 of "abc" with standard padding, through md5_block.
-        let mut block = b"abc".to_vec();
-        block.push(0x80);
-        block.resize(56, 0);
-        block.extend(24u64.to_le_bytes());
-        let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-        md5_block(&mut state, block.as_slice().try_into().unwrap());
-        let hex: String = state
-            .iter()
-            .flat_map(|s| s.to_le_bytes())
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+        for (input, expected) in [
+            ("abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                "d174ab98d277d9f5a5611c2c9f419d9f",
+            ),
+        ] {
+            let mut padded = input.as_bytes().to_vec();
+            padded.push(0x80);
+            padded.resize((padded.len() + 8).next_multiple_of(64) - 8, 0);
+            padded.extend((input.len() as u64 * 8).to_le_bytes());
+            let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+            for block in padded.as_chunks::<64>().0 {
+                md5_block(&mut state, block);
+            }
+            let mut bytes = [0; 16];
+            for (dst, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+                *dst = word.to_le_bytes();
+            }
+            assert_eq!(hex(bytes), expected);
+        }
     }
 }

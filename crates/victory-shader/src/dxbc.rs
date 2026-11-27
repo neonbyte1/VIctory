@@ -168,6 +168,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reports_malformed_fields() {
+        let good = build(&[(FourCC::PSV0, b"abc")]);
+        for (field, value, reason) in [
+            (0x18, 31u32, "container size disagrees with data"),
+            (0x18, 48, "container size disagrees with data"),
+            (0x18, 35, "truncated"), // incomplete offset
+            (0x1c, 257, "implausible part count"),
+            (0x20, 45, "part header out of bounds"),
+            (0x20, 41, "truncated"), // FourCC fits, size does not
+            (0x28, 4, "part data out of bounds"),
+        ] {
+            let mut bytes = good.clone();
+            bytes[field..field + 4].copy_from_slice(&value.to_le_bytes());
+            assert_eq!(
+                Container::parse(&bytes).unwrap_err(),
+                ShaderError::Malformed(reason)
+            );
+        }
+    }
+
+    #[test]
     fn round_trips_parts() {
         let bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4]), (FourCC::HASH, &[9; 20])]);
         let c = Container::parse(&bytes).unwrap();
