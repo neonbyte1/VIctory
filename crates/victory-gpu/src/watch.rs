@@ -216,18 +216,46 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 #[cfg(not(feature = "diagnostics"))]
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
+type GuardsHeld = std::sync::MutexGuard<'static, Guards>;
+
+#[cfg(not(feature = "diagnostics"))]
+fn guards() -> GuardsHeld {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(feature = "diagnostics")]
+type GuardsHeld = Held;
+
 /// The guard lock, timed while held by the line that took it
-/// (diagnostics: [`held_times`]).
+/// (diagnostics: [`held_times`]), and counted for the thread taking it
+/// ([`thread_counts`]).
 #[cfg(feature = "diagnostics")]
 #[track_caller]
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    COUNTS.with(|c| c[0].set(c[0].get() + 1));
     Held(Some(guard), std::time::Instant::now(), line)
+}
+
+#[cfg(feature = "diagnostics")]
+std::thread_local! {
+    /// Per thread (diagnostics): rounds of the guard lock taken, and
+    /// protection changes made (`VirtualProtect` calls). No destructor, so
+    /// the fault handler may touch them.
+    static COUNTS: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
+}
+
+#[cfg(feature = "diagnostics")]
+fn count_protect(calls: u64) {
+    COUNTS.with(|c| c[1].set(c[1].get() + calls));
+}
+
+/// This thread's rounds of the guard lock and protection changes so far
+/// (diagnostics): the caller subtracts two readings.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn thread_counts() -> (u64, u64) {
+    COUNTS.with(|c| (c[0].get(), c[1].get()))
 }
 
 #[cfg(feature = "diagnostics")]
@@ -449,7 +477,10 @@ fn open(g: &mut Guards, page: usize) -> bool {
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::OpenPages, 1);
+    {
+        crate::copystat::add(crate::copystat::C::OpenPages, 1);
+        count_protect(1);
+    }
     true
 }
 
@@ -638,6 +669,148 @@ impl Tracked {
     }
 }
 
+/// One hold of the guard lock for the caller's own writes into a run of a
+/// tracker's pages (`crate::shadow`'s copy-back of marked pages): one round
+/// of the lock and one protection change each way per run of consecutive
+/// pages, where [`writing`] and [`Tracked::taken`] cost three rounds and
+/// two changes a page (2,829 pages a world frame, mostly waiting for the
+/// lock, `CpuAnatomy` §3).
+///
+/// What it guarantees against the title's threads writing meanwhile:
+/// - A page [`Lease::guarded`] reports guarded took no title write since it
+///   was guarded: a write there faults, and the handler waits for this lock
+///   before it lets the write land. Bytes the caller read from it before the
+///   lease are still title memory's.
+/// - A title write faulting while the lease is held (on a guarded page, or
+///   on another mapping of an opened one, which stay guarded) lands after
+///   the lease ends, so after the caller's writes; the handler then marks the
+///   page changed after [`Lease::taken`] cleared it.
+/// - A title write on a page [`Lease::open`] opened lands without a fault,
+///   before or after the caller's: the caller writes only the bytes it
+///   changes, and takes the page only if, once guarded again, title memory
+///   is what the copy holds. Otherwise the page stays changed (marked by
+///   `open`), and the next refresh takes the title's bytes.
+///
+/// Lock order as elsewhere: the guard lock, then a tracker's change set,
+/// then its saved bytes.
+pub(crate) struct Lease<'a> {
+    g: GuardsHeld,
+    tracked: &'a Tracked,
+}
+
+impl Tracked {
+    /// The guard lock, held for the caller's writes into this tracker's
+    /// pages until dropped ([`Lease`]).
+    pub(crate) fn lease(&self) -> Lease<'_> {
+        Lease {
+            g: guards(),
+            tracked: self,
+        }
+    }
+}
+
+/// The consecutive pages of `pages` (ascending, no repeats) as runs
+/// `[first, last)`.
+fn page_runs(pages: &[usize]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        let first = *pages.get(i)?;
+        let mut last = first + 1;
+        i += 1;
+        while pages.get(i) == Some(&last) {
+            last += 1;
+            i += 1;
+        }
+        Some((first, last))
+    })
+}
+
+impl Lease<'_> {
+    /// Whether page `page` is guarded: the title wrote nothing there since
+    /// it was, and a write of its now waits for the lease.
+    pub(crate) fn guarded(&self, page: usize) -> bool {
+        self.g.protected.contains(&page)
+    }
+
+    /// Before the caller writes `pages` (ascending, no repeats): marks them
+    /// changed in every tracker holding them or another mapping of them
+    /// (armed ones keep their bytes first, as for [`writing`]; the caller
+    /// unarms its own), then gives write access back to those guarded, one
+    /// protection change per run of consecutive pages. The other mappings
+    /// stay guarded: the write goes through this one, and the title's
+    /// through them waits for the lease. Returns the protection changes.
+    pub(crate) fn open(&mut self, pages: &[usize]) -> u64 {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        let g = &mut *self.g;
+        for (first, last) in page_runs(pages) {
+            mark_changed(g, first, last, true);
+        }
+        for (_, other) in aliases(g, pages) {
+            mark_changed(g, other, other + 1, true);
+        }
+        let guarded: Vec<usize> = pages.iter().copied().filter(|p| g.protected.contains(p)).collect();
+        let mut calls = 0;
+        for (first, last) in page_runs(&guarded) {
+            let mut old = 0;
+            calls += 1;
+            #[cfg(feature = "diagnostics")]
+            count_protect(1);
+            // SAFETY: blocks we made read-only; only their protection changes.
+            let opened = unsafe {
+                VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) != 0
+            };
+            if opened {
+                for page in first..last {
+                    g.protected.remove(&page);
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::OpenPages, (last - first) as u64);
+            } else {
+                // Across allocations: page by page.
+                for page in first..last {
+                    calls += u64::from(open(g, page));
+                }
+            }
+        }
+        calls
+    }
+
+    /// After the caller's writes: guards `pages` (ascending, no repeats)
+    /// again, one protection change per run of consecutive pages, with every
+    /// other mapping of them. Returns the pages guarded now, leaving out
+    /// those busy with a write the guards do not see, with nothing mapped, or
+    /// with another mapping that cannot be guarded; and the protection
+    /// changes asked.
+    pub(crate) fn guard(&mut self, pages: &[usize]) -> (Vec<usize>, u64) {
+        let g = &mut *self.g;
+        let fresh: Vec<usize> = pages
+            .iter()
+            .copied()
+            .filter(|&p| !g.protected.contains(&p) && !g.busy.iter().any(|&(a, b)| (a..b).contains(&p)))
+            .collect();
+        let calls = page_runs(&fresh).count() as u64;
+        let mut unmapped = Vec::new();
+        let mut taken = protect_noting(g, pages, &mut unmapped);
+        taken.retain(|p| !unmapped.contains(p));
+        let others = aliases(g, &taken);
+        let unguarded = guard_aliases(g, &others);
+        taken.retain(|p| !unguarded.contains(p));
+        (taken, calls)
+    }
+
+    /// Pages `pages`, guarded (by [`Lease::guard`]), hold in the copy what
+    /// title memory holds: taken, their saved bytes stale.
+    pub(crate) fn taken(&mut self, pages: &[usize]) {
+        let c = &self.tracked.changed;
+        let mut changed = c.0.lock().unwrap_or_else(|e| e.into_inner());
+        for &page in pages {
+            changed.remove(&page);
+            c.taken(page);
+        }
+        set_dirty(c.2, !changed.is_empty());
+    }
+}
+
 /// Makes `pages` read-only where not already (in runs), and returns those
 /// now guarded or with nothing mapped (taken either way); a page that is
 /// mapped but cannot be guarded is left out (it stays changed).
@@ -659,6 +832,8 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
     let set = |from: usize, to: usize| {
+        #[cfg(feature = "diagnostics")]
+        count_protect(1);
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }

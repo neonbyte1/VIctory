@@ -156,8 +156,21 @@ pub(crate) enum C {
     ClampStoring,
     ClampHoisted,
     ClampReadMarked,
+    /// Copying back marked pages (`crate::shadow::copy_back_marks`): rounds
+    /// of the guard lock and protection changes the copy-back made; runs
+    /// gone back in one lease and their pages; byte runs and bytes written;
+    /// pages written that a title write reached while open (left changed);
+    /// pages the title wrote, gone back by their saved bytes (left changed).
+    MarkLeases,
+    MarkProtects,
+    MarkRuns,
+    MarkRunPages,
+    MarkDiffRuns,
+    MarkDiffBytes,
+    MarkMisses,
+    MarkMerged,
 }
-const COUNTERS: usize = 89;
+const COUNTERS: usize = 97;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -375,6 +388,19 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    tracing::info!(
+        "  marked copy-back per frame: {:.0} guard lock rounds, {:.0} protection changes; {:.0} runs of \
+         {:.0} pages (the rest page by page); {:.0} byte runs, {:.1} MB written; {:.0} pages a title \
+         write reached while open, {:.0} pages the title wrote gone back by saved bytes",
+        c[C::MarkLeases as usize],
+        c[C::MarkProtects as usize],
+        c[C::MarkRuns as usize],
+        c[C::MarkRunPages as usize],
+        c[C::MarkDiffRuns as usize],
+        mb(c[C::MarkDiffBytes as usize]),
+        c[C::MarkMisses as usize],
+        c[C::MarkMerged as usize],
+    );
     tracing::info!(
         "  copies in video memory per frame: {:.1} completions, {:.1} heavy, {:.1} taking write marks; \
          uploads staged {:.1} MB in {:.1} ms; read back in the submission and put in the mirrors \
