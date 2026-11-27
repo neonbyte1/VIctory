@@ -1307,6 +1307,20 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     d.flags & USES & !flags == 0
         && (family(d.format) == family(own)
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
+        && serves_reads(flags, own, d)
+}
+
+/// Whether a host texture of flags `flags` and format `own` serves the
+/// shader reads of a title texture of host description `d`: one shaders
+/// read does not take a texture made without shader access (denied, or
+/// typed depth; the host takes no shader view of either). A new one
+/// replaces it, the old one's contents copied over (`alias_source`).
+#[cfg(windows)]
+fn serves_reads(flags: u32, own: u32, d: &ResourceDesc) -> bool {
+    const DENY_SHADER_RESOURCE: u32 = 8;
+    d.flags & DENY_SHADER_RESOURCE != 0
+        || (flags & DENY_SHADER_RESOURCE == 0
+            && !DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own))
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one

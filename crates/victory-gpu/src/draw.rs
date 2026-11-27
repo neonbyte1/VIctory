@@ -3225,6 +3225,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+    /// Tests that make alias copies run one at a time: one counts them
+    /// (`texture::ALIAS_COPIES`, one for the process).
+    static ALIASED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// One texture memory written through an unordered view of a resource
     /// object in one format and read through a placed view in another: a
     /// castable pair shares one host texture (no copy), a pair of other
@@ -3239,6 +3243,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let slots = Slots::new(4);
         let read = compile_cs(READ);
+        let _one = ALIASED.lock().unwrap_or_else(|e| e.into_inner());
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // Format written and size, what the shader writes, format read and
         // size, the texel expected, whether one host texture.
@@ -3926,6 +3931,59 @@ void main(uint3 id : SV_DispatchThreadID) {
         let _ = crate::object::slot::<Release>(heap, 0x10)(heap);
         let _ = crate::object::slot::<Release>(dst_buf, 0x10)(dst_buf);
         let _ = crate::object::slot::<Release>(depth, 0x10)(depth);
+    }
+
+    /// A depth texture made without shader access (D32_FLOAT, depth,
+    /// denied shader resource) cleared, then read through a placed view of
+    /// its memory that shaders may read: the view gets a host texture of
+    /// its own (the denied one takes no shader view) with the clear copied
+    /// over.
+    #[test]
+    fn a_depth_texture_denied_to_shaders_reads_through_a_placed_view() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(1);
+        let read = compile_cs(READ);
+        let _one = ALIASED.lock().unwrap_or_else(|e| e.into_inner());
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = title_memory(1 << 20);
+        let depth = texture_at_address(address, &texture_words(64, 64, 40, 0, 2 | 8));
+        let copy = crate::resource::host_copy(depth).expect("a host depth texture");
+        let View::Placed(_, words, mut desc) =
+            placed_view(address, texture_words(64, 64, 40, 0, 2))
+        else {
+            unreachable!()
+        };
+        desc[0] = 41; // R32_FLOAT
+        let view = View::Placed(false, words, desc);
+        let Some(View::Shader(..)) = crate::descriptor::host::placed_texture(&view) else {
+            panic!("a placed texture");
+        };
+        slots.make(0, &view);
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, depth, 0x10);
+        let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let handle = host.dsv(&copy.texture, Some(&dsv));
+        // SAFETY: an open list, the texture in the depth write state.
+        unsafe {
+            list.list
+                .ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH, 0.75, 0, None)
+        };
+        readable(&list, &used(ResourceType::Srv), &view, false);
+        run(&list, &slots, &read, 0, Some(&out), (8, 8));
+        list.close();
+        host.execute(&[&list]);
+        for (x, y) in [(0usize, 0usize), (17, 40), (63, 63)] {
+            // SAFETY: inside the mapped output.
+            let got = unsafe { (data.add((y * 64 + x) * 16) as *const [f32; 4]).read() };
+            assert_eq!(got[0], 0.75, "depth at {x},{y}");
+        }
+        assert_eq!(host.log_messages(), None);
     }
 
 
