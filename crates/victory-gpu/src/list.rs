@@ -1761,31 +1761,249 @@ pub(crate) fn take_counts() -> (u64, u64) {
 }
 
 
-/// The enhanced barriers `(group count, groups)`: buffer, texture and
-/// global barriers with layouts instead of states. Every host use of a
-/// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+/// An enhanced barrier group (`ID3D12GraphicsCommandList7::Barrier`):
+/// barrier type (0 global, 1 texture, 2 buffer), barrier count, and
+/// pointer to the barrier array.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct BarrierGroup {
+    kind: u32,
+    count: u32,
+    barriers: *const u8,
+}
+
+/// An enhanced texture barrier (`D3D12_TEXTURE_BARRIER`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct TextureBarrier {
+    sync_before: u32,
+    sync_after: u32,
+    access_before: u32,
+    access_after: u32,
+    layout_before: u32,
+    layout_after: u32,
+    resource: This,
+    subresources: [u32; 6],
+    flags: u32,
+    _pad: u32,
+}
+
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BARRIER_GROUP, D3D12_BARRIER_SUBRESOURCE_RANGE, D3D12_TEXTURE_BARRIER,
+    };
+    assert!(size_of::<BarrierGroup>() == size_of::<D3D12_BARRIER_GROUP>());
+    assert!(size_of::<TextureBarrier>() == size_of::<D3D12_TEXTURE_BARRIER>());
+    assert!(offset_of!(TextureBarrier, resource) == offset_of!(D3D12_TEXTURE_BARRIER, pResource));
+    assert!(offset_of!(TextureBarrier, subresources) == offset_of!(D3D12_TEXTURE_BARRIER, Subresources));
+    assert!(size_of::<[u32; 6]>() == size_of::<D3D12_BARRIER_SUBRESOURCE_RANGE>());
+    assert!(offset_of!(D3D12_BARRIER_SUBRESOURCE_RANGE, IndexOrFirstMipLevel) == 0);
+    assert!(offset_of!(D3D12_BARRIER_SUBRESOURCE_RANGE, NumMipLevels) == 4);
+    assert!(offset_of!(D3D12_BARRIER_SUBRESOURCE_RANGE, FirstArraySlice) == 8);
+    assert!(offset_of!(D3D12_BARRIER_SUBRESOURCE_RANGE, NumArraySlices) == 12);
+    assert!(offset_of!(D3D12_BARRIER_SUBRESOURCE_RANGE, FirstPlane) == 16);
+    assert!(offset_of!(D3D12_BARRIER_SUBRESOURCE_RANGE, NumPlanes) == 20);
+};
+
+/// Whether an enhanced texture barrier's `D3D12_BARRIER_SUBRESOURCE_RANGE`
+/// covers the whole `texture` (else a partial subresource transition must
+/// not clobber sibling mips/slices/planes on our whole-resource tracker).
+#[cfg(windows)]
+fn is_whole_resource_barrier(
+    subresources: &[u32; 6],
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_INFO, D3D12_FEATURE_FORMAT_INFO,
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+    };
+    // SAFETY: `texture` is a live D3D12 resource.
+    let desc = unsafe { texture.GetDesc() };
+    let planes = crate::host::host().map_or(1u32, |host| {
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+            Format: desc.Format,
+            PlaneCount: 0,
+        };
+        // SAFETY: `info` has the exact layout expected by `D3D12_FEATURE_FORMAT_INFO`.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_INFO,
+                (&raw mut info).cast(),
+                size_of_val(&info) as u32,
+            )
+        }
+        .is_ok();
+        if ok {
+            u32::from(info.PlaneCount).max(1)
+        } else {
+            1
+        }
+    });
+    let mips = u32::from(desc.MipLevels).max(1);
+    let slices = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(desc.DepthOrArraySize).max(1)
+    };
+    let [first_mip_or_index, num_mips, first_slice, num_slices, first_plane, num_planes] =
+        *subresources;
+    if num_mips == 0 {
+        first_mip_or_index == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+            || (first_mip_or_index == 0 && mips == 1 && slices == 1 && planes == 1)
+    } else {
+        first_mip_or_index == 0
+            && num_mips >= mips
+            && first_slice == 0
+            && num_slices >= slices
+            && first_plane == 0
+            && num_planes >= planes
+    }
+}
+
+/// Maps an enhanced barrier `D3D12_BARRIER_LAYOUT` value to the legacy host
+/// `D3D12_RESOURCE_STATES` texture state bitmask, or `None` for `UNDEFINED`
+/// and video-only layouts.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn enhanced_layout_state(layout: u32) -> Option<u32> {
+    Some(match layout {
+        // COMMON / PRESENT and queue-specific COMMON
+        0 | 18 | 24 | 30 => 0,
+        // GENERIC_READ and queue-specific GENERIC_READ (texture bits only)
+        1 | 19 | 25 => 0x40 | 0x80 | 0x800,
+        // RENDER_TARGET
+        2 => 0x4,
+        // UNORDERED_ACCESS and queue-specific UNORDERED_ACCESS
+        3 | 20 | 26 => 0x8,
+        // DEPTH_STENCIL_WRITE
+        4 => 0x10,
+        // DEPTH_STENCIL_READ
+        5 => 0x20,
+        // SHADER_RESOURCE and queue-specific SHADER_RESOURCE
+        6 | 21 | 27 => 0x40 | 0x80,
+        // COPY_SOURCE and queue-specific COPY_SOURCE
+        7 | 22 | 28 => 0x800,
+        // COPY_DEST and queue-specific COPY_DEST
+        8 | 23 | 29 => 0x400,
+        // RESOLVE_SOURCE
+        9 => 0x2000,
+        // RESOLVE_DEST
+        10 => 0x1000,
+        // SHADING_RATE_SOURCE
+        11 => 0x100_0000,
+        // UNDEFINED (u32::MAX), video-only (12..=17), or unknown
+        _ => return None,
+    })
+}
+
+/// The enhanced barriers `(group count, groups)`: translates texture
+/// layout transitions onto the host list's tracked texture states and
+/// emits a global UAV barrier when shader UAV ordering or non-texture
+/// groups require it.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const BarrierGroup) {
+    if count == 0 || groups.is_null() {
+        return;
+    }
     #[cfg(windows)]
-    if count > 0
-        && let Some(list) = host_list(this)
-    {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    if let Some(list) = host_list(this) {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATES as State,
+            D3D12_RESOURCE_UAV_BARRIER,
+        };
+        use windows::core::Interface;
+        const TEXTURE: u32 = 1;
+        const SYNC_SPLIT: u32 = 0x8000_0000;
+        const ACCESS_UAV: u32 = 0x10;
+        const STATE_UAV: u32 = 0x8;
+
+        // SAFETY: the title passes `count` barrier groups.
+        let groups = unsafe { std::slice::from_raw_parts(groups, count as usize) };
         // Which kinds of barriers (0 global, 1 texture, 2 buffer) and how many.
         #[cfg(feature = "diagnostics")]
-        if !_groups.is_null() {
-            // SAFETY: the title passes `count` groups of 16 bytes: kind, count, pointer.
-            let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
-            list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
+        list.note_op(|| {
+            format!(
+                "barrier groups {:?}",
+                groups.iter().map(|g| (g.kind, g.count)).collect::<Vec<_>>()
+            )
+        });
+        let mut out: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+        let mut seen_transitions: Vec<usize> = Vec::new();
+        let mut need_global_uav = false;
+
+        for g in groups {
+            if g.kind == TEXTURE {
+                if g.count == 0 || g.barriers.is_null() {
+                    continue;
+                }
+                // SAFETY: a texture barrier group passes `g.count` `TextureBarrier` entries.
+                let barriers = unsafe {
+                    std::slice::from_raw_parts(
+                        g.barriers.cast::<TextureBarrier>(),
+                        g.count as usize,
+                    )
+                };
+                for b in barriers {
+                    if b.sync_after == SYNC_SPLIT || b.resource.is_null() {
+                        continue;
+                    }
+                    let wanted = enhanced_layout_state(b.layout_after);
+                    let whole = crate::resource::host_resource(b.resource)
+                        .is_some_and(|tex| is_whole_resource_barrier(&b.subresources, &tex));
+                    let mut emitted_transition = false;
+                    if whole
+                        && let Some(wanted) = wanted
+                        && let Some((texture, before)) = list.transition(b.resource, wanted)
+                    {
+                        let after = crate::host::legal_state(&texture, wanted);
+                        if before != after {
+                            let tex_key = texture.as_raw() as usize;
+                            if seen_transitions.contains(&tex_key) {
+                                // SAFETY: an open list and live resources.
+                                unsafe { list.list.ResourceBarrier(&out) };
+                                out.clear();
+                                seen_transitions.clear();
+                            }
+                            seen_transitions.push(tex_key);
+                            out.push(crate::host::transition(
+                                &texture,
+                                State(before as i32),
+                                State(after as i32),
+                            ));
+                            emitted_transition = true;
+                        }
+                    }
+                    if ((b.access_before | b.access_after) & ACCESS_UAV != 0)
+                        || (wanted == Some(STATE_UAV) && !emitted_transition)
+                    {
+                        need_global_uav = true;
+                    }
+                }
+            } else if g.count > 0 {
+                need_global_uav = true;
+            }
         }
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+
+        if need_global_uav {
+            out.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            });
+        }
+        if !out.is_empty() {
+            // SAFETY: an open list and live resources.
+            unsafe { list.list.ResourceBarrier(&out) };
+        }
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = this;
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2132,5 +2350,1054 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    fn new_newer_list(allocator: This) -> This {
+        let mut out = std::ptr::null();
+        let list = Box::new(List {
+            object: Object::new(&NEWER_LIST_FUNCTIONS),
+            kind: 0,
+            put: [0; 5],
+            reserved: [0; 64],
+            graphics_root_headers: [0; 128],
+            compute_root_headers: [0; 128],
+            pipeline_shadow: [0; 8],
+            newer: [0; 256],
+            uploads: Default::default(),
+            #[cfg(windows)]
+            hosts: std::sync::Mutex::new(
+                crate::host::host()
+                    .and_then(|h| h.new_list().ok())
+                    .map(Arc::new)
+                    .into_iter()
+                    .collect(),
+            ),
+            #[cfg(windows)]
+            segment: AtomicUsize::new(0),
+            #[cfg(windows)]
+            state: Default::default(),
+        });
+        let hr = object::hand_out(LIST, list, &LIST_IIDS[1], &LIST_IIDS, &mut out);
+        assert_eq!(hr, S_OK);
+        let _ = allocator;
+        out
+    }
+
+    #[test]
+    fn enhanced_layout_mapping_and_abi() {
+        assert_eq!(size_of::<BarrierGroup>(), 16);
+        assert_eq!(size_of::<TextureBarrier>(), 64);
+
+        let expected: &[(u32, Option<u32>)] = &[
+            (0, Some(0)),
+            (1, Some(0x40 | 0x80 | 0x800)),
+            (2, Some(0x4)),
+            (3, Some(0x8)),
+            (4, Some(0x10)),
+            (5, Some(0x20)),
+            (6, Some(0x40 | 0x80)),
+            (7, Some(0x800)),
+            (8, Some(0x400)),
+            (9, Some(0x2000)),
+            (10, Some(0x1000)),
+            (11, Some(0x100_0000)),
+            (12, None),
+            (13, None),
+            (14, None),
+            (15, None),
+            (16, None),
+            (17, None),
+            (18, Some(0)),
+            (19, Some(0x40 | 0x80 | 0x800)),
+            (20, Some(0x8)),
+            (21, Some(0x40 | 0x80)),
+            (22, Some(0x800)),
+            (23, Some(0x400)),
+            (24, Some(0)),
+            (25, Some(0x40 | 0x80 | 0x800)),
+            (26, Some(0x8)),
+            (27, Some(0x40 | 0x80)),
+            (28, Some(0x800)),
+            (29, Some(0x400)),
+            (30, Some(0)),
+            (31, None),
+            (u32::MAX, None),
+        ];
+        for &(layout, state) in expected {
+            assert_eq!(enhanced_layout_state(layout), state, "layout {layout}");
+        }
+
+        #[cfg(windows)]
+        {
+            use windows::Win32::Graphics::Direct3D12::*;
+            assert_eq!(size_of::<BarrierGroup>(), size_of::<D3D12_BARRIER_GROUP>());
+            assert_eq!(
+                size_of::<TextureBarrier>(),
+                size_of::<D3D12_TEXTURE_BARRIER>()
+            );
+            assert_eq!(
+                offset_of!(TextureBarrier, resource),
+                offset_of!(D3D12_TEXTURE_BARRIER, pResource)
+            );
+            let generic_read = (D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_COPY_SOURCE)
+                .0 as u32;
+            let legacy: &[(D3D12_BARRIER_LAYOUT, Option<u32>)] = &[
+                (
+                    D3D12_BARRIER_LAYOUT_COMMON,
+                    Some(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_PRESENT,
+                    Some(D3D12_RESOURCE_STATE_PRESENT.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON,
+                    Some(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON,
+                    Some(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON,
+                    Some(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+                ),
+                (D3D12_BARRIER_LAYOUT_GENERIC_READ, Some(generic_read)),
+                (
+                    D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ,
+                    Some(generic_read),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ,
+                    Some(generic_read),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_RENDER_TARGET,
+                    Some(D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+                    Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS,
+                    Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS,
+                    Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE,
+                    Some(D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ,
+                    Some(D3D12_RESOURCE_STATE_DEPTH_READ.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+                    Some(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE,
+                    Some(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE,
+                    Some(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+                    Some(D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE,
+                    Some(D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE,
+                    Some(D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_COPY_DEST,
+                    Some(D3D12_RESOURCE_STATE_COPY_DEST.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST,
+                    Some(D3D12_RESOURCE_STATE_COPY_DEST.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST,
+                    Some(D3D12_RESOURCE_STATE_COPY_DEST.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE,
+                    Some(D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_RESOLVE_DEST,
+                    Some(D3D12_RESOURCE_STATE_RESOLVE_DEST.0 as u32),
+                ),
+                (
+                    D3D12_BARRIER_LAYOUT_SHADING_RATE_SOURCE,
+                    Some(D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE.0 as u32),
+                ),
+                (D3D12_BARRIER_LAYOUT_UNDEFINED, None),
+                (D3D12_BARRIER_LAYOUT_VIDEO_DECODE_READ, None),
+                (D3D12_BARRIER_LAYOUT_VIDEO_DECODE_WRITE, None),
+                (D3D12_BARRIER_LAYOUT_VIDEO_PROCESS_READ, None),
+                (D3D12_BARRIER_LAYOUT_VIDEO_PROCESS_WRITE, None),
+                (D3D12_BARRIER_LAYOUT_VIDEO_ENCODE_READ, None),
+                (D3D12_BARRIER_LAYOUT_VIDEO_ENCODE_WRITE, None),
+            ];
+            for &(layout, state) in legacy {
+                assert_eq!(enhanced_layout_state(layout.0 as u32), state, "{layout:?}");
+            }
+        }
+
+        // Null / zero-count / null-pointer groups are safe no-ops.
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let list = new_newer_list(allocator);
+        type BarrierFn = extern "system" fn(This, u32, *const BarrierGroup);
+        let call_barrier = slot::<BarrierFn>(list, 0x490);
+        call_barrier(null, 1, std::ptr::null());
+        call_barrier(list, 0, std::ptr::null());
+        call_barrier(list, 1, std::ptr::null());
+        let null_ptr_group = BarrierGroup {
+            kind: 1,
+            count: 2,
+            barriers: std::ptr::null(),
+        };
+        let zero_count_group = BarrierGroup {
+            kind: 1,
+            count: 0,
+            barriers: (&raw const null_ptr_group).cast(),
+        };
+        let null_tex_barrier = TextureBarrier {
+            sync_before: 0,
+            sync_after: 0,
+            access_before: 0,
+            access_after: 0,
+            layout_before: 0,
+            layout_after: 7,
+            resource: null,
+            subresources: [0; 6],
+            flags: 0,
+            _pad: 0,
+        };
+        let null_res_group = BarrierGroup {
+            kind: 1,
+            count: 1,
+            barriers: (&raw const null_tex_barrier).cast(),
+        };
+        let groups = [null_ptr_group, zero_count_group, null_res_group];
+        call_barrier(list, groups.len() as u32, groups.as_ptr());
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Default)]
+    struct D3d12ErrorCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[cfg(windows)]
+    impl tracing::Subscriber for D3d12ErrorCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            use windows::Win32::Graphics::Direct3D12::D3D12_MESSAGE_SEVERITY_ERROR;
+            struct Visitor {
+                severity: Option<i64>,
+                message: Option<String>,
+            }
+            impl tracing::field::Visit for Visitor {
+                fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                    if field.name() == "severity" {
+                        self.severity = Some(value);
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut v = Visitor {
+                severity: None,
+                message: None,
+            };
+            event.record(&mut v);
+            if let (Some(sev), Some(msg)) = (v.severity, v.message)
+                && msg.starts_with("D3D12:")
+                && sev <= i64::from(D3D12_MESSAGE_SEVERITY_ERROR.0)
+            {
+                self.0.lock().unwrap().push(msg);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn enhanced_texture_barrier_transitions_and_propagates_across_lists() {
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // Clear any messages from earlier tests before capturing.
+        let _ = host.log_messages();
+
+        let errors = D3d12ErrorCapture::default();
+        let subscriber = errors.clone();
+        tracing::subscriber::with_default(subscriber, || {
+            let null = std::ptr::null();
+            let resource_iid = guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let queue_iid = guid(
+                0x0ec870a6,
+                0x5d7e,
+                0x4c22,
+                [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+            );
+
+            assert_eq!(size_of::<D3D12_HEAP_PROPERTIES>(), 20);
+            assert_eq!(size_of::<D3D12_RESOURCE_DESC>(), 56);
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let tex_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                    | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            };
+            let mut tex = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const tex_desc).cast(),
+                    0,
+                    null.cast(),
+                    &resource_iid,
+                    &mut tex,
+                ),
+                S_OK
+            );
+            let host_tex = crate::resource::host_resource(tex).unwrap();
+
+            let mut rtv_slot = [0u64; 16];
+            let rtv = rtv_slot.as_mut_ptr() as u64;
+            crate::descriptor::create_rtv(null, tex, null.cast(), rtv);
+
+            let mut queue = null;
+            let queue_desc = [0u32; 4];
+            assert_eq!(
+                crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+                S_OK
+            );
+
+            let mut allocator1 = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator1),
+                S_OK
+            );
+            let list1 = new_newer_list(allocator1);
+
+            let readback_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let readback_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1024,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut readback: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a 1 KiB readback buffer.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &readback_heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &readback_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut readback,
+                    )
+                    .unwrap();
+            }
+            let readback = readback.unwrap();
+
+            let record_copy_to_readback = |list: This| {
+                let host_list = host_list(list).unwrap();
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(readback.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: 4,
+                                Height: 4,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(host_tex.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                // SAFETY: an open host list and live resources.
+                unsafe { host_list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+            };
+
+            let read_pixel = || -> [u8; 4] {
+                let mut mapped = std::ptr::null_mut();
+                let read_range = D3D12_RANGE { Begin: 0, End: 4 };
+                let written_range = D3D12_RANGE { Begin: 0, End: 0 };
+                // SAFETY: execution waited for completion; readback buffer is 1 KiB.
+                unsafe {
+                    readback
+                        .Map(0, Some(&read_range), Some(&mut mapped))
+                        .unwrap();
+                    let pixel = *(mapped.cast::<[u8; 4]>());
+                    readback.Unmap(0, Some(&written_range));
+                    pixel
+                }
+            };
+
+            type BarrierFn = extern "system" fn(This, u32, *const BarrierGroup);
+            type ExecuteFn = extern "system" fn(This, u32, *const This);
+            let execute = slot::<ExecuteFn>(queue, 0x50);
+            let tex_barrier = |sync_before: D3D12_BARRIER_SYNC,
+                               sync_after: D3D12_BARRIER_SYNC,
+                               access_before: D3D12_BARRIER_ACCESS,
+                               access_after: D3D12_BARRIER_ACCESS,
+                               layout_before: D3D12_BARRIER_LAYOUT,
+                               layout_after: D3D12_BARRIER_LAYOUT|
+             -> TextureBarrier {
+                TextureBarrier {
+                    sync_before: sync_before.0 as u32,
+                    sync_after: sync_after.0 as u32,
+                    access_before: access_before.0 as u32,
+                    access_after: access_after.0 as u32,
+                    layout_before: layout_before.0 as u32,
+                    layout_after: layout_after.0 as u32,
+                    resource: tex,
+                    subresources: [0xffff_ffff, 0, 0, 0, 0, 0],
+                    flags: 0,
+                    _pad: 0,
+                }
+            };
+
+            let unorm = |c: [u8; 4]| c.map(|b| f32::from(b) / 255.0);
+
+            // 1. Basic transition: RENDER_TARGET -> COPY_SOURCE without ensure_state.
+            clear_rtv(list1, rtv, &unorm([64, 128, 191, 255]), 0, null.cast());
+            let b1 = tex_barrier(
+                D3D12_BARRIER_SYNC_RENDER_TARGET,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_ACCESS_RENDER_TARGET,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                D3D12_BARRIER_LAYOUT_RENDER_TARGET,
+                D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+            );
+            let g1 = BarrierGroup {
+                kind: D3D12_BARRIER_TYPE_TEXTURE.0 as u32,
+                count: 1,
+                barriers: (&raw const b1).cast(),
+            };
+            slot::<BarrierFn>(list1, 0x490)(list1, 1, &g1);
+            record_copy_to_readback(list1);
+            assert_eq!(close(list1), S_OK);
+            execute(queue, 1, &list1);
+            assert!(host.log_messages().is_none());
+            assert!(errors.0.lock().unwrap().is_empty());
+            assert_eq!(read_pixel(), [64, 128, 191, 255]);
+
+            // 2. Split-begin skipped, split-end transitions.
+            assert_eq!(reset(list1, allocator1, null), S_OK);
+            clear_rtv(list1, rtv, &unorm([128, 64, 255, 255]), 0, null.cast());
+            let b_split_begin = tex_barrier(
+                D3D12_BARRIER_SYNC_RENDER_TARGET,
+                D3D12_BARRIER_SYNC_SPLIT,
+                D3D12_BARRIER_ACCESS_RENDER_TARGET,
+                D3D12_BARRIER_ACCESS_NO_ACCESS,
+                D3D12_BARRIER_LAYOUT_RENDER_TARGET,
+                D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+            );
+            let g_split_begin = BarrierGroup {
+                kind: D3D12_BARRIER_TYPE_TEXTURE.0 as u32,
+                count: 1,
+                barriers: (&raw const b_split_begin).cast(),
+            };
+            slot::<BarrierFn>(list1, 0x490)(list1, 1, &g_split_begin);
+            // Must still be in RENDER_TARGET so a raw RTV clear succeeds cleanly.
+            // SAFETY: an open host list and live texture in RENDER_TARGET.
+            unsafe {
+                host_list(list1).unwrap().list.ClearRenderTargetView(
+                    host.rtv(&host_tex, None),
+                    &unorm([255, 128, 64, 255]),
+                    None,
+                );
+            }
+            let b_split_end = tex_barrier(
+                D3D12_BARRIER_SYNC_SPLIT,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_ACCESS_NO_ACCESS,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                D3D12_BARRIER_LAYOUT_RENDER_TARGET,
+                D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+            );
+            let g_split_end = BarrierGroup {
+                kind: D3D12_BARRIER_TYPE_TEXTURE.0 as u32,
+                count: 1,
+                barriers: (&raw const b_split_end).cast(),
+            };
+            slot::<BarrierFn>(list1, 0x490)(list1, 1, &g_split_end);
+            record_copy_to_readback(list1);
+            assert_eq!(close(list1), S_OK);
+            execute(queue, 1, &list1);
+            assert!(host.log_messages().is_none());
+            assert!(errors.0.lock().unwrap().is_empty());
+            assert_eq!(read_pixel(), [255, 128, 64, 255]);
+
+            // 3. Duplicate-texture transitions in one Barrier() call + UAV ordering.
+            assert_eq!(reset(list1, allocator1, null), S_OK);
+            clear_rtv(list1, rtv, &unorm([0, 255, 128, 255]), 0, null.cast());
+            let dup = [
+                tex_barrier(
+                    D3D12_BARRIER_SYNC_RENDER_TARGET,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_ACCESS_RENDER_TARGET,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    D3D12_BARRIER_LAYOUT_RENDER_TARGET,
+                    D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+                ),
+                tex_barrier(
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_SYNC_COPY,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                    D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+                    D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+                ),
+            ];
+            let g_dup = BarrierGroup {
+                kind: D3D12_BARRIER_TYPE_TEXTURE.0 as u32,
+                count: dup.len() as u32,
+                barriers: dup.as_ptr().cast(),
+            };
+            slot::<BarrierFn>(list1, 0x490)(list1, 1, &g_dup);
+            record_copy_to_readback(list1);
+            assert_eq!(close(list1), S_OK);
+            execute(queue, 1, &list1);
+            assert!(host.log_messages().is_none());
+            assert!(errors.0.lock().unwrap().is_empty());
+            assert_eq!(read_pixel(), [0, 255, 128, 255]);
+
+            // 4. Cross-list propagation via HostList::prelude.
+            assert_eq!(reset(list1, allocator1, null), S_OK);
+            let mut allocator2 = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator2),
+                S_OK
+            );
+            let list2 = new_newer_list(allocator2);
+
+            clear_rtv(list1, rtv, &unorm([191, 64, 128, 255]), 0, null.cast());
+            let b_to_srv = tex_barrier(
+                D3D12_BARRIER_SYNC_RENDER_TARGET,
+                D3D12_BARRIER_SYNC_ALL_SHADING,
+                D3D12_BARRIER_ACCESS_RENDER_TARGET,
+                D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                D3D12_BARRIER_LAYOUT_RENDER_TARGET,
+                D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+            );
+            let g_to_srv = BarrierGroup {
+                kind: D3D12_BARRIER_TYPE_TEXTURE.0 as u32,
+                count: 1,
+                barriers: (&raw const b_to_srv).cast(),
+            };
+            slot::<BarrierFn>(list1, 0x490)(list1, 1, &g_to_srv);
+            assert_eq!(close(list1), S_OK);
+            execute(queue, 1, &list1);
+            assert_eq!(
+                crate::resource::host_copy(tex)
+                    .unwrap()
+                    .state
+                    .load(Ordering::Relaxed),
+                0x40 | 0x80
+            );
+
+            let b_to_copy = tex_barrier(
+                D3D12_BARRIER_SYNC_ALL_SHADING,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+                D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+            );
+            let g_to_copy = BarrierGroup {
+                kind: D3D12_BARRIER_TYPE_TEXTURE.0 as u32,
+                count: 1,
+                barriers: (&raw const b_to_copy).cast(),
+            };
+            slot::<BarrierFn>(list2, 0x490)(list2, 1, &g_to_copy);
+            record_copy_to_readback(list2);
+            assert_eq!(close(list2), S_OK);
+            execute(queue, 1, &list2);
+            assert!(host.log_messages().is_none());
+            assert_eq!(
+                crate::resource::host_copy(tex)
+                    .unwrap()
+                    .state
+                    .load(Ordering::Relaxed),
+                0x800
+            );
+            assert!(errors.0.lock().unwrap().is_empty());
+            assert_eq!(read_pixel(), [191, 64, 128, 255]);
+
+            let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            assert_eq!(release(list2), 0);
+            assert_eq!(release(allocator2), 0);
+            assert_eq!(release(list1), 0);
+            assert_eq!(release(allocator1), 0);
+            assert_eq!(release(queue), 0);
+            assert_eq!(release(tex), 0);
+        });
+    }
+
+    /// Partial-subresource enhanced barriers (such as targeting mip 1 of a
+    /// two-mip texture) must be skipped on the whole-resource tracker so they
+    /// never move mip 0 out of `RENDER_TARGET` before a subsequent mip-0 clear.
+    #[cfg(windows)]
+    #[test]
+    fn enhanced_texture_barrier_skips_partial_subresource_ranges() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let errors = D3d12ErrorCapture::default();
+        let subscriber = errors.clone();
+        tracing::subscriber::with_default(subscriber, || {
+            let null = std::ptr::null();
+            let resource_iid = guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let queue_iid = guid(
+                0x0ec870a6,
+                0x5d7e,
+                0x4c22,
+                [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+            );
+
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let tex_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 2,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            };
+            let mut tex = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const tex_desc).cast(),
+                    0,
+                    null.cast(),
+                    &resource_iid,
+                    &mut tex,
+                ),
+                S_OK
+            );
+            let mut rtv_slot = [0u64; 16];
+            let rtv = rtv_slot.as_mut_ptr() as u64;
+            crate::descriptor::create_rtv(null, tex, null.cast(), rtv);
+
+            let mut queue = null;
+            let queue_desc = [0u32; 4];
+            assert_eq!(
+                crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+                S_OK
+            );
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let list = new_newer_list(allocator);
+
+            let unorm = |c: [u8; 4]| c.map(|b| f32::from(b) / 255.0);
+            clear_rtv(list, rtv, &unorm([0, 255, 0, 255]), 0, null.cast());
+
+            type BarrierFn = extern "system" fn(This, u32, *const BarrierGroup);
+            type ExecuteFn = extern "system" fn(This, u32, *const This);
+            let call_barrier = slot::<BarrierFn>(list, 0x490);
+            let partial_barriers = [
+                // Flat subresource index 1 (mip 1)
+                TextureBarrier {
+                    sync_before: D3D12_BARRIER_SYNC_RENDER_TARGET.0 as u32,
+                    sync_after: D3D12_BARRIER_SYNC_COPY.0 as u32,
+                    access_before: D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32,
+                    access_after: D3D12_BARRIER_ACCESS_COPY_SOURCE.0 as u32,
+                    layout_before: D3D12_BARRIER_LAYOUT_RENDER_TARGET.0 as u32,
+                    layout_after: D3D12_BARRIER_LAYOUT_COPY_SOURCE.0 as u32,
+                    resource: tex,
+                    subresources: [1, 0, 0, 0, 0, 0],
+                    flags: 0,
+                    _pad: 0,
+                },
+                // Explicit range covering only mip 1
+                TextureBarrier {
+                    sync_before: D3D12_BARRIER_SYNC_RENDER_TARGET.0 as u32,
+                    sync_after: D3D12_BARRIER_SYNC_COPY.0 as u32,
+                    access_before: D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32,
+                    access_after: D3D12_BARRIER_ACCESS_COPY_SOURCE.0 as u32,
+                    layout_before: D3D12_BARRIER_LAYOUT_RENDER_TARGET.0 as u32,
+                    layout_after: D3D12_BARRIER_LAYOUT_COPY_SOURCE.0 as u32,
+                    resource: tex,
+                    subresources: [1, 1, 0, 1, 0, 1],
+                    flags: 0,
+                    _pad: 0,
+                },
+            ];
+            let group = BarrierGroup {
+                kind: D3D12_BARRIER_TYPE_TEXTURE.0 as u32,
+                count: partial_barriers.len() as u32,
+                barriers: partial_barriers.as_ptr().cast(),
+            };
+            call_barrier(list, 1, &group);
+
+            // Must still be in RENDER_TARGET (0x4) so a subsequent mip-0 clear does not fail.
+            assert!(
+                host_list(list).unwrap().transition(tex, 0x4).is_none(),
+                "partial mip-1 barrier clobbered whole-resource RENDER_TARGET state"
+            );
+            clear_rtv(list, rtv, &unorm([0, 128, 255, 255]), 0, null.cast());
+            assert_eq!(close(list), S_OK);
+            slot::<ExecuteFn>(queue, 0x50)(queue, 1, &list);
+
+            assert!(host.log_messages().is_none());
+            assert!(errors.0.lock().unwrap().is_empty());
+
+            let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            assert_eq!(release(list), 0);
+            assert_eq!(release(allocator), 0);
+            assert_eq!(release(queue), 0);
+            assert_eq!(release(tex), 0);
+        });
+    }
+
+    /// Premise check (fails on `main`, passes here): heap-indexed shaders do
+    /// not trigger `list::ensure_state` on render-target textures (`title_written`
+    /// is false), so reading a cleared RTV through a heap SRV relies on the
+    /// enhanced barrier transitioning `RENDER_TARGET -> SHADER_RESOURCE`.
+    #[cfg(windows)]
+    #[test]
+    fn enhanced_texture_barrier_transitions_render_target_for_heap_srv_read() {
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let errors = D3d12ErrorCapture::default();
+        let subscriber = errors.clone();
+        tracing::subscriber::with_default(subscriber, || {
+            let null = std::ptr::null();
+            let resource_iid = guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let queue_iid = guid(
+                0x0ec870a6,
+                0x5d7e,
+                0x4c22,
+                [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+            );
+            let heap_iid = guid(
+                0x8efb471d,
+                0x616c,
+                0x4f49,
+                [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+            );
+
+            let heap_props = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let tex_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            };
+            let mut tex = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap_props).cast(),
+                    0,
+                    (&raw const tex_desc).cast(),
+                    0,
+                    null.cast(),
+                    &resource_iid,
+                    &mut tex,
+                ),
+                S_OK
+            );
+
+            let mut rtv_slot = [0u64; 16];
+            let rtv = rtv_slot.as_mut_ptr() as u64;
+            crate::descriptor::create_rtv(null, tex, null.cast(), rtv);
+
+            let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+            let mut title_heap_ptr = null;
+            assert_eq!(
+                crate::descriptor::create_heap(
+                    null,
+                    heap_desc.as_ptr().cast(),
+                    &heap_iid,
+                    &mut title_heap_ptr
+                ),
+                S_OK
+            );
+            let title_heap = crate::descriptor::heap(title_heap_ptr);
+            crate::descriptor::create_srv(null, tex, std::ptr::null(), title_heap.start);
+            let heap_host = title_heap.host().expect("host view heap");
+
+            let hlsl = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint4 px = (uint4)round(src.Load(int3(0, 0, 0)) * 255.0);
+    dst.Store4(0, px);
+}
+"#;
+            let (mut code, mut compile_errs): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+            // SAFETY: HLSL source and literals outlive the call.
+            unsafe {
+                D3DCompile(
+                    hlsl.as_ptr().cast(),
+                    hlsl.len(),
+                    s!("heap_srv_barrier"),
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut compile_errs),
+                )
+                .unwrap();
+            }
+            let code = code.unwrap();
+            // SAFETY: compiled shader blob bytes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+            };
+            // SAFETY: root signature and compute PSO compiled above.
+            let (root, pso) = unsafe {
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                };
+                let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc).unwrap();
+                (root, pso)
+            };
+
+            let (out_buf, out_ptr) = host.shared_buffer(256).expect("shared buffer");
+            // SAFETY: 256 bytes mapped write-back buffer.
+            unsafe { std::ptr::write_bytes(out_ptr, 0, 256) };
+            // SAFETY: `out_buf` is a live D3D12 resource.
+            let out_gpu = unsafe { out_buf.GetGPUVirtualAddress() };
+
+            let mut queue = null;
+            let queue_desc = [0u32; 4];
+            assert_eq!(
+                crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+                S_OK
+            );
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let list = new_newer_list(allocator);
+
+            let unorm = |c: [u8; 4]| c.map(|b| f32::from(b) / 255.0);
+            clear_rtv(list, rtv, &unorm([64, 128, 192, 255]), 0, null.cast());
+
+            type BarrierFn = extern "system" fn(This, u32, *const BarrierGroup);
+            type ExecuteFn = extern "system" fn(This, u32, *const This);
+            let b = TextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_RENDER_TARGET.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_RENDER_TARGET.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_SHADER_RESOURCE.0 as u32,
+                resource: tex,
+                subresources: [D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, 0, 0, 0, 0, 0],
+                flags: 0,
+                _pad: 0,
+            };
+            let group = BarrierGroup {
+                kind: D3D12_BARRIER_TYPE_TEXTURE.0 as u32,
+                count: 1,
+                barriers: (&raw const b).cast(),
+            };
+            slot::<BarrierFn>(list, 0x490)(list, 1, &group);
+
+            let hlist = host_list(list).unwrap();
+            // Dispatch reading slot 0 from the heap directly (no `ensure_state`).
+            // SAFETY: open list with live shader-visible heap, root signature, PSO, and UAV.
+            unsafe {
+                hlist
+                    .list
+                    .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                hlist.list.SetComputeRootSignature(&root);
+                hlist.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+                hlist.list.SetComputeRootUnorderedAccessView(1, out_gpu);
+                hlist.list.SetPipelineState(&pso);
+                hlist.list.Dispatch(1, 1, 1);
+            }
+            assert!(
+                hlist.transition(tex, 0x40 | 0x80).is_none(),
+                "texture stayed in RENDER_TARGET instead of transitioning to SHADER_RESOURCE"
+            );
+
+            assert_eq!(close(list), S_OK);
+            slot::<ExecuteFn>(queue, 0x50)(queue, 1, &list);
+
+            assert!(host.log_messages().is_none());
+            assert!(errors.0.lock().unwrap().is_empty());
+            assert_eq!(
+                crate::resource::host_copy(tex)
+                    .unwrap()
+                    .state
+                    .load(Ordering::Relaxed),
+                0x40 | 0x80
+            );
+            // SAFETY: GPU execution finished and `out_ptr` is mapped for 256 bytes.
+            let got = unsafe { std::slice::from_raw_parts(out_ptr.cast::<u32>(), 4) };
+            assert_eq!(got, &[64, 128, 192, 255]);
+
+            let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            assert_eq!(release(list), 0);
+            assert_eq!(release(allocator), 0);
+            assert_eq!(release(queue), 0);
+            assert_eq!(release(title_heap_ptr), 0);
+            assert_eq!(release(tex), 0);
+        });
     }
 }
