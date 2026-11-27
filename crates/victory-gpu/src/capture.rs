@@ -81,7 +81,8 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
+    // Keep the last sample when the input width or height is odd.
+    let (w, h) = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
@@ -113,6 +114,57 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn odd_capture_extents_keep_the_final_sampled_row_and_column() {
+    const TEST: &str = "capture::odd_capture_extents_keep_the_final_sampled_row_and_column";
+    const CHILD: &str = "VICTORY_TEST_ODD_CAPTURE";
+    if std::env::var_os(CHILD).is_some() {
+        let mut rows = [255u8; 5 * 16];
+        for y in 0..5u8 {
+            for x in 0..3u8 {
+                let at = usize::from(y) * 16 + usize::from(x) * 4;
+                rows[at..at + 4].copy_from_slice(&[100 + y, 50 + x, y * 10 + x, 200]);
+            }
+        }
+        save_as("odd", 3, 5, 16, true, &rows);
+        return;
+    }
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir()
+        .join(format!("victory-odd-capture-{}-{unique}", std::process::id()));
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST])
+        .env(CHILD, "1")
+        .env("VICTORY_CAPTURE", &dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let png = std::fs::read(dir.join("odd.png")).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+    assert_eq!(&png[12..16], b"IHDR");
+    assert_eq!([word(16), word(20)], [2, 3]);
+    assert_eq!(&png[37..41], b"IDAT");
+    let pixels = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
+    let expected = [
+        0, 0, 50, 100, 2, 52, 100,
+        0, 20, 50, 102, 22, 52, 102,
+        0, 40, 50, 104, 42, 52, 104,
+    ];
+    assert_eq!(pixels, expected);
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
