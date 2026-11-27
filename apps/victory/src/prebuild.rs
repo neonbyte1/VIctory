@@ -107,66 +107,19 @@ pub fn run(paths: &[PathBuf], threads: usize, keys_only: Option<PathBuf>) -> Res
     };
     // A job's pipeline, or why it has none.
     let prepare = |job: Job| -> Result<Prebuild, String> {
-        let g = match job {
-            Job::Graphics(i) => &graphics[i],
+        match job {
+            Job::Graphics(i) => prepare_graphics(&graphics[i], &named, &container),
             Job::Compute(i) => {
                 let (cs, _) = container(compute[i].stage.program).ok_or("shader not found")?;
-                return Ok(Prebuild::compute(&cs));
+                Ok(Prebuild::compute(&cs))
             }
-        };
-        let [ps, vs, gs, ..] = g.stages;
-        if g.stages[3..].iter().any(Option::is_some) {
-            return Err("stages other than vertex, mesh and pixel".into());
         }
-        let (first, stage) = vs
-            .or(gs)
-            .and_then(|s| container(s.program))
-            .ok_or("shader not found")?;
-        let pixel = match ps {
-            Some(ps) => Some(container(ps.program).ok_or("shader not found")?.0),
-            None => None,
-        };
-        let mesh = match stage {
-            HwStage::Ms => true,
-            HwStage::Vs => false,
-            _ => return Err("first stage not a vertex or mesh shader".into()),
-        };
-        let stream = pipelines::stream(g, &named, &first, mesh, pixel.as_deref()).map_err(|u| {
-            match u {
-                Unnamed::DepthStencil => "depth-stencil state not named",
-                Unnamed::Rasterizer => "rasteriser state not named",
-                Unnamed::Blend => "blend state not named",
-                Unnamed::Metadata => "metadata not read",
-            }
-            .to_owned()
-        })?;
-        // SAFETY: the stream points at `first`, `pixel` and its own input
-        // elements, all alive here.
-        Ok(unsafe { Prebuild::graphics(stream.bytes()) })
     };
 
     // A job's shaders as a run names them (diagnostics).
-    let shaders_of = |job: Job| {
-        let stages: Vec<(&str, &[u8])> = match job {
-            Job::Compute(i) => vec![("compute", compute[i].stage.program)],
-            Job::Graphics(i) => {
-                let [ps, vs, gs, ..] = graphics[i].stages;
-                let first = vs
-                    .map(|s| ("vertex", s.program))
-                    .or(gs.map(|s| ("mesh", s.program)));
-                first
-                    .into_iter()
-                    .chain(ps.map(|s| ("pixel", s.program)))
-                    .collect()
-            }
-        };
-        let names: Vec<String> = (stages.iter())
-            .map(|(stage, code)| match container(code) {
-                Some((c, _)) => format!("{stage} {}", &blake3::hash(&c).to_hex()[..16]),
-                None => format!("{stage} ?"),
-            })
-            .collect();
-        format!("[{}]", names.join(", "))
+    let shaders_of = |job: Job| match job {
+        Job::Compute(i) => format_stages([("compute", compute[i].stage.program)], &container),
+        Job::Graphics(i) => shaders_of_graphics(&graphics[i], &container),
     };
     let mut jobs: Vec<Job> = (0..compute.len()).map(Job::Compute).collect();
     jobs.extend((0..graphics.len()).map(Job::Graphics));
@@ -293,6 +246,224 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
         .unwrap_or_default()
 }
 
+/// Turns one graphics pack record into a `Prebuild`, rejecting records that
+/// carry stages outside vertex, mesh, and pixel (including `VS + GS`).
+fn prepare_graphics(
+    g: &shaderpack::Graphics<'_>,
+    named: &Named,
+    container: &impl Fn(&[u8]) -> Option<(Vec<u8>, HwStage)>,
+) -> Result<Prebuild, String> {
+    let [ps, vs, gs, ..] = g.stages;
+    if g.stages[3..].iter().any(Option::is_some) || (vs.is_some() && gs.is_some()) {
+        return Err("stages other than vertex, mesh and pixel".into());
+    }
+    let (first, stage) = vs
+        .xor(gs)
+        .and_then(|s| container(s.program))
+        .ok_or("shader not found")?;
+    let pixel = match ps {
+        Some(ps) => Some(container(ps.program).ok_or("shader not found")?.0),
+        None => None,
+    };
+    let mesh = match stage {
+        HwStage::Ms => true,
+        HwStage::Vs => false,
+        _ => return Err("first stage not a vertex or mesh shader".into()),
+    };
+    let stream = pipelines::stream(g, named, &first, mesh, pixel.as_deref()).map_err(|u| {
+        match u {
+            Unnamed::DepthStencil => "depth-stencil state not named",
+            Unnamed::Rasterizer => "rasteriser state not named",
+            Unnamed::Blend => "blend state not named",
+            Unnamed::Metadata => "metadata not read",
+        }
+        .to_owned()
+    })?;
+    // SAFETY: the stream points at `first`, `pixel` and its own input
+    // elements, all alive here.
+    Ok(unsafe { Prebuild::graphics(stream.bytes()) })
+}
+
+fn stage_name(stage: HwStage) -> &'static str {
+    match stage {
+        HwStage::Ls => "ls",
+        HwStage::Hs => "hs",
+        HwStage::Es => "es",
+        HwStage::Gs => "geometry",
+        HwStage::Vs => "vertex",
+        HwStage::Ps => "pixel",
+        HwStage::Ms => "mesh",
+        HwStage::Cs => "compute",
+    }
+}
+
+fn format_stages<'a>(
+    stages: impl IntoIterator<Item = (&'static str, &'a [u8])>,
+    container: &impl Fn(&[u8]) -> Option<(Vec<u8>, HwStage)>,
+) -> String {
+    let names: Vec<String> = stages
+        .into_iter()
+        .map(|(default, code)| match container(code) {
+            Some((c, stage)) => {
+                format!("{} {}", stage_name(stage), &blake3::hash(&c).to_hex()[..16])
+            }
+            None => format!("{default} ?"),
+        })
+        .collect();
+    format!("[{}]", names.join(", "))
+}
+
+/// Lists all non-empty stages of a graphics record without hiding `GS` behind `VS`.
+fn shaders_of_graphics(
+    g: &shaderpack::Graphics<'_>,
+    container: &impl Fn(&[u8]) -> Option<(Vec<u8>, HwStage)>,
+) -> String {
+    let [ps, vs, gs, es, hs, ls, fetch] = g.stages;
+    let gs_default = if vs.is_some() { "geometry" } else { "mesh" };
+    let slots = [
+        vs.map(|s| ("vertex", s.program)),
+        gs.map(|s| (gs_default, s.program)),
+        es.map(|s| ("es", s.program)),
+        hs.map(|s| ("hs", s.program)),
+        ls.map(|s| ("ls", s.program)),
+        fetch.map(|s| ("fetch", s.program)),
+        ps.map(|s| ("pixel", s.program)),
+    ];
+    format_stages(slots.into_iter().flatten(), container)
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_metadata() -> [u8; 0x50] {
+        let mut m = [0u8; 0x50];
+        m[0x26] = 3; // triangle topology
+        m[0x28..0x2c].copy_from_slice(&1u32.to_le_bytes()); // sample count = 1
+        m[0x38..0x3c].copy_from_slice(&4u32.to_le_bytes()); // input layout bytes (count = 0)
+        m
+    }
+
+    fn test_named() -> Named {
+        let mut named = Named::default();
+        named.depth.insert(0, [0u8; pipelines::DEPTH]);
+        named.raster.insert(0, [0u8; pipelines::RASTER]);
+        named.blend.insert(0, [0u8; pipelines::BLEND]);
+        named
+    }
+
+    fn test_graphics<'a>(
+        metadata: &'a [u8],
+        stages: [Option<shaderpack::Stage<'a>>; 7],
+    ) -> shaderpack::Graphics<'a> {
+        shaderpack::Graphics {
+            key: 1,
+            shader_hash: 2,
+            pipeline_hash: 3,
+            depth_stencil_hash: 0,
+            rasterizer_hash: 0,
+            blend_hash: 0,
+            packet: &[],
+            metadata,
+            stages,
+        }
+    }
+
+    fn stage(program: &[u8]) -> Option<shaderpack::Stage<'_>> {
+        Some(shaderpack::Stage {
+            program,
+            metadata: None,
+        })
+    }
+
+    #[test]
+    fn prepare_rejects_vs_plus_gs_while_allowing_vs_and_ms_pipelines() {
+        let metadata = test_metadata();
+        let named = test_named();
+        let container = |code: &[u8]| match code {
+            b"vs" => Some((b"vs-container".to_vec(), HwStage::Vs)),
+            b"ms" => Some((b"ms-container".to_vec(), HwStage::Ms)),
+            b"gs" => Some((b"gs-container".to_vec(), HwStage::Gs)),
+            b"ps" => Some((b"ps-container".to_vec(), HwStage::Ps)),
+            _ => None,
+        };
+
+        let vs_ps = test_graphics(
+            &metadata,
+            [stage(b"ps"), stage(b"vs"), None, None, None, None, None],
+        );
+        let built_vs = prepare_graphics(&vs_ps, &named, &container).expect("VS+PS succeeds");
+        assert!(built_vs.describe().contains("vertex"));
+        assert!(built_vs.describe().contains("pixel"));
+        let vs_hash = &blake3::hash(b"vs-container").to_hex()[..16];
+        let ps_hash = &blake3::hash(b"ps-container").to_hex()[..16];
+        assert_eq!(
+            shaders_of_graphics(&vs_ps, &container),
+            format!("[vertex {vs_hash}, pixel {ps_hash}]")
+        );
+
+        let ms_ps = test_graphics(
+            &metadata,
+            [stage(b"ps"), None, stage(b"ms"), None, None, None, None],
+        );
+        let built_ms = prepare_graphics(&ms_ps, &named, &container).expect("MS+PS succeeds");
+        assert!(built_ms.describe().contains("mesh"));
+        assert!(built_ms.describe().contains("pixel"));
+        let ms_hash = &blake3::hash(b"ms-container").to_hex()[..16];
+        assert_eq!(
+            shaders_of_graphics(&ms_ps, &container),
+            format!("[mesh {ms_hash}, pixel {ps_hash}]")
+        );
+
+        let vs_gs_ps = test_graphics(
+            &metadata,
+            [
+                stage(b"ps"),
+                stage(b"vs"),
+                stage(b"gs"),
+                None,
+                None,
+                None,
+                None,
+            ],
+        );
+        assert_eq!(
+            prepare_graphics(&vs_gs_ps, &named, &container)
+                .err()
+                .as_deref(),
+            Some("stages other than vertex, mesh and pixel")
+        );
+        let gs_hash = &blake3::hash(b"gs-container").to_hex()[..16];
+        assert_eq!(
+            shaders_of_graphics(&vs_gs_ps, &container),
+            format!("[vertex {vs_hash}, geometry {gs_hash}, pixel {ps_hash}]")
+        );
+
+        let vs_gs_unresolved = test_graphics(
+            &metadata,
+            [
+                None,
+                stage(b"vs"),
+                stage(b"missing-gs"),
+                None,
+                None,
+                None,
+                None,
+            ],
+        );
+        assert_eq!(
+            prepare_graphics(&vs_gs_unresolved, &named, &container)
+                .err()
+                .as_deref(),
+            Some("stages other than vertex, mesh and pixel")
+        );
+        assert_eq!(
+            shaders_of_graphics(&vs_gs_unresolved, &container),
+            format!("[vertex {vs_hash}, geometry ?]")
+        );
+    }
 }
