@@ -508,6 +508,19 @@ impl Shared {
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
+        // Point every level-1 region at block 0 and fill block 0 with `null`
+        // so a table used before its first `rewrite` (for example if its heap
+        // is released before its first submission) routes every lookup to the
+        // null views rather than descriptor slot 0.
+        // SAFETY: `data` is the persistent mapping of `table`, with room for
+        // `TABLE_DWORDS` dwords.
+        let out = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), TABLE_DWORDS) };
+        out[..LEVEL1].fill(0);
+        let (null_slots, _) = out[LEVEL1..LEVEL1 + BLOCK * 2].as_chunks_mut::<2>();
+        for slot in null_slots {
+            slot[0] = null;
+            slot[1] = 0;
+        }
         // SAFETY: a live buffer.
         let gpu = unsafe { table.GetGPUVirtualAddress() };
         Some(Shared {
@@ -1220,5 +1233,83 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    /// A freshly created page table routes every lookup to its `null` view
+    /// pair before `rewrite` has run (for example if its heap is released
+    /// before its first submission), rather than indexing descriptor slot 0.
+    #[test]
+    fn new_table_routes_all_lookups_to_null_before_first_rewrite() {
+        let _guard = gpu_test_lock();
+        let (Some(host), Some(views)) = (crate::host::host(), HostHeap::new(false, 16)) else {
+            return; // no host GPU here
+        };
+        let s = Shared::new(&views).expect("a page table");
+        assert_ne!(
+            s.null, 0,
+            "null view pair is distinct from descriptor slot 0"
+        );
+        // SAFETY: `s.data` is the persistent mapping of `s.table` with room for
+        // `TABLE_DWORDS` dwords and no GPU submission reads it yet.
+        let dwords = unsafe { std::slice::from_raw_parts(s.data as *const u32, TABLE_DWORDS) };
+        assert!(
+            dwords[..LEVEL1].iter().all(|&b| b == 0),
+            "every level-1 entry points at block 0"
+        );
+        let (block0, _) = dwords[LEVEL1..LEVEL1 + BLOCK * 2].as_chunks::<2>();
+        assert!(
+            block0.iter().all(|&slot| slot == [s.null, 0]),
+            "every block-0 slot must point at the null view pair"
+        );
+        for address in [
+            0u64,
+            0x10,
+            0x40_0010,
+            0xd_1234_0010,
+            0xff_ffff_fff0,
+            1u64 << 40,
+        ] {
+            assert_eq!(look_up(dwords, address), (s.null, address as u32));
+        }
+
+        // Bind a non-zero buffer at descriptor slot 0 and dispatch `SOURCE`
+        // against the un-rewritten table; it must read zeros from `s.null`
+        // instead of leaking slot 0's contents.
+        let (slot0, slot0_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: `slot0_cpu` is the mapped 256-byte buffer, not in GPU use.
+        unsafe { std::slice::from_raw_parts_mut(slot0_cpu.cast::<u32>(), 4).fill(0xDEAD_BEEF) };
+        views.raw_pair_at(0, Some(&slot0), 256);
+
+        let (out, out_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: `out_cpu` is the mapped 256-byte buffer, not in GPU use.
+        unsafe { std::slice::from_raw_parts_mut(out_cpu.cast::<u32>(), 4).fill(0xCAFE_BABE) };
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+
+        let (root, pso) = pipeline(SOURCE);
+        let list = host.new_list().unwrap();
+        let address = 0x80_0000_0000u64;
+        let constants = [address as u32, (address >> 32) as u32, 0];
+        // SAFETY: an open list and live objects owned by this test.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+            list.list.SetComputeRootShaderResourceView(1, s.gpu);
+            list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+            list.list
+                .SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: `out_cpu` is the mapped output buffer and the GPU has finished.
+        let got = unsafe { std::slice::from_raw_parts(out_cpu.cast::<u32>(), 4) };
+        assert_eq!(
+            got,
+            [0, 0, 0, 0],
+            "un-rewritten table must read from null view, not slot 0"
+        );
     }
 }
