@@ -1925,6 +1925,8 @@ impl State {
                 (buf, at, true)
             } else {
                 list.end_hoisted_indirect();
+                #[cfg(feature = "diagnostics")]
+                crate::indirect::count_alone(None);
                 let Some(clamped) = crate::indirect::bound(list, args_gpu, spec, is_spread) else {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
@@ -1947,19 +1949,26 @@ impl State {
             // Draws whose shaders write nothing a later execution could read
             // as arguments ([`may_write_arguments`]) may be clamped in a
             // window with the indirect draws next to them (#3197,
-            // `crate::indirect::windowed`).
-            let joins = crate::indirect::windows_on() && kind != DISPATCH && {
-                let stores = may_write_arguments(p);
-                #[cfg(feature = "diagnostics")]
-                if stores {
-                    crate::copystat::add(crate::copystat::C::ClampStoring, 1);
-                }
-                !stores
-            };
+            // `crate::indirect::windowed`); with `VICTORY_GPU_GAPS`, indirect
+            // dispatches and draws that may store too, while nothing but
+            // the window's executions comes between (`crate::indirect::Run`).
+            let stores = may_write_arguments(p);
+            #[cfg(feature = "diagnostics")]
+            if stores && kind != DISPATCH && crate::indirect::windows_on() {
+                crate::copystat::add(crate::copystat::C::ClampStoring, 1);
+            }
+            let alone = crate::indirect::alone(
+                crate::indirect::windows_on(),
+                crate::indirect::gaps_on(),
+                kind == DISPATCH,
+                stores,
+                is_spread,
+            );
+            let joins = alone.is_none();
             let window = joins
                 .then(|| {
                     let (start, _) = args.range();
-                    crate::indirect::windowed(list, args.gpu(start), arguments - start, spec)
+                    crate::indirect::windowed(list, args.gpu(start), arguments - start, spec, stores)
                 })
                 .flatten();
             let (clamped, at, windowed) = match window {
@@ -1970,10 +1979,18 @@ impl State {
                         self.host_roots[1] = 0;
                     }
                     #[cfg(feature = "diagnostics")]
-                    joined(p, false);
+                    if !stores {
+                        joined(p, false);
+                    } else if kind == DISPATCH {
+                        crate::copystat::add(crate::copystat::C::ClampGapsDispatches, 1);
+                    } else {
+                        crate::copystat::add(crate::copystat::C::ClampGapsStoring, 1);
+                    }
                     (out, at, true)
                 }
                 None => {
+                    #[cfg(feature = "diagnostics")]
+                    crate::indirect::count_alone(alone);
                     // Bounded first: the clamp binds a compute pipeline of its own.
                     let Some(clamped) = crate::indirect::bound(list, args_gpu, spec, is_spread) else {
                         why("not bounded (no clamp, or arguments not 4-byte aligned)");

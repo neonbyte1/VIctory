@@ -352,20 +352,35 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 /// Diagnostics, `VICTORY_GPU_TIMING`: GPU time per kind of command and
 /// pipeline (ms, commands) and lists' wall time against the sum of their
-/// commands' (ms), since the last frame-rate line.
+/// commands' (ms), since the last frame-rate line; of the lists with
+/// timestamps (not preludes), their wall time and the GPU's time from
+/// their first timestamp (the list's start, `list start`) to their last.
 #[cfg(feature = "diagnostics")]
-type GpuTimes = (std::collections::HashMap<String, (f64, u64)>, f64, f64);
+#[derive(Default)]
+struct GpuTimes {
+    by: std::collections::HashMap<String, (f64, u64)>,
+    wall: f64,
+    sum: f64,
+    stamped_wall: f64,
+    span: f64,
+}
 #[cfg(feature = "diagnostics")]
 static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
 
 /// Adds a timed list's commands (from [`HostList::slowest`]) to [`GPU_TIMES`],
 /// by the command's kind and pipeline: its note before the first ` | `,
-/// without counts and addresses.
+/// without counts and addresses; and its wall time against its stamps'
+/// span (ms), if it has stamps.
 #[cfg(feature = "diagnostics")]
-fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
+fn gpu_times(wall: Duration, commands: &[(f64, String)], span: Option<f64>) {
     let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
-    let (by, wall_ms, sum) = times.get_or_insert_with(Default::default);
-    *wall_ms += wall.as_secs_f64() * 1e3;
+    let t = times.get_or_insert_with(Default::default);
+    let wall = wall.as_secs_f64() * 1e3;
+    t.wall += wall;
+    if let Some(span) = span {
+        t.stamped_wall += wall;
+        t.span += span;
+    }
     for (ms, note) in commands {
         // "draw 3x1 [mesh 1f.., pixel 2e..] | ...": the kind and the pipeline.
         let head = note.split(" | ").next().unwrap_or_default();
@@ -374,28 +389,69 @@ fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
             Some(at) => format!("{kind} {}", &head[at..]),
             None => kind.to_owned(),
         };
-        let e = by.entry(key).or_default();
+        let e = t.by.entry(key).or_default();
         (e.0, e.1) = (e.0 + ms, e.1 + 1);
-        *sum += ms;
+        t.sum += ms;
     }
 }
 
-/// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest.
+/// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest,
+/// and with `VICTORY_GPU_TIMES_FILE` every row, appended to that file
+/// ([`gpu_times_table`]).
+///
+/// Lists run one at a time here, each waited for: the lists' wall time
+/// less their stamps' span is the time from submitting each list to the
+/// GPU starting it plus from its end to the wait ending, which untimed
+/// runs do not have between the lists of a submission.
 #[cfg(feature = "diagnostics")]
 fn log_gpu_times(frames: f64) {
-    let Some((by, wall, sum)) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+    let Some(t) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
     tracing::info!(
-        "GPU timing: lists {:.1} ms/frame of wall time, their commands {:.1} ms/frame",
-        wall / frames,
-        sum / frames
+        "GPU timing: lists {:.1} ms/frame of wall time, their commands {:.1} ms/frame; lists with stamps {:.1} ms/frame of wall time, {:.1} of it from their first stamp to their last, {:.1} submitting and waiting",
+        t.wall / frames,
+        t.sum / frames,
+        t.stamped_wall / frames,
+        t.span / frames,
+        (t.stamped_wall - t.span) / frames,
     );
-    let mut by: Vec<_> = by.into_iter().collect();
+    let mut by: Vec<_> = t.by.into_iter().collect();
     by.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
     for (key, (ms, n)) in by.iter().take(25) {
         tracing::info!("  GPU {:.2} ms/frame in {:.1} commands/frame: {key}", ms / frames, *n as f64 / frames);
     }
+    if let Some(path) = std::env::var_os("VICTORY_GPU_TIMES_FILE") {
+        static REPORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let report = REPORTS.fetch_add(1, Ordering::Relaxed);
+        let table = gpu_times_table(report, frames, [t.wall, t.sum, t.stamped_wall, t.span], &by);
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, table.as_bytes()));
+        if let Err(e) = written {
+            tracing::warn!(error = %e, path = ?path, "GPU timing table not written");
+        }
+    }
+}
+
+/// One report of [`GPU_TIMES`] as tab-separated rows, costliest first: a
+/// `#` line with the report's number, frames, and per frame the lists'
+/// wall, the commands' time, the stamped lists' wall and their stamps'
+/// span (`totals`), then per row its report, ms per frame, commands per
+/// frame and key.
+#[cfg(feature = "diagnostics")]
+fn gpu_times_table(report: u64, frames: f64, totals: [f64; 4], by: &[(String, (f64, u64))]) -> String {
+    use std::fmt::Write;
+    let [wall, sum, stamped, span] = totals.map(|t| t / frames);
+    let mut out = format!(
+        "# report {report} frames {frames:.0} lists {wall:.3} commands {sum:.3} stamped {stamped:.3} span {span:.3}\n"
+    );
+    for (key, (ms, n)) in by {
+        let _ = writeln!(out, "{report}\t{:.4}\t{:.2}\t{key}", ms / frames, *n as f64 / frames);
+    }
+    out
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
@@ -408,7 +464,7 @@ fn finish_timing_test_window(_: Instant) -> u64 {
         .lock()
         .unwrap()
         .as_ref()
-        .map_or(0, |(by, _, _)| by.values().map(|(_, count)| *count).sum());
+        .map_or(0, |t| t.by.values().map(|(_, count)| *count).sum());
     log_gpu_times(1.0);
     count
 }
@@ -466,6 +522,23 @@ pub(crate) mod tests {
             }
         }
         Ok(())
+    }
+
+    /// `VICTORY_GPU_TIMES_FILE`: every row per frame, past the 25 the log
+    /// shows, after a header with the lists' wall, the commands' time and
+    /// the stamped lists' wall and span per frame (CPU only).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn the_timing_table_has_every_row_and_the_spans_per_frame() {
+        let by: Vec<(String, (f64, u64))> = (0..30u32)
+            .map(|k| (format!("dispatch [compute {k:02}]"), (f64::from(30 - k), 2 * u64::from(30 - k))))
+            .collect();
+        let table = super::gpu_times_table(7, 2.0, [100.0, 90.0, 80.0, 60.0], &by);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines[0], "# report 7 frames 2 lists 50.000 commands 45.000 stamped 40.000 span 30.000");
+        assert_eq!(lines.len(), 31, "past the 25 the log shows");
+        assert_eq!(lines[1], "7\t15.0000\t30.00\tdispatch [compute 00]");
+        assert_eq!(lines[30], "7\t0.5000\t1.00\tdispatch [compute 29]");
     }
 
     #[test]
@@ -1658,7 +1731,7 @@ impl Host {
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
-            Ok(HostList {
+            let host_list = HostList {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
@@ -1684,7 +1757,10 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
-            })
+            };
+            #[cfg(feature = "diagnostics")]
+            host_list.note_start();
+            Ok(host_list)
         }
     }
 
@@ -2222,21 +2298,36 @@ impl Host {
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`),
+        // its prelude before it on its own too: the prelude's wall time is
+        // a row of its own (`prelude`), and a submission of one list is
+        // waited for and timed like the others.
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
+        let timed = timing();
+        #[cfg(feature = "diagnostics")]
+        let (groups, owners) = if timed {
+            let mut groups: Vec<&[Option<ID3D12CommandList>]> = Vec::new();
+            let mut owners = Vec::new();
+            for (i, (&a, &b)) in firsts.iter().zip(firsts.iter().skip(1).chain([&lists.len()])).enumerate() {
+                if b - a > 1 {
+                    groups.push(&lists[a..b - 1]);
+                    owners.push((i, true));
+                }
+                groups.push(&lists[b - 1..b]);
+                owners.push((i, false));
+            }
+            (groups, owners)
         } else {
-            vec![&lists[..]]
+            (vec![&lists[..]], vec![(0, false)])
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let (groups, timed) = ([&lists[..]], false);
         let mut removed_in = None;
-        for (i, group) in groups.iter().enumerate() {
+        for (g, group) in groups.iter().enumerate() {
+            #[cfg(feature = "diagnostics")]
+            let (i, prelude) = owners[g];
+            #[cfg(not(feature = "diagnostics"))]
+            let i = g;
             submitted.value += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -2247,20 +2338,27 @@ impl Host {
                 // SAFETY: our queue and the gate's fence.
                 unsafe { self.queue.Wait(&gate, 1) }.expect("the queue waits for the gate");
             }
+            let (first, last) = (g == 0 && before.is_some(), g + 1 == groups.len() && after.is_some());
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::EclCalls, 1 + u64::from(first) + u64::from(last));
+                add(C::ListsRun, group.len() as u64 + u64::from(first) + u64::from(last));
+            }
             // SAFETY: closed lists; the fence is ours.
             unsafe {
-                if i == 0 && before.is_some() {
+                if first {
                     self.queue.ExecuteCommandLists(std::slice::from_ref(&before));
                 }
                 self.queue.ExecuteCommandLists(group);
-                if i + 1 == groups.len() && after.is_some() {
+                if last {
                     self.queue.ExecuteCommandLists(std::slice::from_ref(&after));
                 }
                 if let Err(e) = self.queue.Signal(&self.fence, submitted.value) {
                     tracing::warn!(error = %e, "host submission not signalled");
                 }
             }
-            if groups.len() == 1 {
+            if groups.len() == 1 && !timed {
                 break;
             }
             self.wait_for(submitted.value);
@@ -2269,13 +2367,18 @@ impl Host {
             // Time every submission when timing is on, including one with a single
             // list: its wall was in `on the GPU` but missing from `GPU timing`.
             #[cfg(feature = "diagnostics")]
-            if timing() {
+            if timed {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                gpu_times(started.elapsed(), &all[i].slowest(frequency, usize::MAX));
+                let wall = started.elapsed();
+                if prelude {
+                    gpu_times(wall, &[(wall.as_secs_f64() * 1e3, "prelude".to_owned())], None);
+                } else {
+                    gpu_times(wall, &all[i].slowest(frequency, usize::MAX), all[i].span(frequency));
+                }
             }
             #[cfg(feature = "diagnostics")]
-            if started.elapsed() > std::time::Duration::from_millis(50) {
+            if !prelude && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = all[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -2294,7 +2397,7 @@ impl Host {
         // Lists timed on their own ran here: a removal is reported with the
         // list it happened in.
         // SAFETY: a plain query.
-        if groups.len() > 1 && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+        if (groups.len() > 1 || timed) && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}{}",
                 all.len(),
@@ -2762,6 +2865,36 @@ impl HostList {
             .as_ref()
     }
 
+    /// With `VICTORY_GPU_TIMING`: a first note where the list starts
+    /// (`list start`), so the list's stamps span it all and the first row
+    /// is the GPU's time before its first noted command (state moves,
+    /// clamps' and twins' work recorded first).
+    #[cfg(feature = "diagnostics")]
+    fn note_start(&self) {
+        if timing() {
+            self.note_op(|| "list start".to_owned());
+        }
+    }
+
+    /// Milliseconds from the list's first timestamp to its last (diagnostics,
+    /// timing on, after the list ran), if it has stamps.
+    #[cfg(feature = "diagnostics")]
+    fn span(&self, frequency: u64) -> Option<f64> {
+        let count = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len().min(STAMPS as usize - 1);
+        let (_, back) = self.stamps()?;
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        let ticks = unsafe {
+            back.Map(0, Some(&range), Some(&mut data)).ok()?;
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1);
+            let ticks = s[count].saturating_sub(s[0]);
+            back.Unmap(0, None);
+            ticks
+        };
+        (count > 0).then(|| ticks as f64 * 1e3 / frequency.max(1) as f64)
+    }
+
     /// The noted commands that took longest on the GPU, longest first, as
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
@@ -2869,6 +3002,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_start();
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this

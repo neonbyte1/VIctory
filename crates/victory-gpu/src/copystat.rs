@@ -166,6 +166,27 @@ pub(crate) enum C {
     ClampStoring,
     ClampHoisted,
     ClampReadMarked,
+    /// `VICTORY_GPU_GAPS` (`crate::indirect::gaps_on`): indirect dispatches
+    /// and indirect draws whose shaders may store clamped in a window;
+    /// executions the open window would have taken but for a barrier or a
+    /// pipeline sync after one that may store. Clamped alone: dispatches
+    /// (switch off), dispatches with spread groups, executions a window
+    /// refused (alignment, size, sources) or a full prelude sent there.
+    /// Resource-barrier calls the clamps recorded (passes and their
+    /// transitions back); the title's barrier and barrier-group calls; its
+    /// pipeline syncs (they record nothing). Host lists run (preludes and
+    /// state lists included) and `ExecuteCommandLists` calls.
+    ClampGapsDispatches,
+    ClampGapsStoring,
+    ClampGapsStale,
+    ClampAloneDispatch,
+    ClampAloneSpread,
+    ClampAloneOther,
+    ClampBarrierCalls,
+    TitleBarrierCalls,
+    PipelineSyncs,
+    ListsRun,
+    EclCalls,
     /// Copying back marked pages (`crate::shadow::copy_back_marks`): rounds
     /// of the guard lock and protection changes the copy-back made; runs
     /// gone back in one lease and their pages; byte runs and bytes written;
@@ -256,7 +277,7 @@ pub(crate) enum C {
     SettleLabelClean,
     SettleTextureClean,
 }
-const COUNTERS: usize = 147;
+const COUNTERS: usize = 158;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -473,6 +494,20 @@ pub(crate) fn log(frames: f64) {
         if windows > 0.0 { draws / windows } else { 0.0 },
         c[C::ClampReadMarked as usize],
         c[C::ClampStoring as usize],
+    );
+    tracing::info!(
+        "  clamps per frame by reason (VICTORY_GPU_GAPS): in windows {:.0} indirect dispatches and {:.0} indirect draws that may store, {:.0} left a window for a barrier or pipeline sync after one that may store; alone {:.0} indirect dispatches, {:.0} with spread groups, {:.0} a window or prelude refused; {:.0} barrier calls by clamps, {:.0} title barrier calls, {:.0} pipeline syncs (no barrier); {:.0} host lists in {:.0} ExecuteCommandLists calls",
+        c[C::ClampGapsDispatches as usize],
+        c[C::ClampGapsStoring as usize],
+        c[C::ClampGapsStale as usize],
+        c[C::ClampAloneDispatch as usize],
+        c[C::ClampAloneSpread as usize],
+        c[C::ClampAloneOther as usize],
+        c[C::ClampBarrierCalls as usize],
+        c[C::TitleBarrierCalls as usize],
+        c[C::PipelineSyncs as usize],
+        c[C::ListsRun as usize],
+        c[C::EclCalls as usize],
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

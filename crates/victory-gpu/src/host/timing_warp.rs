@@ -96,5 +96,6 @@ fn timing_report_uses_each_submitted_list() {
         })
         .collect::<Vec<_>>()
     });
-    assert_eq!(counts, [2, 4, 4]);
+    // Each list: its `list start` row and its two copies.
+    assert_eq!(counts, [3, 6, 6]);
 }
