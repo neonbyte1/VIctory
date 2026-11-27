@@ -3446,6 +3446,163 @@ pub(crate) mod tests {
         assert!(read == want.as_slice(), "the region's rows, and nothing else");
     }
 
+    /// An explicit RTV still inherits its typed resource format
+    /// when the host texture is typeless to allow unordered access.
+    #[cfg(windows)]
+    #[test]
+    fn rtv_unknown_format_inherits_the_typed_resource_format() {
+        const SRGB: u32 = 29;
+        const UNORM: u32 = 28;
+        const UNKNOWN: u32 = 0;
+        const TYPELESS: u32 = 27;
+        const RENDER_TARGET: u32 = 4;
+        const ALLOW_RENDER_TARGET: u32 = 1;
+        const TEXTURE2D_ARRAY: u32 = 5;
+        const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+        const RED: [f32; 4] = [0.25, 0.0, 0.0, 1.0];
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let create = |desc: &ResourceDesc, state| {
+            let mut out = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            out
+        };
+        let queue_iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
+        let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        let queue_desc = [0u32; 4];
+        let (mut queue, mut allocator) = (null, null);
+        assert_eq!(crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue), S_OK);
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Clear = extern "system" fn(This, u64, *const [f32; 4], u32, *const crate::list::Rect);
+        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        for extra_flag in [UNORDERED, 0] {
+            let desc = ResourceDesc {
+                depth_or_array_size: 2,
+                flags: ALLOW_RENDER_TARGET | extra_flag,
+                ..texture(4, 4, SRGB, 1)
+            };
+            let image = create(&desc, RENDER_TARGET);
+            let host_image = host_resource(image).unwrap();
+            // SAFETY: the texture is live. The two guest resources have
+            // the same format, but only the unordered one is promoted.
+            let format = unsafe { host_image.GetDesc() }.Format.0 as u32;
+            assert_eq!(format, if extra_flag == 0 { SRGB } else { TYPELESS });
+            let readback = create(&buffer(2048), 0);
+            let (data, _) = buffer_bytes(readback).unwrap();
+            // SAFETY: the buffer holds 2048 bytes.
+            unsafe { std::ptr::write_bytes(data, 0xEE, 2048) };
+
+            let mut list = null;
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+            let clear = slot::<Clear>(list, 0x1a0);
+            let mut descriptor = [0u64; 16];
+            let handle = descriptor.as_mut_ptr() as u64;
+            let explicit = [SRGB, TEXTURE2D_ARRAY, 0, 0, 2, 0];
+            crate::descriptor::create_rtv(null, image, &explicit, handle);
+            clear(list, handle, &BLUE, 0, null.cast());
+            let inherited = [UNKNOWN, TEXTURE2D_ARRAY, 0, 1, 1, 0];
+            crate::descriptor::create_rtv(null, image, &inherited, handle);
+            // The guest's inheritance must be resolved before the view
+            // is handed to the native API.
+            let record = crate::descriptor::rtv_record(handle).unwrap();
+            assert_eq!(record.desc().unwrap().Format.0 as u32, SRGB, "host format {format}");
+            clear(list, handle, &RED, 0, null.cast());
+
+            let copy = slot::<Copy>(list, 0x80);
+            for subresource in 0..2 {
+                let footprint = PlacedFootprint {
+                    offset: 1024 * subresource,
+                    format: UNORM,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    row_pitch: 256,
+                };
+                let from = Location {
+                    resource: image,
+                    kind: 0,
+                    footprint: PlacedFootprint { offset: subresource, ..footprint },
+                };
+                let to = Location { resource: readback, kind: 1, footprint };
+                copy(list, &to, 0, 0, 0, &from, null.cast());
+            }
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK, "host format {format}");
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+            for subresource in 0..2 {
+                // SAFETY: the submission completes before CPU access and
+                // the first texel of each footprint is within the buffer.
+                let texel = unsafe { data.add(subresource * 1024).cast::<[u8; 4]>().read() };
+                let expected = if subresource == 0 { [0, 0, 255, 255] } else { [137, 0, 0, 255] };
+                assert_eq!(texel, expected, "host format {format}, subresource {subresource}");
+            }
+            let release = |object| slot::<Release>(object, 0x10)(object);
+            assert_eq!(release(list), 0);
+            assert_eq!(release(readback), 0);
+            assert_eq!(release(image), 0);
+        }
+        assert_eq!(slot::<Release>(allocator, 0x10)(allocator), 0);
+        assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dsv_unknown_format_inherits_depth_and_keeps_its_subresource() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_DSV_FLAG_READ_ONLY_DEPTH,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_TYPELESS};
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const DEPTH_WRITE: u32 = 0x10;
+        let null = std::ptr::null();
+        let desc = ResourceDesc { flags: DEPTH, ..texture(4, 4, DXGI_FORMAT_D32_FLOAT.0 as u32, 2) };
+        let mut image = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, DEPTH_WRITE, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let host_image = host_resource(image).unwrap();
+        // SAFETY: a live texture returned by VIctory.
+        assert_eq!(unsafe { host_image.GetDesc() }.Format, DXGI_FORMAT_R32_TYPELESS);
+        let mut descriptor = [0u64; 16];
+        let handle = descriptor.as_mut_ptr() as u64;
+        let inherited = [
+            0,
+            D3D12_DSV_DIMENSION_TEXTURE2D.0 as u32,
+            D3D12_DSV_FLAG_READ_ONLY_DEPTH.0 as u32,
+            1,
+            0,
+            0,
+        ];
+        crate::descriptor::create_dsv(null, image, &inherited, handle);
+        let view = crate::descriptor::dsv_record(handle).unwrap().depth_desc().unwrap();
+        let release = slot::<Release>(image, 0x10);
+        assert_eq!(release(image), 0);
+
+        assert_eq!(view.Format, DXGI_FORMAT_D32_FLOAT);
+        assert_eq!(view.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2D);
+        assert_eq!(view.Flags, D3D12_DSV_FLAG_READ_ONLY_DEPTH);
+        // SAFETY: ViewDimension designates the Texture2D arm.
+        assert_eq!(unsafe { view.Anonymous.Texture2D.MipSlice }, 1);
+    }
+
     /// Two queues, as Grand Theft Auto VI's: a compute list copies a buffer,
     /// then waits for a value a graphics list writes at its end, then reads
     /// back the texture that graphics list fills. Submitted first, its first

@@ -551,11 +551,17 @@ pub(crate) extern "system" fn create_rtv(
     }
     // SAFETY: the title passes a description or null.
     let described = unsafe { desc.as_ref() };
+    let mut words = described.copied().unwrap_or_default();
+    if described.is_some() && words[0] == 0 {
+        // DXGI_FORMAT_UNKNOWN inherits the title format. The host
+        // texture may use a typeless format for its other views.
+        words[0] = crate::resource::title_format(resource).unwrap_or(0);
+    }
     let record = RtvRecord {
         tag: RTV_TAG,
         described: u32::from(described.is_some()),
         resource,
-        desc: described.copied().unwrap_or_default(),
+        desc: words,
     };
     // SAFETY: the handle is a descriptor slot, at least 112 bytes.
     unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
