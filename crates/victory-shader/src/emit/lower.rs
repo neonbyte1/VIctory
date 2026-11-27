@@ -2219,6 +2219,23 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// A multiply kept apart from the add that follows it, rounding like the
+    /// plain product: a driver that folds a `fmul` feeding an `fadd`/`fsub`
+    /// into an FMA (one rounding where `v_mac_f32` and `v_mad_f32` round the
+    /// product first) does not see the `fmul` behind the FMad's call. The
+    /// third operand is a zero signed by the operands' own signs, which the
+    /// addition never steps out of and keeps a -0 product -0.
+    fn mul_apart(&mut self, a: V, b: V) -> V {
+        let c = self.cur;
+        let ia = self.as_int(a);
+        let ib = self.as_int(b);
+        let sign = self.s.m.bin(c, Bin::Xor, ia, ib);
+        let mask = self.s.m.i32(0x8000_0000);
+        let zeros = self.s.m.bin(c, Bin::And, sign, mask);
+        let zero = self.as_float(zeros);
+        self.fmad(a, b, zero)
+    }
+
     /// `f` as an f16 in the low bits, rounded as the program's MODE says at
     /// this point: toward zero where it set that for 16-bit results (the
     /// title does around its 16-bit interpolation), else to nearest even;
@@ -6442,7 +6459,7 @@ impl<'a> Lower<'a> {
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
-                        let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                        let m = self.mul_apart(a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
@@ -6457,7 +6474,7 @@ impl<'a> Lower<'a> {
                 let m = if name == "v_mad_legacy_f32" {
                     self.legacy_mul(a, bb)
                 } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
+                    self.mul_apart(a, bb)
                 };
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
