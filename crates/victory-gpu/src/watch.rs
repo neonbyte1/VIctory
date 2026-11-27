@@ -1341,6 +1341,8 @@ fn mark(g: &Guards, first: usize, last: usize) {
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
     #[cfg(feature = "diagnostics")]
     let _site = at_site(Site::Aliased);
+    #[cfg(feature = "diagnostics")]
+    crate::census::aliased(at, others);
     let mut g = guards();
     let page = at / PAGE;
     for &other in others {
@@ -1360,6 +1362,13 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
         changed(&mut g, page, page + 1, false, &mut None);
         note_opened(&g, page, page + 1);
     }
+}
+
+/// The other page numbers showing the same memory as page `page`
+/// (diagnostics: the owner census).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn mappings(page: usize) -> Vec<usize> {
+    guards().alias_of.get(&page).cloned().unwrap_or_default()
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1390,7 +1399,7 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let page = at / PAGE;
         #[cfg(feature = "diagnostics")]
-        crate::census::written(at, 1, crate::census::Writer::Title);
+        crate::census::written(at, 1, crate::census::Writer::Title(r.ExceptionAddress as usize));
         let mut g = guards();
         // A tracker armed for the page keeps its bytes before the write: they
         // are read without the lock, the page guarded meanwhile, and kept

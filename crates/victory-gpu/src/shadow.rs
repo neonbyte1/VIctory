@@ -715,7 +715,7 @@ impl Shadow {
             return 0;
         };
         #[cfg(feature = "diagnostics")]
-        crate::census::marked(page / PAGE, self as *const Shadow as usize);
+        crate::census::marked(page / PAGE, self as *const Shadow as usize, (self.start as usize, self.len as usize));
         let written = self.copy_back_marked_page(t, page, unchanged);
         self.rearm_for_later(t, owner, &[page]);
         written
@@ -810,7 +810,7 @@ impl Shadow {
         let host = unsafe { std::slice::from_raw_parts(self.data.add(pages[0] - self.start as usize), pages.len() * PAGE) };
         #[cfg(feature = "diagnostics")]
         for &page in pages {
-            crate::census::marked(page / PAGE, self as *const Shadow as usize);
+            crate::census::marked(page / PAGE, self as *const Shadow as usize, (self.start as usize, self.len as usize));
         }
         let back = copy_back_run(t, pages, host, unchanged);
         self.rearm_for_later(t, owner, pages);
@@ -820,7 +820,8 @@ impl Shadow {
         if self.vram && crate::census::on() {
             for &pn in &back.offered {
                 let mirror = self.data as usize + (pn * PAGE - self.start as usize);
-                crate::census::offer(pn, self as *const Shadow as usize, mirror);
+                let range = (self.start as usize, self.len as usize);
+                crate::census::offer(pn, self as *const Shadow as usize, range, mirror, &crate::watch::mappings(pn));
             }
         }
         back

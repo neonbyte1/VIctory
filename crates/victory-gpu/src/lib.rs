@@ -21,6 +21,8 @@ mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(all(windows, feature = "diagnostics"))]
+pub use census::{AsKind as CensusWriter, HleWrite, hle_writes};
+#[cfg(all(windows, feature = "diagnostics"))]
 mod census;
 #[cfg(windows)]
 mod compute;

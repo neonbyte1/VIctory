@@ -485,6 +485,8 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
 /// Reports writes into physical pages through our own views at every title
 /// view showing them (DirectStorage's page destinations).
 fn report_written(shown: &[usize]) {
+    #[cfg(feature = "diagnostics")]
+    let _census = victory_gpu::hle_writes(victory_gpu::HleWrite::StoragePages);
     for &page in shown {
         #[cfg(test)]
         REPORTED.with(|r| r.borrow_mut().push(page));

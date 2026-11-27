@@ -609,7 +609,7 @@ pub(crate) fn log(frames: f64) {
         c[C::SettleLabelClean as usize],
         c[C::SettleTextureClean as usize],
     );
-    if let Some(line) = crate::census::line(frames) {
+    for line in crate::census::lines(frames) {
         tracing::info!("{line}");
     }
     let mut snapshots: Vec<((u64, u64), u64)> =
