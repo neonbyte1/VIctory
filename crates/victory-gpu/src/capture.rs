@@ -719,8 +719,17 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let high = if grey || p99 == 0.0 { max } else { p99 };
     let range = (high - low).max(1e-20);
     tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
+    // A constant nonzero grey target has no contrast to stretch. Keep it
+    // distinguishable from an all-zero target in the dump.
+    let flat_nonzero = grey && low == high && low != 0.0;
     for v in values {
-        let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
+        let c = v.map(|c| {
+            if flat_nonzero && c.is_finite() {
+                255
+            } else {
+                (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8
+            }
+        });
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
@@ -951,6 +960,22 @@ mod tests {
                 "format {format}"
             );
         }
+    }
+
+    #[test]
+    fn constant_nonzero_grayscale_targets_do_not_look_black() {
+        let capture = |format, values: [f32; 2]| {
+            let row: Vec<_> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+            super::to_rgba(format, 2, 1, row.len(), &row).unwrap()
+        };
+        let black = [0, 0, 0, 255];
+        let white = [255; 4];
+        let depth = super::DXGI_FORMAT_D32_FLOAT.0 as u32;
+        let scalar = super::DXGI_FORMAT_R32_FLOAT.0 as u32;
+        assert_eq!(capture(depth, [0.25; 2]), white.repeat(2));
+        assert_eq!(capture(scalar, [-0.25; 2]), white.repeat(2));
+        assert_eq!(capture(depth, [0.0; 2]), black.repeat(2));
+        assert_eq!(capture(depth, [0.25, 0.75]), [black, white].concat());
     }
 
     #[test]
