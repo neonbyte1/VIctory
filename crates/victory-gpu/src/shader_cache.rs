@@ -88,16 +88,32 @@ pub fn host_target() -> Target {
     crate::host::host().map_or(Target::ANY, |h| h.target())
 }
 
+/// Whether programs translate with pair meetings
+/// ([`victory_shader::emit::Options::pair_meetings`]): yes, unless
+/// `VICTORY_BVH_HALVES=0` (for A/B runs; logged once). Off, console wave64
+/// programs with several console waves to a group are refused on hosts of
+/// 32-lane waves, and the BVH builder (whole or not at all) never runs there.
+pub fn pair_meetings() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let off = std::env::var_os("VICTORY_BVH_HALVES").is_some_and(|v| v == "0");
+        if off {
+            tracing::info!("programs translate without pair meetings (VICTORY_BVH_HALVES=0)");
+        }
+        !off
+    });
+    *ON
+}
+
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one, and whether it
-/// came from there. `pair_meetings`: [`victory_shader::emit::Options::pair_meetings`]
-/// (`VICTORY_BVH_HALVES`, `crate::pipeline::builder`).
-pub fn host_shader(container: &[u8], target: Target, pair_meetings: bool) -> (Result<HostShader, String>, bool) {
+/// came from there.
+pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, String>, bool) {
     // The translation depends on it (a view index clamped below a capped
     // heap's end), and so does the cache key.
     crate::descriptor::host::probe_view_limit();
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
+    let pair_meetings = pair_meetings();
     let options = victory_shader::emit::Options {
         view_marks: true,
         target,

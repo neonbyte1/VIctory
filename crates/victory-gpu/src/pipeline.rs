@@ -68,11 +68,6 @@ pub(crate) struct Shader {
     /// The console resources its code reads, from the container alone.
     #[cfg(windows)]
     used: OnceLock<Vec<victory_shader::UsedResource>>,
-    /// A BVH builder pipeline holds it and `VICTORY_BVH_HALVES` is on: it
-    /// translates with pair meetings (`builder::halves`). Set before the
-    /// pipeline's first translation is asked for.
-    #[cfg(windows)]
-    pair_meetings: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -105,8 +100,6 @@ impl Shader {
             translated: OnceLock::new(),
             #[cfg(windows)]
             used: OnceLock::new(),
-            #[cfg(windows)]
-            pair_meetings: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -133,8 +126,7 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let pairs = self.pair_meetings.load(std::sync::atomic::Ordering::Relaxed);
-                let (done, cached) = translate(&self.container, pairs);
+                let (done, cached) = translate(&self.container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -199,9 +191,9 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
-fn translate(container: &[u8], pair_meetings: bool) -> (Result<Translated, String>, bool) {
+fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let target = crate::shader_cache::host_target();
-    let (host, cached) = crate::shader_cache::host_shader(container, target, pair_meetings);
+    let (host, cached) = crate::shader_cache::host_shader(container, target);
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
@@ -499,13 +491,6 @@ fn hand_out(
     let builder = !code.is_empty() && builder::created_by_builder(code);
     #[cfg(not(windows))]
     let _ = code;
-    // (before anything asks for their translation)
-    #[cfg(windows)]
-    if builder && builder::halves() {
-        for s in &shaders {
-            s.pair_meetings.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(
         shaders.clone(),

@@ -19,14 +19,21 @@ const NVIDIA: Target = Target {
     lanes_max: 32,
 };
 
-/// Lane t of a group of `threads` runs a loop t times and reads lane `lane`'s
-/// thread id into s9 in every iteration (`lane_read_loop_tests`' program).
-/// After the loop s9 is the thread id of lane `lane` of t's console wave,
-/// in every lane: lane t stores t + 64 * (t / 64) + lane. Each console wave
-/// of the group leaves the loop after a different number of iterations.
-fn looping(threads: u32, lane: u32) -> crate::NativeProgram {
+/// Lane t of a group of `x` by `y` threads (flat id t = thread x + x * y)
+/// runs a loop t times and reads lane `lane`'s flat id into s9 in every
+/// iteration (`lane_read_loop_tests`' program). After the loop s9 is the
+/// flat id of lane `lane` of t's console wave, in every lane: lane t
+/// stores t + 64 * (t / 64) + lane. Each console wave of the group leaves
+/// the loop after a different number of iterations.
+fn looping([x, y]: [u32; 2], lane: u32) -> crate::NativeProgram {
     let k = |n: u32| 128 + n;
-    let words = [
+    let flat: &[u32] = if y > 1 {
+        // v_lshl_add_u32 v0, v1, log2(x), v0
+        &[0xD746_0000, 256 << 18 | k(x.trailing_zeros()) << 9 | 257]
+    } else {
+        &[]
+    };
+    let words = [flat, &[
         0xBE82_0300, // s_mov_b32 s2, s0
         0xBE83_0380, // s_mov_b32 s3, 0
         0xF408_0101,
@@ -51,7 +58,7 @@ fn looping(threads: u32, lane: u32) -> crate::NativeProgram {
         0xE070_1000,
         0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
         0xBF81_0000, // s_endpgm
-    ];
+    ]].concat();
     crate::NativeProgram {
         stage: crate::HwStage::Cs,
         wave64: true,
@@ -66,8 +73,9 @@ fn looping(threads: u32, lane: u32) -> crate::NativeProgram {
         }],
         used: vec![],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 1,
-            threads: [threads, 1, 1],
+            // (thread ids y in v1 for a 2-D group)
+            rsrc2: 1 << 1 | u32::from(y > 1) << 11,
+            threads: [x, y, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     }
@@ -96,7 +104,7 @@ fn emit(native: &crate::NativeProgram, target: Target, pair_meetings: bool) -> R
 /// waves are unchanged.
 #[test]
 fn several_console_waves_translate_with_pair_meetings() {
-    let native = looping(256, 40);
+    let native = looping([256, 1], 40);
     let refused = emit(&native, NVIDIA, false).expect_err("refused without pair meetings");
     assert!(refused.contains(lower::SEVERAL_CONSOLE_WAVES), "{refused}");
     emit(&native, NVIDIA, true).expect("pair meetings");
@@ -121,15 +129,16 @@ fn hardware() -> Option<Host> {
     }
 }
 
-/// The synthetic loop in groups of four console waves, run on a 32-lane
-/// host: every lane as the console computes it.
+/// The synthetic loop in groups of four console waves, 1-D and 2-D (whose
+/// host waves the ticket in `pair_init` relabels), run on a 32-lane host:
+/// every lane as the console computes it.
 #[test]
 fn a_lane_read_in_a_loop_each_console_wave_leaves_on_its_own() {
     let Some(host) = hardware() else { return };
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for lane in [5, 40] {
-        let threads = 256;
-        let cs = emit(&looping(threads, lane), host.target(), true).unwrap();
+    for (group, lane) in [([256, 1], 5), ([256, 1], 40), ([16, 16], 40), ([8, 16], 33), ([8, 32], 7)] {
+        let threads = group[0] * group[1];
+        let cs = emit(&looping(group, lane), host.target(), true).unwrap();
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         let views = [View::RawUav(2 * threads)];
         let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
@@ -152,7 +161,7 @@ fn a_lane_read_in_a_loop_each_console_wave_leaves_on_its_own() {
             .filter(|&t| out[t] != want[t])
             .map(|t| format!("{t}: {} (want {})", out[t], want[t]))
             .collect();
-        assert!(bad.is_empty(), "lane {lane}: {} lanes wrong: {}", bad.len(), bad.join(", "));
+        assert!(bad.is_empty(), "{group:?} lane {lane}: {} lanes wrong: {}", bad.len(), bad.join(", "));
     }
 }
 

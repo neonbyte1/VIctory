@@ -441,7 +441,7 @@ pub fn last_module_summary() -> String {
 }
 
 /// How a translation is made.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     /// Writes through buffer views mark the pages they write (module notes,
     /// "Write marks"); the host must then bind the view-mark table and the
@@ -453,8 +453,19 @@ pub struct Options {
     /// thread group holds several console waves runs in the console flow
     /// too: the two host waves of each console wave meet on their own
     /// (`lower`'s pair meetings) where a group of one console wave meets
-    /// at a group barrier. Off: such programs are refused, as before.
+    /// at a group barrier. On by default; off, such programs are refused,
+    /// as before. Only programs that are refused without them change.
     pub pair_meetings: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            view_marks: false,
+            target: Target::ANY,
+            pair_meetings: true,
+        }
+    }
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -2067,16 +2078,11 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the halves cannot meet at a group barrier yet.
+        // Two per group: the halves of each meet on their own (pair
+        // meetings, `pair_meeting_tests`).
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
-        assert_eq!(
-            emit_for(&two, NVIDIA),
-            Err(crate::ShaderError::Unsupported {
-                offset: 0,
-                what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
-            })
-        );
+        assert!(emit_for(&two, NVIDIA).is_ok());
         // The same code in waves of 32 runs on either.
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());

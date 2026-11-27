@@ -944,8 +944,8 @@ impl<'a> Lower<'a> {
                 (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
             if needs_wave64 && !x.target.runs(64) {
                 let group: u32 = cs.threads.iter().product();
-                let pairs_fit =
-                    group % 64 == 0 && cs.threads[1] == 1 && cs.threads[2] == 1;
+                // (whole console waves: every host wave is a whole half)
+                let pairs_fit = group % 64 == 0;
                 no_console_flow = if group > 64 && !(PAIR_MEETINGS.get() && pairs_fit) {
                     Some(SEVERAL_CONSOLE_WAVES)
                 } else if group > 64 && !barriers_once(p) {
@@ -11226,24 +11226,52 @@ impl<'a> Lower<'a> {
     }
 
     /// Pair meetings ([`PairMeetings`]): the group-shared counters and
-    /// exchange dwords, and this thread's console wave. Every thread zeroes
-    /// its console wave's counter and the group meets once, in the entry
-    /// block (every thread runs it, before any branch).
+    /// exchange dwords, this thread's console thread and console wave. In
+    /// the entry block (every thread runs it, before any branch): thread n
+    /// zeroes counter n and the last thread past them a ticket; the group
+    /// meets once; then each host wave takes the next 32 console threads
+    /// from the ticket. A host need not give a host wave an aligned run of
+    /// flat thread ids (2-D groups), so the relabelling of
+    /// [`Self::console_flat`] is a bijection only this way (as
+    /// trustno1-coder/VIctory-NVIDIA's `wave_base`, after Vice-Tay c125c0c).
+    /// Every host wave is whole (the group a multiple of 64 threads) and all
+    /// its lanes run here.
     fn pair_init(&mut self) {
         let waves = self.pairs.expect("pair meetings");
-        let (e, i32t, void) = (self.s.entry, self.s.t.i32, self.s.t.void);
-        let counters = self.s.m.array(waves, i32t);
+        let (e, i1t, i32t, void) = (self.s.entry, self.s.t.i1, self.s.t.i32, self.s.t.void);
+        let counters = self.s.m.array(waves + 1, i32t);
         let counters = self.s.m.global("meetings", counters, 3);
         let words = self.s.m.array(4 * waves, i32t);
         let words = self.s.m.global("pair_xchg", words, 3);
-        let f = self.console_flat();
+        let flat = self
+            .s
+            .op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        let last = self.s.m.i32(waves);
+        let past = self.s.m.cmp(e, pred::IUGT, flat, last);
+        let n = self.s.m.select(e, past, last, flat);
+        let mine = self.s.m.element(e, counters, n);
+        let z = self.s.m.i32(0);
+        self.s.m.store(e, mine, z);
+        let mode = self.s.m.i32(1 | 8);
+        self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        // (every lane adds, the first 32: no branch in the entry block)
+        let first = self.s.op(e, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+        let k32 = self.s.m.i32(32);
+        let add = self.s.m.select(e, first, k32, z);
+        let ticket = self.s.m.element(e, counters, last);
+        let old = self.s.m.atomic(e, super::bitcode::Rmw::Add, ticket, add);
+        let base = self
+            .s
+            .op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let lane = self
+            .s
+            .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        self.s.flags |= flags::WAVE_OPS;
+        self.console_flat = Some(f);
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, f, six);
         let counter = self.s.m.element(e, counters, wave);
-        let z = self.s.m.i32(0);
-        self.s.m.store(e, counter, z);
-        let mode = self.s.m.i32(1 | 8);
-        self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         self.pair_slots = Some((counter, words, wave));
     }
 

@@ -392,10 +392,8 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                     continue;
                                 }
                                 let one = std::time::Instant::now();
-                                // (without pair meetings: those are the BVH
-                                // builder's, asked for at run time)
                                 let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container, target, false);
+                                    victory_gpu::shader_cache::host_shader(container, target);
                                 let k = if cached {
                                     0
                                 } else if done.is_ok() {

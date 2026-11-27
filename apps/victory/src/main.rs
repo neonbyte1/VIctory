@@ -95,11 +95,11 @@ enum Command {
         /// are listed as failures. Default: any wave size.
         #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
         host_lanes: Option<(u32, u32)>,
-        /// On hosts without 64-lane waves, translate wave64 programs whose
-        /// groups hold several console waves with pair meetings (what
-        /// `VICTORY_BVH_HALVES=1` does for the BVH builder's programs).
+        /// Translate without pair meetings (what `VICTORY_BVH_HALVES=0`
+        /// does at run time): wave64 programs whose groups hold several
+        /// console waves are refused on hosts without 64-lane waves.
         #[arg(long, conflicts_with = "cache")]
-        pair_meetings: bool,
+        no_pair_meetings: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -195,7 +195,7 @@ fn main() -> Result<()> {
             jobs,
             cache: false,
             host_lanes,
-            pair_meetings,
+            no_pair_meetings,
         } => translate::run(
             paths,
             validate,
@@ -203,7 +203,7 @@ fn main() -> Result<()> {
             list,
             jobs.map(NonZeroUsize::get),
             host_lanes,
-            pair_meetings,
+            !no_pair_meetings,
         ),
         Command::Run {
             exe,
