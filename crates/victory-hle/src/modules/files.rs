@@ -18,6 +18,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
@@ -282,7 +283,8 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+    let create = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle);
+    let handle = create(
         p.ptr(),
         access,
         share,
@@ -290,7 +292,15 @@ pub extern "system" fn CreateFileW(
         disposition,
         flags,
         template,
-    )
+    );
+    // Dropping the translated path may allocate and overwrite the host's
+    // last error. Preserve it for the title on success and failure alike.
+    // SAFETY: no arguments; reads the calling thread's error state.
+    let error = unsafe { GetLastError() };
+    drop(p);
+    // SAFETY: restores the calling thread's error state to a saved value.
+    unsafe { SetLastError(error) };
+    handle
 }
 
 pub extern "system" fn CreateFileA(
@@ -863,6 +873,25 @@ mod tests {
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
         );
+    }
+
+    /// Dropping the translated path must not hide the host's failure from
+    /// the title, including callers that turn it into an HRESULT.
+    #[test]
+    fn open_file_preserves_the_os_error_on_virtual_drives() {
+        use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let path = w(&format!(r"{letter}:\missing.bin"));
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const OPEN_EXISTING: u32 = 3;
+        let null = std::ptr::null_mut();
+        let handle = CreateFileW(path.as_ptr(), GENERIC_READ, 0, null, OPEN_EXISTING, 0, null);
+        // SAFETY: no arguments; reads the calling thread's error state.
+        let error = unsafe { GetLastError() };
+        assert_eq!(handle as isize, -1);
+        assert_eq!(error, ERROR_FILE_NOT_FOUND);
     }
 
     /// A title run by its file name alone has an empty folder: the drive
