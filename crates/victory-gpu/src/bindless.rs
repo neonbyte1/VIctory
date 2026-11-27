@@ -1,4 +1,4 @@
-//! Views shaders reach through the resource heap itself (decision 0007,
+﻿//! Views shaders reach through the resource heap itself (decision 0007,
 //! "Heap-indexed views"). Grand Theft Auto VI is largely bindless: its
 //! shaders load descriptors at indices they take from root constants or
 //! memory (`HostShader::heap`), so no draw names the views it reads. Every
@@ -52,7 +52,10 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
-    textures: BTreeMap<usize, u32>,
+    /// Distinct title-written textures viewed in this heap: `(slot count,
+    /// cached watch::DIRTY bit, idle stamp epoch)` so clean and idle textures
+    /// skip `Resource::host` and `HostTexture::staging` locks during [`uploads`].
+    textures: BTreeMap<usize, (u32, Option<u32>, u64)>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
@@ -115,9 +118,9 @@ impl Inner {
                 }
             }
             Seen::Texture(r) => {
-                let n = self.textures.entry(*r).or_insert(0);
-                step(n);
-                if *n == 0 {
+                let entry = self.textures.entry(*r).or_insert((0, None, 0));
+                step(&mut entry.0);
+                if entry.0 == 0 {
                     self.textures.remove(r);
                 }
             }
@@ -204,74 +207,104 @@ pub(crate) fn uploads(
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
     settle: &mut dyn FnMut(u64, crate::host::Settled),
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
+    static LIST: Mutex<Holder> = Mutex::new(Holder {
+        list: None,
+        needs_recycle: false,
+    });
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    crate::texture::recycle();
-    match &guard.0 {
-        // Closed by the last submission, which has run.
-        Some(list) => list.reset(),
-        // Made open.
-        None => {
-            let list = crate::host::host()?.new_list().ok()?;
-            list.set_ours();
-            guard.0 = Some(list);
-        }
+    if guard.needs_recycle {
+        crate::texture::recycle();
+        guard.needs_recycle = false;
     }
-    let list = guard.0.as_ref()?;
     // What to bring up: the textures lists read through tables, and those
-    // the heaps view that shaders read lately. Collected under the heaps'
-    // locks and brought up without them, several at a time: reading title
-    // memory, detiling and making staging buffers took half the submitting
-    // thread in a new shot, and title threads setting views waited on the
-    // lock meanwhile (run evict5).
+    // the heaps view that shaders read lately. Only textures that may have
+    // changed are collected: clean tracked textures are skipped via their
+    // cached watch::DIRTY bit without taking Resource::host or Staging locks,
+    // and staging creation happens outside each heap's lock so title threads
+    // writing descriptors are not stalled.
     let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
-    let mut staged = std::collections::HashSet::new();
+    let mut staged_set: Option<std::collections::HashSet<*const crate::texture::Staging>> = None;
+    let mut push_unique = |staging: Arc<crate::texture::Staging>, copy: Arc<crate::resource::HostTexture>| {
+        let ptr = Arc::as_ptr(&staging);
+        if let Some(set) = staged_set.as_mut() {
+            if set.insert(ptr) {
+                work.push((staging, copy));
+            }
+        } else if work.len() < 8 {
+            if !work.iter().any(|(s, _)| Arc::as_ptr(s) == ptr) {
+                work.push((staging, copy));
+            }
+        } else {
+            let mut set: std::collections::HashSet<_> = work.iter().map(|(s, _)| Arc::as_ptr(s)).collect();
+            if set.insert(ptr) {
+                work.push((staging, copy));
+            }
+            staged_set = Some(set);
+        }
+    };
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
-        // was not when the list was recorded).
-        if copy.host_written.load(Relaxed) {
+        // was not when the list was recorded), or its memory has not changed.
+        if copy.host_written.load(Relaxed) || !staging.maybe_changed() {
             continue;
         }
-        if staged.insert(Arc::as_ptr(staging)) {
-            work.push((staging.clone(), copy.clone()));
+        push_unique(staging.clone(), copy.clone());
+    }
+    let mut pending: Vec<(usize, Arc<crate::resource::HostTexture>)> = Vec::new();
+    if !heaps.is_empty() {
+        let presented = crate::queue::presented();
+        let epoch = crate::resource::stamp_epoch();
+        let mut done = (heaps.len() > 1).then(std::collections::HashSet::new);
+        for viewed in heaps {
+            let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            for (&r, entry) in inner.textures.iter_mut() {
+                if let Some(bit) = entry.1
+                    && crate::watch::clean_bit(Some(bit))
+                {
+                    continue;
+                }
+                if entry.2 == epoch {
+                    continue;
+                }
+                if let Some(done) = done.as_mut()
+                    && !done.insert(r)
+                {
+                    continue;
+                }
+                // Only what shaders read lately (the eviction pass's stamps):
+                // the heaps view thousands of textures a frame never reads, and
+                // bringing each up whenever its pages change re-uploaded about
+                // 4 GB in 30-46 world frames (runs evict2, noevict1).
+                // shortcut: a texture read again after a gap is brought up after
+                // the submission that read it, which can see bytes one refresh
+                // old (a slot the title rewrites is made fresh anyway); upload on
+                // the mark itself if that shows.
+                let (bit, copy) = crate::resource::bindless_upload_check(r as This, presented);
+                if entry.1.is_none() && bit.is_some() {
+                    entry.1 = bit;
+                }
+                if let Some(texture) = copy {
+                    entry.2 = 0;
+                    pending.push((r, texture));
+                } else if bit.is_none() || !crate::watch::clean_bit(bit) {
+                    // Skipped because it has no host copy, is not recently used,
+                    // or is host-written: stays skipped until STAMP_EPOCH bumps.
+                    entry.2 = epoch;
+                }
+            }
         }
     }
-    let mut done = std::collections::HashSet::new();
-    for viewed in heaps {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for &r in inner.textures.keys() {
-            if !done.insert(r) {
-                continue;
-            }
-            // Not made (given up, or never read): nothing to bring up.
-            let Some(texture) = crate::resource::made_copy(r as This) else {
-                continue;
-            };
-            // Only what shaders read lately (the eviction pass's stamps):
-            // the heaps view thousands of textures a frame never reads, and
-            // bringing each up whenever its pages change re-uploaded about
-            // 4 GB in 30-46 world frames (runs evict2, noevict1).
-            // shortcut: a texture read again after a gap is brought up after
-            // the submission that read it, which can see bytes one refresh
-            // old (a slot the title rewrites is made fresh anyway); upload on
-            // the mark itself if that shows.
-            if !texture.used_recently() {
-                continue;
-            }
-            // Its contents are the host's since a host copy wrote it.
-            if texture.host_written.load(Relaxed) {
-                continue;
-            }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
-                && staged.insert(Arc::as_ptr(&staging))
-            {
-                work.push((staging, texture));
-            }
+    for (r, texture) in pending {
+        if let Some(staging) = crate::texture::staging_for(r as This, &texture)
+            && staging.maybe_changed()
+        {
+            push_unique(staging, texture);
         }
     }
-    let mut recorded = false;
-    // The textures copied into stay alive in `work` until recorded.
-    let mut readable = Vec::new();
+    if work.is_empty() {
+        return None;
+    }
+    guard.needs_recycle = true;
     if let Some(owner) = work
         .iter()
         .filter_map(|(staging, _)| {
@@ -282,25 +315,40 @@ pub(crate) fn uploads(
     {
         settle(owner, crate::host::Settled::Texture);
     }
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
-        if let Some(upload) = upload {
-            readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
-            recorded = true;
-            #[cfg(feature = "diagnostics")]
-            UPLOADED.fetch_add(1, Relaxed);
+    let uploads = crate::texture::refresh_all(&work);
+    let ready: Vec<(&Arc<crate::texture::Staging>, &Arc<crate::resource::HostTexture>, &crate::texture::Upload)> =
+        work.iter()
+            .zip(uploads.iter())
+            .filter_map(|((staging, copy), upload)| upload.as_ref().map(|u| (staging, copy, u)))
+            .collect();
+    if ready.is_empty() {
+        return None;
+    }
+    match &guard.list {
+        // Closed by the last submission that recorded uploads, which has run.
+        Some(list) => list.reset(),
+        // Made open.
+        None => {
+            let list = crate::host::host()?.new_list().ok()?;
+            list.set_ours();
+            guard.list = Some(list);
         }
     }
-    if !readable.is_empty() {
-        // SAFETY: an open list; the barriers name live textures.
-        unsafe { list.list.ResourceBarrier(&readable) };
-    }
+    let list = guard.list.as_ref()?;
+    crate::texture::record_uploads(list, &ready);
+    #[cfg(feature = "diagnostics")]
+    UPLOADED.fetch_add(ready.len() as u64, Relaxed);
     list.close();
-    // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    Some(Uploads(guard))
 }
 
 /// The upload list, used under its lock only.
-pub(crate) struct Holder(Option<HostList>);
+pub(crate) struct Holder {
+    list: Option<HostList>,
+    /// Whether the last submission may have allocated texture staging buffers
+    /// that must be recycled before the next upload.
+    needs_recycle: bool,
+}
 // SAFETY: D3D12 objects are free-threaded; the list is used by one
 // submission at a time, under the lock.
 unsafe impl Send for Holder {}
@@ -310,7 +358,18 @@ pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
 
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+        self.0.list.as_ref().expect("made before it is handed out")
+    }
+}
+
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        // The submission has run (or was never executed): release held
+        // HostTextures and staging buffers now so idle submissions do not
+        // pin evicted VRAM while skipping D3D12 list reset/close.
+        if let Some(list) = &self.0.list {
+            list.clear_held();
+        }
     }
 }
 
@@ -374,6 +433,22 @@ pub(crate) fn forget(resource: usize) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.textures.remove(&resource).is_some() {
             inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+        }
+    }
+}
+
+/// Clears cached `watch::DIRTY` bits for textures whose host copies were
+/// evicted (`crate::resource::give_up`), before those host copies drop and
+/// return their dirty bits to the pool.
+pub(crate) fn clear_texture_bits(resources: &[usize]) {
+    let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
+        let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for &r in resources {
+            if let Some(entry) = inner.textures.get_mut(&r) {
+                entry.1 = None;
+                entry.2 = 0;
+            }
         }
     }
 }
@@ -673,5 +748,103 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
             }
         }
+    }
+
+    /// Cached watch dirty bits skip clean bindless textures without missing
+    /// subsequent writes or stale-bit reuse after eviction and recreation.
+    #[test]
+    fn cached_dirty_bit_reuploads_after_write_and_after_evict_recreate() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let pool = crate::watch::tests::pool(1);
+        let tex = resource_at(pool, 3, 64, 64, 28, LINEAR);
+        let copy = crate::resource::host_copy(tex).expect("host texture");
+        let viewed = Arc::new(Viewed::default());
+        register(&viewed);
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        viewed.set(0, Some(&View::Shader(tex as usize, Some(desc))), true);
+
+        // SAFETY: 64x64 RGBA8 linear = 16 KiB inside our 64 KiB pool page.
+        unsafe { std::ptr::write_bytes(pool as *mut u8, 0x11, 64 * 64 * 4) };
+        copy.stamp();
+        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "initial upload");
+        assert_eq!(crate::texture::uploads(tex), 1);
+
+        // Second submission while clean populates the cached dirty bit in `viewed`
+        // and skips recording an upload list.
+        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_none(), "clean skips list");
+        assert_eq!(crate::texture::uploads(tex), 1);
+        assert!(
+            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.1).is_some(),
+            "dirty bit cached in Viewed"
+        );
+        // Third submission hits the lock-free cached-bit fast path.
+        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_none(), "cached clean skips");
+        assert_eq!(crate::texture::uploads(tex), 1);
+
+        // Writing the guarded page flips the watch bit back to dirty -> re-upload.
+        // SAFETY: as above; write-fault handler opens the page and marks dirty.
+        unsafe { std::ptr::write_bytes(pool as *mut u8, 0x22, 64 * 64 * 4) };
+        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "dirty re-uploads");
+        assert_eq!(crate::texture::uploads(tex), 2);
+
+        // Evicting the host texture clears the cached bit so a recreated host
+        // texture with a fresh staging/bit is never skipped.
+        drop(copy);
+        assert!(crate::resource::give_up_now(tex), "evicted");
+        assert!(
+            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.1).is_none(),
+            "cached dirty bit cleared on eviction"
+        );
+        let copy2 = crate::resource::host_copy(tex).expect("recreated host texture");
+        copy2.stamp();
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes(pool as *mut u8, 0x33, 64 * 64 * 4) };
+        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "recreated uploads");
+        assert_eq!(crate::texture::uploads(tex), 1);
+
+        drop(copy2);
+        drop(viewed);
+        crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10)(tex);
+        crate::watch::tests::free(pool);
+    }
+
+    /// Untracked (committed, non-pool) bindless textures stay uncached so
+    /// content-hash changes are never skipped.
+    #[test]
+    fn untracked_bindless_texture_reuploads_on_memory_change() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let tex = resource(3, 16, 16, 28, LINEAR);
+        let copy = crate::resource::host_copy(tex).expect("host texture");
+        let (mem, desc_meta) = crate::resource::texture_memory(tex).unwrap();
+        let size = crate::resource::texture_layout(&desc_meta).unwrap().planes[0].layout.size as usize;
+        let viewed = Arc::new(Viewed::default());
+        register(&viewed);
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        viewed.set(0, Some(&View::Shader(tex as usize, Some(desc))), true);
+
+        // SAFETY: committed texture memory of `size` bytes.
+        unsafe { std::ptr::write_bytes(mem.cast_mut(), 0x41, size) };
+        copy.stamp();
+        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "initial untracked upload");
+        assert_eq!(crate::texture::uploads(tex), 1);
+        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_none(), "unchanged hash skips");
+        assert!(
+            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.1).is_none(),
+            "untracked texture has no cached dirty bit"
+        );
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes(mem.cast_mut(), 0x52, size) };
+        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "changed untracked re-uploads");
+        assert_eq!(crate::texture::uploads(tex), 2);
+
+        drop(copy);
+        drop(viewed);
+        crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10)(tex);
     }
 }

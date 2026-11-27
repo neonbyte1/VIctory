@@ -55,7 +55,7 @@ pub(crate) struct Staging {
     /// its start, whole layout blocks); empty where the layout gives none.
     spans: Vec<(usize, usize)>,
     last: Mutex<Last>,
-    /// Uploads [`record_upload`] recorded, and the subresources they
+    /// Uploads [`record_uploads`] recorded, and the subresources they
     /// copied.
     uploads: std::sync::atomic::AtomicU64,
     copied: std::sync::atomic::AtomicU64,
@@ -375,32 +375,43 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging, copy);
 }
 
-/// Records into `list` the copy of `buffer` (laid out as `staging` says)
-/// into host texture `copy`. Returns the barrier that leaves it readable by
-/// shaders, for the caller to record with the others after every copy: one
-/// barrier per texture between the copies kept the GPU from overlapping
-/// them (new shots copy hundreds of textures, run evict6).
-#[must_use]
-pub(crate) fn record_upload(
+/// Records into `list` the copies of `items` (each staging buffer, host texture,
+/// and detiled upload), batching the `COPY_DEST` transitions into one barrier
+/// before the copies and the `SHADER_RESOURCE` transitions into one barrier
+/// after them so the GPU can overlap every copy (`evict6`).
+pub(crate) fn record_uploads(
     list: &HostList,
-    copy: &Arc<crate::resource::HostTexture>,
-    staging: &Staging,
-    (buffer, at, subresources): &Upload,
-) -> Option<D3D12_RESOURCE_BARRIER> {
+    items: &[(&Arc<Staging>, &Arc<crate::resource::HostTexture>, &Upload)],
+) {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-    if let Some(b) = list.move_texture(copy, COPY_DEST) {
-        // SAFETY: an open list; the barrier names a live texture.
-        unsafe { list.list.ResourceBarrier(&[b]) };
+    let mut to_dest = Vec::with_capacity(items.len());
+    for &(_, copy, _) in items {
+        if let Some(b) = list.move_texture(copy, COPY_DEST) {
+            to_dest.push(b);
+        }
     }
-    copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
-    list.keep(buffer);
-    staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    list.move_texture(copy, SHADER_RESOURCE)
+    if !to_dest.is_empty() {
+        // SAFETY: an open list; the barriers name live textures.
+        unsafe { list.list.ResourceBarrier(&to_dest) };
+    }
+    let mut readable = Vec::with_capacity(items.len());
+    for &(staging, copy, (buffer, at, subresources)) in items {
+        copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
+        list.keep(buffer);
+        staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if let Some(b) = list.move_texture(copy, SHADER_RESOURCE) {
+            readable.push(b);
+        }
+    }
+    if !readable.is_empty() {
+        // SAFETY: an open list; the barriers name live textures.
+        unsafe { list.list.ResourceBarrier(&readable) };
+    }
 }
 
-/// The uploads [`record_upload`] recorded into `resource`'s host texture
+/// The uploads [`record_uploads`] recorded into `resource`'s host texture
 /// (tests: counts of their own texture, whatever other tests upload
 /// meanwhile).
 #[cfg(test)]
@@ -517,14 +528,29 @@ pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
 /// changed on several threads at once (reading title memory and detiling
 /// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
 pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
+    if work.is_empty() {
+        return Vec::new();
+    }
+    if work.len() == 1 {
+        let upload = work[0].0.maybe_changed().then(|| work[0].0.refresh()).flatten();
+        return vec![upload];
+    }
     // Most find nothing changed (their trackers' clean bits say so): those
     // are not handed to threads.
     let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
+    if changed.is_empty() {
+        return vec![None; work.len()];
+    }
+    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
+    if changed.len() == 1 {
+        let i = changed[0];
+        out[i] = work[i].0.refresh();
+        return out;
+    }
     let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
     in_parallel(changed.len(), |k| {
         *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[changed[k]].0.refresh();
     });
-    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
     for (k, r) in results.into_iter().enumerate() {
         out[changed[k]] = r.into_inner().unwrap_or_else(|e| e.into_inner());
     }
@@ -784,12 +810,23 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
-pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+pub(crate) fn staging(resource: This, _texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
+    staging_for(resource, &copy)
+}
+
+/// [`staging`] when the caller already holds `copy`, avoiding a second
+/// `Resource::host` lock. Publishes the tracker's `watch::DIRTY` bit into
+/// `copy.staging_dirty_bit` once created.
+pub(crate) fn staging_for(
+    resource: This,
+    copy: &crate::resource::HostTexture,
+) -> Option<Arc<Staging>> {
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {
         return Some(s.clone());
     }
+    let texture = &copy.texture;
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -830,6 +867,11 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
     let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let tracked = crate::watch::track(memory as usize, layout_size, true);
+    let dirty_bit = tracked
+        .as_ref()
+        .and_then(crate::watch::Tracked::bit)
+        .unwrap_or(crate::resource::STAGING_ALWAYS_DIRTY);
     let s = Arc::new(Staging {
         size: total,
         footprints,
@@ -837,12 +879,14 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         layout,
         mips: u32::from(d.MipLevels),
         memory,
-        tracked: crate::watch::track(memory as usize, layout_size, true),
+        tracked,
         spans,
         last: Mutex::default(),
         uploads: Default::default(),
         copied: Default::default(),
     });
+    copy.staging_dirty_bit
+        .store(dirty_bit, std::sync::atomic::Ordering::Release);
     *held = Some(s.clone());
     Some(s)
 }
