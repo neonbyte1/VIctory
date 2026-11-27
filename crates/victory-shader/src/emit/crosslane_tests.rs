@@ -522,7 +522,12 @@ fn dispatch_wave32(shader: &HostShader) -> Option<(String, [u32; 32])> {
         .unwrap_or_else(|e| panic!("compute_pipeline failed on {info}: {e}"));
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
-        assert_eq!(u.root, RootType::Table);
+        assert!(
+            u.root == RootType::Table
+                || (u.root == RootType::Constants && u.slot == super::DISPATCH_SLOT),
+            "unexpected user data {:?}",
+            (u.root, u.slot)
+        );
         ud[u.index as usize] = 0;
     }
     let out = host
