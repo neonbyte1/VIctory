@@ -282,19 +282,49 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    for &(start, _, at) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+    // The lock is the one title threads writing views wait on: it is taken a
+    // chunk of slots at a time (`SLOTS`), not around every heap's whole list,
+    // because `mirror` can make a host copy of the memory the view names.
+    const SLOTS: usize = 64;
+    let live: Vec<usize> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps.iter().map(|&(_, _, at)| at).collect()
+    };
+    for at in live {
+        // The heap's slots to make, and where its records are, under one
+        // short hold: the making happens below, a chunk at a time.
+        let Some((start, step, mine)) = ({
+            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(&(start, _, _)) = heaps.iter().find(|&&(_, _, h)| h == at) else {
+                continue;
+            };
+            // SAFETY: registered heaps are live (removed when dropped).
+            let heap = unsafe { &*(at as *const Heap) };
+            if heap.desc.kind != VIEWS_KIND {
+                continue;
+            }
+            increment(heap.desc.kind).map(|step| {
+                let mine = slots.iter().copied().filter(|&i| i < heap.desc.count).collect::<Vec<u32>>();
+                (start, u64::from(step), mine)
+            })
+        }) else {
             continue;
         };
-        if heap.desc.kind != VIEWS_KIND {
-            continue;
-        }
-        for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
-            host.mirror(i, start + u64::from(i) * u64::from(step), true);
-            host.stamp_read(i);
+        for chunk in mine.chunks(SLOTS) {
+            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            if !heaps.iter().any(|&(_, _, h)| h == at) {
+                break;
+            }
+            // SAFETY: registered heaps are live (removed when dropped, which
+            // waits for the lock we hold).
+            let heap = unsafe { &*(at as *const Heap) };
+            let Some(Some(host)) = heap.host.get() else {
+                break;
+            };
+            for &i in chunk {
+                host.mirror(i, start + u64::from(i) * step, true);
+                host.stamp_read(i);
+            }
         }
     }
 }
