@@ -395,6 +395,16 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+#[cfg(feature = "diagnostics")]
+struct HostCreationTimer(std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for HostCreationTimer {
+    fn drop(&mut self) {
+        super::timing::HOST.record(self.0.elapsed().as_micros() as u64);
+    }
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -433,6 +443,8 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        #[cfg(feature = "diagnostics")]
+        let _creation_timer = HostCreationTimer(std::time::Instant::now());
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
