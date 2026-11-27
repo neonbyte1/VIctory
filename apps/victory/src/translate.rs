@@ -69,7 +69,7 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
-    /// Reason → programs stopped by it, and the first one.
+    /// Reason → programs stopped by it, and the smallest recorded label.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
@@ -78,16 +78,19 @@ struct Tally {
 
 impl Tally {
     fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
+        let example = example();
         if self.list {
-            let e = example();
-            self.lines.push(format!("{e}  {reason}"));
-            self.failed.entry(reason).or_insert((0, e)).0 += 1;
-            return;
+            self.lines.push(format!("{example}  {reason}"));
         }
-        self.failed
-            .entry(reason)
-            .or_insert_with(|| (0, example()))
-            .0 += 1;
+        self.record_failure(reason, 1, example);
+    }
+
+    fn record_failure(&mut self, reason: String, n: usize, example: String) {
+        let (count, sample) = self.failed.entry(reason).or_default();
+        if *count == 0 || example < *sample {
+            *sample = example;
+        }
+        *count += n;
     }
 
     fn merge(&mut self, other: Tally) {
@@ -135,7 +138,7 @@ impl Tally {
         }
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
-            self.failed.entry(reason).or_insert((0, example)).0 += n;
+            self.record_failure(reason, n, example);
         }
     }
 }
@@ -877,6 +880,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use super::Tally;
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {
@@ -893,5 +898,34 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn failure_example_is_independent_of_worker_order() {
+        for list in [false, true] {
+            for reverse in [false, true] {
+                let mut first = Tally {
+                    list,
+                    ..Tally::default()
+                };
+                first.fail("reason".into(), || "z@0x0".into());
+                first.fail("reason".into(), || "a@0x0".into());
+                let mut second = Tally {
+                    list,
+                    ..Tally::default()
+                };
+                second.fail("reason".into(), || "m@0x0".into());
+                let mut total = Tally::default();
+                if reverse {
+                    std::mem::swap(&mut first, &mut second);
+                }
+                total.merge(first);
+                total.merge(second);
+                let (count, example) = &total.failed["reason"];
+                assert_eq!(*count, 3);
+                assert_eq!(example, "a@0x0");
+                assert_eq!(total.lines.len(), if list { 3 } else { 0 });
+            }
+        }
     }
 }
