@@ -73,7 +73,7 @@ enum Command {
         disasm: bool,
         /// Instead list the effects of shader databases: technique, pass,
         /// shaders (name, container hash, engine hash) and pass state.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["verbose", "disasm"])]
         effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
