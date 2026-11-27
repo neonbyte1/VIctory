@@ -92,15 +92,27 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    let alignment = if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
+        2 * MIB
+    } else {
+        0
+    };
+    virtual_alloc(base, size, kind, flags, protect, alignment)
+}
+
+fn virtual_alloc(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+    alignment: usize,
+) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
-        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
-        } else {
-            0
-        },
+        Alignment: alignment,
     };
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
@@ -309,12 +321,17 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f);
+        // `MEM_ADDRESS_REQUIREMENTS::Alignment` must be 0 or at least the
+        // 64 KiB allocation granularity; 0 already aligns to 64 KiB.
+        let alignment = if align > PAGE { align } else { 0 };
+        return virtual_alloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
+            alignment,
         );
     }
     let Some((align, layout)) = layout(size, attributes) else {
@@ -1288,6 +1305,39 @@ mod tests {
             let heap = unsafe { HeapSize(GetProcessHeap(), 0, p.cast::<u8>().sub(offset).cast()) };
             assert_eq!(heap, 1000 + align, "align {align}");
             XMemFreeDefault(p, attributes);
+        }
+    }
+
+    #[test]
+    fn alloc_32bit_honours_alignments_above_64k() {
+        // Hold multiple live allocations per alignment so adjacent 64 KiB
+        // slots cannot all happen to land on a coarser boundary by chance.
+        for (field, align) in [
+            (0, 16),
+            (4, 16),
+            (16, PAGE),
+            (17, 128 << 10),
+            (18, 256 << 10),
+            (21, 2 * MIB),
+        ] {
+            let attributes = field << ALIGNMENT_SHIFT | ALLOC_32BIT;
+            let mut blocks = Vec::new();
+            for _ in 0..4 {
+                let p = XMemAllocDefault(4096, attributes);
+                assert!(!p.is_null(), "field {field:#x}");
+                assert!((p as usize) < 1 << 32, "field {field:#x}: {p:p}");
+                assert_eq!(
+                    p as usize % align,
+                    0,
+                    "field {field:#x}: {p:p} is not {align}-byte aligned"
+                );
+                // SAFETY: 4096 bytes were allocated read-write.
+                unsafe { p.cast::<u8>().write_bytes(0xcd, 4096) };
+                blocks.push(p);
+            }
+            for p in blocks {
+                XMemFreeDefault(p, attributes);
+            }
         }
     }
 
