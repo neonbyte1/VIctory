@@ -421,13 +421,25 @@ impl State {
                 );
                 continue;
             };
+            if record.resource.is_null() {
+                // A typed null RTV discards writes without changing the output slot.
+                if let Some(desc) = record.desc() {
+                    rtvs.push(host.rtv(None, Some(&desc)));
+                } else {
+                    tracing::debug!(
+                        handle = format_args!("{h:#x}"),
+                        "null render target view without a description"
+                    );
+                }
+                continue;
+            }
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(Some(&texture), record.desc().as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -2574,7 +2586,7 @@ uint ps() : SV_Target { return 1; }
             ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        let (rtv, dsv) = (host.rtv(&target, None), host.dsv(texture, Some(&dsv)));
+        let (rtv, dsv) = (host.rtv(Some(&target), None), host.dsv(texture, Some(&dsv)));
         // SAFETY: an open list; the target in the render target state, the
         // depth texture in the depth write state; copies into our buffer.
         unsafe {
@@ -3912,5 +3924,210 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn typed_null_rtv_keeps_the_next_color_slot() {
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        struct Texture(This);
+
+        impl Drop for Texture {
+            fn drop(&mut self) {
+                let release = crate::object::slot::<extern "system" fn(This) -> u32>(self.0, 0x10);
+                release(self.0);
+            }
+        }
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let device = &host.device;
+        let list = host.new_list().expect("host command list");
+        let l = &list.list;
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let source = r#"
+            [RootSignature("RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)")]
+            float4 vs(uint id : SV_VertexID) : SV_Position {
+                return float4(id == 2 ? 3 : -1, id == 1 ? -3 : 1, 0, 1);
+            }
+            struct Colors { float4 red : SV_Target0; float4 green : SV_Target1; };
+            Colors ps() {
+                Colors c;
+                c.red = float4(1, 0, 0, 1);
+                c.green = float4(0, 1, 0, 1);
+                return c;
+            }
+        "#;
+        let compile = |entry, target| {
+            let mut code = None;
+            // SAFETY: source and shader names are live, and code is our output pointer.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    s!("rtv-slot-test"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+                .expect("compile fixture shader");
+            }
+            code.expect("fixture bytecode")
+        };
+        let vs = compile(s!("vs"), s!("vs_5_1"));
+        let ps = compile(s!("ps"), s!("ps_5_1"));
+        // SAFETY: compiled fixture shaders and their embedded root signature are live.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let bytecode = |blob: &ID3DBlob| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: blob.GetBufferPointer(),
+                BytecodeLength: blob.GetBufferSize(),
+            };
+            let code = bytecode(&vs);
+            let root = device
+                .CreateRootSignature(
+                    0,
+                    std::slice::from_raw_parts(code.pShaderBytecode.cast(), code.BytecodeLength),
+                )
+                .expect("graphics root signature");
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code,
+                PS: bytecode(&ps),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 2,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            // D3D12 requires UNKNOWN in the PSO slot that binds a null RTV.
+            desc.RTVFormats[1] = format;
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+                D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let pso = device
+                .CreateGraphicsPipelineState(&desc)
+                .expect("graphics pipeline");
+            (root, pso)
+        };
+
+        const SIDE: u32 = 4;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(SIDE),
+            Height: SIDE,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut target = std::ptr::null();
+        let null = std::ptr::null();
+        let iid = ID3D12Resource::IID;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut target,
+            ),
+            crate::object::S_OK
+        );
+        let _target = Texture(target);
+        let color = crate::resource::host_resource(target).expect("color target");
+        let mut slots = [[0u64; 16]; 2];
+        let handles = slots.each_mut().map(|slot| slot.as_mut_ptr() as u64);
+        let null_desc = [
+            format.0 as u32,
+            D3D12_RTV_DIMENSION_TEXTURE2D.0 as u32,
+            0,
+            0,
+            0,
+            0,
+        ];
+        crate::descriptor::create_rtv(null, null, &null_desc, handles[0]);
+        crate::descriptor::create_rtv(null, target, null.cast(), handles[1]);
+        crate::list::ensure_state(&list, target, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        // SAFETY: open list, live target and graphics pipeline.
+        unsafe {
+            l.ClearRenderTargetView(host.rtv(Some(&color), None), &[0.0, 0.0, 1.0, 1.0], None);
+            l.SetGraphicsRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        }
+        let mut state = State::default();
+        state.viewports(
+            &list,
+            &[D3D12_VIEWPORT {
+                Width: SIDE as f32,
+                Height: SIDE as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }],
+        );
+        state.scissors(
+            &list,
+            &[RECT {
+                right: SIDE as i32,
+                bottom: SIDE as i32,
+                ..Default::default()
+            }],
+        );
+        state.set_targets(&list, &handles, 0);
+        // SAFETY: complete graphics state on the open list.
+        unsafe { l.DrawInstanced(3, 1, 0, 0) };
+
+        crate::list::ensure_state(&list, target, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, footprint) =
+            crate::capture::read_back(device, l, &color).expect("color readback");
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        let mut pixels = Vec::new();
+        // SAFETY: execution has completed and all pixels lie in the mapped footprint.
+        unsafe {
+            readback
+                .Map(0, None, Some(&mut mapped))
+                .expect("map readback");
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let at = footprint.Offset as usize
+                        + (y * footprint.Footprint.RowPitch + x * 4) as usize;
+                    pixels.push(mapped.cast::<u8>().add(at).cast::<[u8; 4]>().read());
+                }
+            }
+            readback.Unmap(0, None);
+        }
+        assert_eq!(pixels, [[0, 255, 0, 255]; (SIDE * SIDE) as usize]);
     }
 }

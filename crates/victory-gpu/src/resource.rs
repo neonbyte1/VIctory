@@ -285,8 +285,8 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
+    let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
     (format != own).then_some(own)
@@ -2677,6 +2677,12 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_resource_has_no_default_view_format() {
+        assert_eq!(view_format(std::ptr::null()), None);
     }
 
     #[test]

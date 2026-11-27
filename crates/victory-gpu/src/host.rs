@@ -1719,14 +1719,14 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host render target view, valid until it is recorded.
     pub(crate) fn rtv(
         &self,
-        resource: &ID3D12Resource,
+        resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource.
+        // SAFETY: a slot of our heap and a live resource or a typed null view.
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
@@ -4304,7 +4304,7 @@ mod present_plane_tests {
                     .unwrap();
                 let texture = texture.unwrap();
                 list.list
-                    .ClearRenderTargetView(host.rtv(&texture, None), color, None);
+                    .ClearRenderTargetView(host.rtv(Some(&texture), None), color, None);
                 texture
             }
         };
