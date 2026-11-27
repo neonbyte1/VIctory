@@ -346,7 +346,7 @@ fn same_as_title(page: usize, mirror: usize) -> bool {
         t.resize(PAGE, 0);
         // SAFETY: the copy's bytes of a whole page, alive (see `touch`).
         let mirror = unsafe { std::slice::from_raw_parts(mirror as *const u8, PAGE) };
-        crate::host::read_into((page * PAGE) as *const u8, &mut t) && t[..] == *mirror
+        crate::host::read_raw((page * PAGE) as *const u8, &mut t) && t[..] == *mirror
     })
 }
 

@@ -2435,6 +2435,10 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        // Lazy view pages still hold the title bytes we left (diagnostics:
+        // a writer that went past us loses its bytes at the first touch).
+        #[cfg(feature = "diagnostics")]
+        crate::watch::verify_lazy(32);
         if marks_taken {
             // Pages shaders marked first: the copy-backs below end what the
             // copies keep for them.
@@ -3790,6 +3794,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::census::touch(src as usize, len);
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
+    // Nor may the source be a page shaders wrote that has not gone back.
+    crate::watch::reading(src as usize, len);
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
@@ -3827,10 +3833,19 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
-/// readable.
+/// readable. Pages shaders wrote that have not gone back go first
+/// (`crate::watch::reading`).
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     #[cfg(feature = "diagnostics")]
     crate::census::touch(src as usize, dst.len());
+    crate::watch::reading(src as usize, dst.len());
+    read(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// [`read_into`] with no look at pages that have not gone back (a page with
+/// no access fails the read): for holders of the guard lock, which that look
+/// takes.
+pub(crate) fn read_raw(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 

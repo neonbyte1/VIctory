@@ -677,6 +677,10 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    let reached = pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]);
+    // Title views showing the pages: those whose shaders' bytes have not
+    // gone back get them now, under ours (`victory_gpu::unseen_writing`).
+    let unseen = victory_gpu::unseen_writing(|| shown_at(reached));
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -687,7 +691,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         (within, done) = (0, done + k);
     }
     // Where the pages show once written (see `PageWindow`).
-    report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
+    report_written(&shown_at(reached));
+    drop(unseen);
     true
 }
 
@@ -705,6 +710,9 @@ pub(crate) struct PageWindow {
     /// the page there before the bytes landed would never hear of them. An
     /// address that stops showing a page meanwhile was told by the unmap.
     pages: Vec<usize>,
+    /// The title views showing them when the window opened: none of their
+    /// pages goes lazy until it is done (`victory_gpu::unseen_writing`).
+    _unseen: victory_gpu::UnseenWriting,
 }
 
 impl Drop for PageWindow {
@@ -730,11 +738,14 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let reached = pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec();
+    let view = View::map(slice, *n)?;
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view,
         within: offset % PAGE,
         len,
-        pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
+        _unseen: victory_gpu::unseen_writing(|| shown_at(&reached)),
+        pages: reached,
     })
 }
 

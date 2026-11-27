@@ -255,8 +255,28 @@ pub(crate) enum C {
     SettleAliasClean,
     SettleLabelClean,
     SettleTextureClean,
+    /// Lazy view pages (`VICTORY_LAZY_VIEWS`, `crate::watch::Lease::lazify`):
+    /// offered and made lazy instead of written; lazy pages shaders wrote
+    /// again before any touch (nothing read or copied); first touches,
+    /// each copying the page in (title reads, title writes, our host);
+    /// dropped unwritten (withheld); time of those copies; protection
+    /// changes for lazy pages; offered but not made so: changed, not
+    /// guarded, shown elsewhere where it cannot be, other.
+    LazyOffered,
+    LazyMade,
+    LazyAgain,
+    LazyTitleReads,
+    LazyTitleWrites,
+    LazyHostTouches,
+    LazyDropped,
+    LazyResolveUs,
+    LazyProtects,
+    LazyRefusedChanged,
+    LazyRefusedUnguarded,
+    LazyRefusedAlias,
+    LazyRefusedOther,
 }
-const COUNTERS: usize = 147;
+const COUNTERS: usize = 160;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -509,6 +529,34 @@ pub(crate) fn log(frames: f64) {
         c[C::MarkViewProtects as usize],
         c[C::MarkThrough as usize],
     );
+    let (checks, missed, last) = crate::watch::take_lazy_checks();
+    tracing::info!(
+        "  lazy view pages per frame (on: {}): {:.0} offered, {:.0} made lazy (not copied back), {:.0} marked \
+         again before any touch (never copied); copied on demand: {:.0} at title reads, {:.0} at title writes, \
+         {:.0} for our host, {:.1} ms; {:.0} dropped unwritten; {} lazy now; {:.0} protection changes; not made \
+         lazy: {:.0} changed, {:.0} not guarded, {:.0} shown elsewhere, {:.0} other; checked {:.0}, {:.0} \
+         written behind our back",
+        crate::watch::lazy_views(),
+        c[C::LazyOffered as usize],
+        c[C::LazyMade as usize],
+        c[C::LazyAgain as usize],
+        c[C::LazyTitleReads as usize],
+        c[C::LazyTitleWrites as usize],
+        c[C::LazyHostTouches as usize],
+        ms(c[C::LazyResolveUs as usize]),
+        c[C::LazyDropped as usize],
+        crate::watch::lazy_live(),
+        c[C::LazyProtects as usize],
+        c[C::LazyRefusedChanged as usize],
+        c[C::LazyRefusedUnguarded as usize],
+        c[C::LazyRefusedAlias as usize],
+        c[C::LazyRefusedOther as usize],
+        checks as f64 / frames,
+        missed as f64 / frames,
+    );
+    if missed > 0 {
+        tracing::warn!(pages = missed, last = ?last, "lazy view pages written behind our back (their bytes lost at the first touch)");
+    }
     let sites: Vec<String> = crate::watch::site_counts()
         .iter()
         .zip(crate::watch::SITE_NAMES)

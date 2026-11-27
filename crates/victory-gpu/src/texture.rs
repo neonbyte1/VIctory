@@ -787,6 +787,9 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
+    // A page shaders wrote that has not gone back has no access until it
+    // does: the caller reads it next.
+    crate::watch::reading(at as usize, len);
     let mut p = at as usize;
     let Some(end) = p.checked_add(len) else {
         return false;

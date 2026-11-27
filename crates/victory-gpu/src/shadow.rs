@@ -1048,6 +1048,11 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // Pages shaders wrote that have not gone back: now, while the bytes
+        // are here.
+        if let Some(t) = &self.tracked {
+            t.resolve_all();
+        }
         // Census: its bytes are freed below.
         #[cfg(feature = "diagnostics")]
         crate::census::drop_copy(self as *const Shadow as usize);
@@ -1607,6 +1612,7 @@ pub(crate) fn copy_back_marks(
             add(C::MarkMerged, back.merged as u64);
             add(C::MarkBridged, back.bridged as u64);
             add(C::MarkThrough, back.through as u64);
+            add(C::LazyAgain, back.again as u64);
             for (c, us) in [C::MarkPreUs, C::MarkWaitUs, C::MarkProtectUs, C::MarkWriteUs, C::MarkVerifyUs]
                 .into_iter()
                 .zip(back.us)
@@ -1778,6 +1784,11 @@ pub(crate) struct RunBack {
     /// saved bytes and left changed; kept the title's bytes (none saved).
     pub(crate) merged: usize,
     pub(crate) kept: usize,
+    /// Pages made lazy instead of written (`crate::watch::Lease::lazify`);
+    /// pages lazy for this copy already that shaders wrote again before any
+    /// touch (nothing read, written or copied).
+    pub(crate) lazy: usize,
+    pub(crate) again: usize,
     /// Protection changes asked.
     pub(crate) protects: u64,
     /// Microseconds (diagnostics): reading and comparing before the lease,
@@ -1864,13 +1875,17 @@ fn copy_back_run(
     debug_assert_eq!(host.len(), pages.len() * PAGE);
     /// Per page: byte runs `[a, b)` of `diffs` to write; the title had not
     /// written it (`Clean`) or had (`Merge`); it keeps the title's bytes
-    /// (`Kept`); title memory is not readable (`Skip`, as page by page).
+    /// (`Kept`); title memory is not readable (`Skip`, as page by page); it
+    /// may be lazy for this copy, read nothing (`Lazy`, decided under the
+    /// lease); made lazy instead of written (`Deferred`).
     #[derive(Clone, Copy)]
     enum Plan {
         Clean(usize, usize),
         Merge(usize, usize),
         Kept,
         Skip,
+        Lazy,
+        Deferred,
     }
     fn page_in(host: &[u8], i: usize) -> &[u8] {
         &host[i * PAGE..(i + 1) * PAGE]
@@ -1903,6 +1918,11 @@ fn copy_back_run(
             merge(i, &before, &mut diffs)
         } else if t.changed(page / PAGE) {
             Plan::Kept
+        } else if crate::watch::maybe_lazy(page / PAGE) {
+            // Lazy (`crate::watch::Lease::lazify`): if for this copy, shaders
+            // wrote it again before any touch, and what goes back then is in
+            // the copy already; nothing to read.
+            Plan::Lazy
         } else if unchanged.contains(&(host_page(i).as_ptr() as usize)) {
             Plan::Clean(diffs.len(), diffs.len())
         } else if crate::host::read_into(page as *const u8, &mut title) {
@@ -1930,13 +1950,33 @@ fn copy_back_run(
     // Our writes below must not save the pages for this copy (unarmed under
     // the lease: a first title write before it still saved them). A page
     // the title wrote since it was read goes back by what that write saved.
+    let mut back = RunBack::default();
     for (i, &page) in pages.iter().enumerate() {
         let pn = page / PAGE;
         t.unarm(pn);
+        if matches!(plans[i], Plan::Lazy) {
+            if lease.lazy_own(pn, host_page(i).as_ptr() as usize) {
+                back.again += 1;
+                continue;
+            }
+            // Not this copy's (any more): given its bytes, it goes back as
+            // any other page, its title bytes read now (guarded: no title
+            // write lands while the lease is held).
+            lease.resolve(pn);
+            plans[i] = if !lease.guarded(pn) || t.changed(pn) {
+                Plan::Kept
+            } else if crate::host::read_raw(page as *const u8, &mut title) {
+                let s = diffs.len();
+                diff_runs(host_page(i), &title, DIFF_RUNS, &mut diffs);
+                Plan::Clean(s, diffs.len())
+            } else {
+                Plan::Skip
+            };
+        }
         let again = match plans[i] {
             Plan::Clean(..) => !lease.guarded(pn) || t.changed(pn),
             Plan::Kept => true,
-            Plan::Merge(..) | Plan::Skip => false,
+            Plan::Merge(..) | Plan::Skip | Plan::Lazy | Plan::Deferred => false,
         };
         if again {
             plans[i] = match t.saved(pn) {
@@ -1945,7 +1985,30 @@ fn copy_back_run(
             };
         }
     }
-    let mut back = RunBack::default();
+    // View pages the shaders changed and the title did not: lazy instead of
+    // written (`VICTORY_LAZY_VIEWS`), but not while a miss withholds what
+    // shaders write (a lazy page written again would lose its earlier bytes
+    // with the withheld ones, `crate::watch::forget_lazy`).
+    if crate::watch::lazy_views() && !crate::memory::withholding() {
+        let offer: Vec<crate::watch::LazyView> = pages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &page)| match (plans[i], alias[i]) {
+                (Plan::Clean(a, b), Some(alias)) if a < b => Some(crate::watch::LazyView {
+                    page: page / PAGE,
+                    src: host_page(i).as_ptr() as usize,
+                    alias,
+                }),
+                _ => None,
+            })
+            .collect();
+        if !offer.is_empty() {
+            for pn in lease.lazify(&offer) {
+                plans[pn - first] = Plan::Deferred;
+                back.lazy += 1;
+            }
+        }
+    }
     let written: Vec<usize> = pages
         .iter()
         .zip(&plans)
@@ -1964,7 +2027,7 @@ fn copy_back_run(
         (Some(&lo), Some(&hi)) => (lo + 1..hi)
             .filter(|&pn| match plans[pn - first] {
                 Plan::Clean(a, b) | Plan::Merge(a, b) if a < b => false,
-                Plan::Skip => false,
+                Plan::Skip | Plan::Lazy | Plan::Deferred => false,
                 _ => !lease.guarded(pn) || lease.alone(pn),
             })
             .collect(),
@@ -2013,7 +2076,8 @@ fn copy_back_run(
         let bridged = bridge.binary_search(&pn).is_ok();
         back.bridged += usize::from(bridged);
         let opened = (a < b && alias[i].is_none()) || bridged;
-        if !opened || crate::host::read_into((pn * PAGE) as *const u8, &mut title) && title[..] == *host_page(i) {
+        // Under the lease: no look at lazy pages (an opened page is none).
+        if !opened || crate::host::read_raw((pn * PAGE) as *const u8, &mut title) && title[..] == *host_page(i) {
             taken.push(pn);
             #[cfg(feature = "diagnostics")]
             if a < b && alias[i].is_some() {
@@ -3048,6 +3112,106 @@ pub(crate) mod tests {
         let title_word = unsafe { (p as *const u32).read_volatile() };
         assert_eq!(title_word, 0x1337_c0de);
     }
+
+    /// Sets the views' write mark `n` (a shader's write through a view).
+    fn mark_written(b: &Bitmap, n: usize) {
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+    }
+
+    /// `VICTORY_LAZY_VIEWS=1`, a title buffer on physical-page views: a
+    /// marked page the shaders changed and the title did not stays out of
+    /// title memory (no access; the runtime's own view shows the old bytes)
+    /// until the title's first read, which finds what the shaders wrote, in
+    /// a second submission before that read too (not copied in between). A
+    /// page the title wrote meanwhile goes back at once by its saved bytes.
+    #[test]
+    fn lazy_view_marked_pages_go_back_at_the_first_touch() {
+        use crate::watch::tests::{LazyOn, own_alias, raw, section_views};
+        let _on = LazyOn::set();
+        let (v, own) = section_views(2, 1);
+        let p = v[0];
+        let len = 2 * PAGE;
+        own_alias(p, len, own);
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(0, p, len).unwrap();
+        copy.writing(0, p, len, true);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + PAGE + 20) as u64, &[0xbb]);
+        // SAFETY: a byte of the title's view (guarded: the handler opens it).
+        unsafe { ((p + PAGE + 40) as *mut u8).write_volatile(0x11) };
+        mark_written(b, base);
+        mark_written(b, base + 1);
+        copy_back_marks(0, &WriteMarks::take_ram(), &[], false, &Default::default());
+        // SAFETY: (all) bytes of the runtime's own view.
+        let old = |at: usize| unsafe { ((own + at) as *const u8).read_volatile() };
+        assert_eq!((raw(p + 10), old(10)), (None, 0), "page 0 lazy: nothing written");
+        assert_eq!((raw(p + PAGE + 20), raw(p + PAGE + 40)), (Some(0xbb), Some(0x11)), "page 1 at once");
+        // The shaders write page 0 again before anyone touched it.
+        copy.write_host((p + 12) as u64, &[0xab]);
+        mark_written(b, base);
+        copy_back_marks(0, &WriteMarks::take_ram(), &[], false, &Default::default());
+        assert_eq!((raw(p + 10), old(10), old(12)), (None, 0, 0), "still lazy, not copied");
+        // SAFETY: bytes of the title's view (no access: the handler gives them).
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(12), read(14)), (0xaa, 0xab, 0), "the first read finds both writes");
+        assert_eq!(copy.update(0, p, PAGE), Ok(0), "the copy holds the page as title memory does");
+        copy.copy_back(0, p, len);
+        unregister(p, p as u64);
+    }
+
+    /// [`vram_marked_view_writes_go_back_to_title`] on physical-page views
+    /// with `VICTORY_LAZY_VIEWS=1`: the shader's write (read back into the
+    /// copy's mirror) stays out of title memory until the title's first read,
+    /// and a second submission's write before that read is what it finds.
+    #[test]
+    fn vram_lazy_view_writes_go_back_at_the_first_read() {
+        use crate::watch::tests::{LazyOn, own_alias, raw, section_views};
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let _on = LazyOn::set();
+        let (v, own) = section_views(1, 1);
+        let p = v[0];
+        own_alias(p, PAGE, own);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return;
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(0, p, PAGE).unwrap();
+        let submit = |value: u32| {
+            let list = host.new_list().unwrap();
+            let (up, up_ptr) = host.upload_buffer(8).expect("upload bit and word");
+            // SAFETY: mapped 8-byte upload buffer.
+            unsafe { up_ptr.cast::<[u32; 2]>().write_volatile([1u32 << (base % 32), value]) };
+            list.keep(&up);
+            let word_off = ((base / 32) * 4) as u64;
+            // SAFETY: open command list and valid buffer regions.
+            unsafe {
+                list.list.CopyBufferRegion(&copy.buffer, copy.base, &up, 4, 4);
+                list.list.CopyBufferRegion(b.vram.as_ref().map_or(&b._buffer, |(vram, _)| vram), word_off, &up, 0, 4);
+            }
+            list.close();
+            host.execute(&[&list]);
+        };
+        // SAFETY: (both) the runtime's own view.
+        let old = || unsafe { (own as *const u32).read_volatile() };
+        submit(0x1337_c0de);
+        assert_eq!((raw(p), old()), (None, 0), "lazy: nothing written yet");
+        submit(0x2222_2222);
+        assert_eq!((raw(p), old()), (None, 0), "written again before any touch: still lazy");
+        // SAFETY: the title's view (no access: the handler gives it).
+        assert_eq!(unsafe { (p as *const u32).read_volatile() }, 0x2222_2222);
+        unregister(p, p as u64);
+    }
+
     /// Overlapping `writing` calls only snapshot uncovered gaps, and a
     /// `copy_back` across multiple segments and 64 KiB chunks merges GPU writes
     /// without clobbering concurrent title writes.
@@ -3659,5 +3823,90 @@ mod run_tests {
         assert_eq!((title[100], title[PAGE + 100]), (0x5c, 0x5d), "the title's writes land last");
         assert_eq!((&title[101..108], &title[PAGE + 101..PAGE + 108]), (&host[101..108], &host[PAGE + 101..PAGE + 108]));
         assert!(t.changed(a / PAGE) && t.changed(a / PAGE + 1), "both pages changed after the run took them");
+    }
+
+    /// `VICTORY_LAZY_VIEWS`: view pages the shaders changed and the title
+    /// did not are not written back. Title memory keeps its bytes (the
+    /// runtime's own view shows them) behind no access at every title
+    /// mapping; a page the shaders left goes back (taken) as before. The
+    /// title's first read finds the GPU's bytes, and a kernel read gives the
+    /// other page them.
+    #[test]
+    fn lazy_views_a_page_shaders_wrote_is_not_copied_until_touched() {
+        use crate::watch::tests::{LazyOn, raw};
+        let _on = LazyOn::set();
+        let (a, b, c) = three_views(3);
+        let t = crate::watch::track_copy(a, 3 * PAGE, true).expect("views are tracked");
+        fill(a, 3 * PAGE);
+        let mut host = title_bytes(a, 3 * PAGE);
+        assert!(!t.take(a, a + 3 * PAGE).is_empty());
+        host[100..200].fill(0xaa);
+        host[2 * PAGE + 7] ^= 1;
+        let back = copy_back_run(&t, &pages_at(a, 3), &host, &Default::default());
+        assert_eq!((back.written, back.through, back.lazy, back.misses), (0, 0, 2, 0), "{back:?}");
+        // SAFETY: (both) bytes of the runtime's own view.
+        let own = |at: usize| unsafe { ((c + at) as *const u8).read_volatile() };
+        assert_eq!((own(100), own(2 * PAGE + 7)), (pattern(100), pattern(2 * PAGE + 7)), "nothing written");
+        assert_eq!((raw(a + 100), raw(b + 100), raw(a + 2 * PAGE)), (None, None, None), "no access");
+        assert_eq!(raw(a + PAGE), Some(pattern(PAGE)), "the page the shaders left");
+        // SAFETY: a byte of the title's view, without access: the handler gives it.
+        assert_eq!(unsafe { ((a + 150) as *const u8).read_volatile() }, 0xaa, "the first read finds the GPU's bytes");
+        assert_eq!(title_bytes(a, 3 * PAGE), host, "a kernel read gives the other page them");
+        assert!((0..3).all(|k| !t.changed(a / PAGE + k)), "taken");
+    }
+
+    /// A lazy page the shaders write again before anyone touches it is not
+    /// read, compared or written: the first touch finds both writes.
+    #[test]
+    fn lazy_views_a_page_marked_again_before_any_touch_is_never_copied() {
+        use crate::watch::tests::{LazyOn, raw};
+        let _on = LazyOn::set();
+        let (a, b, c) = three_views(1);
+        let t = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
+        fill(a, PAGE);
+        let mut host = title_bytes(a, PAGE);
+        assert!(!t.take(a, a + PAGE).is_empty());
+        host[10] = 0xaa;
+        let back = copy_back_run(&t, &[a], &host, &Default::default());
+        assert_eq!((back.written, back.lazy, back.again), (0, 1, 0));
+        host[12] = 0xab;
+        let back = copy_back_run(&t, &[a], &host, &Default::default());
+        assert_eq!((back.written, back.lazy, back.again, back.diff_bytes), (0, 0, 1, 0), "nothing copied");
+        // SAFETY: (both) bytes of the runtime's own view.
+        let own = |at: usize| unsafe { ((c + at) as *const u8).read_volatile() };
+        assert_eq!((own(10), own(12)), (pattern(10), pattern(12)), "never written in between");
+        assert_eq!(raw(a), None, "still lazy");
+        // SAFETY: (both) bytes of the title's other view, without access: the handler gives them.
+        let read = |at: usize| unsafe { ((b + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(12), read(14)), (0xaa, 0xab, pattern(14)));
+        assert_eq!(title_bytes(a, PAGE), host);
+    }
+
+    /// DirectStorage writes a lazy page through the runtime's own view of it
+    /// (`xmem::page_window`): the shaders' bytes go in first, the streamed
+    /// bytes land over them and win where they land, and the copy takes them
+    /// at its next refresh.
+    #[test]
+    fn lazy_views_a_directstorage_write_lands_over_the_shaders_bytes() {
+        use crate::watch::tests::LazyOn;
+        let _on = LazyOn::set();
+        let (a, b, c) = three_views(1);
+        let t = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
+        fill(a, PAGE);
+        let mut host = title_bytes(a, PAGE);
+        assert!(!t.take(a, a + PAGE).is_empty());
+        host[100..108].fill(0xaa);
+        assert_eq!(copy_back_run(&t, &[a], &host, &Default::default()).lazy, 1);
+        let window = crate::watch::unseen_writing(|| vec![a, b]);
+        // SAFETY: the runtime's own view, read-write.
+        unsafe { std::ptr::write_bytes((c + 96) as *mut u8, 0x77, 8) };
+        drop(window);
+        // Reported where the page shows once written (`xmem::report_written`).
+        drop(crate::watch::writing(a, PAGE));
+        drop(crate::watch::writing(b, PAGE));
+        let title = title_bytes(a, PAGE);
+        assert_eq!((&title[96..104], &title[104..108]), (&[0x77; 8][..], &[0xaa; 4][..]));
+        assert_eq!(title[..96], host[..96]);
+        assert!(t.changed(a / PAGE), "the copy takes the streamed bytes next");
     }
 }
