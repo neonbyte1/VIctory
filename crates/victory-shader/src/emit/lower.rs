@@ -3820,6 +3820,88 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
+                "s_bfe_u64" | "s_bfe_i64" => {
+                    // src1: offset in bits 0-5, width in bits 16-22. A field
+                    // from bit 64 on, or a width of 64 and up, is not defined
+                    // by the ISA; it only has to stay in range here.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let n = src32(self, 1)?;
+                    let signed = name == "s_bfe_i64";
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let b = self.s.m.bin(c, Bin::Shl, b, k32);
+                    let x = self.s.m.bin(c, Bin::Or, a, b);
+                    let (k63, k16, k127, k64) = (
+                        self.s.m.i32(63),
+                        self.s.m.i32(16),
+                        self.s.m.i32(0x7F),
+                        self.s.m.i32(64),
+                    );
+                    let off = self.s.m.bin(c, Bin::And, n, k63);
+                    let off = self.s.m.cast(c, Cast::ZExt, off, i64t);
+                    let w = self.s.m.bin(c, Bin::LShr, n, k16);
+                    let w = self.s.m.bin(c, Bin::And, w, k127);
+                    let full = self.s.m.cmp(c, pred::IUGE, w, k64);
+                    let w = self.s.m.bin(c, Bin::And, w, k63);
+                    let w = self.s.m.cast(c, Cast::ZExt, w, i64t);
+                    let shift = if signed { Bin::AShr } else { Bin::LShr };
+                    let shifted = self.s.m.bin(c, shift, x, off);
+                    let (one, zero, ones) = (
+                        self.s.m.int_const(i64t, 1),
+                        self.s.m.int_const(i64t, 0),
+                        self.s.m.int_const(i64t, -1),
+                    );
+                    let mask = self.s.m.bin(c, Bin::Shl, one, w);
+                    let mask = self.s.m.bin(c, Bin::Sub, mask, one);
+                    let mask = self.s.m.select(c, full, ones, mask);
+                    let mut r = self.s.m.bin(c, Bin::And, shifted, mask);
+                    if signed {
+                        // Sign-extend a field narrower than 64 bits (none for
+                        // width 0).
+                        let k64l = self.s.m.int_const(i64t, 64);
+                        let k63l = self.s.m.int_const(i64t, 63);
+                        let left = self.s.m.bin(c, Bin::Sub, k64l, w);
+                        let left = self.s.m.bin(c, Bin::And, left, k63l);
+                        let t = self.s.m.bin(c, Bin::Shl, r, left);
+                        let t = self.s.m.bin(c, Bin::AShr, t, left);
+                        let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
+                        let keep = self.s.m.bin(c, Bin::Or, full, is0);
+                        r = self.s.m.select(c, keep, r, t);
+                    }
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    let s = nonzero(self, rl, rh);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    // ((1 << src0[5:0]) - 1) << src1[5:0]; SCC is untouched.
+                    let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k63 = self.s.m.i32(63);
+                    let a = self.s.m.bin(c, Bin::And, a, k63);
+                    let b = self.s.m.bin(c, Bin::And, b, k63);
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let m = self.s.m.bin(c, Bin::Shl, one, a);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let r = self.s.m.bin(c, Bin::Shl, m, b);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    Ok(())
+                }
                 "s_mov_b64" => {
                     // Dword by dword: one without a value (the high dword of
                     // a 64-bit wave sum) leaves the other usable.
@@ -11815,6 +11897,33 @@ mod tests {
         ];
         for head in bit_tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
+            lowers(&words, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn scalar_64_bit_field_ops_lower() {
+        // Each makes a 64-bit field from constants and branches on SCC (only
+        // code with an effect needs its operands).
+        let tail = [
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE87_0380, // s_mov_b32 s7, 0
+            S_ENDPGM,
+        ];
+        let consts = [
+            0xBE80_0387, // s_mov_b32 s0, 7
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xBE82_0388, // s_mov_b32 s2, 8
+        ];
+        let field_tests: [&[u32]; 3] = [
+            &[0x9484_0200], // s_bfe_u64 s[4:5], s[0:1], s2
+            &[0x9504_0200], // s_bfe_i64 s[4:5], s[0:1], s2
+            // s_bfm_b64 s[4:5], s0, s1; its result is read by s_or_b32,
+            // which sets the SCC the branch uses.
+            &[0x9284_0100, 0x8806_0504],
+        ];
+        for body in field_tests {
+            let words: Vec<u32> = consts.iter().chain(body).chain(&tail).copied().collect();
             lowers(&words, 0).unwrap();
         }
     }

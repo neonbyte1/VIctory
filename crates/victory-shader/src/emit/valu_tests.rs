@@ -2095,6 +2095,105 @@ fn image_atomics_of_64_bits() {
     }
 }
 
+/// SOPC `op src0, src1`.
+const fn sopc(op: u8, src0: u8, src1: u8) -> u32 {
+    0xBF00_0000 | (op as u32) << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
+/// `s_cselect_b32 s12, 1, 0; v_mov_b32 v0, s12`: SCC as 0 or 1 in v0.
+fn scc_to_v0() -> [u32; 2] {
+    [sop2(0x0A, 12, 129, 128), vop1(0x001, 0, sgpr(12))]
+}
+
+#[test]
+fn s_bfe_64_extracts_and_sets_scc() {
+    // s_bfe_u64 / s_bfe_i64 s[6:7], s[0:1], s2 (SOP2 0x29 / 0x2a: s2 = off[5:0]
+    // | width[22:16]); the result's low dword, high dword or SCC goes to v0.
+    let result = |op: u8, tail: &[u32]| {
+        let mut body = vec![sop2(op, 6, 0, 2)];
+        body.extend_from_slice(tail);
+        build_valu_cs(&body)
+    };
+    let lo = |op| result(op, &[vop1(0x001, 0, sgpr(6))]);
+    let hi = |op| result(op, &[vop1(0x001, 0, sgpr(7))]);
+    let scc = |op| result(op, &scc_to_v0());
+    let field = |off: u32, width: u32| off | width << 16;
+    let x = 0xFEDC_BA98_7654_3210u64;
+    // (src, offset, width, signed, expected)
+    let cases: &[(u64, u32, u32, bool, u64)] = &[
+        (x, 32, 16, false, 0xBA98),
+        (x, 32, 16, true, 0xFFFF_FFFF_FFFF_BA98),
+        (x, 0, 8, true, 0x10),
+        (x, 4, 40, false, 0x00A9_8765_4321),
+        (x, 56, 4, true, 0xFFFF_FFFF_FFFF_FFFE),
+        (x, 60, 4, false, 0xF),
+        (x, 8, 0, false, 0),
+        (x, 8, 0, true, 0),
+        (0x0000_00F0_0000_0000, 0, 32, false, 0),
+        (0x0000_00F0_0000_0000, 36, 4, true, 0xFFFF_FFFF_FFFF_FFFF),
+        (0x0000_00F0_0000_0000, 36, 4, false, 0xF),
+        (0x0000_00F0_0000_0000, 32, 4, true, 0),
+    ];
+    for &(src, off, width, signed, want) in cases {
+        let op = if signed { 0x2A } else { 0x29 };
+        let inputs = [[src as u32, (src >> 32) as u32, field(off, width), 0]];
+        let what = format!("s_bfe_{}64({src:#018x}, {off}, {width})", ["u", "i"][signed as usize]);
+        run_cases(&lo(op), &inputs, |backend, _, _, got| {
+            assert_eq!(got, want as u32, "{backend}: {what} low dword = {got:#010x}");
+        });
+        run_cases(&hi(op), &inputs, |backend, _, _, got| {
+            assert_eq!(got, (want >> 32) as u32, "{backend}: {what} high dword = {got:#010x}");
+        });
+        run_cases(&scc(op), &inputs, |backend, _, _, got| {
+            assert_eq!(got, (want != 0) as u32, "{backend}: {what} SCC = {got}");
+        });
+    }
+}
+
+#[test]
+fn s_bfm_b64_builds_a_mask_and_keeps_scc() {
+    // s_cmp_lg_u32 s3, 0 sets SCC from s3; s_bfm_b64 s[6:7], s0, s1 (SOP2
+    // 0x25: width s0[5:0], offset s1[5:0]) must leave it alone.
+    let prefix = [sopc(0x07, 3, 128), sop2(0x25, 6, 0, 1)];
+    let build = |tail: &[u32]| build_valu_cs(&[&prefix[..], tail].concat());
+    let (lo, hi) = (
+        build(&[vop1(0x001, 0, sgpr(6))]),
+        build(&[vop1(0x001, 0, sgpr(7))]),
+    );
+    let scc = build(&scc_to_v0());
+    // (width, offset, expected)
+    let cases: &[(u32, u32, u64)] = &[
+        (40, 8, 0x0000_FFFF_FFFF_FF00),
+        (32, 8, 0x0000_00FF_FFFF_FF00),
+        (0, 5, 0),
+        (1, 63, 0x8000_0000_0000_0000),
+        (32, 0, 0x0000_0000_FFFF_FFFF),
+        (32, 32, 0xFFFF_FFFF_0000_0000),
+        (63, 0, 0x7FFF_FFFF_FFFF_FFFF),
+        (4, 0x80 | 2, 0x0000_0000_0000_003C), // only bits 5:0 count
+    ];
+    for &(width, off, want) in cases {
+        let inputs = [[width, off, 0, 0]];
+        run_cases(&lo, &inputs, |backend, _, _, got| {
+            assert_eq!(got, want as u32, "{backend}: s_bfm_b64({width}, {off}) low = {got:#010x}");
+        });
+        run_cases(&hi, &inputs, |backend, _, _, got| {
+            assert_eq!(
+                got,
+                (want >> 32) as u32,
+                "{backend}: s_bfm_b64({width}, {off}) high = {got:#010x}",
+            );
+        });
+        // SCC keeps the compare's value whether or not the mask is empty.
+        for s3 in [0u32, 1] {
+            run_cases(&scc, &[[width, off, 0, s3]], |backend, _, _, got| {
+                assert_eq!(got, s3, "{backend}: s_bfm_b64({width}, {off}) changed SCC {s3} to {got}");
+            });
+        }
+    }
+}
+
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
