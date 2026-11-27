@@ -151,6 +151,25 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// The `dx.op.*` declarations made so far: name, signature, attributes,
+    /// the function and its opcode constant. A program repeats the same few
+    /// operations, and declaring one costs a `format!`, a signature type and
+    /// four hashed lookups.
+    op_decls: Vec<OpDecl>,
+}
+
+/// The `dx.op` declarations kept: a program uses tens, and the scan of a
+/// declaration the cache dropped costs less than the declaration.
+const OP_DECLS: usize = 48;
+
+struct OpDecl {
+    name: String,
+    attr: Attr,
+    ret: Ty,
+    args: Vec<Ty>,
+    opcode: u32,
+    f: V,
+    code: V,
 }
 
 impl Shader {
@@ -213,6 +232,7 @@ impl Shader {
             lds: None,
             main,
             entry,
+            op_decls: Vec::new(),
         }
     }
 
@@ -238,24 +258,63 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        let mut params = vec![self.t.i32];
-        params.extend(args.iter().map(|&a| self.m.type_of(a)));
-        let fty = self.m.func_ty(ret, params);
-        self.m.ptr(fty);
-        let f = self
-            .m
-            .function(&format!("dx.op.{name}"), fty, Some(attr), false);
-        let mut all = vec![self.m.i32(opcode)];
-        all.extend(args);
+        let declared = self.op_decls.iter().position(|d| {
+            d.name == name
+                && d.attr == attr
+                && d.ret == ret
+                && d.opcode == opcode
+                && d.args.len() == args.len()
+                && d.args
+                    .iter()
+                    .zip(args)
+                    .all(|(&t, &a)| t == self.m.type_of(a))
+        });
+        let (f, code) = match declared {
+            Some(i) => {
+                // The hot operations sit at the front, where the next scan
+                // starts.
+                self.op_decls[..=i].rotate_right(1);
+                (self.op_decls[0].f, self.op_decls[0].code)
+            }
+            None => {
+                let mut params = Vec::with_capacity(1 + args.len());
+                params.push(self.t.i32);
+                let types: Vec<Ty> = args.iter().map(|&a| self.m.type_of(a)).collect();
+                params.extend_from_slice(&types);
+                let fty = self.m.func_ty(ret, params);
+                self.m.ptr(fty);
+                let f = self
+                    .m
+                    .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+                let code = self.m.i32(opcode);
+                let decl = OpDecl {
+                    name: name.into(),
+                    attr,
+                    ret,
+                    args: types,
+                    opcode,
+                    f,
+                    code,
+                };
+                if self.op_decls.len() == OP_DECLS {
+                    self.op_decls.pop();
+                }
+                self.op_decls.insert(0, decl);
+                (f, code)
+            }
+        };
+        let mut all = Vec::with_capacity(1 + args.len());
+        all.push(code);
+        all.extend_from_slice(args);
         let choice = self
             .sampler_choices
             .iter()
             .copied()
             .find(|&(a, _, _)| args.contains(&a));
-        let r = self.m.call(block, f, all.clone());
         let Some((a, b, cond)) = choice else {
-            return r;
+            return self.m.call(block, f, all);
         };
+        let r = self.m.call(block, f, all.clone());
         for x in &mut all {
             if *x == a {
                 *x = b;
