@@ -678,6 +678,12 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         1..=2 => (16, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
         })),
+        67 => (4, Box::new(move |b| {
+            let v = u32_at(b, 0);
+            // One exponent with bias 15 scales the three 9-bit fractions.
+            let scale = 2f32.powi((v >> 27) as i32 - 15 - 9);
+            [0, 9, 18].map(|shift| ((v >> shift) & 0x1ff) as f32 * scale)
+        })),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
         35..=36 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         37..=38 => (4, Box::new(move |b| [f32::from(i16_at(b, 0)), f32::from(i16_at(b, 1)), 0.0])),
@@ -914,6 +920,29 @@ static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
+}
+
+#[cfg(test)]
+mod rgb9e5_tests {
+    #[test]
+    fn rgb9e5_target_decodes_pitched_rows_with_shared_exponents() {
+        use super::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, to_rgba};
+
+        let pitch = 256;
+        let mut rows = [0xff; 256 + 4];
+        // The same RGB mantissas yield (1, 0.5, 0.25) and (2, 1, 0.5).
+        rows[..4].copy_from_slice(&0x8101_0100u32.to_le_bytes());
+        rows[pitch..].copy_from_slice(&0x8901_0100u32.to_le_bytes());
+        assert_eq!(
+            to_rgba(DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32, 1, 2, pitch, &rows),
+            Some(vec![127, 63, 31, 255, 255, 127, 63, 255]),
+        );
+        let rgba = to_rgba(DXGI_FORMAT_R32_UINT.0 as u32, 1, 2, pitch, &rows).unwrap();
+        assert_eq!(rgba.len(), 8);
+        for &pixel in rgba.as_chunks::<4>().0 {
+            assert_eq!(pixel, [pixel[0], pixel[0], pixel[0], 255]);
+        }
+    }
 }
 
 #[cfg(test)]
