@@ -1181,7 +1181,11 @@ mod tests {
             }
             s.m.terminate(b, Term::Ret);
             let case = format!("{load}, ROV={rov}, store={store}, read={read}");
-            assert_eq!(s.m.written_calls(&format!("dx.op.{load}")), usize::from(read), "{case}");
+            assert_eq!(
+                s.m.written_calls(&format!("dx.op.{load}")).count(),
+                usize::from(read),
+                "{case}"
+            );
             let mut dxil = s.finish();
             let container = Container::parse(&dxil).unwrap();
             let part = container.part(FourCC::SFI0).unwrap();

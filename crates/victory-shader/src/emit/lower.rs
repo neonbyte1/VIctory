@@ -1451,7 +1451,7 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(all(test, windows))]
-            wave_ballot_calls: self.s.m.written_calls("dx.op.waveActiveBallot"),
+            wave_ballot_calls: self.s.m.written_calls("dx.op.waveActiveBallot").count(),
             #[cfg(test)]
             rovs: self.s.m.uses().rovs,
             #[cfg(test)]
@@ -1459,7 +1459,7 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
-            wave_ballots: self.s.m.written_calls("dx.op.waveActiveBallot") as u32,
+            wave_ballots: self.s.m.written_calls("dx.op.waveActiveBallot").count() as u32,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
