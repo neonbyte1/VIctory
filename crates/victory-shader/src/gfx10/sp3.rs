@@ -136,6 +136,14 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             soffset,
             cache,
         } => {
+            let off = match (soffset, offset) {
+                (Operand::Scalar { code: NULL, .. }, 0) => soffset.to_string(),
+                (Operand::Scalar { code: NULL, .. }, _) => {
+                    format!("0x{:06x}", offset & 0x1F_FFFF)
+                }
+                (_, 0) => soffset.to_string(),
+                _ => format!("{soffset} offset:0x{:06x}", offset & 0x1F_FFFF),
+            };
             if let Some(data) = data {
                 let data = match (name, data) {
                     ("s_atc_probe" | "s_atc_probe_buffer", Operand::Literal(imm)) => {
@@ -143,19 +151,14 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                     }
                     _ => data.to_string(),
                 };
-                let off = match (soffset, offset) {
-                    (Operand::Scalar { code: NULL, .. }, 0) => soffset.to_string(),
-                    (Operand::Scalar { code: NULL, .. }, _) => {
-                        format!("0x{:06x}", offset & 0x1F_FFFF)
-                    }
-                    (_, 0) => soffset.to_string(),
-                    _ => format!("{soffset} offset:0x{:06x}", offset & 0x1F_FFFF),
-                };
                 out = match name {
                     // The data is a counter or the wave ID; these have no address.
                     "s_memtime" | "s_memrealtime" | "s_get_waveid_in_workgroup" => data.to_string(),
                     _ => format!("{data}, {base}, {off}"),
                 };
+            } else if name.starts_with("s_dcache_discard") {
+                // No data, but the address of what is discarded.
+                out = format!("{base}, {off}");
             }
             flags(&mut out, cache, false);
         }
@@ -333,7 +336,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                 0..=7 => format!("mrt{target}"),
                 8 => "mrtz".into(),
                 9 => "null".into(),
-                12..=15 => format!("pos{}", target - 12),
+                12..=16 => format!("pos{}", target - 12),
                 20 => "prim".into(),
                 32..=63 => format!("param{}", target - 32),
                 _ => format!("<target {target}>"),
@@ -801,6 +804,27 @@ mod tests {
             assert_eq!(got_base, base, "{words:08x?}");
             assert_eq!(cache, Cache::default(), "{words:08x?}");
         }
+    }
+
+    #[test]
+    fn discards_name_their_address_and_position_four_its_target() {
+        // Encodings from LLVM's llvm/test/MC/AMDGPU/gfx10_asm_smem.s and
+        // exp-gfx10.s. LLVM spells the first offset `0x64`.
+        let got = [
+            one(&[0xF4A0_0001, 0xFA00_0064], true),
+            one(&[0xF4A0_0001, 0x0400_0000], true),
+            one(&[0xF4A4_0001, 0x0E00_0064], true),
+            one(&[0xF800_010F, 0x0102_0304], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "s_dcache_discard s[2:3], 0x000064",
+                "s_dcache_discard s[2:3], s2",
+                "s_dcache_discard_x2 s[2:3], s7 offset:0x000064",
+                "exp pos4, v4, v3, v2, v1",
+            ]
+        );
     }
 
     #[test]
