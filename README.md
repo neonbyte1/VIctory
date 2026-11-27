@@ -86,6 +86,10 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+With a GPU, `cargo test -p victory-shader --lib fuzz_tests -- --ignored --nocapture`
+runs each lowered VALU instruction on every adapter and on WARP and reports
+where they disagree (`VICTORY_FUZZ_OUT=report.md` writes the report).
+
 Run the title:
 
 ```powershell
