@@ -731,9 +731,18 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// elsewhere: gives write access back where we guarded them and marks them
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
-fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+/// As [`changed`], but only the pages themselves: a mapping that still shows
+/// the same physical pages shows what it did and is not marked. This is what
+/// a remap needs - what it showed is gone, the same pages are not (#2414).
+fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded = g.protected.range(first..last).next().is_some();
-    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    mark_changed(g, first, last, save);
+    open_guarded(g, first, last);
+    guarded
+}
+
+fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+    let guarded = g.protected.range(first..last).next().is_some();    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
@@ -852,8 +861,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     REMAP_EPOCH.fetch_add(1, Ordering::Release);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
-    // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    // What it showed is gone already: nothing to keep. Only these pages: a
+    // mapping that still shows the same physical pages shows what it did, and
+    // its tracker (armed for a marked write, say) keeps it (#2414).
+    changed_here(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1527,5 +1538,32 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// A page the runtime remaps stops being current where it was mapped, but
+    /// a mapping that still shows the same physical page does not (#2414): its
+    /// tracker keeps what it had, so a marked copy-back there is not dropped
+    /// with "changed, nothing saved".
+    #[test]
+    fn remapping_one_mapping_leaves_the_other_unchanged() {
+        let a = pool(1);
+        let b = pool(1);
+        let Some(tracked) = track(a, PAGE, true) else {
+            free(a);
+            free(b);
+            return;
+        };
+        // Taken by a refresh, then armed for a marked write.
+        tracked.taken(&[a / PAGE]);
+        tracked.arm(a, a + PAGE);
+        // `b` shows the same physical page; the runtime remaps it.
+        title_memory_aliased(a, &[b]);
+        title_memory_remapped(b, PAGE);
+        assert!(
+            !tracked.changed(a / PAGE),
+            "the other mapping still shows what it did"
+        );
+        free(a);
+        free(b);
     }
 }
