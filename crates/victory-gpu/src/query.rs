@@ -439,7 +439,7 @@ mod tests {
             use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
             let host = crate::host::host().unwrap();
             let list = crate::list::host_list(list).unwrap();
-            let rtv = host.rtv(&self.target, None);
+            let rtv = host.rtv(Some(&self.target), None);
             let size = Self::SIZE as i32;
             // Cut away: a rectangle beside the target (the driver here does not
             // always cut everything for an empty one).

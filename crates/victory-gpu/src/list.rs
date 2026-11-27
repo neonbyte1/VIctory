@@ -2619,7 +2619,7 @@ mod tests {
             );
             let _ = host.log_messages();
 
-            let source_rtv = host.rtv(&src_tex, None);
+            let source_rtv = host.rtv(Some(&src_tex), None);
             for y in 0..4 {
                 for x in 0..4 {
                     let rect = RECT {
@@ -2666,7 +2666,7 @@ mod tests {
                     ViewDimension: dimension,
                     Anonymous: view,
                 };
-                let rtv = host.rtv(&dst_tex, Some(&desc));
+                let rtv = host.rtv(Some(&dst_tex), Some(&desc));
                 // SAFETY: the view is live and its subresource begins in RENDER_TARGET.
                 unsafe { recorded.list.ClearRenderTargetView(rtv, &color, None) };
             }
@@ -3607,7 +3607,7 @@ mod tests {
             // SAFETY: an open host list and live texture in RENDER_TARGET.
             unsafe {
                 host_list(list1).unwrap().list.ClearRenderTargetView(
-                    host.rtv(&host_tex, None),
+                    host.rtv(Some(&host_tex), None),
                     &unorm([255, 128, 64, 255]),
                     None,
                 );
