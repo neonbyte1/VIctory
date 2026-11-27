@@ -15,7 +15,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
@@ -95,6 +95,10 @@ struct Port {
     mode: Mode,
     tasks: Mutex<VecDeque<Task>>,
     ready: Condvar,
+    /// The queues using the port, each with the port it is to that queue:
+    /// its own, and composite queues made from it (one may use it as both
+    /// of its ports). Each one's monitors hear of every task submitted here.
+    attached: Mutex<Vec<(Weak<Queue>, u32)>>,
 }
 
 impl Port {
@@ -103,6 +107,7 @@ impl Port {
             mode,
             tasks: Mutex::default(),
             ready: Condvar::new(),
+            attached: Mutex::default(),
         });
         if mode == Mode::Serialized {
             // The worker ends once it holds the last reference (every queue
@@ -208,12 +213,19 @@ pub struct Queue {
 
 impl Queue {
     fn new(ports: [Arc<Port>; 2]) -> Arc<Queue> {
-        Arc::new(Queue {
+        let queue = Arc::new(Queue {
             ports,
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
             delayed: Mutex::default(),
-        })
+        });
+        for (kind, port) in (WORK..).zip(&queue.ports) {
+            let mut attached = lock(&port.attached);
+            // Queues closed since are forgotten here.
+            attached.retain(|(q, _)| q.strong_count() > 0);
+            attached.push((Arc::downgrade(&queue), kind));
+        }
+        queue
     }
 
     fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, task: Task) -> HRESULT {
@@ -250,14 +262,37 @@ impl Queue {
         S_OK
     }
 
+    /// Submits `task` to one of the queue's ports and tells the monitors of
+    /// every queue using that port, as the public reference does (a port's
+    /// attached contexts each hear of an item queued to it): a composite
+    /// queue's task wakes a dispatcher driven by the other queue's monitor.
+    /// An immediate port runs the task after the monitors heard of it.
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
-        // Copied out: a monitor may unregister itself.
-        let monitors = lock(&self.monitors).clone();
-        for (_, context, callback) in monitors {
-            // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
-            let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
-            callback(context as *mut c_void, Arc::as_ptr(self), port);
+        let target = &self.ports[port as usize];
+        if target.mode == Mode::Immediate {
+            Self::tell_monitors(target);
+            task.run(false);
+        } else {
+            target.submit(task);
+            Self::tell_monitors(target);
+        }
+    }
+
+    /// Calls the monitors of each queue using `port`, with that queue's
+    /// handle and the port it is to that queue.
+    fn tell_monitors(port: &Port) {
+        // Copied out: a monitor may register, unregister or close a queue.
+        let queues: Vec<(Arc<Queue>, u32)> = lock(&port.attached)
+            .iter()
+            .filter_map(|(queue, kind)| Some((queue.upgrade()?, *kind)))
+            .collect();
+        for (queue, kind) in queues {
+            let monitors = lock(&queue.monitors).clone();
+            for (_, context, callback) in monitors {
+                // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
+                let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
+                callback(context as *mut c_void, Arc::as_ptr(&queue), kind);
+            }
         }
     }
 }
@@ -1345,6 +1380,73 @@ mod tests {
         assert_eq!(RAN.load(Ordering::SeqCst), 5);
         assert!(!slot::<Dispatch>(0x80)(this, q, COMPLETION, 0));
         slot::<Close>(0x88)(this, q);
+    }
+
+    /// The documented way to drive a manual queue is a monitor that wakes
+    /// its dispatcher, and the documented way for a library to share it a
+    /// composite queue made of its ports. A task the library submits must
+    /// reach the queue's monitor (as in the public reference, every queue
+    /// using a port hears of what is queued to it), or the dispatcher
+    /// sleeps through it.
+    #[test]
+    fn monitors_hear_of_tasks_submitted_through_a_composite_queue() {
+        static HEARD: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+        extern "system" fn heard(_: *mut c_void, queue: *const Queue, port: u32) {
+            lock(&HEARD).push((queue as usize, port));
+        }
+        extern "system" fn nothing(_: *mut c_void, _: bool) {}
+        let mut owner = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut owner), S_OK);
+        let mut work = std::ptr::null();
+        assert_eq!(XTaskQueueGetPort(owner, WORK, &mut work), S_OK);
+        // Work and completions of the library's calls both go to the
+        // owner's work port.
+        let mut derived = std::ptr::null();
+        assert_eq!(XTaskQueueCreateComposite(work, work, &mut derived), S_OK);
+        let (none, mut token) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            XTaskQueueRegisterMonitor(owner, none, Some(heard), &mut token),
+            S_OK
+        );
+        let hr = XTaskQueueSubmitDelayedCallback(derived, COMPLETION, 0, none, Some(nothing));
+        assert_eq!(hr, S_OK);
+        assert_eq!(*lock(&HEARD), [(owner as usize, WORK)]);
+        assert!(
+            XTaskQueueDispatch(owner, WORK, 0),
+            "queued on the owner's port"
+        );
+        XTaskQueueUnregisterMonitor(owner, token);
+        XTaskQueueCloseHandle(derived);
+        XTaskQueueCloseHandle(owner);
+    }
+
+    /// An immediate port runs a task after the monitors have heard of it,
+    /// as the public reference does (it notifies, then drains the item).
+    #[test]
+    fn monitors_hear_of_an_immediate_task_before_it_runs() {
+        static RAN_YET: AtomicBool = AtomicBool::new(false);
+        static HEARD_BEFORE: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+        extern "system" fn heard(_: *mut c_void, _: *const Queue, _: u32) {
+            lock(&HEARD_BEFORE).push(!RAN_YET.load(Ordering::SeqCst));
+        }
+        extern "system" fn run(_: *mut c_void, _: bool) {
+            RAN_YET.store(true, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(3, 3, &mut q), S_OK);
+        let (none, mut token) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            XTaskQueueRegisterMonitor(q, none, Some(heard), &mut token),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(run)),
+            S_OK
+        );
+        assert!(RAN_YET.load(Ordering::SeqCst), "immediate: ran in the call");
+        assert_eq!(*lock(&HEARD_BEFORE), [true]);
+        XTaskQueueUnregisterMonitor(q, token);
+        XTaskQueueCloseHandle(q);
     }
 
     /// A provider that schedules its work and returns a u64 result.
