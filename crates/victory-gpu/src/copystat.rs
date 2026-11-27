@@ -199,12 +199,11 @@ pub(crate) enum C {
     /// Submissions prepared while an earlier one was still in flight.
     PreparedOverlapping,
     /// Submissions whose preparing first completed those in flight (any of
-    /// them, `Host::submit`): for a barrier among them, being one, title
-    /// writes at submission, the upload list, a list run again, the
-    /// eviction pass, overlapping declared ranges.
+    /// them, `Host::submit`): for a barrier among them, being one, the
+    /// upload list, a list run again, the eviction pass, overlapping
+    /// declared ranges.
     WaitBarrier,
     WaitAlone,
-    WaitTitleWrites,
     WaitUploads,
     WaitListAgain,
     WaitEviction,
@@ -212,12 +211,14 @@ pub(crate) enum C {
     /// Completions during a submission's preparing (`Host::settle`), by
     /// what it was about to read: pages the title changed under ranges of
     /// the same copy, another copy of written memory, bottom-of-pipe
-    /// writes, title memory read directly, textures; and the time.
+    /// writes, title memory read directly, textures, title copies at
+    /// submission; and the time.
     SettleSame,
     SettleAlias,
     SettleLabel,
     SettleFill,
     SettleTexture,
+    SettleCopy,
     SettleUs,
 }
 const COUNTERS: usize = 127;
@@ -523,14 +524,13 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "  light submissions per frame: {:.1} prepared with an earlier one in flight; waited for those in flight \
-         before preparing: {:.1} behind a barrier, {:.1} being one, {:.1} title writes at submission, {:.1} \
+         before preparing: {:.1} behind a barrier, {:.1} being one, {:.1} \
          uploads, {:.1} a list again, {:.1} eviction, {:.1} overlapping declared ranges; completed while \
          preparing: {:.1} changed pages under their ranges, {:.1} other copies, {:.1} bottom-of-pipe writes, \
-         {:.1} title reads, {:.1} textures ({:.1} ms)",
+         {:.1} title reads, {:.1} textures, {:.1} title copies ({:.1} ms)",
         c[C::PreparedOverlapping as usize],
         c[C::WaitBarrier as usize],
         c[C::WaitAlone as usize],
-        c[C::WaitTitleWrites as usize],
         c[C::WaitUploads as usize],
         c[C::WaitListAgain as usize],
         c[C::WaitEviction as usize],
@@ -540,6 +540,7 @@ pub(crate) fn log(frames: f64) {
         c[C::SettleLabel as usize],
         c[C::SettleFill as usize],
         c[C::SettleTexture as usize],
+        c[C::SettleCopy as usize],
         ms(c[C::SettleUs as usize]),
     );
     let mut snapshots: Vec<((u64, u64), u64)> =

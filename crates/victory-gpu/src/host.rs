@@ -1052,11 +1052,12 @@ enum Step {
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Copy` or `Run`
-    /// intervenes.
+    /// once per submission, whichever lists ask, until a `Copy` or
+    /// `CopyMemory` intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    /// A copy between title memory addresses (destination, source, bytes),
+    /// made only where both are committed (`CopyMemoryToMemoryX`).
+    CopyMemory(usize, usize, usize),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy;
@@ -1065,7 +1066,7 @@ enum Step {
     /// when such a list misses, `crate::memory::withholding`).
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    /// whichever lists sample it, until a `Copy` or `CopyMemory` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
@@ -1190,6 +1191,10 @@ pub(crate) enum Settled {
     Fill,
     /// A texture over memory it writes (`crate::bindless::uploads`).
     Texture,
+    /// A title memory copy at submission (`Step::Copy`, `Step::CopyMemory`)
+    /// whose source or destination it writes: on the GPU's timeline the
+    /// copy comes after it, so it reads and overwrites its results.
+    Copy,
 }
 
 /// Tests: the `settle` of a preparing with nothing in flight, never asked.
@@ -1676,9 +1681,7 @@ impl Host {
         // - barriers ([`barrier`]): their completion writes title memory
         //   nobody declared, or takes marks shared with later submissions;
         // - all of them before a barrier (its checks and page tables see
-        //   every earlier result), and before title copies and work that
-        //   write title memory on the CPU for the GPU's timeline (those
-        //   before may still read what they overwrite);
+        //   every earlier result);
         // - those declaring a range of a copy this one declares too, unless
         //   both mark ([`declared_overlap`]);
         // - the last upload list before another; a host list's last run
@@ -1687,8 +1690,9 @@ impl Host {
         //   mark reads, for the eviction pass to clear the marks (not before a
         //   present's: it would wait for the frame it shows).
         // The rest stay in flight: what this one's preparing reads of what
-        // they write is waited for where it is read ([`Settled`]).
-        let writes = runs.iter().any(|l| l.writes_at_submission());
+        // they write, or overwrites (title copies at submission), is waited
+        // for where it is touched ([`Settled`]): no GPU work reads title
+        // memory itself, only copies taken when it was prepared.
         let uploading = runs.iter().any(|l| l.uploads_at_submission());
         let reasons = runs.iter().fold(0u8, |r, l| r | l.heavy_reasons());
         let marking = runs.iter().any(|l| l.marks.load(Ordering::Relaxed));
@@ -1698,11 +1702,10 @@ impl Host {
         let mut submitted = self.complete_while(self.lock_submitted(), |r| {
             let bits = u8::from(r.barrier)
                 | u8::from(alone) << 1
-                | u8::from(writes) << 2
-                | u8::from(uploading && r.uploads) << 3
-                | u8::from(r.lists.iter().any(|held| lists.iter().any(|l| std::sync::Arc::ptr_eq(held, l)))) << 4
-                | u8::from(queue != 0 && r.marks && crate::resource::eviction_due()) << 5
-                | u8::from(declared_overlap(&declared, &r.declared)) << 6;
+                | u8::from(uploading && r.uploads) << 2
+                | u8::from(r.lists.iter().any(|held| lists.iter().any(|l| std::sync::Arc::ptr_eq(held, l)))) << 3
+                | u8::from(queue != 0 && r.marks && crate::resource::eviction_due()) << 4
+                | u8::from(declared_overlap(&declared, &r.declared)) << 5;
             why.set(why.get() | bits);
             bits != 0
         });
@@ -1712,7 +1715,6 @@ impl Host {
             for (bit, c) in [
                 C::WaitBarrier,
                 C::WaitAlone,
-                C::WaitTitleWrites,
                 C::WaitUploads,
                 C::WaitListAgain,
                 C::WaitEviction,
@@ -1927,6 +1929,7 @@ impl Host {
                     Settled::Label => C::SettleLabel,
                     Settled::Fill => C::SettleFill,
                     Settled::Texture => C::SettleTexture,
+                    Settled::Copy => C::SettleCopy,
                 },
                 1,
             );
@@ -2946,16 +2949,6 @@ impl HostList {
         declared.chain(labels).collect()
     }
 
-    /// Whether the list's steps write title memory when it is submitted
-    /// (title buffer copies, work), which the GPU's timeline orders after
-    /// the submissions before.
-    fn writes_at_submission(&self) -> bool {
-        self.deferred()
-            .copies
-            .iter()
-            .any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))
-    }
-
     /// Whether a submission of the list brings textures up to date with
     /// the upload list (`crate::bindless::uploads`).
     fn uploads_at_submission(&self) -> bool {
@@ -3397,11 +3390,13 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+    /// Copies `len` bytes of title memory from `src` to `dst` when the list
+    /// is submitted, in order with its other copies, where both are
+    /// committed (refreshes after it copy again).
+    pub(crate) fn defer_copy_memory(&self, dst: *mut u8, src: *const u8, len: usize) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::CopyMemory(dst as usize, src as usize, len));
+        deferred.refreshed.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -3435,8 +3430,8 @@ impl HostList {
                 started,
                 match step {
                     Step::Refresh(..) => C::StepRefreshUs,
-                    Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
-                    Step::Run(_) | Step::Host(_) => C::StepWorkUs,
+                    Step::Copy(..) | Step::CopyMemory(..) | Step::Fill(..) => C::StepCopyUs,
+                    Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
@@ -3444,14 +3439,28 @@ impl HostList {
                 },
             );
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                &Step::Copy(dst, src, len) | &Step::CopyMemory(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written(owner, settle);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    let crossed = [(dst, len), (src, len)]
+                        .into_iter()
+                        .filter_map(|(at, n)| crate::shadow::crossing(at, at + n, 0).map(|c| c.0))
+                        .max();
+                    if let Some(o) = crossed {
+                        settle(o, Settled::Copy);
+                    }
+                    if matches!(step, Step::Copy(..)) {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    } else if crate::texture::committed(src as *const u8, len)
+                        && crate::texture::committed(dst as *const u8, len)
+                    {
+                        // SAFETY: both ranges are committed title memory.
+                        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -3475,10 +3484,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written(owner, settle);
-                    }
+                Step::Host(work) => {
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
@@ -6129,6 +6135,37 @@ mod light {
             [(ELSEWHERE, "Alias".to_owned()), (ELSEWHERE, "Label".to_owned()), (ELSEWHERE, "Same".to_owned())]
         );
         release(p, Some(a));
+    }
+
+    /// Title copies at submission complete a submission in flight first only
+    /// where their source or destination meets what it writes (its declared
+    /// ranges, through any copy, or its bottom-of-pipe writes); others run
+    /// with it in flight. Both kinds of copy.
+    #[test]
+    fn title_copies_wait_only_for_writers_of_their_ranges() {
+        let Some(host) = host() else { return };
+        const ELSEWHERE: u64 = u64::MAX / 2 + 1;
+        let p = crate::watch::tests::pool(4);
+        let settled = std::cell::RefCell::new(Vec::new());
+        let mut settle = |owner: u64, why: Settled| {
+            settled.borrow_mut().push((owner, format!("{why:?}")));
+            crate::shadow::land(owner);
+        };
+        let list = host.new_list().unwrap();
+        // Page 0 → page 1 meets nothing in flight; page 2 → page 3 reads what
+        // it writes; page 1 → page 0 overwrites its bottom-of-pipe write.
+        list.defer_copy((p + PAGE) as *mut u8, p as *const u8, 64);
+        list.defer_copy_memory((p + 3 * PAGE) as *mut u8, (p + 2 * PAGE) as *const u8, 64);
+        list.defer_copy(p as *mut u8, (p + PAGE) as *const u8, 64);
+        crate::shadow::fly(ELSEWHERE, vec![(p + 2 * PAGE + 32, p + 2 * PAGE + 40, 1)]);
+        crate::shadow::fly(ELSEWHERE + 1, vec![(p + 8, p + 16, crate::shadow::LABEL)]);
+        list.run_deferred(&mut Batch::default(), 1, &mut settle);
+        assert_eq!(
+            settled.into_inner(),
+            [(ELSEWHERE, "Copy".to_owned()), (ELSEWHERE + 1, "Copy".to_owned())]
+        );
+        list.close();
+        crate::watch::tests::free(p);
     }
 }
 
