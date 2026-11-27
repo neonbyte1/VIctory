@@ -2819,6 +2819,22 @@ fn scalar_probes() -> Vec<Probe> {
             move |i| vec![if f(i[0], i[1]) { i[2] } else { i[3] }],
         ));
     }
+    // s_bitcmp0/1_b32: SCC is whether bit src1[4:0] of src0 is clear / set.
+    let bits = pairs(&U32_EDGES[..24], &[0, 1, 16, 31, 32, 33, 0xFFFF_FFE1]);
+    for (op, set) in [(0x0Cu16, false), (0x0D, true)] {
+        p.push(scalar(
+            [
+                sopc(op, s(16), s(17)),
+                sop2(0x0A, 20, s(18), s(19)),
+                vop1(0x01, 5, s(20)),
+            ],
+            bits.clone(),
+            move |i| {
+                let bit = i[0] >> (i[1] & 31) & 1 != 0;
+                vec![if bit == set { i[2] } else { i[3] }]
+            },
+        ));
+    }
     // SCC as a vector operand (`src_scc`).
     p.push(scalar(
         [sopc(0x0A, s(16), s(17)), vop1(0x01, 5, SRC_SCC)],
