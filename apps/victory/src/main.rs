@@ -248,7 +248,10 @@ fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
 
 fn show_config() -> Result<()> {
     let cfg = victory_core::Config::load()?;
-    let status = |p: &Option<PathBuf>| match p {
+    let status = |p: &Option<PathBuf>, directory: bool| match p {
+        Some(p) if directory && p.exists() && !p.is_dir() => {
+            format!("{}  (not a directory)", p.display())
+        }
         Some(p) if p.exists() => format!("{}", p.display()),
         Some(p) => format!("{}  (does not exist)", p.display()),
         None => "(not set)".to_owned(),
@@ -259,12 +262,12 @@ fn show_config() -> Result<()> {
             .as_ref()
             .map_or("(none)".into(), |p| p.display().to_string())
     );
-    println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("game_dir    : {}", status(&cfg.game_dir, true));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
-    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
+    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir, true));
     for t in &cfg.test_titles {
-        println!("test_title  : {}", status(&Some(t.clone())));
+        println!("test_title  : {}", status(&Some(t.clone()), false));
     }
     check_policy(&cfg)
 }
