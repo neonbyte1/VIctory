@@ -3887,8 +3887,16 @@ impl Host {
         }
         if (p.width, p.height, p.format) != (width, height, format) {
             let resized = retry.attempt(Instant::now(), || {
-                // SAFETY: no back buffer is held; every submission was waited for.
+                // Present queues work after the copy list's fence. Wait for it
+                // before DXGI releases the old back buffers during the resize.
+                let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                *submitted += 1;
+                // SAFETY: the queue and fence belong to this host. A null
+                // event waits synchronously for the signalled value.
                 unsafe {
+                    self.queue.Signal(&self.fence, *submitted)?;
+                    self.fence.SetEventOnCompletion(*submitted, HANDLE::default())?;
+                    drop(submitted);
                     p.swap_chain.ResizeBuffers(
                         BUFFERS,
                         width,
