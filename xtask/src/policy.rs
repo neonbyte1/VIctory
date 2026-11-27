@@ -111,7 +111,7 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
             "diff",
             "--cached",
             "--name-only",
-            "--diff-filter=ACMR",
+            "--diff-filter=ACMRT",
             "-z",
         ])?
         .context("--staged needs a git repository");
