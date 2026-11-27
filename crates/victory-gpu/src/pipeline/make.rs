@@ -293,12 +293,10 @@ fn queue(p: Arc<Pending>, now: bool) {
 /// A worker: makes queued pipelines, those draws wait for first, and saves
 /// the cache when idle (first uses of pipelines made before).
 fn work() {
-    // Below the title's own threads (loading, recording).
-    // SAFETY: a plain call on our own thread.
-    unsafe {
-        use windows::Win32::System::Threading::*;
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
+    // At the title's own priority: below it, the world's busy threads
+    // starved the workers (236 pipelines a minute at the start screen, 7 a
+    // minute in the world on a 16-thread laptop), and draws stay dropped
+    // until their pipelines exist.
     let (lock, work) = &QUEUES;
     loop {
         let p = {
