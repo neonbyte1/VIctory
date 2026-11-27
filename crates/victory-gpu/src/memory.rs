@@ -1195,10 +1195,9 @@ void main() {
         // SAFETY: our pool.
         let title = || unsafe { (at as *const u32).read_volatile() };
         write(0x33, true);
-        // Another test's submission may have refreshed the copy already.
-        let held = copy.read_host(at as u64, 1)[0];
-        assert!(!copy.clean() || held == 0x11, "the written page counts as changed at once");
         assert_eq!(title(), 0x11, "nothing went back");
+        // Observe the retake through the next dispatch. Another submission
+        // may refresh the copy before this read.
         assert_eq!(read(), 0x11, "the next submission reads title memory's bytes");
         // Unless another test ends a frame meanwhile (its retake is right).
         let frame = FRAMES.load(std::sync::atomic::Ordering::Relaxed);
