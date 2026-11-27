@@ -181,6 +181,19 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+## Experimental memory option
+
+Set `VICTORY_TRIM_IDLE_SHADERS=1` before launch to periodically remove
+shader-cache entries that are no longer referenced by any pipeline or
+worker. A sweep runs after every 256 new shader-cache entries, not on cache
+hits. Live shader objects are retained; the disk shader cache is unchanged.
+
+This is opt-in: the default keeps shader objects for the entire run.
+Revisiting an evicted shader can require additional cache reads or
+translation (including previously failed translations). The option reduces
+retained CPU-side shader data when idle entries exist; it does not cap
+overall memory use or GPU VRAM, and no title-level savings are established.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

@@ -73,18 +73,66 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+/// Optional idle-cache sweeps are amortized over new containers, not hits.
+const SHADER_TRIM_INTERVAL: usize = 256;
+
+#[derive(Default)]
+struct ShaderCache {
+    entries: HashMap<[u8; 32], Arc<Shader>>,
+    misses_since_trim: usize,
+}
+
+impl ShaderCache {
+    fn get(
+        &mut self,
+        full: blake3::Hash,
+        stage: &'static str,
+        bytes: &[u8],
+        trim: bool,
+    ) -> Arc<Shader> {
+        if let Some(shader) = self.entries.get(full.as_bytes()) {
+            return shader.clone();
+        }
+        if trim {
+            self.misses_since_trim += 1;
+            if self.misses_since_trim == SHADER_TRIM_INTERVAL {
+                self.misses_since_trim = 0;
+                self.trim_idle();
+            }
+        }
+        let shader = Arc::new(Shader::new(stage, bytes));
+        self.entries.insert(*full.as_bytes(), shader.clone());
+        shader
+    }
+
+    /// Keep all containers still owned by a pipeline, worker or other user.
+    /// The cache lock prevents another lookup from racing with eviction.
+    fn trim_idle(&mut self) {
+        let before = self.entries.len();
+        self.entries.retain(|_, shader| Arc::strong_count(shader) > 1);
+        let removed = before - self.entries.len();
+        if removed != 0 {
+            // Avoid retaining a large table after a substantial sweep.
+            if self.entries.capacity() > self.entries.len().saturating_mul(2).max(256) {
+                self.entries.shrink_to_fit();
+            }
+            tracing::debug!(removed, remaining = self.entries.len(), "idle shaders trimmed");
+        }
+    }
+}
+
+/// Containers shared by full content hash. By default they stay for the run.
+static SHADERS: Mutex<Option<ShaderCache>> = Mutex::new(None);
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+    static TRIM: OnceLock<bool> = OnceLock::new();
+    let trim = *TRIM.get_or_init(|| {
+        matches!(std::env::var("VICTORY_TRIM_IDLE_SHADERS").as_deref(), Ok("1"))
+    });
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
-        .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
-        .clone()
+    shaders.get_or_insert_with(ShaderCache::default).get(full, stage, bytes, trim)
 }
 
 impl Shader {
@@ -919,6 +967,61 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[test]
+    fn idle_shader_trim_preserves_live_identity() {
+        let mut cache = ShaderCache::default();
+        let live_hash = blake3::hash(b"live");
+        let idle_hash = blake3::hash(b"idle");
+        let live = cache.get(live_hash, "compute", b"live", true);
+        let idle = cache.get(idle_hash, "compute", b"idle", true);
+        let idle_weak = Arc::downgrade(&idle);
+        drop(idle);
+        cache.trim_idle();
+        assert!(idle_weak.upgrade().is_none());
+        assert!(!cache.entries.contains_key(idle_hash.as_bytes()));
+        assert!(Arc::ptr_eq(
+            &live,
+            &cache.get(live_hash, "compute", b"live", true)
+        ));
+        let recreated = cache.get(idle_hash, "compute", b"idle", true);
+        assert_eq!(recreated.container.as_slice(), b"idle");
+        assert_eq!(recreated.hash, idle_hash.to_hex()[..16]);
+    }
+
+    #[test]
+    fn idle_shader_trim_is_opt_in_and_amortized_over_misses() {
+        let mut cache = ShaderCache::default();
+        let old = blake3::hash(b"old");
+        drop(cache.get(old, "compute", b"old", false));
+        cache.misses_since_trim = SHADER_TRIM_INTERVAL - 1;
+        drop(cache.get(blake3::hash(b"disabled"), "compute", b"disabled", false));
+        assert!(cache.entries.contains_key(old.as_bytes()));
+        // A cache hit must not trigger a sweep.
+        drop(cache.get(old, "compute", b"old", true));
+        assert_eq!(cache.misses_since_trim, SHADER_TRIM_INTERVAL - 1);
+        assert!(cache.entries.contains_key(old.as_bytes()));
+        drop(cache.get(blake3::hash(b"new"), "compute", b"new", true));
+        assert_eq!(cache.misses_since_trim, 0);
+        assert!(!cache.entries.contains_key(old.as_bytes()));
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn idle_shader_trim_reduces_retained_container_bytes() {
+        let retained = |trim| {
+            let mut cache = ShaderCache::default();
+            let mut bytes = vec![0; 64 * 1024];
+            for index in 0..SHADER_TRIM_INTERVAL {
+                bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                drop(cache.get(blake3::hash(&bytes), "compute", &bytes, trim));
+            }
+            cache.entries.values().map(|shader| shader.container.len()).sum::<usize>()
+        };
+        // Synthetic payloads only; no shader translation or GPU is involved.
+        assert_eq!(retained(false), SHADER_TRIM_INTERVAL * 64 * 1024);
+        assert_eq!(retained(true), 64 * 1024);
     }
 
     #[test]
