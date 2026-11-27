@@ -2300,6 +2300,99 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn geometry_user_data_is_found_in_the_merged_layout() {
+        let r = track_words(
+            &[
+                0xBE82_0308, // s_mov_b32 s2, s8
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 0, 1)],
+            HwStage::Gs,
+        );
+        assert_eq!(r.scalar, [((0, 2), at(0, 0))]);
+    }
+
+    #[test]
+    fn a_standalone_geometry_layout_is_not_recognized() {
+        // A GS on gfx9+ always runs merged, with eight system SGPRs before
+        // its user data; s0-s1 then hold the address of the GS user data,
+        // not user data itself. A program shaped for a standalone layout
+        // reads s0 as a table address, which tracing refuses rather than
+        // reading that system pointer as user data.
+        let code: Vec<u8> = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 0, 1)], HwStage::Gs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 8,
+                what: "an address in an SGPR that is no root parameter"
+            }
+        );
+    }
+
+    #[test]
+    fn geometry_root_descriptors_use_the_merged_layout() {
+        let r = track_words(
+            &[
+                0xBE8A_03C1, // s_mov_b32 s10, -1
+                0xBE8B_03FF,
+                0x1101_4FAC, // s_mov_b32 s11, 0x11014fac
+                0xF430_0004,
+                0xFA00_0000, // s_buffer_load_dwordx16 s[0:15], s[8:11], null
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 0, 2)],
+            HwStage::Gs,
+        );
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(0, 0),
+                bits: 0,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+    }
+
+    #[test]
+    fn a_merged_geometry_shader_keeps_its_system_sgprs_out_of_the_root_parameters() {
+        // A merged GS has eight system SGPRs before its user data, so the
+        // read of system SGPR s4 stays a system value even though s4 would
+        // be user-data dword 4 without the prefix. The read comes first:
+        // the load below overwrites s4 with the table's data.
+        let r = track_words(
+            &[
+                0xBE94_0304, // s_mov_b32 s20, s4
+                0xBE82_0308, // s_mov_b32 s2, s8
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 0, 8)],
+            HwStage::Gs,
+        );
+        assert_eq!(r.scalar, [((0, 3), at(0, 0))]);
+        assert_eq!(
+            r.params.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
+            [(0, 0)]
+        );
+    }
+
+    #[test]
     fn root_descriptors_are_built_in_code() {
         let r = track_words(
             &[
