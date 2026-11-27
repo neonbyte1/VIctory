@@ -1039,14 +1039,19 @@ impl State {
     /// such a signature (the debug layer's id 1419), and breaking that rule
     /// removes the device on NVIDIA. Compute lists that only read views are
     /// the case: they bind no sampler heap, and every signature we make says
-    /// its sampler heap is indexed directly.
+    /// its sampler heap is indexed directly. Its view heap too: a list whose
+    /// shaders read neither title memory nor root views gets ours as well.
     fn wanted(title: [usize; 2], memory_heap: bool) -> [usize; 2] {
         let sampler = if title[1] != 0 {
             title[1]
         } else {
             SAMPLERS_OURS
         };
-        let views = if memory_heap { MEMORY_HEAP } else { title[0] };
+        let views = if memory_heap || title[0] == 0 {
+            MEMORY_HEAP
+        } else {
+            title[0]
+        };
         [views, sampler]
     }
 
@@ -1061,7 +1066,9 @@ impl State {
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
-            if memory_heap && let Some(h) = crate::memory::heap() {
+            if want[0] == MEMORY_HEAP
+                && let Some(h) = crate::memory::heap()
+            {
                 heaps.insert(0, Some(h.heap.clone()));
             }
             if want[1] == SAMPLERS_OURS {
@@ -2258,6 +2265,17 @@ mod tests {
                 assert_ne!(want, state.host_heaps, "{title:x?}, memory heap {memory_heap}");
             }
         }
+    }
+
+    /// Every signature we make says its view heap is indexed directly too:
+    /// a list that binds no view heap gets ours, also when its shaders read
+    /// neither title memory nor root views (constants only).
+    #[test]
+    fn a_list_without_a_view_heap_gets_ours() {
+        assert_eq!(State::wanted([0, 0], false), [MEMORY_HEAP, SAMPLERS_OURS]);
+        assert_eq!(State::wanted([0, 0x20], false), [MEMORY_HEAP, 0x20]);
+        // A title view heap stays.
+        assert_eq!(State::wanted([0x10, 0x20], false), [0x10, 0x20]);
     }
     use crate::object::{HRESULT, S_OK};
 
