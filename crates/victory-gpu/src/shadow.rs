@@ -184,6 +184,19 @@ pub(crate) fn take_vram_uploads() -> Vec<VramCopy> {
     std::mem::take(&mut *VRAM_UPLOADS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// Tests: uploads queued for the next submission into the buffer `raw`
+/// (its `as_raw`).
+#[cfg(test)]
+pub(crate) fn queued_uploads_into(raw: *mut std::ffi::c_void) -> usize {
+    use windows::core::Interface;
+    VRAM_UPLOADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|u| u.dst.as_raw() == raw)
+        .count()
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -1026,6 +1039,17 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // Its uploads not run yet would write a copy that is gone: into
+        // freed video memory once their clone of the buffer is all that
+        // holds it, or over the next copy given its run of a shared buffer.
+        if self.vram {
+            use windows::core::Interface;
+            let (raw, from, to) = (self.buffer.as_raw(), self.base, self.base + self.len);
+            VRAM_UPLOADS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|u| u.dst.as_raw() != raw || u.dst_off < from || u.dst_off >= to);
+        }
         if let Some(slice) = self.slice {
             arena().give_back(slice);
         } else if self.vram && self.alloc_size > 0 {

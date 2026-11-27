@@ -142,6 +142,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    // Also where no subscriber listens (tests): the abort below says nothing
+    // itself (0xc0000409 on Windows).
+    eprintln!("victory-gpu: host GPU failure: {text}");
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -1137,6 +1140,10 @@ struct VramSync {
     /// staging (`crate::shadow::capture_write_marks`), and the bytes of
     /// each: its own marks, whatever ran before or after it.
     marks: Option<([Option<u64>; 2], u64, usize)>,
+    /// The uploads its list before records, held until it has run: each
+    /// holds the destination buffer, which a copy released since it was
+    /// queued no longer does (the GPU would write freed memory).
+    uploaded: Vec<crate::shadow::VramCopy>,
 }
 
 /// A range `(copy, start, end, marked)` (title addresses) a submission's
@@ -1826,8 +1833,9 @@ impl Host {
 
     /// Tests: the host GPU waits before the next submission that may stay
     /// in flight until the guard goes (a fence the queue waits for, queued
-    /// with it under the lock, signalled from the CPU), or for 10 s at
-    /// most, so that a test failing meanwhile holds no other.
+    /// with it under the lock, signalled from the CPU), or for 1.5 s at
+    /// most, so that a test failing meanwhile holds no other, and the queue
+    /// never waits as long as Windows' default GPU timeout (2 s).
     #[cfg(test)]
     pub(crate) fn hold_gpu(&self) -> impl Drop {
         struct Gate(ID3D12Fence);
@@ -1844,7 +1852,7 @@ impl Host {
         *GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate.clone());
         let late = gate.clone().into_raw() as usize;
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(1500));
             // SAFETY: the reference taken above, ours to release.
             let late = unsafe { ID3D12Fence::from_raw(late as *mut std::ffi::c_void) };
             // SAFETY: our fence.
@@ -4273,6 +4281,7 @@ impl Host {
         let run = c.list.cast().ok();
         sync.lists.push(c);
         sync.staging.extend(staging.map(|s| (false, s)));
+        sync.uploaded = uploads;
         run
     }
 
@@ -4403,7 +4412,10 @@ impl Host {
             predicted,
             signature,
             marks,
+            uploaded,
         } = sync;
+        // It has run: the buffers it uploaded into may go.
+        drop(uploaded);
         let marks = match (marked, marks) {
             (false, _) => crate::shadow::WriteMarks::default(),
             // SAFETY: the submission has run; its read-back staging is held
@@ -6131,6 +6143,31 @@ mod light {
 
     fn in_flight(host: &Host) -> usize {
         host.lock_submitted().flight.len()
+    }
+
+    /// A copy released with the upload of a refresh still queued for the next
+    /// submission (a preparing refreshed it and nothing ran it yet, as
+    /// `refreshes_wait_for_writers_of_their_memory_in_flight` leaves) leaves
+    /// none behind. Its clone of the buffer would be the last hold on it: the
+    /// next submission's list before records a copy into it and drops the
+    /// clone, and the GPU then writes freed video memory (on native drivers
+    /// a device removal and `fail`'s abort, 0xc0000409, in the next test
+    /// that submits: neonbyte1/VIctory#5), or into the next copy given its
+    /// run of a shared buffer.
+    #[test]
+    fn a_released_copy_leaves_no_upload_behind() {
+        if host().is_none() {
+            return;
+        }
+        let _queues = crate::queue::tests::TITLE_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((p, a)) = vram_copy(1) else { return };
+        // SAFETY: a word of our pool (guarded: the write marks the page).
+        unsafe { (p as *mut u32).write_volatile(7) };
+        a.update(1, p, PAGE).unwrap();
+        let raw = windows::core::Interface::as_raw(&a.buffer);
+        assert!(crate::shadow::queued_uploads_into(raw) > 0, "the refresh queued an upload");
+        release(p, Some(a));
+        assert_eq!(crate::shadow::queued_uploads_into(raw), 0, "none left behind");
     }
 
     /// Overlapping, two submissions writing different copies stay in
