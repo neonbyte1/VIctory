@@ -121,10 +121,16 @@ pub(crate) enum Shape {
 }
 
 /// The section starting at instruction `start` of a block: its restore
-/// index and the shapes of the values it writes.
+/// index, the shapes of the values it writes, and the first step the
+/// simulation could not follow, by operation kind (untracked values in
+/// the section come from it): [`lower`](super::lower) reports it as the
+/// program's refusal, so a census of an untranslated corpus
+/// (`victory translate --list`) counts kinds apart and support lands
+/// where it moves programs.
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    pub unknown: Option<&'static str>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -162,8 +168,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, unknown) = simulate(&insts[i + 1..end], wave, saved);
+        out.insert(i, Section { end, shapes, unknown });
         i = end + 1;
     }
     out
@@ -312,7 +318,25 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// The step the simulation could not follow, by operation kind. Reasons
+/// name a class of step, not one instruction, so every class is a constant
+/// and a program's refusal (which carries it) groups the corpus by what
+/// support would move.
+///
+/// shortcut: classes outside the ones `sections` reports (`ds_swizzle`, the
+/// rest of `ds`) share one reason: `Why` is static, so a class per
+/// instruction would need one constant per opcode.
+fn unmodelled(name: &str) -> &'static str {
+    if name.starts_with("ds_swizzle") || name.starts_with("ds_permute") {
+        "a whole-wave section step the simulation does not follow: a lane swizzle it does not model"
+    } else if name.starts_with("ds_") {
+        "a whole-wave section step the simulation does not follow: a shared-memory step it does not model"
+    } else {
+        "a whole-wave section step the simulation does not follow: an operation it does not model"
+    }
+}
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, Option<&'static str>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -323,6 +347,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let mut uni: HashMap<Value, Sym> = HashMap::new();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
+    // The first step the simulation could not follow, by operation kind.
+    let mut unknown: Option<&'static str> = None;
     for inst in insts {
         let name = inst.name();
         if inst.write(Reg::S(EXEC)).is_some() {
@@ -333,7 +359,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return (
+                    shapes(vec, uni, wave),
+                    Some(*unknown.get_or_insert(
+                        "a whole-wave section step the simulation does not follow: a lane set it writes another way",
+                    )),
+                );
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -348,7 +379,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return (
+                    shapes(vec, uni, wave),
+                    Some(*unknown.get_or_insert(
+                        "a whole-wave section step the simulation does not follow: a lane set it writes another way",
+                    )),
+                );
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -369,6 +405,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             for &(_, w) in &inst.writes {
                 vec.insert(w, vec![Sym::Unknown; wave as usize]);
             }
+            unknown.get_or_insert(unmodelled(name));
             continue;
         };
         let f16_inline = name == "v_add_f16";
@@ -416,7 +453,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             if let Some(w) = inst.write(Reg::S(code)) {
                 let s = l
                     .and_then(|l| x.get(l as usize).copied())
-                    .unwrap_or(Sym::Unknown);
+                    .unwrap_or_else(|| {
+                        unknown.get_or_insert(
+                            "a whole-wave section step the simulation does not follow: a fixed-lane read of a lane it does not name",
+                        );
+                        Sym::Unknown
+                    });
                 uni.insert(w, s);
             }
             continue;
@@ -445,6 +487,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             (Some(d), Some(s)) => {
                 if exec != all {
                     vec.insert(dst, vec![Sym::Unknown; wave as usize]);
+                    unknown.get_or_insert(
+                        "a whole-wave section step the simulation does not follow: a DPP step over lanes it has not named",
+                    );
                     continue;
                 }
                 let mut f = Vec::with_capacity(wave as usize);
@@ -460,6 +505,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                         _ => ok = false,
                     }
                 }
+                if !ok {
+                    unknown.get_or_insert(
+                        "a whole-wave section step the simulation does not follow: a DPP step it does not model",
+                    );
+                }
                 ok.then_some(f)
             }
             (None, Some(s)) => Some(s.clone()),
@@ -467,7 +517,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
         };
         let src = |k: usize| v.src.get(k).map(|o| lanes(o, &vec, &uni));
         let result: Vec<Sym> = match (name, fetched) {
-            _ if modifiers => vec![Sym::Unknown; wave as usize],
+            _ if modifiers => {
+                unknown.get_or_insert(
+                    "a whole-wave section step the simulation does not follow: a step with source modifiers",
+                );
+                vec![Sym::Unknown; wave as usize]
+            }
             ("v_mov_b32", Some(a)) => a,
             ("v_bfrev_b32", Some(a)) => a
                 .into_iter()
@@ -481,6 +536,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                     _ => None,
                 };
+                if !matches!(mask, Some(m) if masked.contains(&m)) {
+                    unknown.get_or_insert(
+                        "a whole-wave section step the simulation does not follow: a select on a mask it does not name",
+                    );
+                }
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
@@ -516,7 +576,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                             })
                             .collect()
                     }
-                    _ => vec![Sym::Unknown; wave as usize],
+                    _ => {
+                        unknown.get_or_insert(
+                            "a whole-wave section step the simulation does not follow: a lane permutation it does not model",
+                        );
+                        vec![Sym::Unknown; wave as usize]
+                    }
                 }
             }
             ("v_sub_nc_u32", Some(a)) => {
@@ -567,9 +632,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
                     .collect(),
-                _ => vec![Sym::Unknown; wave as usize],
+                _ => {
+                    unknown.get_or_insert(unmodelled(n));
+                    vec![Sym::Unknown; wave as usize]
+                }
             },
-            _ => vec![Sym::Unknown; wave as usize],
+            _ => {
+                unknown.get_or_insert(unmodelled(name));
+                vec![Sym::Unknown; wave as usize]
+            }
         };
         let merged = (0..wave as usize)
             .map(|l| {
@@ -582,7 +653,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    (shapes(vec, uni, wave), unknown)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -980,6 +1051,49 @@ mod tests {
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
+    }
+
+    /// A section whose every step the simulation follows leaves no
+    /// unknown named; one whose step it cannot follow (`v_mac_legacy_f32`) is,
+    /// by operation kind, so a census of a refused corpus counts programs
+    /// by the class of step that needs support.
+    #[test]
+    fn unmodelled_steps_are_named_by_operation_kind() {
+        // s_or_saveexec s0, -1; v_mac_legacy_f32 v2, s0, v1; s_mov exec, s0.
+        for (wave64, saveexec, mov_exec) in [(true, 0x25, 0x04), (false, 0x3D, 0x03)] {
+            let unmodelled = [
+                sop1(0, saveexec, 193),
+                vop2(2, 0x06, 128, 1),
+                sop1(EXEC, mov_exec, 0),
+            ];
+            let p = build(&unmodelled, wave64);
+            let sec = &sections(&p, 0)[&0];
+            assert_eq!(
+                sec.unknown,
+                Some(
+                    "a whole-wave section step the simulation does not follow: an operation it does not model"
+                )
+            );
+            assert!(
+                sec.shapes.is_empty(),
+                "the unmodelled step's result has no shape"
+            );
+
+            // The same section with every step followed (v_mov): no unknown.
+            let modeled = [
+                sop1(0, saveexec, 193),
+                vop1(2, 0x01, 0),
+                sop1(EXEC, mov_exec, 0),
+            ];
+            let p = build(&modeled, wave64);
+            let value = p.blocks[0].insts[1].write(Reg::V(2)).unwrap();
+            let sec = &sections(&p, 0)[&0];
+            assert_eq!(sec.unknown, None);
+            assert!(
+                sec.shapes.contains_key(&value),
+                "the move's result has a shape"
+            );
+        }
     }
 
     #[test]
