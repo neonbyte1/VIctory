@@ -169,6 +169,12 @@
 //!   a view the bit of its first byte's page as base with that byte's
 //!   offset in its page as phase. Writes at computed addresses mark the
 //!   page-table bitmap instead ("Title memory").
+//! * **The host's tables** (the page table, the view addresses, the view
+//!   marks, the view strides) are read once per entry (added 2026-11-25):
+//!   where a shader reads an entry it has read on every path there, it
+//!   takes the first read's value (`bitcode::reuse`). So the reads of one
+//!   entry inside an invocation agree, even where the host rewrites the
+//!   entry while the list runs.
 //! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
 //!   every image instruction that reads a texture shader view the program
 //!   takes from the resource heap itself (not through a table, whose slots
