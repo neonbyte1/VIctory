@@ -2802,6 +2802,12 @@ fn scalar_probes() -> Vec<Probe> {
         (0x08, |a, b| a > b),
         (0x04, |a, b| (a as i32) < (b as i32)),
         (0x02, |a, b| (a as i32) > (b as i32)),
+        (0x00, |a, b| a as i32 == b as i32),
+        (0x01, |a, b| a as i32 != b as i32),
+        (0x03, |a, b| (a as i32) >= (b as i32)),
+        (0x05, |a, b| (a as i32) <= (b as i32)),
+        (0x09, |a, b| a >= b),
+        (0x0B, |a, b| a <= b),
     ] {
         p.push(scalar(
             [
