@@ -1073,8 +1073,7 @@ const SCC_MIN_MAX: &str = "s_min and s_max set SCC from the result";
 const FLOOR_CVT: &str = "v_cvt_flr and v_cvt_rpi: NaN and the half";
 const MED3_ZERO: &str = "v_med3_f32 orders -0 and +0 as the host does";
 const CONSTANT_CMP: &str = "a constant compare removes the WARP device";
-/// A fused f16 result (`v_fma_f16`, `v_pk_fma_f16`, `v_fma_mix{lo,hi}_f16`)
-/// whose single rounding the lowering's f32 intermediate changes: the f32
+/// A fused f16 result whose single rounding the f32 intermediate changes: the f32
 /// value lands on an f16 tie the exact one is not on (1 f16 ULP; the
 /// exact result needs more than f32 between the multiply-add and the
 /// narrowing).
@@ -2307,37 +2306,71 @@ fn sixteen_bit_probes() -> Vec<Probe> {
         };
         p.push(pk(0x0F, |a, b, _| a + b));
         p.push(pk(0x10, |a, b, _| a * b));
-        p.push(
-            pk(0x0E, |a, b, c| a.mul_add(b, c)).shows(F16_DOUBLE, move |i| {
-                [false, true].iter().any(|&hi| {
-                    twice(h(pick(i[0], 0, hi)).mul_add(h(pick(i[1], 1, hi)), h(pick(i[2], 2, hi))))
-                })
-            }),
-        );
+        p.push(pk(0x0E, |a, b, c| a.mul_add(b, c)));
     }
     // v_pk_fmac_f16: both halves accumulate into v5 = c.
     let m = |i: [u32; 4], rtz: bool| {
         let r = |s: u32| to_f16(h(i[0] >> s).mul_add(h(i[1] >> s), h(i[2] >> s)), rtz);
         vec![r(0) | r(16) << 16]
     };
-    p.push(
-        f16_tags(
-            probe(
-                [vop1(0x01, 5, v(3)), vop2(0x3C, 5, v(1), 2)],
-                half_pairs(),
-                Kind::Halves { ulps: 0 },
-                move |i| m(i, false),
-            ),
-            m,
-            |i| i[..3].iter().flat_map(|&x| [x, x >> 16]).collect(),
-        )
-        .shows(F16_DOUBLE, |i| {
-            [0, 16]
-                .iter()
-                .any(|&s| twice(h(i[0] >> s).mul_add(h(i[1] >> s), h(i[2] >> s))))
-        }),
-    );
+    p.push(f16_tags(
+        probe(
+            [vop1(0x01, 5, v(3)), vop2(0x3C, 5, v(1), 2)],
+            half_pairs(),
+            Kind::Halves { ulps: 0 },
+            move |i| m(i, false),
+        ),
+        m,
+        |i| i[..3].iter().flat_map(|&x| [x, x >> 16]).collect(),
+    ));
     p
+}
+
+#[test]
+fn packed_fused_f16_rounds_each_half_once() {
+    let inputs = vec![
+        // In each half the exact result is just above or below an f16 midpoint.
+        [0x3C03_3C01, 0x3E00_3E00, 0x0001_8001, 0],
+        [0xBC03_BC01, 0x3E00_3E00, 0x8001_0001, 0],
+        // A subnormal tie in the high half and cancellation in the low half.
+        [0x0001_3C01, 0x3800_3E00, 0x0001_BE00, 0],
+        [0x3C00_4000, 0x4000_3C00, 0, 0],
+    ];
+    let expected = |i: [u32; 4], select: [u8; 2], neg: [u8; 2], clamp: bool| {
+        let result = |half: usize| {
+            let operand = |source: usize| {
+                let shift = 16 * (select[half] >> source & 1);
+                let sign = u32::from(neg[half] >> source & 1) << 15;
+                h((i[source] >> shift) ^ sign)
+            };
+            let fused = operand(0).mul_add(operand(1), operand(2));
+            to_f16(if clamp { fused.clamp(0.0, 1.0) } else { fused }, false)
+        };
+        vec![result(0) | result(1) << 16]
+    };
+    let mut probes = Vec::new();
+    for (select, neg, clamp) in [
+        ([0, 7], [0, 0], false),
+        ([7, 0], [0, 0], false),
+        ([0, 7], [0, 1], true),
+    ] {
+        let mut words = vop3p(0x0E, 5, [v(1), v(2), v(3)], select[0], select[1], neg);
+        words[0] |= u32::from(clamp) << 15;
+        probes.push(probe(words, inputs.clone(), Kind::Halves { ulps: 0 }, move |i| {
+            expected(i, select, neg, clamp)
+        }));
+    }
+    let copy_addend = vop1(0x01, 5, v(3));
+    let fmac = vop3(0x13C, 5, [v(1), v(2), 0], NONE);
+    for words in [
+        vec![copy_addend, vop2(0x3C, 5, v(1), 2)],
+        vec![copy_addend, fmac[0], fmac[1]],
+    ] {
+        probes.push(probe(words, inputs.clone(), Kind::Halves { ulps: 0 }, move |i| {
+            expected(i, [0, 7], [0, 0], false)
+        }));
+    }
+    assert_clean(check(&probes));
 }
 
 #[test]

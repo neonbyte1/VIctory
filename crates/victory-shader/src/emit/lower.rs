@@ -7920,18 +7920,22 @@ impl<'a> Lower<'a> {
                 }
             }
             let r = if float {
-                let mut f = match op {
-                    "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
-                    "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
-                    "min_f16" => self.max_min(false, xs[0], xs[1]),
-                    "max_f16" => self.max_min(true, xs[0], xs[1]),
-                    // shortcut: FMad in f32, as v_fma_f16.
-                    _ => self.fmad(xs[0], xs[1], xs[2]),
-                };
-                if v.clamp {
-                    f = self.unary(7, f);
+                if matches!(op, "fma_f16" | "fmac_f16") && matches!(self.mode16, None | Some(0)) {
+                    self.fma_f16(xs[0], xs[1], xs[2], v.clamp)
+                } else {
+                    let mut f = match op {
+                        "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
+                        "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
+                        "min_f16" => self.max_min(false, xs[0], xs[1]),
+                        "max_f16" => self.max_min(true, xs[0], xs[1]),
+                        // Directed modes still use an f32 FMad.
+                        _ => self.fmad(xs[0], xs[1], xs[2]),
+                    };
+                    if v.clamp {
+                        f = self.unary(7, f);
+                    }
+                    self.narrow16(f)
                 }
-                self.narrow16(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
