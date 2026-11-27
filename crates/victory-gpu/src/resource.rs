@@ -1188,11 +1188,26 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// (no view takes them).
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
+    // `DXGI_FORMAT_R8G8_B8G8_UNORM` (68) and `DXGI_FORMAT_G8R8_G8B8_UNORM` (69)
+    // are 4:2:2 2x1 subsampled 4-byte block formats, not 1x1 2-byte texels
+    // (despite `element()`'s `(2, 1)` byte-per-texel approximation). Per
+    // DirectX-Specs (`d3d/VulkanOn12.md`, Format List Casting), castable
+    // formats must match block size and texels-per-block, so these cannot be
+    // cast with 16-bit 1x1 formats.
+    const SUBSAMPLED_422: [u32; 2] = [68, 69];
+    if SUBSAMPLED_422.contains(&format) {
+        return Vec::new();
+    }
     let Some(e) = element(format) else {
         return Vec::new();
     };
     (1..=115)
-        .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
+        .filter(|&f| {
+            f != format
+                && element(f) == Some(e)
+                && !DEPTH_FAMILIES.contains(&f)
+                && !SUBSAMPLED_422.contains(&f)
+        })
         .filter(|&f| !(family(f) == f && family(f + 1) == f))
         .collect()
 }
@@ -2522,6 +2537,9 @@ mod tests {
         for f in [42, 39, 40, 45, 27, 10, 56] {
             assert!(!c.contains(&f), "{f}");
         }
+        let u16_like = castable(48);
+        assert!(!u16_like.contains(&68) && !u16_like.contains(&69));
+        assert!(castable(68).is_empty() && castable(69).is_empty());
         let bc1 = castable(71);
         assert!(bc1.contains(&72) && bc1.contains(&80) && bc1.contains(&81));
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
