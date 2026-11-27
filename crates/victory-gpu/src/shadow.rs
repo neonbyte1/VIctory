@@ -642,11 +642,14 @@ impl Shadow {
     /// submission: title memory where the title has not written the page
     /// since the copy took it, else what the page held when the title first
     /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
-    /// Returns the bytes written.
+    /// Returns the bytes written. A page in `unchanged` (by its address in
+    /// the copy: a copy in video memory read back as the copy held it,
+    /// `crate::host`) was not changed by shaders: nothing goes back, and
+    /// title memory is not read.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+    pub(crate) fn copy_back_marked(&self, page: usize, unchanged: &std::collections::HashSet<usize>) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -666,11 +669,14 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+        // Shaders changed nothing: as below with no difference found.
+        let gpu_unchanged = unchanged.contains(&(host.as_ptr() as usize));
         let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
+        if !gpu_unchanged && !crate::host::read_into(from as *const u8, &mut title) {
             return 0;
         }
         let written = match &saved {
+            _ if gpu_unchanged => None,
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
             None => (*host != title[..]).then_some(host.as_ptr()),
@@ -1200,11 +1206,16 @@ pub(crate) fn forget_read(slot: u32) {
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared) and, with `memory_withheld`, pages that shaders using
 /// title memory marked; the bitmaps are cleared. Before the copy-backs of
-/// declared ranges, which disarm the copies.
+/// declared ranges, which disarm the copies. `unchanged`: pages of copies
+/// in video memory shaders left as they were ([`Shadow::copy_back_marked`]).
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
-pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+pub(crate) fn copy_back_marks(
+    withheld: &[(Arc<Shadow>, usize, usize)],
+    memory_withheld: bool,
+    unchanged: &std::collections::HashSet<usize>,
+) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
@@ -1260,7 +1271,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         {
             continue;
         }
-        let written = copy.copy_back_marked(page);
+        let written = copy.copy_back_marked(page, unchanged);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -1839,7 +1850,7 @@ pub(crate) mod tests {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
         }
-        copy_back_marks(&[], false);
+        copy_back_marks(&[], false, &Default::default());
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
@@ -1874,7 +1885,7 @@ pub(crate) mod tests {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
         }
-        copy_back_marks(&[], true);
+        copy_back_marks(&[], true, &Default::default());
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
@@ -1955,8 +1966,8 @@ pub(crate) mod tests {
         copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
         write(20, 0x66);
         write(PAGE + 20, 0x77);
-        copy.copy_back_marked(p);
-        copy.copy_back_marked(p + PAGE);
+        copy.copy_back_marked(p, &Default::default());
+        copy.copy_back_marked(p + PAGE, &Default::default());
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         assert_eq!(
@@ -1965,6 +1976,32 @@ pub(crate) mod tests {
         );
         assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
         copy.copy_back(p, PAGE + 16);
+        unregister(p, p as u64);
+    }
+
+    /// A marked page read back as the copy held it (shaders left it as it
+    /// was, `crate::host`) goes back with no look at title memory: the
+    /// copy's bytes are not written over title memory though they differ.
+    /// Not named so, the same page goes back by what differs.
+    #[test]
+    fn a_marked_page_shaders_left_does_not_go_back() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        copy.write_host((p + 8) as u64, &[0xaa]);
+        // SAFETY: a byte of our pool.
+        let read = || unsafe { ((p + 8) as *const u8).read_volatile() };
+        let unchanged = std::collections::HashSet::from([copy.data as usize]);
+        assert_eq!(copy.copy_back_marked(p, &unchanged), 0);
+        assert_eq!(read(), 0, "title memory not written");
+        assert_eq!(copy.copy_back_marked(p, &Default::default()), PAGE);
+        assert_eq!(read(), 0xaa, "not named unchanged: the difference goes back");
+        copy.copy_back(p, PAGE);
         unregister(p, p as u64);
     }
 

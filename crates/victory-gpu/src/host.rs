@@ -875,6 +875,10 @@ pub(crate) struct HostList {
     /// Shaders of the list mark in the views' written-pages and read-marks
     /// bitmaps ([`HostList::marking`]).
     marks: std::sync::atomic::AtomicBool,
+    /// A program of the list may write through the bound heap's views
+    /// (`heap_writes` of its translation): its write marks name pages no
+    /// declared range does ([`HostList::heavy_reasons`]).
+    heap_writes: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -1143,6 +1147,31 @@ fn signature(runs: &[&HostList]) -> u64 {
     h.finish()
 }
 
+/// Puts `len` read-back bytes at `from` into a copy's mirror at `to`, unless
+/// it holds them already: then a whole read (`whole`, not a piece of one)
+/// is noted in `unchanged` by `to`, and its page's copy-back needs no look
+/// at title memory ([`crate::shadow::copy_back_marks`]).
+///
+/// # Safety
+/// `from` and `to` are valid for `len` bytes, and do not overlap.
+unsafe fn into_mirror(
+    from: *const u8,
+    to: usize,
+    len: usize,
+    whole: bool,
+    unchanged: &mut std::collections::HashSet<usize>,
+) {
+    // SAFETY: the caller's.
+    let (new, old) = unsafe { (std::slice::from_raw_parts(from, len), std::slice::from_raw_parts_mut(to as *mut u8, len)) };
+    if new == &*old {
+        if whole {
+            unchanged.insert(to);
+        }
+    } else {
+        old.copy_from_slice(new);
+    }
+}
+
 /// How many of `lens` (in order) are staged at 16-byte offsets within
 /// `max` bytes, and those bytes.
 fn staged(lens: impl IntoIterator<Item = u64>, max: u64) -> (usize, u64) {
@@ -1233,7 +1262,7 @@ struct InFlight {
     /// then recycled.
     lists: Vec<std::sync::Arc<HostList>>,
     /// Its completion writes title memory or reads the marks bitmaps
-    /// ([`HostList::heavy`]): it completes before the next submission is
+    /// ([`HostList::heavy_reasons`]): it completes before the next submission is
     /// prepared.
     heavy: bool,
     /// It runs the upload list (`crate::bindless::uploads`), which the next
@@ -1495,6 +1524,7 @@ impl Host {
                 ours: false.into(),
                 memory_writer: false.into(),
                 marks: false.into(),
+                heap_writes: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 id,
@@ -1900,7 +1930,28 @@ impl Host {
         // back over what the CPU cleared meanwhile (`crate::shadow`).
         let mut vram = VramSync::default();
         let before = self.vram_before(vram_uploads, &vram_bitmaps, marks, &mut vram);
-        let heavy = runs.iter().any(|l| l.heavy());
+        let reasons = runs.iter().fold(0u8, |r, l| r | l.heavy_reasons());
+        let heavy = reasons & 0x3f != 0;
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            for (bit, c) in [
+                C::HeavyHeapWrites,
+                C::HeavyAfter,
+                C::HeavyWrites,
+                C::HeavyMissed,
+                C::HeavyGpuWrites,
+                C::HeavyMemory,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                add(c, u64::from(reasons >> bit & 1));
+            }
+            add(C::HeavyWritesOnly, u64::from(reasons & 0x3f == 1 << 2));
+            // Heavy before the heap's read-only marks stopped counting.
+            add(C::HeapReadsOnly, u64::from(reasons == 1 << 6));
+        }
         // Completing it takes the write marks (`Host::finish`) or reads the
         // lists' page bitmaps (`crate::memory::bind`'s probes).
         let takes = (marks && (heavy || !overlap) || runs.iter().any(|l| !l.deferred().vram_probes.is_empty()))
@@ -2064,7 +2115,7 @@ impl Host {
             add(C::HeavyCompletions, u64::from(record.heavy));
             add(C::MarksTaken, u64::from(marks_taken));
         }
-        self.vram_completed(std::mem::take(&mut record.vram), runs, marks_taken);
+        let unchanged = self.vram_completed(std::mem::take(&mut record.vram), runs, marks_taken);
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
@@ -2124,7 +2175,7 @@ impl Host {
         if marks_taken {
             // Pages shaders marked first: the copy-backs below end what the
             // copies keep for them.
-            crate::shadow::copy_back_marks(&withheld, withholding);
+            crate::shadow::copy_back_marks(&withheld, withholding, &unchanged);
         }
         // Texture views left null that shaders read: made for what follows
         // (a later submission's marks taken with them only make its views
@@ -2519,6 +2570,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.marks.store(false, Ordering::Relaxed);
+        self.heap_writes.store(false, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2649,24 +2701,34 @@ impl HostList {
         self.marks.store(true, Ordering::Relaxed);
     }
 
-    /// Whether completing a submission of the list writes title memory or
-    /// takes what its shaders marked as written: copy-backs of title
-    /// buffers' copies its shaders write (declared, or marked through the
-    /// heap's views), title memory through page tables, work after it or
-    /// bottom-of-pipe writes. The next submission's refreshes and copies
-    /// read title memory, and its shaders mark in the same bitmaps, so it is
-    /// prepared only once such a submission has completed. Marks of views
-    /// read alone (tables, root views) do not count: taken early, they make
-    /// views early.
-    fn heavy(&self) -> bool {
+    /// A program of the list indexing the bound heap may write through its
+    /// views.
+    pub(crate) fn writes_through_heap(&self) {
+        self.heap_writes.store(true, Ordering::Relaxed);
+    }
+
+    /// Why completing a submission of the list writes title memory or takes
+    /// what its shaders marked as written, as bits (any of 0–5: the list is
+    /// heavy): 0 writes marked through the heap's views, 1 work after it,
+    /// 2 bottom-of-pipe writes, 3 missed-memory checks, 4 copy-backs of
+    /// declared ranges its shaders write, 5 title memory through page tables.
+    /// The next submission's refreshes and copies read title memory, and its
+    /// shaders mark in the same bitmaps, so it is prepared only once a heavy
+    /// submission has completed. Marks of views read alone (tables, root
+    /// views, and the heap's when no program of the list writes through
+    /// them) do not count: taken early, they make views early. Bit 6, not
+    /// heavy: the list marks through the heap's views and only reads them.
+    fn heavy_reasons(&self) -> u8 {
         let d = self.deferred();
-        self.marks.load(Ordering::Relaxed) && d.copies.iter().any(|s| matches!(s, Step::Heap(_)))
-            || !d.after.is_empty()
-            || !d.writes.is_empty()
-            || !d.missed.is_empty()
-            || d.copies
-                .iter()
-                .any(|s| matches!(s, Step::GpuWrite(..) | Step::Memory(_)))
+        let heap = self.marks.load(Ordering::Relaxed) && d.copies.iter().any(|s| matches!(s, Step::Heap(_)));
+        let heap_writes = self.heap_writes.load(Ordering::Relaxed);
+        u8::from(heap && heap_writes)
+            | u8::from(!d.after.is_empty()) << 1
+            | u8::from(!d.writes.is_empty()) << 2
+            | u8::from(!d.missed.is_empty()) << 3
+            | u8::from(d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..)))) << 4
+            | u8::from(d.copies.iter().any(|s| matches!(s, Step::Memory(_)))) << 5
+            | u8::from(heap && !heap_writes) << 6
     }
 
     /// Whether the list's steps write title memory when it is submitted
@@ -3647,8 +3709,9 @@ impl Host {
     /// Copies GPU-written VRAM ranges back to their CPU mirrors via a reusable
     /// 32 MiB readback ring, waited for: on a submission's completion
     /// (`Host::finish`), the ranges known only then and those past
-    /// [`STAGED_MAX`].
-    fn readback_vram_copies(&self, reads: &[VramRead]) {
+    /// [`STAGED_MAX`]. Reads whose bytes the mirror holds already are noted
+    /// in `unchanged` by mirror address ([`into_mirror`]).
+    fn readback_vram_copies(&self, reads: &[VramRead], unchanged: &mut std::collections::HashSet<usize>) {
         if reads.is_empty() {
             return;
         }
@@ -3664,29 +3727,25 @@ impl Host {
         };
 
         let mut offset = 0u64;
-        let mut batch: Vec<(ID3D12Resource, u64, u64, usize, u64)> = Vec::new();
-        let flush = |batch: &mut Vec<(ID3D12Resource, u64, u64, usize, u64)>| {
+        // (source, its offset, ring offset, mirror, bytes, the whole read).
+        type Chunk = (ID3D12Resource, u64, u64, usize, u64, bool);
+        let mut batch: Vec<Chunk> = Vec::new();
+        let mut flush = |batch: &mut Vec<Chunk>| {
             if batch.is_empty() {
                 return;
             }
             self.run_copy_list(
                 |list| {
-                    for (src, src_off, dst_off, _, len) in batch.iter() {
+                    for (src, src_off, dst_off, _, len, _) in batch.iter() {
                         // SAFETY: valid VRAM buffer and readback ring regions.
                         unsafe { list.CopyBufferRegion(&ring_buf, *dst_off, src, *src_off, *len) };
                     }
                 },
                 true,
             );
-            for (_, _, ring_off, cpu_ptr, len) in batch.drain(..) {
+            for (_, _, ring_off, cpu_ptr, len, whole) in batch.drain(..) {
                 // SAFETY: GPU finished writing `ring_buf`; `cpu_ptr` is valid for `len` bytes.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        ring_ptr.add(ring_off as usize),
-                        cpu_ptr as *mut u8,
-                        len as usize,
-                    );
-                }
+                unsafe { into_mirror(ring_ptr.add(ring_off as usize), cpu_ptr, len as usize, whole, unchanged) };
             }
         };
 
@@ -3700,7 +3759,8 @@ impl Host {
                     avail = RING_BYTES;
                 }
                 let chunk = (*total_len - done).min(avail);
-                batch.push((src.clone(), *src_off + done, offset, *cpu_ptr + done as usize, chunk));
+                let whole = chunk == *total_len;
+                batch.push((src.clone(), *src_off + done, offset, *cpu_ptr + done as usize, chunk, whole));
                 offset = (offset + chunk).next_multiple_of(16).min(RING_BYTES);
                 done += chunk;
             }
@@ -3901,27 +3961,23 @@ impl Host {
     /// waited for. Those submissions are heavy or waited for, so nothing runs
     /// after them: what the list after read back is what is there now, and
     /// the wait is for these copies alone. The pages named become the next
-    /// prediction. The lists and staging go back to their pools.
-    fn vram_completed(&self, sync: VramSync, runs: &[&HostList], marked: bool) {
+    /// prediction. The lists and staging go back to their pools. Returns the
+    /// named pages whose bytes the GPU left as the mirror had them, by mirror
+    /// address ([`into_mirror`]).
+    fn vram_completed(
+        &self,
+        sync: VramSync,
+        runs: &[&HostList],
+        marked: bool,
+    ) -> std::collections::HashSet<usize> {
         let VramSync {
             lists,
             staging,
             reads,
-            mut later,
+            later,
             predicted,
             signature,
         } = sync;
-        {
-            #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::VramStagedUs);
-            for &(from, to, len) in &reads {
-                // SAFETY: the submission has run: the staging holds the bytes;
-                // the mirror lives while the lists that declared the range do.
-                unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, len) };
-            }
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::VramStagedBytes, reads.iter().map(|r| r.2 as u64).sum());
-        }
         let mut named: Vec<VramRead> = Vec::new();
         if marked {
             named.extend(crate::shadow::vram_marked_reads());
@@ -3933,16 +3989,21 @@ impl Host {
                 probed = true;
             }
         }
+        // Each page once: a second look would find the bytes just put in.
+        let mut seen = std::collections::HashSet::new();
+        named.retain(|r| seen.insert((r.0.as_raw() as usize, r.1, r.3)));
+        let mut unchanged = std::collections::HashSet::new();
         let mut used = std::collections::HashSet::new();
+        let mut missed = Vec::new();
         for read in &named {
             let key = (read.0.as_raw() as usize, read.1, read.3);
             if let Some(&from) = predicted.get(&key) {
                 // SAFETY: as above; `read`'s mirror is a live copy's, just
                 // named.
-                unsafe { std::ptr::copy_nonoverlapping(from as *const u8, read.2 as *mut u8, read.3 as usize) };
+                unsafe { into_mirror(from as *const u8, read.2, read.3 as usize, true, &mut unchanged) };
                 used.insert(key);
             } else {
-                later.push(read.clone());
+                missed.push(read.clone());
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -3955,18 +4016,34 @@ impl Host {
                 C::VramWastedBytes,
                 predicted.keys().filter(|k| !used.contains(*k)).map(|k| k.2).sum(),
             );
-            add(C::VramWaitedBytes, later.iter().map(|r| r.3).sum());
+            add(C::VramWaitedBytes, later.iter().chain(&missed).map(|r| r.3).sum());
         }
         {
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::VramWaitedUs);
-            self.readback_vram_copies(&later);
+            self.readback_vram_copies(&missed, &mut unchanged);
+            // Declared ranges past the staging are not pages: what they hold
+            // says nothing of a page's copy-back.
+            self.readback_vram_copies(&later, &mut std::collections::HashSet::new());
         }
+        // Declared ranges last: the named pages were compared with the
+        // mirrors as the submission found them.
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::VramStagedUs);
+            for &(from, to, len) in &reads {
+                // SAFETY: the submission has run: the staging holds the bytes;
+                // the mirror lives while the lists that declared the range do.
+                unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, len) };
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::VramStagedBytes, reads.iter().map(|r| r.2 as u64).sum());
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::VramUnchangedPages, unchanged.len() as u64);
         if let Some(kind) = signature
             && (marked || probed)
         {
-            let mut seen = std::collections::HashSet::new();
-            named.retain(|r| seen.insert((r.0.as_raw() as usize, r.1, r.3)));
             let mut kinds = PREDICTED.lock().unwrap_or_else(|e| e.into_inner());
             if kinds.len() >= PREDICTED_KINDS && !kinds.contains_key(&kind) {
                 kinds.clear();
@@ -3981,6 +4058,7 @@ impl Host {
                 pool.push(s);
             }
         }
+        unchanged
     }
 
     #[cfg(test)]
@@ -5396,6 +5474,26 @@ mod vram_async {
         assert_eq!(smallest_fitting([4, 1, 2, 8], 3), Some(0));
         assert_eq!(smallest_fitting([4, 1, 2, 8], 9), None);
         assert_eq!(smallest_fitting([], 1), None);
+    }
+
+    /// A list marking through the heap's views is heavy only if one of its
+    /// programs may write through them; reading alone, it is light (its read
+    /// marks may be taken early). A reset list is neither.
+    #[test]
+    fn heap_marks_make_a_list_heavy_only_when_it_writes_through_the_heap() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let viewed = std::sync::Arc::<crate::bindless::Viewed>::default();
+        list.marking();
+        list.defer_heap(&viewed);
+        assert_eq!(list.heavy_reasons(), 1 << 6, "reads only: light");
+        list.writes_through_heap();
+        assert_eq!(list.heavy_reasons(), 1, "writes through the heap: heavy");
+        list.close();
+        list.reset();
+        assert_eq!(list.heavy_reasons(), 0);
     }
 
     /// Overlapping, a submission whose shaders write a copy in video memory

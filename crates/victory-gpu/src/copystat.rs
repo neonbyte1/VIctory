@@ -127,8 +127,25 @@ pub(crate) enum C {
     Completions,
     HeavyCompletions,
     MarksTaken,
+    /// Submissions by why they are heavy (`HostList::heavy_reasons`, any
+    /// of their lists): writes through the heap's views, work after them,
+    /// bottom-of-pipe writes, missed-memory checks, declared GPU writes,
+    /// title memory through page tables; and those marking through the
+    /// heap's views that only read (not heavy).
+    HeavyHeapWrites,
+    HeavyAfter,
+    HeavyWrites,
+    HeavyMissed,
+    HeavyGpuWrites,
+    HeavyMemory,
+    HeapReadsOnly,
+    /// Submissions heavy for bottom-of-pipe writes alone.
+    HeavyWritesOnly,
+    /// Pages the marks or page bitmaps named whose bytes the GPU left as
+    /// the mirror had them: copied back without a look at title memory.
+    VramUnchangedPages,
 }
-const COUNTERS: usize = 74;
+const COUNTERS: usize = 83;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -337,7 +354,8 @@ pub(crate) fn log(frames: f64) {
         "  copies in video memory per frame: {:.1} completions, {:.1} heavy, {:.1} taking write marks; \
          uploads staged {:.1} MB in {:.1} ms; read back in the submission and put in the mirrors \
          {:.1} MB in {:.1} ms; pages named by marks and page bitmaps {:.0}, {:.0} of them read back in \
-         the submission ({:.1} MB, {:.1} MB read for none); read back waited for {:.1} MB in {:.1} ms",
+         the submission ({:.1} MB, {:.1} MB read for none); read back waited for {:.1} MB in {:.1} ms; \
+         {:.0} named pages left as they were by the GPU",
         c[C::Completions as usize],
         c[C::HeavyCompletions as usize],
         c[C::MarksTaken as usize],
@@ -351,6 +369,20 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::VramWastedBytes as usize]),
         mb(c[C::VramWaitedBytes as usize]),
         ms(c[C::VramWaitedUs as usize]),
+        c[C::VramUnchangedPages as usize],
+    );
+    tracing::info!(
+        "  heavy submissions per frame by why (any of their lists): {:.1} write through the heap's views, \
+         {:.1} work after, {:.1} bottom-of-pipe writes ({:.1} for those alone), {:.1} missed-memory checks, \
+         {:.1} declared GPU writes, {:.1} title memory through page tables; {:.1} light that marking heap reads alone made heavy before",
+        c[C::HeavyHeapWrites as usize],
+        c[C::HeavyAfter as usize],
+        c[C::HeavyWrites as usize],
+        c[C::HeavyWritesOnly as usize],
+        c[C::HeavyMissed as usize],
+        c[C::HeavyGpuWrites as usize],
+        c[C::HeavyMemory as usize],
+        c[C::HeapReadsOnly as usize],
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
