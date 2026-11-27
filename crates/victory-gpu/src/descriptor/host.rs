@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at, views_current};
+use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -25,6 +25,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// [`crate::descriptor::view_deaths`] at each 64 KiB page's last sync,
+    /// by page of the heap: equal, no view died since and an unchanged
+    /// record's view is still current (see [`HostHeap::sync_slots`]).
+    pages: Vec<std::sync::atomic::AtomicU64>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -306,6 +310,9 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            pages: (0..(u64::from(count) * u64::from(step)).div_ceil(crate::watch::PAGE as u64))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -386,6 +393,42 @@ impl HostHeap {
     fn null_sampler(&self, index: u32) {
         null_sampler(self.cpu(index));
     }
+}
+
+/// The slots of `first..last` whose record at `at(i)` needs mirroring: a
+/// record that differs from the key the slot was made from, or - with
+/// `gens`, every view's generation, when views have died since the page was
+/// last synced - one whose record names a view that is no longer its own
+/// (which leaves it nothing to read).
+fn stale_slots(
+    made: &[u64],
+    first: u32,
+    last: u32,
+    at: impl Fn(u32) -> u64,
+    gens: Option<&[u32]>,
+) -> Vec<u32> {
+    let mut stale = Vec::new();
+    for i in first..last {
+        // SAFETY: records in title heap memory the caller found mapped.
+        let [tag, view, generation] = unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
+        // Generations start at 1, so a made slot's key is never 0.
+        let key = u64::from(generation) << 32 | u64::from(view);
+        let current = tag == VIEW_TAG
+            && gens.is_none_or(|gens| gens.get(view as usize) == Some(&generation));
+        let want = if current { key } else { 0 };
+        let seen = made.get(i as usize).copied().unwrap_or(u64::MAX);
+        if seen == want {
+            continue;
+        }
+        stale.push(i);
+        #[cfg(feature = "diagnostics")]
+        if current {
+            crate::copystat::add(crate::copystat::C::SyncChanged, 1);
+        } else {
+            crate::copystat::add(crate::copystat::C::SyncStale, 1);
+        }
+    }
+    stale
 }
 
 /// A plain point sampler at `at`.
@@ -803,24 +846,52 @@ impl HostHeap {
     /// differs from what the slot holds, the rest passed by as `mirror`
     /// would, with one lock of each kind for them all instead of two per slot
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
+    ///
+    /// The slots of a page are read and compared with the key the slot was
+    /// made from; only a slot that differs is mirrored. In the world 27,000
+    /// of a written page's 374,101 slots a frame differ, so the scan is the
+    /// frame's 17 ms, not the making: the records are read either way, and
+    /// what made the scan 46 ns a slot was looking each record's view up in
+    /// `Views`' ~150-byte entries to see whether it is still current - two
+    /// cache lines and a TLB miss a slot. That look-up is now
+    /// [`crate::descriptor::with_generations`]'s dword per view, and only
+    /// for a page a view has died since the last sync of
+    /// ([`crate::descriptor::view_deaths`]): with no death since, a record
+    /// equal to the slot's is still current by construction
+    /// (local://HeapDirty.md).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Slots the host has no room for are not mirrored ([`HostHeap::mirror`]
+        // refuses them), so they are not read either: the title writes ~96
+        // pages of them a world frame, and scanning and mirroring those was
+        // 44 % of the sync's pages (local://HeapDirty.md).
+        let last = last.min(self.count);
+        if first >= last {
+            return;
+        }
         let at = |i: u32| start + u64::from(i) * step;
-        // SAFETY: records in title heap memory the caller found mapped.
-        let records: Vec<[u32; 3]> =
-            (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
-        let current = views_current(&records);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncPages, 1);
+        let deaths = crate::descriptor::view_deaths();
+        // The page the range starts on: the caller syncs a page at a time
+        // (`sync_heaps`); a range over several pages is checked as one.
+        let page = ((u64::from(first) * step) / crate::watch::PAGE as u64) as usize;
+        let earlier = self.pages.get(page).map_or(u64::MAX, |p| p.load(Relaxed));
         let stale: Vec<u32> = {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            (first..last)
-                .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
-                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(&m) => m != 0,
-                    None => true,
-                })
-                .map(|(i, _)| i)
-                .collect()
+            if deaths == earlier {
+                stale_slots(&made, first, last, at, None)
+            } else {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::SyncRechecks, 1);
+                crate::descriptor::with_generations(|gens| stale_slots(&made, first, last, at, Some(gens)))
+            }
         };
+        // Before the scan: a view dying during it leaves the page to be
+        // checked again at its next sync.
+        if let Some(epoch) = self.pages.get(page) {
+            epoch.store(deaths, Relaxed);
+        }
         for i in stale {
             self.mirror(i, at(i), false);
         }
@@ -2203,6 +2274,100 @@ mod tests {
         crate::descriptor::make_read(&[read]);
         assert!(crate::descriptor::tests::WHILE_MAKING.lock().unwrap().is_none(), "the make ran");
         assert!(host.kept(read), "made for the read");
+    }
+
+    /// A view entry's index and generation as a slot's made key.
+    fn key(view: u32, generation: u32) -> u64 {
+        u64::from(generation) << 32 | u64::from(view)
+    }
+
+    /// The view generations, entry `i` at `i`: 0 for an entry that is not
+    /// there, so `set` is what each named view's generation is.
+    fn generations(set: &[(u32, u32)]) -> Vec<u32> {
+        let mut gens = vec![0u32; 16];
+        for &(i, generation) in set {
+            gens[i as usize] = generation;
+        }
+        gens
+    }
+
+    /// The slots of `records` the sync makes again: `records` are laid out as
+    /// a heap's (32 bytes apart), `made` is what each slot holds, `gens` the
+    /// view generations (None: none died since the page was synced, so no
+    /// record's view is looked up).
+    fn stale(records: &[[u32; 3]], made: &[u64], gens: Option<&[u32]>) -> Vec<u32> {
+        // The last dword of each 32-byte record: nothing reads it.
+        let mut packed = vec![0u32; records.len() * 8];
+        for (i, record) in records.iter().enumerate() {
+            packed[i * 8..i * 8 + 3].copy_from_slice(record);
+        }
+        let at = |i: u32| packed.as_ptr() as u64 + u64::from(i) * 32;
+        stale_slots(made, 0, records.len() as u32, at, gens)
+    }
+
+    /// A slot's record equal to the one it was made from is passed by: its
+    /// view is not looked up, and it is not made again.
+    #[test]
+    fn a_slot_whose_record_did_not_change_is_not_made_again() {
+        let records = [[VIEW_TAG, 7, 3], [VIEW_TAG, 9, 1]];
+        let made = [key(7, 3), key(9, 1)];
+        assert_eq!(stale(&records, &made, None), Vec::<u32>::new());
+        // With every view's generation looked up, the same.
+        let gens = generations(&[(7, 3), (9, 1)]);
+        assert_eq!(stale(&records, &made, Some(&gens)), Vec::<u32>::new());
+    }
+
+    /// A record whose view or generation differs from the slot's is made
+    /// again.
+    #[test]
+    fn a_changed_record_is_made_again() {
+        let records = [[VIEW_TAG, 7, 4], [VIEW_TAG, 9, 1]];
+        let made = [key(7, 3), key(9, 1)];
+        assert_eq!(stale(&records, &made, None), vec![0]);
+        let records = [[VIEW_TAG, 7, 3], [VIEW_TAG, 2, 1]];
+        assert_eq!(stale(&records, &made, None), vec![1]);
+    }
+
+    /// A page with one record changed makes that slot alone: the page is the
+    /// unit the write watch reports, not the unit of work.
+    #[test]
+    fn a_page_partially_changed_makes_only_its_changed_slots() {
+        let records = [
+            [VIEW_TAG, 1, 1],
+            [VIEW_TAG, 2, 1],
+            [VIEW_TAG, 3, 2],
+            [VIEW_TAG, 4, 1],
+        ];
+        let made = [key(1, 1), key(2, 1), key(3, 1), key(4, 1)];
+        assert_eq!(stale(&records, &made, None), vec![2]);
+    }
+
+    /// A record whose view died (its resource released) is nulled only when
+    /// the sync knows views died since the page was last synced; otherwise
+    /// it is passed by as current, which the page's death count guarantees.
+    #[test]
+    fn a_record_whose_view_died_is_nulled_only_when_views_died() {
+        let records = [[VIEW_TAG, 5, 1]];
+        let made = [key(5, 1)];
+        let gens = generations(&[(5, 2)]);
+        assert_eq!(stale(&records, &made, None), Vec::<u32>::new());
+        assert_eq!(stale(&records, &made, Some(&gens)), vec![0], "the view's generation moved on");
+        // A view index past the table is no view at all: a slot holding
+        // nothing stays as it is, one holding a key is nulled.
+        let records = [[VIEW_TAG, 15, 1]];
+        let gens = generations(&[(15, 1)]);
+        let past = &gens[..4];
+        assert_eq!(stale(&records, &[0], Some(past)), Vec::<u32>::new());
+        assert_eq!(stale(&records, &[key(15, 1)], Some(past)), vec![0]);
+    }
+
+    /// A record cleared to zeros, or one that is not a view, leaves a made
+    /// slot with nothing to read; a slot never made is passed by.
+    #[test]
+    fn a_cleared_record_nulls_a_made_slot() {
+        let records = [[0, 0, 0], [0x1234_5678, 0, 0]];
+        assert_eq!(stale(&records, &[key(5, 1), key(6, 1)], None), vec![0, 1]);
+        assert_eq!(stale(&records, &[0, 0], None), Vec::<u32>::new());
     }
 
     /// A heap sync makes the slots whose records the title changed as bytes

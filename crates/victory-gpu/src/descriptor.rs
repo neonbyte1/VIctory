@@ -188,12 +188,15 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                // Slots past the host heap's count (the host's limit, on
+                // NVIDIA) have no host slot: the title writes ~96 pages of
+                // them a world frame (6 MB, 44 % of the pages the watch
+                // marks), and mirroring one made nothing. Left out of the
+                // scan here, which is where the waste was.
+                let last = last.min(u64::from(host.count()));
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                crate::copystat::add(crate::copystat::C::SyncSlots, last.saturating_sub(first));
+                host.sync_slots(first as u32, last as u32, start, step);
             }
         }
     }
@@ -455,6 +458,13 @@ pub(crate) enum View {
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// Each entry's generation alone, kept equal to `list`'s: a heap sync
+    /// checks a slot's record against it for every slot of a page the title
+    /// wrote (374,101 slots a world frame), and an entry of `list` is ~150
+    /// bytes of a table that grows past two million of them - two cache
+    /// lines and a TLB miss a check, 9 of the sync's 17 ms
+    /// (local://HeapDirty.md).
+    gens: Vec<u32>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -463,10 +473,29 @@ struct Views {
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     list: Vec::new(),
+    gens: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
+
+/// Bumped when views go stale (their resource released, [`forget`]): a heap
+/// sync whose page has seen no bump since its last sync needs no view
+/// generation looked up for the page's unchanged records.
+static DEATHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`DEATHS`]: how many times views have gone stale in all.
+#[cfg(windows)]
+pub(crate) fn view_deaths() -> u64 {
+    DEATHS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs `f` with every view's generation, in index order, under one lock:
+/// the heap sync's check that a record's view is still its own.
+#[cfg(windows)]
+pub(crate) fn with_generations<R>(f: impl FnOnce(&[u32]) -> R) -> R {
+    f(&VIEWS.lock().unwrap_or_else(|e| e.into_inner()).gens)
+}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
@@ -495,6 +524,7 @@ fn record(handle: u64, view: View) {
                 }
                 None => {
                     views.list.push((view.clone(), 1));
+                    views.gens.push(1);
                     views.list.len() as u32 - 1
                 }
             };
@@ -527,10 +557,17 @@ pub(crate) fn forget(resource: usize) {
             continue;
         }
         views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        let generation = generation.wrapping_add(1).max(1);
+        views.list[i as usize].1 = generation;
+        views.gens[i as usize] = generation;
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        // A page whose unchanged records the syncs may have passed by holds
+        // one naming a dead view: they are checked again.
+        DEATHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ViewDeaths, 1);
     }
 }
 
@@ -540,18 +577,6 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
-}
-
-/// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    records
-        .iter()
-        .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
-        })
-        .collect()
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -981,6 +1006,26 @@ pub(crate) mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// The generation the heap sync checks a record against is the record's
+    /// own, and a release moves it on: nothing else is kept in step with
+    /// [`Views::list`].
+    #[test]
+    fn a_views_generation_is_the_one_its_record_names() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let at = slots.as_ptr() as u64;
+        let resource = 0x7777_0001usize;
+        create_srv(null, resource as This, std::ptr::null(), at);
+        // SAFETY: a record written into `slots` by `create_srv`.
+        let [tag, i, generation] = unsafe { *(at as *const [u32; 3]) };
+        assert_eq!(tag, VIEW_TAG);
+        assert_eq!(with_generations(|gens| gens[i as usize]), generation, "the record's own");
+        let deaths = view_deaths();
+        forget(resource);
+        assert_ne!(with_generations(|gens| gens[i as usize]), generation, "the release moves it on");
+        assert!(view_deaths() > deaths, "and counts as a death for the synced pages");
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no

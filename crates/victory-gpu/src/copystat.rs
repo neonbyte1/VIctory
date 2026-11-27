@@ -97,8 +97,18 @@ pub(crate) enum C {
     /// Preparing submissions: descriptors the title copied into its heaps
     /// as bytes, made on the host first.
     SyncHeapsUs,
-    /// Of those: heap slots looked at (every slot of each page written).
+    /// Of those: heap pages and slots looked at (every slot of each page
+    /// written), of the slots those whose record differed from the slot's
+    /// (made again), those whose record names no live view any more
+    /// (nulled), and the pages whose unchanged records had their view
+    /// checked because a view died since.
+    SyncPages,
     SyncSlots,
+    SyncChanged,
+    SyncStale,
+    SyncRechecks,
+    /// View entries freed by a resource's release (they go stale).
+    ViewDeaths,
     /// Time in copies redone piece by piece after meeting an unmapped page.
     FallbackUs,
     /// Title threads writing a view into a shader-visible heap: time
@@ -187,7 +197,7 @@ pub(crate) enum C {
     /// Marked pages written through the runtime's own mapping of them.
     MarkThrough,
 }
-const COUNTERS: usize = 108;
+const COUNTERS: usize = 113;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -316,7 +326,7 @@ pub(crate) fn log(frames: f64) {
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
-         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
+         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} pages, {:.0} slots: {:.0} changed, {:.0} of a dead view, {:.0} pages re-checked after {:.0} view deaths), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
          {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -371,7 +381,12 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::UploadsUs as usize]),
         ms(c[C::PreludeUs as usize]),
         ms(c[C::SyncHeapsUs as usize]),
+        c[C::SyncPages as usize],
         c[C::SyncSlots as usize],
+        c[C::SyncChanged as usize],
+        c[C::SyncStale as usize],
+        c[C::SyncRechecks as usize],
+        c[C::ViewDeaths as usize],
         ms(c[C::MirrorWaitUs as usize]),
         mb(c[C::CompareBytes as usize]),
         ms(c[C::CompareUs as usize]),
