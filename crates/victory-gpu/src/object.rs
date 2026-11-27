@@ -196,7 +196,7 @@ extern "system" fn get_private_data(
     S_OK
 }
 
-/// Null data removes the entry.
+/// Null data removes the entry and reports S_FALSE if it was already absent.
 extern "system" fn set_private_data(
     this: This,
     id: *const Iid,
@@ -207,14 +207,18 @@ extern "system" fn set_private_data(
     let Some(&id) = (unsafe { id.as_ref() }) else {
         return E_INVALIDARG;
     };
+    let key = (this as usize, id);
     let mut map = private_data();
     if data.is_null() {
-        map.remove(&(this as usize, id));
-    } else {
-        // SAFETY: the title passes `size` bytes.
-        let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
-        map.insert((this as usize, id), value.to_vec());
+        return if map.remove(&key).is_some() {
+            S_OK
+        } else {
+            S_FALSE
+        };
     }
+    // SAFETY: the title passes `size` bytes.
+    let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
+    map.insert(key, value.to_vec());
     S_OK
 }
 
@@ -479,8 +483,11 @@ mod tests {
         assert_eq!(set(first, &TAG, 99, std::ptr::null()), S_OK);
         assert_eq!(get(first, &TAG, &mut size, data.as_mut_ptr()), NOT_FOUND);
         assert_eq!(size, 0);
+        assert_eq!(set(first, &TAG, 0, std::ptr::null()), S_FALSE);
         assert_eq!(get(first, &OTHER_TAG, &mut size, data.as_mut_ptr()), S_OK);
         assert_eq!(size, 0);
+        assert_eq!(set(first, &OTHER_TAG, 0, std::ptr::null()), S_OK);
+        assert_eq!(set(first, &OTHER_TAG, 0, std::ptr::null()), S_FALSE);
         assert_eq!(release(first), 0);
         size = 3;
         assert_eq!(get(second, &TAG, &mut size, data.as_mut_ptr()), S_OK);
