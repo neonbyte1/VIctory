@@ -410,44 +410,16 @@ fn log2(v: usize) -> u32 {
 /// The rotations come from [`Rotations`], built once per subframe size, so
 /// a subframe costs no sines or cosines and no allocation.
 fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
-    let n = input.len();
-    let m = n / 2;
-    let built;
-    let rotations = match rotations().get(log2(n).wrapping_sub(7) as usize) {
-        Some(r) if r.pre_re.len() == m => r,
-        _ => {
-            built = Rotations::new(n);
-            &built
+    match input.len() {
+        128 => rotations()[0].transform(input, out, scale, &mut [0.0; 64], &mut [0.0; 64]),
+        256 => rotations()[1].transform(input, out, scale, &mut [0.0; 128], &mut [0.0; 128]),
+        512 => rotations()[2].transform(input, out, scale, &mut [0.0; 256], &mut [0.0; 256]),
+        n => {
+            let m = n / 2;
+            let mut scratch = vec![0.0; 2 * m];
+            let (re, im) = scratch.split_at_mut(m);
+            Rotations::new(n).transform(input, out, scale, re, im);
         }
-    };
-    let mut stack = [0f64; FRAME_SAMPLES];
-    let mut heap = Vec::new();
-    let (re, im) = if m <= stack.len() / 2 {
-        stack.split_at_mut(m)
-    } else {
-        heap.resize(2 * m, 0f64);
-        heap.split_at_mut(m)
-    };
-    let im = &mut im[..m];
-    // Pre-rotation, each point stored at its bit-reversed place, which is
-    // where the FFT's input permutation would move it.
-    let pre = rotations
-        .pre_re
-        .iter()
-        .zip(&rotations.pre_im)
-        .zip(&rotations.reversed);
-    for (k, ((&c, &s), &to)) in pre.enumerate() {
-        let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
-        re[to as usize] = a * c - b * s;
-        im[to as usize] = a * s + b * c;
-    }
-    rotations.butterflies(re, im);
-    let post = rotations.post_re.iter().zip(&rotations.post_im);
-    for (k, ((&re, &im), (&c, &s))) in re.iter().zip(im.iter()).zip(post).enumerate() {
-        let (wr, wi) = (re * c - im * s, re * s + im * c);
-        // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
-        out[n - 1 - 2 * k] = (wr as f32) * scale;
-        out[2 * k] = -(wi as f32) * scale;
     }
 }
 
@@ -524,24 +496,67 @@ impl Rotations {
         }
     }
 
+    #[inline(always)]
+    fn transform(
+        &self,
+        input: &[f32],
+        out: &mut [f32],
+        scale: f32,
+        re: &mut [f64],
+        im: &mut [f64],
+    ) {
+        let n = input.len();
+        // Pre-rotation, each point stored at its bit-reversed place, which is
+        // where the FFT's input permutation would move it.
+        let pre = self.pre_re.iter().zip(&self.pre_im).zip(&self.reversed);
+        for (k, ((&c, &s), &to)) in pre.enumerate() {
+            let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
+            re[to as usize] = a * c - b * s;
+            im[to as usize] = a * s + b * c;
+        }
+        self.butterflies(re, im);
+        let post = self.post_re.iter().zip(&self.post_im);
+        for (k, ((&re, &im), (&c, &s))) in re.iter().zip(im.iter()).zip(post).enumerate() {
+            let (wr, wi) = (re * c - im * s, re * s + im * c);
+            // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
+            out[n - 1 - 2 * k] = (wr as f32) * scale;
+            out[2 * k] = -(wi as f32) * scale;
+        }
+    }
+
     /// The butterfly stages of an in-place radix-2 forward DFT
     /// (`exp(-2πi nk/N)`) on points already in bit-reversed order.
+    #[inline(always)]
     fn butterflies(&self, re: &mut [f64], im: &mut [f64]) {
         let m = re.len().min(im.len());
+        // Complete the short stages in a single pass over each eight-point
+        // block. Fixed stage widths let the compiler unroll the butterflies.
         let mut len = 2;
-        while len <= m {
-            let half = len / 2;
-            let wr = &self.twiddle_re[half - 1..][..half];
-            let wi = &self.twiddle_im[half - 1..][..half];
-            let blocks = re[..m]
-                .chunks_exact_mut(len)
-                .zip(im[..m].chunks_exact_mut(len));
-            for (re, im) in blocks {
-                let (are, bre) = re.split_at_mut(half);
-                let (aim, bim) = im.split_at_mut(half);
-                butterfly_block(are, aim, bre, bim, wr, wi);
+        if m >= 8 && m.is_multiple_of(8) {
+            let (real, _) = re.as_chunks_mut::<8>();
+            let (imag, _) = im.as_chunks_mut::<8>();
+            for (re, im) in real.iter_mut().zip(imag) {
+                self.stage(re, im, 2);
+                self.stage(re, im, 4);
+                self.stage(re, im, 8);
             }
+            len = 16;
+        }
+        while len <= m {
+            self.stage(re, im, len);
             len <<= 1;
+        }
+    }
+
+    #[inline(always)]
+    fn stage(&self, re: &mut [f64], im: &mut [f64], len: usize) {
+        let half = len / 2;
+        let wr = &self.twiddle_re[half - 1..][..half];
+        let wi = &self.twiddle_im[half - 1..][..half];
+        for (re, im) in re.chunks_exact_mut(len).zip(im.chunks_exact_mut(len)) {
+            let (are, bre) = re.split_at_mut(half);
+            let (aim, bim) = im.split_at_mut(half);
+            butterfly_block(are, aim, bre, bim, wr, wi);
         }
     }
 }
@@ -1325,16 +1340,16 @@ mod tests {
 
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
     /// the standard formula, negated).
-    fn imdct_reference(input: &[f32]) -> Vec<f32> {
+    fn imdct_reference(input: &[f32]) -> Vec<f64> {
         let n = input.len();
         (0..n)
             .map(|j| {
                 let t = (j + n / 2) as f64 + 0.5 + n as f64 / 2.0;
-                -(input
+                -input
                     .iter()
                     .enumerate()
                     .map(|(k, &x)| x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos())
-                    .sum::<f64>() as f32)
+                    .sum::<f64>()
             })
             .collect()
     }
@@ -1342,14 +1357,53 @@ mod tests {
     #[test]
     fn fast_imdct_matches_the_direct_sum() {
         for n in [128usize, 256, 512] {
-            let input: Vec<f32> = (0..n).map(|i| ((i * 7919) % 97) as f32 - 48.0).collect();
-            let mut fast = vec![0f32; n];
-            imdct_half(&input, &mut fast, 1.0);
-            let reference = imdct_reference(&input);
-            for (a, b) in fast.iter().zip(&reference) {
-                assert!((a - b).abs() < 1e-2 * (1.0 + b.abs()), "n {n}: {a} vs {b}");
+            let mut max_error = 0.0_f64;
+            let mut check = |input: &[f32], scale: f32| {
+                let mut fast = vec![0.0; n];
+                imdct_half(input, &mut fast, scale);
+                for (i, (&actual, expected)) in fast.iter().zip(imdct_reference(input)).enumerate() {
+                    let error = (f64::from(actual) - expected * f64::from(scale)).abs();
+                    assert!(error < 1e-5, "n {n}, sample {i}, error {error}");
+                    max_error = max_error.max(error);
+                }
+            };
+            let mut input = vec![0.0; n];
+            check(&input, 1.0);
+            for k in [0, 1, n / 2 - 1, n / 2, n - 2, n - 1] {
+                input[k] = -1.0;
+                check(&input, 1.0);
+                input[k] = 0.0;
             }
+            for (i, value) in input.iter_mut().enumerate() {
+                *value = [0.25, -0.25, f32::MIN_POSITIVE, -0.0][i % 4];
+            }
+            check(&input, 1.0);
+            for seed in [17, 91, 731, 8129] {
+                check(&noise(n, seed), 2.0 / n as f32 / 32768.0);
+            }
+            println!("n {n}: max absolute IMDCT error {max_error:e}");
         }
+    }
+
+    #[test]
+    fn decode_single_bin_xma_frame() {
+        // Mono, 48 kHz, one 512-sample subframe. All scale factors are equal,
+        // quant_step = 80 and coefficient 0 is +1, followed by end-of-block.
+        let frame = [0x00, 0xa5, 0x00, 0x0c, 0x03, 0x63, 0xff, 0xff, 0xf8, 0xab, 0x00];
+        let mut decoder = Decoder::new(1, 48_000);
+        let mut pcm = Vec::new();
+        decoder.decode(&frame, 82, &mut pcm).unwrap();
+        decoder.flush(&mut pcm);
+
+        let n = FRAME_SAMPLES;
+        let mut spectrum = vec![0.0; n];
+        spectrum[0] = 10_000.0;
+        let mut expected = vec![0.0; n / 2];
+        for sample in imdct_reference(&spectrum) {
+            expected.push(sample as f32 * (2.0 / n as f32 / 32768.0));
+        }
+        window_overlap(&mut expected[..n], &sine_window(n));
+        assert_eq!(pcm, expected.into_iter().map(to_i16).collect::<Vec<_>>());
     }
 
     /// The transform as it was before [`Rotations`]: every rotation worked
