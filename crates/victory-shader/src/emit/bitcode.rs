@@ -1107,7 +1107,7 @@ impl Plan {
     /// is still there (not a constant branch's other edge, not from a block
     /// left out).
     fn edge(&self, m: &Module, b: usize, x: usize) -> bool {
-        self.seen[b] && successors(m.term(b)).iter().any(|&s| self.to(s) == x)
+        self.seen[b] && successors(m.term(b)).contains(&x)
     }
 }
 
@@ -1557,6 +1557,44 @@ mod tests {
         assert!(plan.edge(&m, f2, t2) && plan.edge(&m, q2, t2));
         assert!(!plan.layout.contains(&f2));
         let _ = m.write();
+    }
+
+    /// A constant branch to an empty block that folds into the other target:
+    /// the join's phi drops the untaken direct edge instead of emitting two
+    /// entries for the same predecessor.
+    #[test]
+    fn a_constant_branch_through_a_folded_block_drops_the_direct_phi_entry() {
+        let build = |with_dead_edge: bool| {
+            let (mut m, b, sink) = module(3);
+            let [entry, empty, join] = b[..] else {
+                unreachable!()
+            };
+            let i32t = m.int(32);
+            let (one, two, t) = (m.i32(1), m.i32(2), m.bool(true));
+            let term = if with_dead_edge {
+                Term::CondBr(t, empty, join)
+            } else {
+                Term::Br(empty)
+            };
+            m.terminate(entry, term);
+            m.terminate(empty, Term::Br(join));
+            let phi = m.phi(join, i32t);
+            let inc = if with_dead_edge {
+                vec![(one, empty), (two, entry)]
+            } else {
+                vec![(one, empty)]
+            };
+            m.set_phi(phi, inc);
+            let _ = m.call(join, sink, vec![phi]);
+            m.terminate(join, Term::Ret);
+            m
+        };
+        let m = build(true);
+        let plan = m.plan();
+        assert_eq!(plan.fold[1], Some((0, 2)));
+        assert!(plan.edge(&m, 1, 2), "the taken folded edge stays");
+        assert!(!plan.edge(&m, 0, 2), "the untaken direct edge goes");
+        assert_eq!(m.write(), build(false).write());
     }
 
     /// A value only a dropped value reads is dropped too; operations with
