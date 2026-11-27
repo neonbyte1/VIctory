@@ -17,8 +17,6 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Interface, PCSTR, s};
 
@@ -144,8 +142,11 @@ void main(uint lane : SV_GroupIndex) {
 }
 "#;
 
+// As `crate::compute` takes it (Wine's compiler as well as Microsoft's): no
+// `RootSignature` attribute ([`batch_clamp`] makes it: the batch (b0), the
+// jobs (t0), the title's records (t1), the clamped ones (u0), the budget
+// (u1)), and the budget, read and written, a structured buffer of `uint`.
 const BATCH_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Batch : register(b0) { uint first_job; uint job_count; uint unused0; uint unused1; };
 // Packed 32-byte job descriptors:
 //   j0 = uint4(kind, stride, records, src_offset)
@@ -153,7 +154,7 @@ cbuffer Batch : register(b0) { uint first_job; uint job_count; uint unused0; uin
 ByteAddressBuffer jobs : register(t0);
 ByteAddressBuffer src_args : register(t1);
 RWByteAddressBuffer dst_args : register(u0);
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
 static const uint PAST = 0xffffffffu;
@@ -206,12 +207,11 @@ void write_record(uint kind, uint stride, uint src_at, uint dst_at, bool over, u
     }
 }
 
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
     uint left = 0;
     if (lane == 0) {
-        left = BUDGET - min(budget.Load(0), BUDGET);
+        left = BUDGET - min(budget[0], BUDGET);
     }
     uint j = first_job;
     uint end = first_job + job_count;
@@ -306,7 +306,7 @@ void main(uint lane : SV_GroupIndex) {
         }
     }
     if (lane == 0) {
-        budget.Store(0, BUDGET - left);
+        budget[0] = BUDGET - left;
     }
 }
 "#;
@@ -336,78 +336,41 @@ fn clamp() -> Option<&'static Clamp> {
 
 /// The clamp, its root signature the record (b0), the title's records
 /// (t0), the budget (u1) and the clamped records (u0), as [`bound`] binds.
-/// The `[RootSignature]` is built here rather than taken from the shader:
+/// The root signature is built here rather than taken from the shader:
 /// this one also takes the spread flag in `Record.w`, and its buffers are
 /// buffers of records, not byte addresses, so it binds root descriptors.
 fn make() -> windows::core::Result<Clamp> {
+    use D3D12_ROOT_PARAMETER_TYPE_SRV as SRV;
+    use D3D12_ROOT_PARAMETER_TYPE_UAV as UAV;
+    let params = [constants(0, 4), root_view(SRV, 0, 0), root_view(UAV, 1, 0), root_view(UAV, 0, 0)];
+    make_with(SOURCE, s!("argument clamp"), &params)
+}
+
+/// A clamp pipeline of `source` (named `name` in compiler messages) and
+/// its root signature of `params` (`crate::compute`).
+fn make_with(source: &str, name: PCSTR, params: &[D3D12_ROOT_PARAMETER]) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let params = [
-        constants(0, 4),
-        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, 0),
-        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, 0),
-        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0),
-    ];
-    let (root, pso) = compute(device, s!("argument clamp"), SOURCE, 0, &params)?;
+    let (root, pso) = compute(device, name, source, 0, params)?;
     Ok(Clamp { root, pso })
 }
+
 fn batch_clamp() -> Option<&'static Clamp> {
+    use D3D12_ROOT_PARAMETER_TYPE_SRV as SRV;
+    use D3D12_ROOT_PARAMETER_TYPE_UAV as UAV;
     static BATCH: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     BATCH
-        .get_or_init(|| match compile(BATCH_SOURCE, s!("batch_clamp")) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(error = %e, "no batched argument clamp: falling back to inline");
-                None
+        .get_or_init(|| {
+            // As [`HoistedClamps::record_prelude`] binds them.
+            let params = [constants(0, 4), root_view(SRV, 0, 0), root_view(SRV, 1, 0), root_view(UAV, 0, 0), root_view(UAV, 1, 0)];
+            match make_with(BATCH_SOURCE, s!("batch clamp"), &params) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no batched argument clamp: falling back to inline");
+                    None
+                }
             }
         })
         .as_ref()
-}
-
-fn compile(source: &str, name: PCSTR) -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            name,
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
-    }
 }
 
 const HOIST_CHUNK: u64 = 256 << 10;
@@ -815,6 +778,29 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// The single and batched clamps compile with the system's compiler,
+    /// Wine's included (no device: their root signatures are made apart).
+    /// Wine's did not take the batched one while it read its budget through
+    /// `RWByteAddressBuffer::Load` (E5005) and declared its root signature
+    /// in an attribute Wine's ignores, so every hoisted clamp fell back to
+    /// a single one there.
+    #[test]
+    fn every_clamp_compiles_without_a_root_signature_attribute() {
+        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+        use windows::core::s;
+        for (source, name) in [(super::SOURCE, s!("argument clamp")), (super::BATCH_SOURCE, s!("batch clamp"))] {
+            assert!(!source.contains("RootSignature"));
+            let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+            // SAFETY: the source and names live through the call; out pointers ours.
+            let compiled = unsafe {
+                D3DCompile(source.as_ptr().cast(), source.len(), name, None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
+            };
+            let text = errors.as_ref().map(|e| String::from_utf8_lossy(crate::compute::bytes(e)).into_owned());
+            // SAFETY: a static name.
+            assert!(compiled.is_ok() && code.is_some(), "{}: {text:?}", unsafe { name.display() });
+        }
     }
 
     /// Clamps the records of `kind` in `title`, `per` words apart, in a
@@ -1428,15 +1414,15 @@ mod tests {
             return;
         };
         const WRITER: &str = r#"
-#define RS "UAV(u0)"
 RWByteAddressBuffer dst : register(u0);
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     dst.Store3(0, uint3(90000, 1, 1));
 }
 "#;
-        let writer = super::compile(WRITER, super::s!("writer")).unwrap();
+        let writer =
+            super::make_with(WRITER, super::s!("writer"), &[super::root_view(super::D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0)])
+                .unwrap();
         let (src, ptr) = host.shared_buffer(256).unwrap();
         // SAFETY: mapped buffer; live buffer.
         let gpu = unsafe {
