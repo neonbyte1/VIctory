@@ -39,7 +39,7 @@ pub const E_ILLEGAL_METHOD_CALL: HRESULT = 0x8000_000E_u32 as i32;
 pub const E_NO_TASK_QUEUE: HRESULT = 0x8007_01AB_u32 as i32;
 
 const WORK: u32 = 0;
-const COMPLETION: u32 = 1;
+pub(super) const COMPLETION: u32 = 1;
 const INFINITE: u32 = u32::MAX;
 
 type Callback = extern "system" fn(*mut c_void, bool);
