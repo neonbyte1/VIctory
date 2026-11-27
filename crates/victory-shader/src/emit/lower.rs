@@ -6527,6 +6527,12 @@ impl<'a> Lower<'a> {
                     "v_sin_f32" => 13,
                     _ => 12,
                 };
+                // These three take a denormal away from zero where the host
+                // keeps it (an RTX 5080 on vkd3d-proton does).
+                let a = match op {
+                    22 | 27 | 28 => self.ftz(a),
+                    _ => a,
+                };
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
                     22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
