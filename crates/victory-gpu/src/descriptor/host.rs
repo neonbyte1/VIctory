@@ -1149,6 +1149,19 @@ fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool) 
     ]
 }
 
+/// Byte range of a nonempty buffer view. Check each arithmetic step before
+/// looking for (or allocating) a shadow buffer. In release builds a wrapped
+/// address could otherwise select unrelated title memory.
+fn checked_view_span(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    if count == 0 || element == 0 {
+        return None;
+    }
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    let len = u64::from(count).checked_mul(element)?;
+    start.checked_add(len)?;
+    Some((start, len))
+}
+
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
@@ -1172,13 +1185,13 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_view_span(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The host copy a buffer view's bytes are in (the one its host view
@@ -1192,6 +1205,9 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -1201,10 +1217,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_view_span(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The host resource a slot made by [`make`] views, if any, and the view's
@@ -1222,6 +1235,9 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -1230,10 +1246,9 @@ fn buffer_srv(
         return None;
     }
     // The copy its own bytes are in, its first element counted from there.
-    let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
-    else {
+    let (start, bytes) =
+        checked_view_span(address, buffer.FirstElement, buffer.NumElements, element)?;
+    let Some((shadow, own)) = crate::shadow::for_view(start, bytes, element) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
@@ -1268,7 +1283,8 @@ fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> b
 }
 
 fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
-    count > 0 && first.saturating_add(u64::from(count)).saturating_mul(element) <= width
+    checked_view_span(0, first, count, element)
+        .is_some_and(|(start, len)| start <= width && len <= width - start)
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1282,6 +1298,9 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -1295,8 +1314,9 @@ fn buffer_uav(
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
-    let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (start, bytes) =
+        checked_view_span(address, buffer.FirstElement, buffer.NumElements, element)?;
+    let (shadow, own) = crate::shadow::for_view(start, bytes, element)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -2269,6 +2289,42 @@ mod tests {
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+    }
+
+    #[test]
+    fn view_spans_reject_all_arithmetic_overflows() {
+        assert_eq!(checked_view_span(0x1000, 3, 2, 16), Some((0x1030, 32)));
+        assert_eq!(checked_view_span(0, u64::MAX, 1, 2), None);
+        assert_eq!(checked_view_span(u64::MAX - 3, 1, 1, 4), None);
+        assert_eq!(checked_view_span(0, 0, 2, u64::MAX), None);
+        assert_eq!(checked_view_span(u64::MAX - 3, 0, 1, 4), None);
+        assert_eq!(checked_view_span(0, 0, 0, 4), None);
+        assert_eq!(checked_view_span(0, 0, 1, 0), None);
+        assert_eq!(
+            checked_view_span(u64::MAX - 4, 0, 1, 4),
+            Some((u64::MAX - 4, 4))
+        );
+    }
+
+    #[test]
+    fn bounds_do_not_accept_saturated_endpoints() {
+        assert!(!within(u64::MAX, u64::MAX, 1, 1));
+        assert!(!within(u64::MAX, u64::MAX / 2, 2, 2));
+        assert!(!within(16, 0, 1, 0));
+        assert!(within(u64::MAX, u64::MAX - 1, 1, 1));
+    }
+
+    #[test]
+    fn nonbuffer_descriptor_dimensions_do_not_produce_buffer_ranges() {
+        // Synthetic placed buffer descriptions with texture-view dimensions.
+        // No host resource or device is needed to reject these descriptors.
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        let mut desc = [0u32; 16];
+        desc[1] = 4; // Texture2D in both SRV and UAV descriptors.
+        desc[10] = 0x1000;
+        assert_eq!(buffer_range(&View::Placed(false, resource, desc)), None);
+        assert_eq!(buffer_range(&View::Placed(true, resource, desc)), None);
     }
 
     /// The world's 16-byte view of 0 elements removed the device.
