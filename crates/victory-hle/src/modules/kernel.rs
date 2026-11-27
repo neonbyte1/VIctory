@@ -332,8 +332,11 @@ fn handle(m: &HleModule) -> *mut c_void {
 /// mapped now.
 fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    // As the Windows loader does, a name without extension means a DLL.
-    let file = if file.contains('.') {
+    // As the Windows loader does, a name without extension means a DLL;
+    // trailing dots say it has none (and are not part of the name).
+    let file = if file.ends_with('.') {
+        file.trim_end_matches('.').to_owned()
+    } else if file.contains('.') {
         file.to_owned()
     } else {
         format!("{file}.dll")
@@ -810,6 +813,23 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    /// Trailing dots mean the name has no extension: no `.dll` is added.
+    #[test]
+    fn a_module_name_with_a_trailing_dot_gets_no_dll_appended() {
+        let (bare, dll) = (0x7400_0000_0000usize, 0x7500_0000_0000usize);
+        runtime::set_image_path(bare, std::path::Path::new(r"C:\title\plain"));
+        runtime::set_image_path(dll, std::path::Path::new(r"C:\title\plain.dll"));
+        assert_eq!(GetModuleHandleW(w("plain.").as_ptr()) as usize, bare);
+        assert_eq!(
+            GetModuleHandleA(c"sub\\PLAIN.".as_ptr().cast()) as usize,
+            bare
+        );
+        assert_eq!(GetModuleHandleW(w("plain..").as_ptr()) as usize, bare);
+        assert_eq!(GetModuleHandleW(w("plain.dll..").as_ptr()) as usize, dll);
+        assert_eq!(GetModuleHandleW(w("plain").as_ptr()) as usize, dll);
+        assert_eq!(GetModuleHandleW(w("plain.dll").as_ptr()) as usize, dll);
     }
 
     /// No buffer: nothing written, the error says it was too small.
