@@ -1035,3 +1035,78 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
     // never spinning to LOOP_LIMIT (1 << 20).
     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }
+
+/// Empty root-constant slices (`Vec::new()`, whose pointer is dangling `0x4`)
+/// bind a single zero dword so the `user_data_dwords().max(1)` slot declared
+/// by `root_signature_for` stays defined without dereferencing `0x4` on NVIDIA.
+#[test]
+fn empty_root_constants_bind_zero_in_draw_and_dispatch() {
+    let mut cs = super::shader::Shader::new(false);
+    cs.threads = Some([1, 1, 1]);
+    cs.m.terminate(cs.entry, super::bitcode::Term::Ret);
+    let cs = HostShader {
+        stage: HwStage::Cs,
+        dxil: cs.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        memory: false,
+        memory_writes: false,
+        view_addresses: false,
+        heap: false,
+        heap_writes: false,
+        view_marks: false,
+    };
+    let ps = super::host::stub_ps();
+    let vs = super::host::stub_vs(&ps).expect("stub_vs");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (c_root, c_pso) = host.compute_pipeline(&cs).expect("compute pipeline");
+        let out = host
+            .dispatch(
+                &c_root,
+                &c_pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(Vec::new()))],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label} dispatch: {e}"));
+        assert!(out.is_empty(), "{label}");
+
+        let (g_root, g_pso) = host.pipeline(&vs, &ps).expect("graphics pipeline");
+        let texels = host
+            .draw(
+                &g_root,
+                &g_pso,
+                &super::host::Draw {
+                    roots: vec![
+                        (0, Root::Constants(Vec::new())),
+                        (1, Root::Constants(Vec::new())),
+                    ],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (1, 1),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label} draw: {e}"));
+        assert_eq!(texels.len(), 1, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
