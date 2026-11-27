@@ -63,6 +63,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    /// Mapped upload buffers returned on list reset for reuse.
+    upload_pool: Mutex<Vec<(u64, ID3D12Resource, usize)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -265,6 +267,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            upload_pool: Mutex::default(),
         })
     }
 }
@@ -1141,6 +1144,7 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    pooled_uploads: Vec<(u64, ID3D12Resource, usize)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -2066,7 +2070,15 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
+        let mut deferred = self.deferred();
+        let pooled = std::mem::take(&mut deferred.pooled_uploads);
+        *deferred = Deferred::default();
+        drop(deferred);
+        if let Some(host) = host() {
+            for (size, buffer, data) in pooled {
+                host.return_upload(size, buffer, data);
+            }
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2496,13 +2508,13 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset (and returned to the host pool for reuse).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
+        let (cap, buffer, data) = host.take_upload(size)?;
+        name(&buffer, || format!("list upload {cap:#x}"));
+        self.deferred()
+            .pooled_uploads
+            .push((cap, buffer.clone(), data as usize));
         Some((buffer, data))
     }
 
@@ -3109,6 +3121,35 @@ impl Host {
             )
         };
         made.ok().and(buffer)
+    }
+
+    fn take_upload(&self, size: u64) -> Option<(u64, ID3D12Resource, *mut u8)> {
+        let size = size.max(1);
+        let max_fit = size.saturating_mul(2);
+        {
+            let mut pool = self.upload_pool.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((idx, _)) = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, (cap, _, _))| *cap >= size && *cap <= max_fit)
+                .min_by_key(|(_, (cap, _, _))| *cap)
+            {
+                let (cap, buffer, data) = pool.swap_remove(idx);
+                return Some((cap, buffer, data as *mut u8));
+            }
+        }
+        let (buffer, data) = self.upload_buffer(size)?;
+        Some((size, buffer, data))
+    }
+
+    fn return_upload(&self, size: u64, buffer: ID3D12Resource, data: usize) {
+        const MAX_POOLED_BUFFERS: usize = 64;
+        const MAX_POOLED_BYTES: u64 = 64 << 20;
+        let mut pool = self.upload_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let total: u64 = pool.iter().map(|(s, _, _)| *s).sum();
+        if pool.len() < MAX_POOLED_BUFFERS && total.saturating_add(size) <= MAX_POOLED_BYTES {
+            pool.push((size, buffer, data));
+        }
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -4657,5 +4698,28 @@ mod fills {
             let each = best.as_nanos() as f64 / FILLS as f64;
             println!("{FILLS} fills of {len} B: {best:?} ({each:.1} ns each)");
         }
+    }
+
+    #[test]
+    fn upload_buffers_are_pooled_across_list_resets() {
+        let Some(host) = super::host() else {
+            return; // no host GPU
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (first, first_ptr) = list.upload(host, 4096).expect("first upload");
+        let first_raw = windows::core::Interface::as_raw(&first);
+        // SAFETY: `list` is open from `new_list`; close it before `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
+        let (second, second_ptr) = list.upload(host, 4096).expect("second upload");
+        let second_raw = windows::core::Interface::as_raw(&second);
+        assert_eq!(first_raw, second_raw);
+        assert_eq!(first_ptr, second_ptr);
+        drop((first, second));
+        // SAFETY: `list` is open again after `reset()`; close it before the final `reset()`.
+        unsafe { list.list.Close().expect("close list") };
+        list.reset();
     }
 }
