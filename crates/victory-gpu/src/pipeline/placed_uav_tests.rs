@@ -277,7 +277,7 @@ fn direct_and_indirect_dispatch_write_each_group_once() {
     }));
     let null = std::ptr::null();
     let mut pipeline = null;
-    assert_eq!(hand_out(vec![shader], None, &PIPELINE_IIDS[0], &mut pipeline), S_OK);
+    assert_eq!(hand_out(vec![shader], None, &[], &PIPELINE_IIDS[0], &mut pipeline), S_OK);
     let pipeline = Guest(pipeline);
     assert!(host_pipeline(pipeline.0).is_some(), "synthetic host pipeline");
 
