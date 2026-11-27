@@ -909,6 +909,28 @@ mod tests {
     }
 
     #[test]
+    fn gws_operands_are_in_the_address_field() {
+        // Encodings from LLVM's llvm/test/MC/AMDGPU/gfx10_asm_ds.s: the one
+        // operand of these three is where other DS instructions have their
+        // address, not in the first data field.
+        let got = [
+            one(&[0xD876_1234, 0x0000_00FF], true),
+            one(&[0xD866_0000, 0x0000_00FF], true),
+            one(&[0xD86E_FFFF, 0x0000_00FF], true),
+            one(&[0xD876_0000, 0x0000_0000], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "ds_gws_barrier v255 offset:4660 gds",
+                "ds_gws_init v255 gds",
+                "ds_gws_sema_br v255 offset:65535 gds",
+                "ds_gws_barrier v0 gds",
+            ]
+        );
+    }
+
+    #[test]
     fn image_d16_data_is_packed() {
         // Three f16 channels occupy two VGPRs; NSA lists the addresses.
         let words = [0xF09C_070A, 0x8024_0801, 0x0000_0005];

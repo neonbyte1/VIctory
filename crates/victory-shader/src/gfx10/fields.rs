@@ -316,11 +316,15 @@ impl Instruction {
                 } else {
                     1
                 };
+                // The operand of `ds_gws_init`, `ds_gws_sema_br` and
+                // `ds_gws_barrier` is in the address field (LLVM: "data0 is
+                // encoded as addr").
+                let first = if name.starts_with("ds_gws") { 0 } else { 8 };
                 Fields::Ds {
                     dst: returns.then(|| vector(w1 >> 24, ty * (1 + u8::from(pair)))),
                     addr: (!no_addr).then(|| vector(w1 & 0xFF, 1)),
                     data: (0..data)
-                        .map(|i| vector(w1 >> (8 + 8 * i) & 0xFF, ty))
+                        .map(|i| vector(w1 >> (first + 8 * i) & 0xFF, ty))
                         .collect(),
                     offset0: w0 as u8,
                     offset1: (w0 >> 8) as u8,
