@@ -233,7 +233,7 @@ impl Ranges<'_> {
                 best = best.min(h);
             }
         }
-        if best == u32::MAX { self.hi(a) } else { best }
+        best.min(self.hi(a))
     }
 
     /// What an unsigned compare whose result `c` is `holds` says of the
@@ -571,6 +571,47 @@ mod tests {
                 reads[..],
                 "{narrow_first}"
             );
+        }
+    }
+
+    #[test]
+    fn compare_against_looser_or_unbounded_operand_preserves_existing_bound() {
+        // s0 = s2 & 3 (bounded to 3). Joining s0 (along an edge where s0 < s3
+        // or !(s0 >= s3), with s3 either unbounded or bounded looser to 255)
+        // with 0 must keep s0's tighter bound of 3: `edge_hi` must take the
+        // minimum of the compare fact and `self.hi(s0)` rather than letting a
+        // looser compare bound hide `self.hi(s0)`.
+        for (cmp, branch) in [
+            (0xBF0A_0300, 0xBF85_0001), // s_cmp_lt_u32 s0, s3; s_cbranch_scc1 +1
+            (0xBF09_0300, 0xBF84_0001), // s_cmp_ge_u32 s0, s3; s_cbranch_scc0 +1
+        ] {
+            for prefix in [
+                &[][..],
+                &[0x8703_FF04, 255][..], // s_and_b32 s3, s4, 255 (bounded to 255)
+            ] {
+                let mut words = prefix.to_vec();
+                words.extend([
+                    0x8700_8302,          // s_and_b32 s0, s2, 3
+                    cmp,                  // compare s0 against s3
+                    branch,               // -> join when s0 < s3
+                    0xBE80_0380,          // s_mov_b32 s0, 0
+                    M0_S0,                // join: s_mov_b32 m0, s0
+                    vop1(0x43, 4, V + 8), // v_movrels_b32 v4, v8
+                    S_ENDPGM,
+                ]);
+                let p = build_words(&words);
+                let movrels = p
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .find(|i| i.name() == "v_movrels_b32")
+                    .unwrap();
+                assert_eq!(
+                    vgprs(&movrels.reads),
+                    [8, 9, 10, 11, 4],
+                    "{cmp:#010x} prefix={prefix:?}"
+                );
+            }
         }
     }
 }
