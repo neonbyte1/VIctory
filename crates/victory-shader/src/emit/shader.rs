@@ -748,12 +748,26 @@ impl Shader {
             }
             let mut samplers = None;
             if self.samplers > 0 {
-                let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
-                let p = self.m.ptr(ty);
-                let u = self.m.undef(p);
+                let mut plain = None;
+                let mut comparison = None;
                 let mut list = Vec::new();
                 for n in 0..self.samplers {
-                    let kind = (self.cmp_samplers >> n & 1) as u32;
+                    let is_cmp = self.cmp_samplers >> n & 1 != 0;
+                    let u = if is_cmp {
+                        *comparison.get_or_insert_with(|| {
+                            let ty = self
+                                .m
+                                .named_struct("struct.SamplerComparisonState", vec![self.t.i32]);
+                            let p = self.m.ptr(ty);
+                            self.m.undef(p)
+                        })
+                    } else {
+                        *plain.get_or_insert_with(|| {
+                            let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
+                            let p = self.m.ptr(ty);
+                            self.m.undef(p)
+                        })
+                    };
                     let ops = vec![
                         Some(i32c(&mut self, n)),
                         Some(self.m.md_value(u)),
@@ -762,7 +776,7 @@ impl Shader {
                         Some(i32c(&mut self, n)),
                         Some(i32c(&mut self, 1)),
                         // Sampler kind: 1 comparison.
-                        Some(i32c(&mut self, kind)),
+                        Some(i32c(&mut self, u32::from(is_cmp))),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
