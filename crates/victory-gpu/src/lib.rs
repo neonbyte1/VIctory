@@ -23,6 +23,8 @@ mod capture;
 #[cfg(windows)]
 mod compute;
 pub mod console;
+#[cfg(windows)]
+mod copy_pool;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
