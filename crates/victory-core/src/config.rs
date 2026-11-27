@@ -54,18 +54,7 @@ impl Config {
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
-        let file = if path.is_file() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            Some((path, text))
-        } else if let Some(p) = explicit {
-            anyhow::bail!(
-                "VICTORY_CONFIG points at {}, which does not exist",
-                p.display()
-            );
-        } else {
-            None
-        };
+        let file = read_config_file(&path, explicit.is_some())?.map(|text| (path, text));
         let (source, parsed) = match file {
             Some((path, text)) => {
                 let parsed: FileConfig =
@@ -132,6 +121,17 @@ fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Opt
         .map(PathBuf::from)
 }
 
+/// A missing implicit config is optional; an unreadable one is not.
+fn read_config_file(path: &Path, required: bool) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
+        Err(error) if required => Err(error)
+            .with_context(|| format!("reading VICTORY_CONFIG at {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     let dir = root.join(sub);
     ensure_outside_repo(&dir)?;
@@ -153,6 +153,44 @@ fn default_dir(name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn missing_implicit_config_is_optional_but_explicit_is_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        assert_eq!(read_config_file(&path, false).unwrap(), None);
+        assert!(read_config_file(&path, true).is_err());
+        std::fs::write(&path, "[paths]").unwrap();
+        assert_eq!(
+            read_config_file(&path, false).unwrap().as_deref(),
+            Some("[paths]")
+        );
+    }
+
+    #[test]
+    fn unreadable_implicit_config_is_not_silently_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_config_file(&path, false).is_err());
+        assert!(read_config_file(&path, true).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_config_is_an_error_in_both_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        std::fs::write(&path, [0xff]).unwrap();
+        for required in [false, true] {
+            let error = read_config_file(&path, required).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert!(error.to_string().contains("victory.toml"));
+            assert_eq!(error.to_string().contains("VICTORY_CONFIG"), required);
+        }
+    }
 
     #[test]
     fn environment_overrides_file() {
