@@ -365,24 +365,6 @@ fn make_with(source: &str, name: PCSTR, params: &[D3D12_ROOT_PARAMETER]) -> wind
     Ok(Clamp { root, pso })
 }
 
-/// A clamp pipeline of `source` (named `name` in compiler messages), its
-/// root signature the shader's own.
-fn compile(source: &str, name: PCSTR) -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let code = crate::compute::compile(source, name, s!("main"), s!("cs_5_1"), 0)?;
-    let bytes = crate::compute::bytes(&code);
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
-            ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
-    }
-}
-
 fn batch_clamp() -> Option<&'static Clamp> {
     use D3D12_ROOT_PARAMETER_TYPE_SRV as SRV;
     use D3D12_ROOT_PARAMETER_TYPE_UAV as UAV;
@@ -829,8 +811,10 @@ const WINDOW_SOURCES: usize = 4;
 /// A table: a header of 4 words, then 8 words per draw.
 const TABLE_BYTES: u64 = 16 + 32 * WINDOW_ENTRIES as u64;
 
+// As `crate::compute` takes it: no `RootSignature` attribute
+// ([`window_clamp`] makes it: t0 to t4, the budget u1, `dest` u0), and the
+// budget a structured buffer of `uint`.
 const WINDOW_SOURCE: &str = concat!(mesh_groups!(), r#"
-#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u1), UAV(u0)"
 // The host copies records are read from, only read.
 ByteAddressBuffer a0 : register(t0);
 ByteAddressBuffer a1 : register(t1);
@@ -841,7 +825,7 @@ ByteAddressBuffer a3 : register(t3);
 // offset in `dest`. Draws in order; none without records.
 ByteAddressBuffer table : register(t4);
 RWByteAddressBuffer dest : register(u0);
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
 uint word(uint source, uint at) {
@@ -887,14 +871,13 @@ static const uint PAST = 0xffffffffu;
 groupshared uint costs[64];
 // As the single clamp: one group, tiles of 64 records, the first lane
 // charges each tile's records in order.
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
     uint records = table.Load(0);
     uint draws = min(table.Load(4), 64u);
     uint left = 0;
     if (lane == 0) {
-        left = BUDGET - min(budget.Load(0), BUDGET);
+        left = BUDGET - min(budget[0], BUDGET);
     }
     for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
@@ -931,19 +914,27 @@ void main(uint lane : SV_GroupIndex) {
         }
     }
     if (lane == 0) {
-        budget.Store(0, BUDGET - left);
+        budget[0] = BUDGET - left;
     }
 }
 "#);
 
 fn window_clamp() -> Option<&'static Clamp> {
+    use D3D12_ROOT_PARAMETER_TYPE_SRV as SRV;
+    use D3D12_ROOT_PARAMETER_TYPE_UAV as UAV;
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match compile(WINDOW_SOURCE, s!("clamp window")) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(error = %e, "no windowed argument clamp: each indirect draw clamped on its own");
-                None
+        .get_or_init(|| {
+            // As [`open`] binds them: the sources and the table, the budget,
+            // the window's records.
+            let mut params: Vec<_> = (0..=WINDOW_SOURCES as u32).map(|t| root_view(SRV, t, 0)).collect();
+            params.extend([root_view(UAV, 1, 0), root_view(UAV, 0, 0)]);
+            match make_with(WINDOW_SOURCE, s!("clamp window"), &params) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no windowed argument clamp: each indirect draw clamped on its own");
+                    None
+                }
             }
         })
         .as_ref()
@@ -1143,17 +1134,21 @@ mod tests {
         assert!(super::clamp().is_some());
     }
 
-    /// The single and batched clamps compile with the system's compiler,
-    /// Wine's included (no device: their root signatures are made apart).
-    /// Wine's did not take the batched one while it read its budget through
-    /// `RWByteAddressBuffer::Load` (E5005) and declared its root signature
-    /// in an attribute Wine's ignores, so every hoisted clamp fell back to
-    /// a single one there.
+    /// The single, batched and windowed clamps compile with the system's
+    /// compiler, Wine's included (no device: their root signatures are
+    /// made apart). Wine's took neither of the latter two while they read
+    /// their budgets through `RWByteAddressBuffer::Load` (E5005) and
+    /// declared their root signatures in an attribute Wine's ignores, so
+    /// every hoisted or windowed clamp fell back to a single one there.
     #[test]
     fn every_clamp_compiles_without_a_root_signature_attribute() {
         use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
         use windows::core::s;
-        for (source, name) in [(super::SOURCE, s!("argument clamp")), (super::BATCH_SOURCE, s!("batch clamp"))] {
+        for (source, name) in [
+            (super::SOURCE, s!("argument clamp")),
+            (super::BATCH_SOURCE, s!("batch clamp")),
+            (super::WINDOW_SOURCE, s!("clamp window")),
+        ] {
             assert!(!source.contains("RootSignature"));
             let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
             // SAFETY: the source and names live through the call; out pointers ours.
@@ -1383,10 +1378,8 @@ mod tests {
     }
 
     const WRITE: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0)"
 cbuffer Word : register(b0) { uint at; uint value; };
 RWByteAddressBuffer title : register(u0);
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() { title.Store(at, value); }
 "#;
@@ -1416,7 +1409,12 @@ void main() { title.Store(at, value); }
             })
             .collect();
         let (results, data) = host.shared_buffer(1 << 20).unwrap();
-        let writer = super::compile(WRITE, super::s!("write")).unwrap();
+        let writer = super::make_with(
+            WRITE,
+            super::s!("write"),
+            &[super::constants(0, 2), super::root_view(super::D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0)],
+        )
+        .unwrap();
         let list = host.new_list().unwrap();
         // Each draw's records: offset in `results`, words.
         let mut placed = Vec::new();
