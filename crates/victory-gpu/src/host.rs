@@ -6153,12 +6153,13 @@ mod light {
         };
         let list = host.new_list().unwrap();
         // Page 0 → page 1 meets nothing in flight; page 2 → page 3 reads what
-        // it writes; page 1 → page 0 overwrites its bottom-of-pipe write.
+        // the first writes; page 1 → page 3 + 1 KiB overwrites the second's
+        // bottom-of-pipe write.
         list.defer_copy((p + PAGE) as *mut u8, p as *const u8, 64);
         list.defer_copy_memory((p + 3 * PAGE) as *mut u8, (p + 2 * PAGE) as *const u8, 64);
-        list.defer_copy(p as *mut u8, (p + PAGE) as *const u8, 64);
+        list.defer_copy((p + 3 * PAGE + 1024) as *mut u8, (p + PAGE) as *const u8, 64);
         crate::shadow::fly(ELSEWHERE, vec![(p + 2 * PAGE + 32, p + 2 * PAGE + 40, 1)]);
-        crate::shadow::fly(ELSEWHERE + 1, vec![(p + 8, p + 16, crate::shadow::LABEL)]);
+        crate::shadow::fly(ELSEWHERE + 1, vec![(p + 3 * PAGE + 1032, p + 3 * PAGE + 1040, crate::shadow::LABEL)]);
         list.run_deferred(&mut Batch::default(), 1, &mut settle);
         assert_eq!(
             settled.into_inner(),
