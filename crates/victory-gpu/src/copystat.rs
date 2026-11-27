@@ -178,8 +178,14 @@ pub(crate) enum C {
     MarkProtectUs,
     MarkWriteUs,
     MarkVerifyUs,
+    /// Marked pages in the runtime's pools (private, write-watched) and in
+    /// views (sections' pages), and the protection changes each cost.
+    MarkPoolPages,
+    MarkViewPages,
+    MarkPoolProtects,
+    MarkViewProtects,
 }
-const COUNTERS: usize = 103;
+const COUNTERS: usize = 107;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -418,6 +424,28 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::MarkWriteUs as usize]),
         ms(c[C::MarkVerifyUs as usize]),
     );
+    tracing::info!(
+        "  marked pages per frame by memory: pools {:.0} pages, {:.0} protection changes; views {:.0} \
+         pages, {:.0} protection changes",
+        c[C::MarkPoolPages as usize],
+        c[C::MarkPoolProtects as usize],
+        c[C::MarkViewPages as usize],
+        c[C::MarkViewProtects as usize],
+    );
+    let sites: Vec<String> = crate::watch::site_counts()
+        .iter()
+        .zip(crate::watch::SITE_NAMES)
+        .filter(|(n, _)| n[0] > 0)
+        .map(|(n, name)| {
+            format!(
+                "{name} {:.0} calls {:.0} pages ({:.1} failed ranges)",
+                n[0] as f64 / frames,
+                n[1] as f64 / frames,
+                n[2] as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!("  protection changes per frame by caller: {}", sites.join(", "));
     tracing::info!(
         "  copies in video memory per frame: {:.1} completions, {:.1} heavy, {:.1} taking write marks; \
          uploads staged {:.1} MB in {:.1} ms; read back in the submission and put in the mirrors \

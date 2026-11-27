@@ -244,11 +244,109 @@ std::thread_local! {
     /// protection changes made (`VirtualProtect` calls). No destructor, so
     /// the fault handler may touch them.
     static COUNTS: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
+    /// The caller the thread's protection changes count for ([`Site`]).
+    static SITE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Who asked for a protection change (diagnostics census, [`site_counts`]):
+/// the outermost entry that named itself on the thread (0: none did).
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+pub(crate) enum Site {
+    /// The title's write fault ([`install`]'s handler).
+    Handler = 1,
+    /// [`writing`] and its drop: kernel reads and DirectStorage.
+    Writing,
+    WritingDrop,
+    Remapped,
+    Aliased,
+    TrackerDrop,
+    /// [`Tracked::take_split`] of a host buffer copy (refresh), of other
+    /// trackers (textures, heaps).
+    TakeCopy,
+    TakeOther,
+    /// [`Tracked::taken`] other than below.
+    Taken,
+    /// `crate::shadow`: marked pages page by page (its `writing` and
+    /// `taken`), declared ranges' copy-back.
+    MarkedPage,
+    Declared,
+    /// [`Lease::open`], [`Lease::guard`].
+    LeaseOpen,
+    LeaseGuard,
 }
 
 #[cfg(feature = "diagnostics")]
-fn count_protect(calls: u64) {
+const SITES: usize = 14;
+
+#[cfg(feature = "diagnostics")]
+pub(crate) const SITE_NAMES: [&str; SITES] = [
+    "other",
+    "fault handler",
+    "kernel writes (writing)",
+    "kernel writes ended",
+    "remapped",
+    "aliased",
+    "tracker dropped",
+    "refresh take (copies)",
+    "take (textures, heaps)",
+    "taken (other)",
+    "marked page by page",
+    "declared ranges back",
+    "run open",
+    "run guard",
+];
+
+/// Per [`Site`]: protection changes, pages they cover, range changes that
+/// failed and went page by page.
+#[cfg(feature = "diagnostics")]
+static SITE_COUNTS: [[AtomicU64; 3]; SITES] = [const { [const { AtomicU64::new(0) }; 3] }; SITES];
+
+/// Names the caller of the protection changes the thread makes until the
+/// result drops, unless an outer one named itself (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) struct AtSite(Option<u8>);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn at_site(site: Site) -> AtSite {
+    SITE.with(|s| {
+        if s.get() == 0 {
+            s.set(site as u8);
+            AtSite(Some(0))
+        } else {
+            AtSite(None)
+        }
+    })
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for AtSite {
+    fn drop(&mut self) {
+        if let Some(old) = self.0 {
+            SITE.with(|s| s.set(old));
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn count_protect(calls: u64, pages: u64) {
     COUNTS.with(|c| c[1].set(c[1].get() + calls));
+    let site = SITE.with(std::cell::Cell::get) as usize;
+    SITE_COUNTS[site][0].fetch_add(calls, Ordering::Relaxed);
+    SITE_COUNTS[site][1].fetch_add(pages, Ordering::Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+fn count_fallback() {
+    let site = SITE.with(std::cell::Cell::get) as usize;
+    SITE_COUNTS[site][2].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Per [`Site`] since the last call: protection changes, pages, failed
+/// range changes (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn site_counts() -> [[u64; 3]; SITES] {
+    std::array::from_fn(|s| std::array::from_fn(|k| SITE_COUNTS[s][k].swap(0, Ordering::Relaxed)))
 }
 
 /// This thread's rounds of the guard lock and protection changes so far
@@ -447,6 +545,8 @@ impl Drop for Tracked {
     /// was set when that tracker took its page), and with it opened a write
     /// here went unseen there.
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let _site = at_site(Site::TrackerDrop);
         let mut g = guards();
         let mut free = Vec::new();
         for page in self.start / PAGE..self.end.div_ceil(PAGE) {
@@ -479,7 +579,7 @@ fn open(g: &mut Guards, page: usize) -> bool {
     #[cfg(feature = "diagnostics")]
     {
         crate::copystat::add(crate::copystat::C::OpenPages, 1);
-        count_protect(1);
+        count_protect(1, 1);
     }
     true
 }
@@ -507,6 +607,8 @@ impl Tracked {
     /// read as zeros, with no copy to try (each such page cost a dozen
     /// failing kernel reads, 7-30 ms a frame in run perf4).
     pub(crate) fn take_split(&self, from: usize, to: usize) -> (Runs, Runs) {
+        #[cfg(feature = "diagnostics")]
+        let _site = at_site(if self.changed.3 { Site::TakeCopy } else { Site::TakeOther });
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
             return (Vec::new(), Vec::new());
@@ -574,6 +676,8 @@ impl Tracked {
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
+        #[cfg(feature = "diagnostics")]
+        let _site = at_site(Site::Taken);
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         let others = aliases(&g, pages);
@@ -759,6 +863,8 @@ impl Lease<'_> {
     /// title's through them waits for the lease. Returns the protection
     /// changes.
     pub(crate) fn open(&mut self, write: &[usize], bridge: &[usize]) -> u64 {
+        #[cfg(feature = "diagnostics")]
+        let _site = at_site(Site::LeaseOpen);
         use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
         let g = &mut *self.g;
         for (first, last) in page_runs(write) {
@@ -778,7 +884,7 @@ impl Lease<'_> {
             let mut old = 0;
             calls += 1;
             #[cfg(feature = "diagnostics")]
-            count_protect(1);
+            count_protect(1, (last - first) as u64);
             // SAFETY: title memory of the copy; only its protection changes
             // (pages open already stay so).
             let opened = unsafe {
@@ -793,6 +899,8 @@ impl Lease<'_> {
                 }
             } else {
                 // Across allocations: page by page.
+                #[cfg(feature = "diagnostics")]
+                count_fallback();
                 for page in first..last {
                     calls += u64::from(open(g, page));
                 }
@@ -821,6 +929,8 @@ impl Lease<'_> {
     /// with another mapping that cannot be guarded; and the protection
     /// changes asked.
     pub(crate) fn guard(&mut self, pages: &[usize]) -> (Vec<usize>, u64) {
+        #[cfg(feature = "diagnostics")]
+        let _site = at_site(Site::LeaseGuard);
         let g = &mut *self.g;
         let fresh: Vec<usize> = pages
             .iter()
@@ -872,7 +982,7 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
     let set = |from: usize, to: usize| {
         #[cfg(feature = "diagnostics")]
-        count_protect(1);
+        count_protect(1, (to - from) as u64);
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
@@ -907,6 +1017,10 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             g.protected.extend(run);
             taken.extend(run);
             continue;
+        }
+        #[cfg(feature = "diagnostics")]
+        if run.len() > 1 {
+            count_fallback();
         }
         for &page in run {
             if set(page, page + 1) {
@@ -999,6 +1113,8 @@ pub struct Writing {
 
 impl Drop for Writing {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let _site = at_site(Site::WritingDrop);
         let mut g = guards();
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
@@ -1014,6 +1130,8 @@ impl Drop for Writing {
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
 pub fn writing(at: usize, len: usize) -> Writing {
+    #[cfg(feature = "diagnostics")]
+    let _site = at_site(Site::Writing);
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
@@ -1025,6 +1143,8 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let _site = at_site(Site::Remapped);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
@@ -1078,6 +1198,8 @@ fn mark(g: &Guards, first: usize, last: usize) {
 /// too (a write through the new mapping must not go unseen by the trackers
 /// there).
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
+    #[cfg(feature = "diagnostics")]
+    let _site = at_site(Site::Aliased);
     let mut g = guards();
     let page = at / PAGE;
     for &other in others {
@@ -1117,6 +1239,8 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        #[cfg(feature = "diagnostics")]
+        let _site = at_site(Site::Handler);
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
         // Held across both checks: another thread may have opened the block

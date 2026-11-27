@@ -548,6 +548,8 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _site = crate::watch::at_site(crate::watch::Site::Declared);
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -1307,7 +1309,14 @@ pub(crate) fn copy_back_marks(
         .collect();
     for (range, run) in mark_runs(&items, RUN_PAGES) {
         let copy = &pages[range.start].0;
+        // Census (diagnostics): the pages' memory, a pool (private,
+        // write-watched) or a view (a section's pages), and the protection
+        // changes they cost.
+        #[cfg(feature = "diagnostics")]
+        let _kind = MarkKind::new(pages[range.start].1, range.len() as u64);
         if !run {
+            #[cfg(feature = "diagnostics")]
+            let _site = crate::watch::at_site(crate::watch::Site::MarkedPage);
             let written = copy.copy_back_marked(pages[range.start].1, unchanged);
             #[cfg(feature = "diagnostics")]
             {
@@ -1348,6 +1357,41 @@ pub(crate) fn copy_back_marks(
         let (rounds, protects) = crate::watch::thread_counts();
         crate::copystat::add(crate::copystat::C::MarkLeases, rounds - counts.0);
         crate::copystat::add(crate::copystat::C::MarkProtects, protects - counts.1);
+    }
+}
+
+/// Counts a range of marked pages and the protection changes it cost by
+/// the memory it lies in, when dropped (diagnostics census).
+#[cfg(feature = "diagnostics")]
+struct MarkKind(bool, u64, u64);
+
+#[cfg(feature = "diagnostics")]
+impl MarkKind {
+    fn new(page: usize, pages: u64) -> Self {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        // A pool is write-watched (asking about one page, no reset: cheap,
+        // where `VirtualQuery` walks the runtime's big pools).
+        let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+        // SAFETY: room for one answer; no reset, so nothing changes.
+        let pool = unsafe {
+            GetWriteWatch(0, page as *const _, PAGE, (&raw mut found).cast(), &mut count, &mut granularity) == 0
+        };
+        Self(!pool, pages, crate::watch::thread_counts().1)
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for MarkKind {
+    fn drop(&mut self) {
+        use crate::copystat::{C, add};
+        let protects = crate::watch::thread_counts().1 - self.2;
+        let (pages, calls) = if self.0 {
+            (C::MarkViewPages, C::MarkViewProtects)
+        } else {
+            (C::MarkPoolPages, C::MarkPoolProtects)
+        };
+        add(pages, self.1);
+        add(calls, protects);
     }
 }
 
