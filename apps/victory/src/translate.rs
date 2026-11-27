@@ -147,6 +147,8 @@ type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 struct Checks {
     /// The wave sizes to translate for.
     target: emit::Target,
+    /// Pair meetings ([`emit::Options::pair_meetings`]).
+    pair_meetings: bool,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
@@ -161,6 +163,7 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
     host_lanes: Option<(u32, u32)>,
+    pair_meetings: bool,
 ) -> Result<()> {
     // Dumped shaders and validator reports are game-derived (rule #1).
     if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
@@ -227,6 +230,7 @@ pub fn run(
                             };
                             let mut checks = Checks {
                                 target,
+                                pair_meetings,
                                 keep: (!pairs.is_empty()).then(|| kept.clone()),
                                 validator: validate
                                     .then(|| Validator::load(dll.as_deref()).ok())
@@ -388,8 +392,10 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                     continue;
                                 }
                                 let one = std::time::Instant::now();
+                                // (without pair meetings: those are the BVH
+                                // builder's, asked for at run time)
                                 let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container, target);
+                                    victory_gpu::shader_cache::host_shader(container, target, false);
                                 let k = if cached {
                                     0
                                 } else if done.is_ok() {
@@ -591,6 +597,7 @@ fn translate(
                     let options = emit::Options {
                         view_marks: true,
                         target: checks.target,
+                        pair_meetings: checks.pair_meetings,
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {

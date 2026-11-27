@@ -447,6 +447,12 @@ pub struct Options {
     pub view_marks: bool,
     /// The wave sizes the host runs ([`Target::ANY`] by default).
     pub target: Target,
+    /// On a host without 64-lane waves, a console wave64 program whose
+    /// thread group holds several console waves runs in the console flow
+    /// too: the two host waves of each console wave meet on their own
+    /// (`lower`'s pair meetings) where a group of one console wave meets
+    /// at a group barrier. Off: such programs are refused, as before.
+    pub pair_meetings: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -520,6 +526,9 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
+    // (for every lowering of this program: the per-lane form, the console
+    // flow, and the per-lane form again)
+    let _pairs = lower::PairMeetings::set(options.pair_meetings);
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),

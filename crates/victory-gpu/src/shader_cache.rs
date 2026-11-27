@@ -90,8 +90,9 @@ pub fn host_target() -> Target {
 
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one, and whether it
-/// came from there.
-pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, String>, bool) {
+/// came from there. `pair_meetings`: [`victory_shader::emit::Options::pair_meetings`]
+/// (`VICTORY_BVH_HALVES`, `crate::pipeline::builder`).
+pub fn host_shader(container: &[u8], target: Target, pair_meetings: bool) -> (Result<HostShader, String>, bool) {
     // The translation depends on it (a view index clamped below a capped
     // heap's end), and so does the cache key.
     crate::descriptor::host::probe_view_limit();
@@ -100,20 +101,25 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
     let options = victory_shader::emit::Options {
         view_marks: true,
         target,
+        pair_meetings,
     };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &host_key(build(), target), container, translate),
+        Some(cache) => cached(cache, &host_key(build(), target, pair_meetings), container, translate),
         None => (translate(container), false),
     }
 }
 
 /// The part of an entry's key before the container: the build, and the
-/// host's wave sizes (a translation for one host's waves is not another's).
-fn host_key(build: &[u8; 32], target: Target) -> [u8; 32] {
+/// host's wave sizes (a translation for one host's waves is not another's),
+/// and pair meetings when asked for (keys without them stay as they were).
+fn host_key(build: &[u8; 32], target: Target, pair_meetings: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
+    if pair_meetings {
+        h.update(b"pair meetings");
+    }
     *h.finalize().as_bytes()
 }
 
@@ -539,9 +545,11 @@ mod tests {
             lanes_min: 32,
             lanes_max: 64,
         };
-        assert_eq!(host_key(&build, nvidia), host_key(&build, nvidia));
-        assert_ne!(host_key(&build, nvidia), host_key(&build, rdna));
-        assert_ne!(host_key(&build, nvidia), host_key(&[8; 32], nvidia));
+        assert_eq!(host_key(&build, nvidia, false), host_key(&build, nvidia, false));
+        assert_ne!(host_key(&build, nvidia, false), host_key(&build, rdna, false));
+        assert_ne!(host_key(&build, nvidia, false), host_key(&[8; 32], nvidia, false));
+        // Pair meetings change the translation of the builder's programs.
+        assert_ne!(host_key(&build, nvidia, false), host_key(&build, nvidia, true));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

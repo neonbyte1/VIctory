@@ -77,6 +77,25 @@ fn callers() -> Vec<usize> {
     Vec::new()
 }
 
+/// Whether the builder's programs translate with pair meetings
+/// (`VICTORY_BVH_HALVES=1`; `victory_shader::emit::Options::pair_meetings`);
+/// logged once. On a host of 32-lane waves five of its programs hold
+/// several console wave64s to a thread group, and their halves exchange
+/// lanes: without pair meetings they are refused, and the builder (whole
+/// or not at all) never runs there. Off by default.
+pub(crate) fn halves() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = crate::switch::on("VICTORY_BVH_HALVES");
+        if on {
+            tracing::info!(
+                "the BVH builder's programs translate with pair meetings (VICTORY_BVH_HALVES)"
+            );
+        }
+        on
+    });
+    *ON
+}
+
 /// The builder's pipelines (alive while the title holds them).
 static PIPELINES: Mutex<Vec<Weak<Pending>>> = Mutex::new(Vec::new());
 

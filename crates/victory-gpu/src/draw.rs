@@ -3879,6 +3879,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             Options {
                 view_marks: true,
                 target: victory_shader::emit::Target::ANY,
+                pair_meetings: false,
             },
         )
         .unwrap();

@@ -133,6 +133,89 @@ pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange la
 pub(crate) const LANE_PHI_IN_CONSOLE_FLOW: &str =
     "a per-lane descriptor chosen by control flow in the console flow";
 
+/// Why a console wave64 program whose group holds several console waves
+/// stays out of the console flow on a host without 64-lane waves.
+pub(crate) const SEVERAL_CONSOLE_WAVES: &str =
+    "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves";
+
+/// Pair meetings ([`super::Options::pair_meetings`]): the console flow for
+/// a thread group of several console waves on a host without 64-lane waves.
+///
+/// In the console flow each console wave takes its branches as the console
+/// does, wave-wide; two console waves of a group may go different ways (a
+/// loop as long as the wave's index, say), so a group barrier between the
+/// two halves of one console wave would wait for threads that are elsewhere.
+/// Instead the two host waves of a console wave meet on their own: an LDS
+/// counter per console wave that each host wave counts up (one lane) and
+/// reads until the other has counted too ([`Lower::meet`]). Both halves run
+/// the same blocks in the same order (every branch decision is the console
+/// wave's, exchanged), so they meet equally often and in step: when a half
+/// counts in for its k-th meeting, the counter is 2k-2 or 2k-1, and it
+/// reaches 2k only when both have. What either half wrote to LDS before a
+/// meeting (with a group-shared fence before the count and after the wait)
+/// the other reads after it: an exchange ([`Lower::pair_exchange`]) and
+/// the order of the console wave's LDS accesses are exact as with a group
+/// barrier. Console waves are ordered among themselves only by the title's
+/// `s_barrier`s, as on the console, which stay group barriers: each must
+/// be met exactly once by every console wave ([`barriers_once`]).
+///
+/// Idea from the half-wave pair meetings of trustno1-coder/VIctory-NVIDIA
+/// (`emit/lower.rs`: `with_pair_meetings`, `Lower::meet`,
+/// `exchange_dword`; foxhound lineage), re-implemented on the console flow.
+pub(super) struct PairMeetings(bool);
+
+thread_local! {
+    /// Whether this thread's lowering makes pair meetings.
+    static PAIR_MEETINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl PairMeetings {
+    /// Pair meetings on or off for this thread until the guard drops.
+    pub(super) fn set(on: bool) -> PairMeetings {
+        PairMeetings(PAIR_MEETINGS.replace(on))
+    }
+}
+
+impl Drop for PairMeetings {
+    fn drop(&mut self) {
+        PAIR_MEETINGS.set(self.0);
+    }
+}
+
+/// Polls of a meeting's counter before a host wave goes on without the
+/// other half: never reached while both run the program (the other half
+/// is at most a memory access behind); a half cut out of a loop at
+/// [`LOOP_LIMIT`] has left the program, and the wait must end. About a
+/// millisecond of polling or more, short of the driver's reset.
+const MEETING_POLLS: u32 = 1 << 20;
+
+/// Whether each block holding an `s_barrier` runs exactly once on every
+/// path from the entry to the end: in no cycle, and no path to an end
+/// passes around it. Every console wave then meets the title's barriers in
+/// the same order, once each.
+fn barriers_once(p: &Program) -> bool {
+    let n = p.blocks.len();
+    let succs = |b: usize| p.blocks[b].exit.successors();
+    // The blocks reached from `from` without entering `avoid`.
+    let reach = |from: &[usize], avoid: Option<usize>| {
+        let mut seen = vec![false; n];
+        let mut work: Vec<usize> = from.iter().copied().filter(|&b| Some(b) != avoid).collect();
+        while let Some(b) = work.pop() {
+            if std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            work.extend(succs(b).into_iter().filter(|&s| Some(s) != avoid && !seen[s]));
+        }
+        seen
+    };
+    let ends = |seen: &[bool]| {
+        (0..n).any(|b| seen[b] && matches!(p.blocks[b].exit, Exit::End | Exit::Indirect))
+    };
+    (0..n)
+        .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
+        .all(|b| !reach(&succs(b), None)[b] && (b == 0 || !ends(&reach(&[0], Some(b)))))
+}
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -311,6 +394,22 @@ struct Lower<'a> {
     console_flat: Option<V>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
+    /// Console flow in halves for a group of this many console waves (more
+    /// than one): the halves of each meet on their own ([`PairMeetings`]).
+    pairs: Option<u32>,
+    /// With [`Self::pairs`]: this console wave's group-shared meeting
+    /// counter, the exchange dwords (two buffers of two per console wave)
+    /// and this thread's console wave (made in the entry block).
+    pair_slots: Option<(V, V, V)>,
+    /// With [`Self::pairs`]: why a meeting could not be made where the
+    /// lowering asked for one (the program is refused).
+    pair_fail: Option<Why>,
+    /// With [`Self::pairs`]: the exchanged ballots of masks written in an
+    /// earlier block and console-wave SCCs, made at or before the
+    /// instruction being lowered ([`Self::exchange_first`]); valid until
+    /// the block ends.
+    pair_ballots: HashMap<Value, (V, V)>,
+    pair_sccs: HashMap<Value, V>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -827,9 +926,14 @@ impl<'a> Lower<'a> {
             let needs_wave64 =
                 (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
             if needs_wave64 && !x.target.runs(64) {
-                no_console_flow = if cs.threads.iter().product::<u32>() > 64 {
+                let group: u32 = cs.threads.iter().product();
+                let pairs_fit =
+                    group % 64 == 0 && cs.threads[1] == 1 && cs.threads[2] == 1;
+                no_console_flow = if group > 64 && !(PAIR_MEETINGS.get() && pairs_fit) {
+                    Some(SEVERAL_CONSOLE_WAVES)
+                } else if group > 64 && !barriers_once(p) {
                     Some(
-                        "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
+                        "a title barrier not met once by every console wave of a group in halves",
                     )
                 } else if insts()
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
@@ -976,6 +1080,17 @@ impl<'a> Lower<'a> {
             no_console_flow,
             console_flat: None,
             xchg: None,
+            pairs: match x.native.io {
+                StageIo::Cs(cs) if x.console_cf && split && PAIR_MEETINGS.get() => {
+                    let group: u32 = cs.threads.iter().product();
+                    (group > 64).then_some(group / 64)
+                }
+                _ => None,
+            },
+            pair_slots: None,
+            pair_fail: None,
+            pair_ballots: HashMap::new(),
+            pair_sccs: HashMap::new(),
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1605,6 +1720,7 @@ impl<'a> Lower<'a> {
                 );
                 let total = bits(self, total);
                 let (lo, _) = self.exchange(c, total);
+                let c = self.cur;
                 let lo = value(self, lo);
                 let (_, half) = self.console_lane();
                 let zero = self.s.m.i32(0);
@@ -1617,6 +1733,7 @@ impl<'a> Lower<'a> {
             }
             let r = bits(self, r);
             let (lo, hi) = self.exchange(c, r);
+            let c = self.cur;
             if float {
                 let (lo, hi) = (self.as_float(lo), self.as_float(hi));
                 let r = match op {
@@ -1651,6 +1768,13 @@ impl<'a> Lower<'a> {
     fn run(mut self) -> Result<Lowered, Stop> {
         if self.wants_console_flow && !self.x.console_cf && !self.x.per_lane_only {
             return Err(unsupported(0, CONSOLE_FLOW));
+        }
+        if self.console_cf
+            && self.split
+            && self.pairs.is_none()
+            && self.s.threads.is_some_and(|t| t.iter().product::<u32>() > 64)
+        {
+            return Err(unsupported(0, SEVERAL_CONSOLE_WAVES));
         }
         if let Some(n) = self.s.wave_size
             && !self.x.target.runs(n)
@@ -1697,6 +1821,12 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        if self.pairs.is_some() {
+            if self.counters.contains_key(&order[0]) {
+                return Err(unsupported(0, "pair meetings in a program that starts with a loop"));
+            }
+            self.pair_init();
+        }
         self.find_sections();
         self.inputs()?;
         if self.x.native.stage == HwStage::Cs && !self.counters.contains_key(&order[0]) {
@@ -1710,6 +1840,8 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            self.pair_ballots.clear();
+            self.pair_sccs.clear();
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -1761,8 +1893,17 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
+            // (A branch the halves decide together met in new blocks: the
+            // edges leave from the last one.)
+            self.tail[b] = Some(self.cur);
+        }
+        if let Some(why) = self.pair_fail {
+            return Err(unsupported(0, why));
         }
         self.fill_phis()?;
+        if self.pairs.is_some() && !self.s.m.defs_dominate_uses() {
+            return Err(unsupported(0, "a value used before the meeting of the halves that makes it"));
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2264,7 +2405,7 @@ impl<'a> Lower<'a> {
         if self.console_cf {
             // Every lane runs every block: the mask's bits are the lanes'
             // own, both halves' words exchanged.
-            if let Some(&xy) = self.ballots.get(&lo) {
+            if let Some(&xy) = self.ballots.get(&lo).or(self.pair_ballots.get(&lo)) {
                 return Ok(if high { xy.1 } else { xy.0 });
             }
             let at = match self.def_block.get(&lo) {
@@ -2273,6 +2414,17 @@ impl<'a> Lower<'a> {
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
             let bit = self.boolean(m, at)?;
+            if self.pairs.is_some() && at != self.cur {
+                // The halves meet only where code is being lowered: each
+                // takes its word where the mask is written, and they
+                // exchange the words here (kept for this instruction only:
+                // valid below here).
+                let word = self.ballot_word(at, bit);
+                let c = self.cur;
+                let xy = self.exchange(c, word);
+                self.pair_ballots.insert(lo, xy);
+                return Ok(if high { xy.1 } else { xy.0 });
+            }
             let xy = self.console_ballot(at, bit);
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
@@ -3569,6 +3721,7 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::And, lane, k31);
         let mine = self.read_lane(x, at);
         let (x0, x1) = self.exchange(c, mine);
+        let c = self.cur;
         let h = self.s.m.bin(c, Bin::LShr, lane, k5);
         let h = self.s.m.bin(c, Bin::And, h, one);
         let low = self.s.m.cmp(c, pred::EQ, h, z);
@@ -3808,11 +3961,20 @@ impl<'a> Lower<'a> {
             // The console runs an instruction in all 64 lanes before the
             // next one. The halves are two host waves, both here (console
             // flow): a group barrier before each LDS access puts it after
-            // every earlier one, whichever half made it.
-            let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
-            self.s
-                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // every earlier one, whichever half made it. (With several
+            // console waves to a group, the halves of each meet on their
+            // own: the console orders its waves' accesses only at the
+            // title's barriers.)
+            if self.pairs.is_some() {
+                self.meet();
+            } else {
+                let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+                self.s
+                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
         }
+        // (after a meeting, in its new block)
+        let c = self.cur;
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as aligned to what they access.
         // The address is `addr + offset` in 32 bits (it wraps: LLVM folds a
@@ -4049,6 +4211,9 @@ impl<'a> Lower<'a> {
             }
             MaskData::None => name == "s_bcnt1_i32_b64",
         };
+        if self.pairs.is_some() {
+            self.exchange_first(inst);
+        }
         let effect = matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
             || name.contains("store")
@@ -10882,7 +11047,6 @@ impl<'a> Lower<'a> {
     fn console_branch(&mut self, b: usize) -> Result<V, Why> {
         let inst = self.x.p.blocks[b].insts.last().ok_or("a branch")?;
         let name = inst.name();
-        let c = self.cur;
         let (any, set) = match name {
             "s_cbranch_scc0" | "s_cbranch_scc1" => {
                 let v = inst.read(Reg::Scc).ok_or("a branch's SCC")?;
@@ -10910,7 +11074,7 @@ impl<'a> Lower<'a> {
             any
         } else {
             let t = self.s.m.bool(true);
-            self.s.m.bin(c, Bin::Xor, any, t)
+            self.s.m.bin(self.cur, Bin::Xor, any, t)
         })
     }
 
@@ -10921,6 +11085,9 @@ impl<'a> Lower<'a> {
             Some(&Val::Bit(x)) => return Ok(x),
             Some(&Val::Missing(why)) if why != LANE_MASK => return Err(why),
             _ => {}
+        }
+        if let Some(&x) = self.pair_sccs.get(&v) {
+            return Ok(x);
         }
         let b = *self
             .def_block
@@ -10944,7 +11111,11 @@ impl<'a> Lower<'a> {
                     .find_map(|w| self.x.st.masks.get(&w.1).copied())
             })
             .ok_or("an SCC the emitter did not compute")?;
-        self.any_lane(mask)
+        let x = self.any_lane(mask)?;
+        if self.pairs.is_some() {
+            self.pair_sccs.insert(v, x);
+        }
+        Ok(x)
     }
 
     /// Console flow: whether `m` holds in some lane of the console wave.
@@ -10952,6 +11123,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let bit = self.boolean(m, c)?;
         let (lo, hi) = self.console_ballot(c, bit);
+        let c = self.cur;
         let or = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, pred::NE, or, z))
@@ -11036,12 +11208,158 @@ impl<'a> Lower<'a> {
         (lane, half)
     }
 
+    /// Pair meetings ([`PairMeetings`]): the group-shared counters and
+    /// exchange dwords, and this thread's console wave. Every thread zeroes
+    /// its console wave's counter and the group meets once, in the entry
+    /// block (every thread runs it, before any branch).
+    fn pair_init(&mut self) {
+        let waves = self.pairs.expect("pair meetings");
+        let (e, i32t, void) = (self.s.entry, self.s.t.i32, self.s.t.void);
+        let counters = self.s.m.array(waves, i32t);
+        let counters = self.s.m.global("meetings", counters, 3);
+        let words = self.s.m.array(4 * waves, i32t);
+        let words = self.s.m.global("pair_xchg", words, 3);
+        let f = self.console_flat();
+        let six = self.s.m.i32(6);
+        let wave = self.s.m.bin(e, Bin::LShr, f, six);
+        let counter = self.s.m.element(e, counters, wave);
+        let z = self.s.m.i32(0);
+        self.s.m.store(e, counter, z);
+        let mode = self.s.m.i32(1 | 8);
+        self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.pair_slots = Some((counter, words, wave));
+    }
+
+    /// Pair meetings: the two host waves of this thread's console wave
+    /// meet, at [`Self::cur`]; the code after it goes on in a new block
+    /// (`cur` again). What either wrote to group-shared memory before, the
+    /// other reads after. One lane of each host wave counts it in; each
+    /// wave reads the counter (one dword all lanes share) until it reaches
+    /// the next even number, at most [`MEETING_POLLS`] times.
+    fn meet(&mut self) {
+        let (counter, ..) = self.pair_slots.expect("pair meetings");
+        let (i1t, i32t, void) = (self.s.t.i1, self.s.t.i32, self.s.t.void);
+        let (fence, zero, one) = (self.s.m.i32(8), self.s.m.i32(0), self.s.m.i32(1));
+        let c = self.cur;
+        self.s.op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let first = self
+            .s
+            .op(c, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+        self.s.flags |= flags::WAVE_OPS;
+        let at = self.begin_guarded(Some(first));
+        let old = self
+            .s
+            .m
+            .atomic(self.cur, super::bitcode::Rmw::Add, counter, one);
+        let old = self.end_guarded(at, &[(old, zero)])[0];
+        let c = self.cur;
+        let old = self
+            .s
+            .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let (even, two) = (self.s.m.i32(!1), self.s.m.i32(2));
+        let base = self.s.m.bin(c, Bin::And, old, even);
+        let target = self.s.m.bin(c, Bin::Add, base, two);
+        let (wait, done) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(c, Term::Br(wait));
+        let n = self.s.m.phi(wait, i32t);
+        self.s
+            .op(wait, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let now = self.s.m.load(wait, counter);
+        let now = self
+            .s
+            .op(wait, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[now]);
+        let short = self.s.m.bin(wait, Bin::Sub, now, target);
+        let early = self.s.m.cmp(wait, pred::SLT, short, zero);
+        let next = self.s.m.bin(wait, Bin::Add, n, one);
+        let limit = self.s.m.i32(MEETING_POLLS);
+        let more = self.s.m.cmp(wait, pred::IULT, next, limit);
+        let again = self.s.m.bin(wait, Bin::And, early, more);
+        self.s.m.terminate(wait, Term::CondBr(again, wait, done));
+        self.s.m.set_phi(n, vec![(zero, c), (next, wait)]);
+        self.s
+            .op(done, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        self.cur = done;
+    }
+
+    /// [`Self::exchange`] with pair meetings, at [`Self::cur`] only (a
+    /// meeting splits the block being lowered). Each console wave has two
+    /// buffers of two dwords (lower half's, upper half's); a half that has
+    /// met m times finds the counter at 2m or 2m + 1 and takes buffer m % 2.
+    /// The other half takes the same one (it has met m times as well), and
+    /// neither writes it again before the meeting after next, which needs
+    /// the other past its reads of this one.
+    fn pair_exchange(&mut self, at: usize, x: V) -> (V, V) {
+        let z = self.s.m.i32(0);
+        if at != self.cur {
+            self.pair_fail
+                .get_or_insert("an exchange of the halves outside the block being lowered");
+            return (z, z);
+        }
+        let (counter, words, wave) = self.pair_slots.expect("pair meetings");
+        let i32t = self.s.t.i32;
+        let (_, half) = self.console_lane();
+        let c = self.cur;
+        let now = self.s.m.load(c, counter);
+        let now = self
+            .s
+            .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[now]);
+        let (one, two) = (self.s.m.i32(1), self.s.m.i32(2));
+        let met = self.s.m.bin(c, Bin::LShr, now, one);
+        let buffer = self.s.m.bin(c, Bin::And, met, one);
+        let buffer = self.s.m.bin(c, Bin::Shl, buffer, one);
+        let first = self.s.m.bin(c, Bin::Shl, wave, two);
+        let first = self.s.m.bin(c, Bin::Add, first, buffer);
+        let own = self.s.m.bin(c, Bin::Add, first, half);
+        let own = self.s.m.element(c, words, own);
+        self.s.m.store(c, own, x);
+        self.meet();
+        let c = self.cur;
+        let second = self.s.m.bin(c, Bin::Add, first, one);
+        let p0 = self.s.m.element(c, words, first);
+        let p1 = self.s.m.element(c, words, second);
+        (self.s.m.load(c, p0), self.s.m.load(c, p1))
+    }
+
+    /// Pair meetings: the ballots of the lane masks `inst` reads as
+    /// numbers, and the console-wave SCC it reads, exchanged before its own
+    /// code is lowered. A meeting starts a new block, and an instruction's
+    /// code goes on in the block it began in; made here, its code finds
+    /// them made. What fails here fails again where the instruction reads
+    /// it, and is told there. (As trustno1-coder/VIctory-NVIDIA's
+    /// `exchange_first`.)
+    fn exchange_first(&mut self, inst: &Inst) {
+        let st = self.x.st;
+        let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+        let name = inst.name();
+        if reads_mask_as_data(st, inst)
+            || name == "v_readfirstlane_b32"
+            || name.starts_with("v_mbcnt")
+        {
+            for &(r, v) in &inst.reads {
+                if matches!(r, Reg::S(_)) && is_mask(v) {
+                    let _ = self.mask_dword(v);
+                }
+            }
+        }
+        if let Some(v) = inst.read(Reg::Scc)
+            && matches!(self.vals.get(&v), None | Some(Val::Missing(LANE_MASK)))
+        {
+            let _ = self.scc_bit(v);
+        }
+    }
+
     /// Console flow: each half gives `x` (the same in all its lanes) and
     /// both get (the lower half's, the upper half's): through two group-
     /// shared dwords between group barriers, which every thread of the
     /// group reaches (see [`CONSOLE_FLOW`]). A group of 32 threads or
     /// fewer has no upper half: its lanes count as inactive there (0).
+    /// With pair meetings ([`Self::pair_exchange`]) the results are in
+    /// [`Self::cur`], which is then a new block: code after an exchange
+    /// goes there.
     fn exchange(&mut self, at: usize, x: V) -> (V, V) {
+        if self.pairs.is_some() {
+            return self.pair_exchange(at, x);
+        }
         let threads: u32 = self.s.threads.expect("compute").iter().product();
         let z = self.s.m.i32(0);
         if threads <= 32 {

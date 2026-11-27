@@ -255,8 +255,12 @@ pub(crate) enum C {
     SettleAliasClean,
     SettleLabelClean,
     SettleTextureClean,
+    /// Dispatches of the BVH builder's pipelines run and held back
+    /// (`crate::pipeline::builder`, `VICTORY_BVH_HALVES`).
+    BvhRun,
+    BvhHeld,
 }
-const COUNTERS: usize = 147;
+const COUNTERS: usize = 149;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -618,6 +622,11 @@ pub(crate) fn log(frames: f64) {
         .map(|((start, len), bytes)| format!("{start:#x}+{len:#x} {:.1} MB", *bytes as f64 / 1e6 / frames))
         .collect();
     tracing::info!("  snapshots per frame by copy: {}", snapshots.join(", "));
+    tracing::info!(
+        "  BVH builder per frame: {:.1} dispatches run, {:.1} held back (VICTORY_BVH_HALVES)",
+        c[C::BvhRun as usize],
+        c[C::BvhHeld as usize],
+    );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
