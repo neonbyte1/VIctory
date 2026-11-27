@@ -520,6 +520,14 @@ mod tests {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::s;
 
+    /// [`uploads`] with no submission in flight to settle.
+    fn uploads_now(
+        heaps: &[Arc<Viewed>],
+        textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+    ) -> Option<Uploads> {
+        uploads(heaps, textures, &mut crate::host::nothing_in_flight)
+    }
+
     /// Reads slots 0 (raw buffer) and 2 (texture) of the heap and writes
     /// slot 1 (raw unordered buffer): through a table over the heap's
     /// start, the same slots a shader indexing the heap reads.
@@ -769,25 +777,25 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: 64x64 RGBA8 linear = 16 KiB inside our 64 KiB pool page.
         unsafe { std::ptr::write_bytes(pool as *mut u8, 0x11, 64 * 64 * 4) };
         copy.stamp();
-        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "initial upload");
+        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "initial upload");
         assert_eq!(crate::texture::uploads(tex), 1);
 
         // Second submission while clean populates the cached dirty bit in `viewed`
         // and skips recording an upload list.
-        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_none(), "clean skips list");
+        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_none(), "clean skips list");
         assert_eq!(crate::texture::uploads(tex), 1);
         assert!(
             viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.1).is_some(),
             "dirty bit cached in Viewed"
         );
         // Third submission hits the lock-free cached-bit fast path.
-        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_none(), "cached clean skips");
+        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_none(), "cached clean skips");
         assert_eq!(crate::texture::uploads(tex), 1);
 
         // Writing the guarded page flips the watch bit back to dirty -> re-upload.
         // SAFETY: as above; write-fault handler opens the page and marks dirty.
         unsafe { std::ptr::write_bytes(pool as *mut u8, 0x22, 64 * 64 * 4) };
-        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "dirty re-uploads");
+        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "dirty re-uploads");
         assert_eq!(crate::texture::uploads(tex), 2);
 
         // Evicting the host texture clears the cached bit so a recreated host
@@ -802,7 +810,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         copy2.stamp();
         // SAFETY: as above.
         unsafe { std::ptr::write_bytes(pool as *mut u8, 0x33, 64 * 64 * 4) };
-        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "recreated uploads");
+        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "recreated uploads");
         assert_eq!(crate::texture::uploads(tex), 1);
 
         drop(copy2);
@@ -831,16 +839,16 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: committed texture memory of `size` bytes.
         unsafe { std::ptr::write_bytes(mem.cast_mut(), 0x41, size) };
         copy.stamp();
-        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "initial untracked upload");
+        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "initial untracked upload");
         assert_eq!(crate::texture::uploads(tex), 1);
-        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_none(), "unchanged hash skips");
+        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_none(), "unchanged hash skips");
         assert!(
             viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.1).is_none(),
             "untracked texture has no cached dirty bit"
         );
         // SAFETY: as above.
         unsafe { std::ptr::write_bytes(mem.cast_mut(), 0x52, size) };
-        assert!(uploads(std::slice::from_ref(&viewed), &[]).is_some(), "changed untracked re-uploads");
+        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "changed untracked re-uploads");
         assert_eq!(crate::texture::uploads(tex), 2);
 
         drop(copy);
