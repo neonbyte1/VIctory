@@ -509,6 +509,16 @@ fn wave32_hardware_info(host: &Host) -> Option<String> {
 }
 
 fn dispatch_wave32(shader: &HostShader) -> Option<(String, [u32; 32])> {
+    // Check the fixture's binding layout even when no Wave32 device is available.
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if u.slot == super::DISPATCH_SLOT {
+            assert_eq!(u.root, RootType::Constants);
+            continue;
+        }
+        assert_eq!(u.root, RootType::Table);
+        ud[u.index as usize] = 0;
+    }
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -523,14 +533,6 @@ fn dispatch_wave32(shader: &HostShader) -> Option<(String, [u32; 32])> {
     let (root, pso) = host
         .compute_pipeline(shader)
         .unwrap_or_else(|e| panic!("compute_pipeline failed on {info}: {e}"));
-    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-    for u in &shader.user_data {
-        if u.slot == super::DISPATCH_SLOT {
-            continue;
-        }
-        assert_eq!(u.root, RootType::Table);
-        ud[u.index as usize] = 0;
-    }
     let out = host
         .dispatch(
             &root,
