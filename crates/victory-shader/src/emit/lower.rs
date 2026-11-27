@@ -3694,7 +3694,10 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
+        let wide = name.ends_with("_b64")
+            || name.ends_with("_u64")
+            || name.ends_with("_i64")
+            || name == "s_bitreplicate_b64_b32";
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
@@ -3840,6 +3843,84 @@ impl<'a> Lower<'a> {
                         let r = self.s.m.select(c, cond, a, b);
                         self.set(v, Val::I32(r));
                     }
+                    Ok(())
+                }
+                "s_bitset0_b64" | "s_bitset1_b64" => {
+                    let code = dst_code.ok_or("a missing operand")?;
+                    let old_lo =
+                        self.i32_of(inst.read(Reg::S(code)).ok_or("an unread operand")?)?;
+                    let old_hi =
+                        self.i32_of(inst.read(Reg::S(code + 1)).ok_or("an unread operand")?)?;
+                    let a = src32(self, 0)?;
+                    let (k31, k32, one, zero) = (
+                        self.s.m.i32(31),
+                        self.s.m.i32(32),
+                        self.s.m.i32(1),
+                        self.s.m.i32(0),
+                    );
+                    let sh = self.s.m.bin(c, Bin::And, a, k31);
+                    let bit = self.s.m.bin(c, Bin::Shl, one, sh);
+                    let hi_flag = self.s.m.bin(c, Bin::And, a, k32);
+                    let is_hi = self.s.m.cmp(c, pred::NE, hi_flag, zero);
+                    let mask_lo = self.s.m.select(c, is_hi, zero, bit);
+                    let mask_hi = self.s.m.select(c, is_hi, bit, zero);
+                    let (new_lo, new_hi) = if name == "s_bitset1_b64" {
+                        (
+                            self.s.m.bin(c, Bin::Or, old_lo, mask_lo),
+                            self.s.m.bin(c, Bin::Or, old_hi, mask_hi),
+                        )
+                    } else {
+                        let ones = self.s.m.i32(u32::MAX);
+                        let inv_lo = self.s.m.bin(c, Bin::Xor, mask_lo, ones);
+                        let inv_hi = self.s.m.bin(c, Bin::Xor, mask_hi, ones);
+                        (
+                            self.s.m.bin(c, Bin::And, old_lo, inv_lo),
+                            self.s.m.bin(c, Bin::And, old_hi, inv_hi),
+                        )
+                    };
+                    self.set(lo, Val::I32(new_lo));
+                    self.set(hi, Val::I32(new_hi));
+                    Ok(())
+                }
+                "s_brev_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let r_lo = self
+                        .s
+                        .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[b]);
+                    let r_hi = self
+                        .s
+                        .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[a]);
+                    self.set(lo, Val::I32(r_lo));
+                    self.set(hi, Val::I32(r_hi));
+                    Ok(())
+                }
+                "s_bitreplicate_b64_b32" => {
+                    let a = src32(self, 0)?;
+                    let k16 = self.s.m.i32(16);
+                    let kffff = self.s.m.i32(0x0000_FFFF);
+                    let lo_in = self.s.m.bin(c, Bin::And, a, kffff);
+                    let hi_in = self.s.m.bin(c, Bin::LShr, a, k16);
+                    let mut spread16 = |mut x: V| {
+                        for (sh, mask) in [
+                            (8u32, 0x00FF_00FFu32),
+                            (4, 0x0F0F_0F0F),
+                            (2, 0x3333_3333),
+                            (1, 0x5555_5555),
+                        ] {
+                            let s = self.s.m.i32(sh);
+                            let t = self.s.m.bin(c, Bin::Shl, x, s);
+                            let o = self.s.m.bin(c, Bin::Or, x, t);
+                            let m = self.s.m.i32(mask);
+                            x = self.s.m.bin(c, Bin::And, o, m);
+                        }
+                        let one = self.s.m.i32(1);
+                        let t = self.s.m.bin(c, Bin::Shl, x, one);
+                        self.s.m.bin(c, Bin::Or, x, t)
+                    };
+                    let r_lo = spread16(lo_in);
+                    let r_hi = spread16(hi_in);
+                    self.set(lo, Val::I32(r_lo));
+                    self.set(hi, Val::I32(r_hi));
                     Ok(())
                 }
                 _ => Err(name),
