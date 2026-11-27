@@ -1111,7 +1111,8 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let host = emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY)
+            .unwrap();
         Shader::for_test(
             "compute",
             Translated {

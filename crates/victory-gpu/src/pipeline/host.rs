@@ -1016,8 +1016,16 @@ mod tests {
         let resources =
             resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
         let shader_io = io::raise(&program, &native).unwrap();
-        let host_shader =
-            emit::emit(&container, &native, &program, &structured, &shader_io, &resources).unwrap();
+        let host_shader = emit::emit(
+            &container,
+            &native,
+            &program,
+            &structured,
+            &shader_io,
+            &resources,
+            victory_shader::emit::Target::ANY,
+        )
+        .unwrap();
         let shader = Shader::new("mesh", &host_shader.dxil);
         assert!(
             shader
@@ -1273,7 +1281,16 @@ mod tests {
             let resources =
                 resource::track(&program, &native.layout, native.stage, Some(&flow)).unwrap();
             let io = io::raise(&program, &native).unwrap();
-            emit::emit(&container, &native, &program, &flow, &io, &resources).unwrap()
+            emit::emit(
+                &container,
+                &native,
+                &program,
+                &flow,
+                &io,
+                &resources,
+                victory_shader::emit::Target::ANY,
+            )
+            .unwrap()
         };
         eprintln!("emitting the synthetic compute shaders");
         let original = shader(1);

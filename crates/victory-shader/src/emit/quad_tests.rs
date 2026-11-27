@@ -78,7 +78,7 @@ fn pixel(
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
 }
 
 fn validate(shader: &HostShader) {

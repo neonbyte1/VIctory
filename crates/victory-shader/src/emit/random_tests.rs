@@ -540,6 +540,7 @@ fn random_programs_translate_or_are_refused_the_same_way_every_time() {
         // Odd seeds with write marks, as the title's pipelines are made
         // (`victory-gpu`'s shader cache), even ones without, as `translate`.
         let options = super::Options {
+            target: crate::emit::Target::ANY,
             view_marks: seed % 2 == 1,
         };
         let once = || std::panic::catch_unwind(|| translate(&native, &c, options));

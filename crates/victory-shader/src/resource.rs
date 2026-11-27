@@ -3210,7 +3210,9 @@ pub(crate) mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).unwrap();
+        let shader =
+            crate::emit::emit(&empty, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
+                .unwrap();
         assert!(shader.user_data.contains(&crate::emit::UserData {
             index: 16,
             slot: 1,
@@ -3248,7 +3250,9 @@ pub(crate) mod tests {
         let st2 = crate::structure::structure(&p2).unwrap();
         let res2 = track(&p2, &s16_only.layout, s16_only.stage, Some(&st2)).unwrap();
         let io2 = crate::io::raise(&p2, &s16_only).unwrap();
-        let shader2 = crate::emit::emit(&empty, &s16_only, &p2, &st2, &io2, &res2).unwrap();
+        let shader2 =
+            crate::emit::emit(&empty, &s16_only, &p2, &st2, &io2, &res2, crate::emit::Target::ANY)
+                .unwrap();
         assert!(
             !shader2.user_data.iter().any(|u| u.index >= 16),
             "reading GroupId in s16 must not reference spilled user_data[16]: {:?}",

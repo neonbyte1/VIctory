@@ -184,6 +184,7 @@ fn lower_native(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })?;
     let shader = HostShader {

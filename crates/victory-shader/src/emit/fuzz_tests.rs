@@ -211,6 +211,7 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })
     .map_err(|e| format!("lower: {e:?}"))?;

@@ -320,6 +320,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            target: crate::emit::Target::ANY,
             view_marks: false,
         })
     }

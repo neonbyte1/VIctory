@@ -1592,7 +1592,7 @@ mod tests {
         let st = structure::structure(&p)?;
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native)?;
-        emit(&c, &native, &p, &st, &io, &res)
+        emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
     }
 
     /// Mesh programs drawing lines (topology 1) translate as well as
@@ -2400,6 +2400,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: crate::emit::Target::ANY,
             view_marks: false,
         })
         .unwrap();
@@ -2566,6 +2567,7 @@ mod tests {
                 outputs: Vec::new(),
                 prims: Vec::new(),
                 mesh_stride: 0,
+                target: crate::emit::Target::ANY,
                 view_marks: false,
             })
             .expect("lower");

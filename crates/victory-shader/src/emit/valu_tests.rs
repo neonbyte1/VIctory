@@ -1365,6 +1365,7 @@ fn three_xor_swap_tracks_table_through_vcc_and_64bit_pair() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })
     .unwrap();
@@ -4006,7 +4007,7 @@ fn packed_fmac_dpp_reads_the_swizzled_lane() {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io");
-    let ps = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+    let ps = super::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).expect("emit");
     let mut s = Shader::new(false);
     let b = s.entry;
     for col in 0..4u8 {
@@ -4531,6 +4532,7 @@ fn build_wave32_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })
     .expect("lower");
