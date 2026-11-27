@@ -193,6 +193,9 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            if let Some(device) = &device {
+                crate::adapter::log(device);
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }

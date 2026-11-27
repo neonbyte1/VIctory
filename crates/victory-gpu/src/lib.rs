@@ -17,6 +17,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod adapter;
+#[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
