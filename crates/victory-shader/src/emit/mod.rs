@@ -1408,7 +1408,7 @@ mod tests {
             ran += 1;
         }
         if ran == 0 {
-            eprintln!("no device with mesh shaders; skipped");
+            crate::emit::host::no_device("no device with mesh shaders", &[]);
         }
     }
 

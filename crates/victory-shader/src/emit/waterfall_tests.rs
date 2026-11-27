@@ -153,10 +153,9 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         out.push((label, words[0].clone()));
     }
-    assert!(
-        !out.is_empty(),
-        "neither hardware nor WARP SM 6.6 device available"
-    );
+    if out.is_empty() {
+        crate::emit::host::no_device("no SM 6.6 device for the waterfall", &[]);
+    }
     out
 }
 

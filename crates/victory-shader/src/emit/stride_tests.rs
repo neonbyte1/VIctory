@@ -301,7 +301,9 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// A buffer read at a heap index from data whose slot holds no buffer view
@@ -352,7 +354,9 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         assert_eq!(words[0], [0; 32], "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// Constant data through the resource heap itself is read from a raw view
@@ -417,7 +421,9 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
         assert_eq!(words[0], vec![9; 32], "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// `buffer_load_ushort`: the half at its byte address, zero-extended (the
@@ -473,7 +479,9 @@ fn a_half_buffer_load_reads_the_half_at_its_address() {
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// `buffer_store_short`: each lane's half lands at its byte address and
@@ -516,7 +524,9 @@ fn half_buffer_stores_leave_the_other_half_alone() {
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 #[test]
@@ -578,7 +588,9 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 /// User data: s0 a table with a typed buffer UAV, s1 a table with a raw
 /// buffer of 2 dwords a lane, s2 a table with a raw UAV. Each lane stores

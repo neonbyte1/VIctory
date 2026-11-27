@@ -319,7 +319,9 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// A root SRV in a program that does not use title memory is read through
@@ -486,7 +488,9 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         assert_eq!(out[0], want, "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// Writes through unordered buffer views mark their pages (`emit`, "Write
@@ -626,7 +630,9 @@ fn writes_through_views_mark_their_pages() {
         assert_eq!(marked, [100, 101, 200], "{label}: pages");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// Reads of texture views the program takes from the resource heap itself

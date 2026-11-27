@@ -278,7 +278,9 @@ fn gathers_at_a_level_match_the_hardware() {
             }
         }
     }
-    assert!(ran > 0, "no device");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device for the gather", &[]);
+    }
 }
 
 #[test]
@@ -342,12 +344,16 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        // The program declares the console's wave of 32, which WARP refuses.
-        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp, "{label}: no pipeline for a wave of 32");
-            eprintln!("{label}: no pipeline for a wave of 32; skipped");
+        // The program declares the console's wave of 32, which WARP and some
+        // integrated GPUs cannot run: skip those, and still fail a device
+        // that claims 32 lanes and refuses the pipeline.
+        if !host.wave32() {
+            eprintln!("{label}: no wave of 32 on this device; skipped");
             continue;
-        };
+        }
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
             .dispatch(

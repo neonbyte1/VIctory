@@ -1318,7 +1318,9 @@ fn cube_gradients_pick_the_level() {
         }
         ran += 1;
     }
-    assert!(ran > 0, "no SM 6.6 device");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// Equal bits, both zero (the console's legacy multiply gives +0 where PC

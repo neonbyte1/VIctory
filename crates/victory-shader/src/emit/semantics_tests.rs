@@ -549,11 +549,18 @@ fn defective(probes: Vec<Probe>, defect: &str) -> Vec<Probe> {
 /// (each with its first differing inputs).
 fn check(probes: &[Probe]) -> Vec<String> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut hosts: Vec<(&str, bool, Host)> = [("hardware", false), ("warp", true)]
-        .into_iter()
-        .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, warp, h)))
-        .collect();
-    assert!(!hosts.is_empty(), "no SM 6.6 device");
+    let mut hosts: Vec<(&str, bool, Host)> = Vec::new();
+    let mut errors = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        match Host::new(warp) {
+            Ok(h) => hosts.push((label, warp, h)),
+            Err(e) => errors.push(format!("{label}: {e}")),
+        }
+    }
+    if hosts.is_empty() {
+        crate::emit::host::no_device("no SM 6.6 device", &errors);
+        return Vec::new();
+    }
     let report = std::env::var("VICTORY_SEMANTICS_REPORT").ok();
     let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref());
     let mut failures = Vec::new();
