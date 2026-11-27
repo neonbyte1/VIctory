@@ -511,6 +511,7 @@ const _: () = assert!(size_of::<ResourceDesc1>() == 72);
 
 /// Where one resource goes in [`allocation_info2`]'s placement.
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AllocationInfo1 {
     offset: u64,
     alignment: u64,
@@ -552,7 +553,7 @@ fn place<'a>(
 ) -> AllocationInfo {
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 1,
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
@@ -3184,5 +3185,136 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn allocation_info_preserves_sub_64k_alignments() {
+        type GetInfo = extern "system" fn(
+            *mut AllocationInfo,
+            This,
+            u32,
+            u32,
+            *const ResourceDesc,
+        ) -> *mut AllocationInfo;
+        type GetInfo2 = extern "system" fn(
+            *mut AllocationInfo,
+            This,
+            u32,
+            u32,
+            *const ResourceDesc1,
+            *mut AllocationInfo1,
+        ) -> *mut AllocationInfo;
+
+        let device = crate::device::device();
+        let get_info = slot::<GetInfo>(device, 0xc8);
+        let get_info2 = slot::<GetInfo2>(device, 0x360);
+        let invalid = AllocationInfo {
+            size: u64::MAX,
+            alignment: 0,
+        };
+        let invalid_each = AllocationInfo1 {
+            offset: u64::MAX,
+            alignment: 0,
+            size: u64::MAX,
+        };
+        let wrap1 = |desc: ResourceDesc| ResourceDesc1 {
+            desc,
+            mip_region: [0; 3],
+        };
+
+        // 1. Sub-64 KiB console textures keep their 4 KiB and 256-byte alignments,
+        // and GetResourceAllocationInfo2's total agrees with each[0].
+        let bc7_4k = texture(512, 512, 98, 10);
+        let mut out = invalid;
+        let ret = get_info(&mut out, device, 0, 1, &bc7_4k);
+        assert_eq!(ret, &raw mut out);
+        assert_eq!(
+            out,
+            AllocationInfo {
+                size: 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        let mut each1 = [invalid_each; 1];
+        let mut out2 = invalid;
+        let bc7_desc1 = [wrap1(bc7_4k)];
+        let ret2 = get_info2(
+            &mut out2,
+            device,
+            0,
+            1,
+            bc7_desc1.as_ptr(),
+            each1.as_mut_ptr(),
+        );
+        assert_eq!(ret2, &raw mut out2);
+        assert_eq!(out2, out);
+        assert_eq!(
+            each1[0],
+            AllocationInfo1 {
+                offset: 0,
+                alignment: 0x1000,
+                size: 0x56000,
+            }
+        );
+
+        let linear_256b = ResourceDesc {
+            layout: 1,
+            ..texture(64, 64, 28, 1)
+        };
+        let linear_fp = footprint(&linear_256b).unwrap();
+        assert_eq!(linear_fp.alignment, 256);
+        get_info(&mut out, device, 0, 1, &linear_256b);
+        assert_eq!(out, linear_fp);
+        let linear_desc1 = [wrap1(linear_256b)];
+        get_info2(
+            &mut out2,
+            device,
+            0,
+            1,
+            linear_desc1.as_ptr(),
+            each1.as_mut_ptr(),
+        );
+        assert_eq!(out2, linear_fp);
+        assert_eq!(
+            each1[0],
+            AllocationInfo1 {
+                offset: 0,
+                alignment: 256,
+                size: linear_fp.size,
+            }
+        );
+
+        // 2. Mixed sub-64 KiB and 64 KiB arrays preserve offsets and max alignment.
+        let sub_pair = [wrap1(linear_256b), wrap1(bc7_4k)];
+        let mut each2 = [invalid_each; 2];
+        get_info2(
+            &mut out2,
+            device,
+            0,
+            2,
+            sub_pair.as_ptr(),
+            each2.as_mut_ptr(),
+        );
+        let bc7_off = linear_fp.size.next_multiple_of(0x1000);
+        assert_eq!(out2.alignment, 0x1000);
+        assert_eq!(out2.size, bc7_off + 0x56000);
+        assert_eq!(each2[0].offset, 0);
+        assert_eq!(each2[1].offset, bc7_off);
+
+        let mixed3 = [wrap1(bc7_4k), wrap1(buffer(100)), wrap1(linear_256b)];
+        let mut each3 = [invalid_each; 3];
+        get_info2(&mut out2, device, 0, 3, mixed3.as_ptr(), each3.as_mut_ptr());
+        let buf_off = 0x56000u64.next_multiple_of(KIB_64);
+        let lin_off = buf_off + KIB_64;
+        assert_eq!(
+            out2,
+            AllocationInfo {
+                size: lin_off + linear_fp.size,
+                alignment: KIB_64,
+            }
+        );
+        assert_eq!(each3[0].offset, 0);
+        assert_eq!(each3[1].offset, buf_off);
+        assert_eq!(each3[2].offset, lin_off);
     }
 }
