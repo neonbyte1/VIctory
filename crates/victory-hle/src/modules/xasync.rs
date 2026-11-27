@@ -804,17 +804,26 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     status(block)
 }
 
+/// The call's status, and the size of the result it still holds, which is
+/// written whatever the status: 0 while the call is pending, after it
+/// failed, and once its result was taken (or it had none), as the public
+/// reference reports it (libHttpClient's AsyncLib.cpp writes the size of
+/// the call's state, 0 without one).
 pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     if block.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     let hr = status(block);
     // Any nonnegative completion carries a result, not just S_OK: S_FALSE
-    // is a success code too and a provider may return data with it.
-    if hr >= 0 {
-        // SAFETY: checked non-null.
-        unsafe { out.write(words(block).1.load(Ordering::Acquire)) };
-    }
+    // is a success code too and a provider may return data with it. A call
+    // is filed until its result is taken.
+    let size = if hr >= 0 && call(block).is_some() {
+        words(block).1.load(Ordering::Acquire)
+    } else {
+        0
+    };
+    // SAFETY: checked non-null.
+    unsafe { out.write(size) };
     hr
 }
 
@@ -1570,6 +1579,55 @@ mod tests {
         assert_eq!((value, used), (0x1234, 8));
         assert!(call(&raw mut block).is_none(), "the call ends with its result");
         XTaskQueueCloseHandle(q);
+    }
+
+    /// `XAsyncGetResultSize` writes the size whatever the status, as the
+    /// public reference does: 0 while the call is pending, after it failed
+    /// and once its result was taken. A title that sizes a buffer from it
+    /// before looking at the status reads no stale value.
+    #[test]
+    fn result_size_is_zero_without_a_result_to_take() {
+        /// Completes when the test says so; its result is a u64.
+        extern "system" fn later(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_GET_RESULT {
+                // SAFETY: the runtime checked eight bytes.
+                unsafe { (*data).buffer.cast::<u64>().write(7) };
+            }
+            S_OK
+        }
+        const STALE: usize = 0xdead_beef;
+        let fresh = || AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let identity = 0x79 as *const c_void;
+        let (none, mut size) = (std::ptr::null_mut(), STALE);
+
+        let mut block = fresh();
+        let hr = XAsyncBegin(&mut block, none, identity, std::ptr::null(), Some(later));
+        assert_eq!(hr, S_OK);
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), E_PENDING);
+        assert_eq!(size, 0, "pending");
+
+        XAsyncComplete(&mut block, S_OK, 8);
+        size = STALE;
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
+        assert_eq!(size, 8, "a result to take");
+        let mut value = 0u64;
+        assert_eq!(result(&mut block, identity, &mut value), S_OK);
+        assert_eq!(value, 7);
+        size = STALE;
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
+        assert_eq!(size, 0, "taken");
+
+        // Failed, as our offline answers (network, tokens) are.
+        let mut block = fresh();
+        assert_eq!(finished(&mut block, identity, E_ABORT), S_OK);
+        size = STALE;
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), E_ABORT);
+        assert_eq!(size, 0, "failed");
     }
 
     #[test]
