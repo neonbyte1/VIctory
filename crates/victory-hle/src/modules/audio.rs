@@ -634,11 +634,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let mut at = context.field(2, 0, 26) as usize;
-    if at < 32 {
-        at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
-    }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let at = context.field(2, 0, 26) as usize;
+    let start = if at < 32 { xma::first_frame(data) } else { Some(at) };
+    let Some(frame) = start.and_then(|pos| xma::read_frame(data, pos)) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
@@ -653,7 +651,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
-                at,
+                at = frame.start,
                 bits = frame.bits,
                 head = ?&frame.data[..frame.data.len().min(8)],
                 %e,

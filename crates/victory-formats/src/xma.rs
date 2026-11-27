@@ -63,6 +63,23 @@ pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
     })
 }
 
+/// Bit offset of the first frame that begins in this stream's input buffer.
+pub fn first_frame(data: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    loop {
+        let header = packet(data, index)?;
+        if header.frames != 0 {
+            let offset = HEADER_BITS + header.first_frame_bit as usize;
+            if offset >= PACKET_BITS {
+                return None;
+            }
+            let start = index.checked_mul(PACKET_BITS)?.checked_add(offset)?;
+            return (start / 8 < data.len()).then_some(start);
+        }
+        index += 1 + header.skip as usize;
+    }
+}
+
 /// One frame's bits gathered out of its packets.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -1815,6 +1832,28 @@ mod tests {
     /// frame and ends within the frames the buffer can hold (each is over
     /// 15 bits and the walk only moves on).
     #[test]
+    fn first_frame_follows_stream_skips_past_continuation_packets() {
+        let mut data = vec![0; 3 * PACKET_BYTES];
+        // No starts in packet 0. Packet 1 belongs to another stream.
+        put_bits(&mut data, 0, 32, 1);
+        put_bits(&mut data, PACKET_BITS, 32, 1 << 26);
+        put_bits(&mut data, 2 * PACKET_BITS, 32, (1 << 26) | (9 << 11));
+        let start = 2 * PACKET_BITS + HEADER_BITS + 9;
+        put_bits(&mut data, start, 15, 31);
+        assert_eq!(first_frame(&data), Some(start));
+        assert_eq!(read_frame(&data, start).unwrap().bits, 31);
+        assert_eq!(first_frame(&data[..2 * PACKET_BYTES]), None);
+    }
+
+    #[test]
+    fn first_frame_rejects_an_offset_outside_the_announcing_payload() {
+        let mut data = vec![0; 2 * PACKET_BYTES];
+        let payload = (PACKET_BITS - HEADER_BITS) as u32;
+        put_bits(&mut data, 0, 32, (1 << 26) | (payload << 11));
+        assert_eq!(first_frame(&data), None);
+    }
+
+    #[test]
     fn noise_packets_walk_and_decode() {
         let mut noise = Noise(0x2545_f491_4f6c_dd1d);
         for round in 0..60 {
@@ -1839,7 +1878,7 @@ mod tests {
                 let mut decoder = Decoder::new(channels, 48_000);
                 let per_frame = FRAME_SAMPLES * channels;
                 let (mut pcm, mut frames) = (Vec::new(), 0);
-                let mut at = packet(&data, 0).map(|p| HEADER_BITS + p.first_frame_bit as usize);
+                let mut at = first_frame(&data);
                 while let Some(frame) = at.and_then(|bit| read_frame(&data, bit)) {
                     frames += 1;
                     let moves_on = frame.next.is_none_or(|next| next > frame.start);
@@ -1990,7 +2029,7 @@ mod tests {
             let rate = [24_000, 32_000, 44_100, 48_000][(word >> 27 & 3) as usize];
             let mut decoder = Decoder::new(1 + (word >> 29 & 1) as usize, rate);
             let (mut walked, mut errors, mut peak, mut pcm) = (0, 0, 0i16, Vec::new());
-            let mut at = Some(HEADER_BITS + packet(&data, 0).unwrap().first_frame_bit as usize);
+            let mut at = first_frame(&data);
             while let Some(frame) = at.and_then(|bit| read_frame(&data, bit)) {
                 pcm.clear();
                 errors += decoder.decode(&frame.data, frame.bits, &mut pcm).is_err() as u32;
@@ -2028,7 +2067,7 @@ mod tests {
                 .collect();
             let mut decoder = Decoder::new(channels, 48_000);
             let mut pcm = Vec::new();
-            let mut at = Some(HEADER_BITS + packet(&data, 0).unwrap().first_frame_bit as usize);
+            let mut at = first_frame(&data);
             let mut errors = 0;
             while let Some(frame) = at.and_then(|bit| read_frame(&data, bit)) {
                 errors += decoder.decode(&frame.data, frame.bits, &mut pcm).is_err() as usize;
