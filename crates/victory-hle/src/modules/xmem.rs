@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -386,9 +386,15 @@ struct Slice {
     index: usize,
 }
 
+/// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
+/// 16: Grand Theft Auto VI keeps them as 21-bit `number >> 4` and rebuilds
+/// them with `<< 4` (128 GiB of pages at most).
+const FRAMES: usize = PAGE >> 12;
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
+    free: BTreeSet<usize>,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
@@ -396,6 +402,60 @@ struct Physical {
     /// its page in every view showing it (the GPU side's change tracking
     /// follows writes through one view to the others, `aliases`).
     shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+impl Physical {
+    /// Allocates `n` contiguous page numbers, either from a recycled run in
+    /// `free` or by advancing `next_page`.
+    fn take(&mut self, n: usize) -> usize {
+        let mut candidate = None;
+        if self.free.len() >= n {
+            let mut run_start = None;
+            let mut run_len = 0;
+            for &page in &self.free {
+                match run_start {
+                    Some(start) if page == start + run_len * FRAMES => {
+                        run_len += 1;
+                    }
+                    _ => {
+                        run_start = Some(page);
+                        run_len = 1;
+                    }
+                }
+                if run_len == n {
+                    candidate = run_start;
+                    break;
+                }
+            }
+        }
+        match candidate {
+            Some(start) => {
+                for i in 0..n {
+                    self.free.remove(&(start + i * FRAMES));
+                }
+                start
+            }
+            None => {
+                let start = self.next_page;
+                self.next_page += n * FRAMES;
+                start
+            }
+        }
+    }
+
+    /// Records `number` in `free` for recycling, trimming any trailing
+    /// high-water pages contiguous with `next_page`.
+    fn give_back(&mut self, number: usize) {
+        self.free.insert(number);
+        while let Some(&last) = self.free.iter().next_back() {
+            if last + FRAMES == self.next_page {
+                self.free.remove(&last);
+                self.next_page -= FRAMES;
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 impl Slice {
@@ -518,8 +578,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     let section = Arc::new(Section(handle));
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
+    let first = physical.take(n);
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -532,11 +591,6 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     1
 }
-
-/// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
-/// 16: Grand Theft Auto VI keeps them as 21-bit `number >> 4` and rebuilds
-/// them with `<< 4` (128 GiB of pages at most).
-const FRAMES: usize = PAGE >> 12;
 
 /// How many of `pages` are no allocated page (diagnostics: a DirectStorage
 /// destination that could not be written).
@@ -553,7 +607,10 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        let number = unsafe { *pages.add(i) };
+        if physical.pages.remove(&number).is_some() {
+            physical.give_back(number);
+        }
     }
     1
 }
@@ -1385,6 +1442,31 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    #[test]
+    fn physical_pages_recycles_freed_page_numbers() {
+        let mut physical = Physical {
+            next_page: 0x10_0000,
+            ..Default::default()
+        };
+        let a = physical.take(3);
+        let original = [a, a + FRAMES, a + 2 * FRAMES];
+        assert_eq!(physical.next_page, 0x10_0000 + 3 * FRAMES);
+
+        // Free the middle page and reallocate 1 page: it reuses the middle page number.
+        physical.give_back(original[1]);
+        assert_eq!(physical.take(1), original[1]);
+
+        // Free all 3 pages and reallocate 3 pages: it reuses the exact original 3 page numbers.
+        for p in original {
+            physical.give_back(p);
+        }
+        // Trimming trailing high-water pages retracts next_page back to the base.
+        assert_eq!(physical.next_page, 0x10_0000);
+        let new_first = physical.take(3);
+        let new_pages = [new_first, new_first + FRAMES, new_first + 2 * FRAMES];
+        assert_eq!(new_pages, original);
     }
 
     #[test]
