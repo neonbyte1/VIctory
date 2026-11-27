@@ -609,7 +609,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(part.len() / 32));
     for i in 0..count {
         let at = base + 32 * i;
         let name_at = u32_at(part, at + 4)? as usize;
@@ -679,6 +679,11 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             }
         };
         let register = u32_at(part, at + 20)?;
+        // PSV0 counts a signature's register rows in a byte, and lays out
+        // the input/output dependence table from them.
+        if register != u32::MAX && register > 254 {
+            return Err(ShaderError::Malformed("signature element register"));
+        }
         out.push(container::SigElement {
             name: String::from_utf8_lossy(name).into_owned(),
             index: u32_at(part, at + 8)?,
@@ -701,6 +706,43 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// An `ISG1` part of one element, with the given row register and mask.
+    fn isg1(register: u32, mask: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(1u32.to_le_bytes()); // count
+        out.extend(8u32.to_le_bytes()); // row table offset
+        let at = out.len();
+        out.resize(at + 32, 0);
+        out[at + 4..at + 8].copy_from_slice(&40u32.to_le_bytes()); // name
+        out[at + 12..at + 16].copy_from_slice(&64u32.to_le_bytes()); // SV_Target
+        out[at + 16..at + 20].copy_from_slice(&3u32.to_le_bytes()); // f32
+        out[at + 20..at + 24].copy_from_slice(&register.to_le_bytes());
+        out[at + 24] = mask;
+        out.extend(b"SV_Target\0");
+        out
+    }
+
+    /// A count from a damaged part does not size the allocation, and the
+    /// rows it asks for are refused where they run off the part.
+    #[test]
+    fn a_signature_count_past_its_rows_is_refused() {
+        let mut part = isg1(0, 0x1);
+        part[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(signature(&part).is_err());
+        let part = [0x20u8, 0, 0, 0, 0, 0, 0, 0];
+        assert!(signature(&part).is_err());
+    }
+
+    /// PSV0 counts a signature's register rows in a byte.
+    #[test]
+    fn a_signature_register_outside_its_field_is_refused() {
+        assert_eq!(
+            signature(&isg1(0x4000_0000, 0x1)).unwrap_err(),
+            ShaderError::Malformed("signature element register")
+        );
+        assert_eq!(signature(&isg1(u32::MAX, 0xC)).unwrap().len(), 1);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
