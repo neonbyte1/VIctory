@@ -251,6 +251,27 @@ pub extern "C" fn exit(code: i32) -> ! {
     host::exit(code)
 }
 
+/// The kernel's `ExitProcess`: logged as [`exit`] is (it was bound to the
+/// host's, silently: a title that ended the process that way left no line
+/// saying so), then what Windows' does. The other threads end and the
+/// title images get `DLL_PROCESS_DETACH` (the loader's, as after `exit`'s
+/// functions), then the host's `ExitProcess` ends the process with the
+/// title's code. Not the CRT's `exit`: that runs the exit table on the
+/// calling thread while the title's other threads live, where an exit
+/// function waiting for a lock one of them holds hangs; Windows runs no
+/// exit table of the program here.
+pub extern "system" fn ExitProcess(code: u32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title ends the process");
+    end_process(code, host::detach_images, host::exit_process)
+}
+
+/// [`ExitProcess`]'s steps: the title images `detach`, then `exit` ends
+/// the process with `code`.
+fn end_process(code: u32, detach: fn(), exit: fn(u32) -> !) -> ! {
+    detach();
+    exit(code)
+}
+
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
 pub extern "C" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
@@ -395,6 +416,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(OutputDebugStringA),
             hle_export!(OutputDebugStringW),
             hle_export!(exit),
+            hle_export!(ExitProcess),
             hle_export!(abort),
             hle_export!(terminate),
             hle_export!(_invalid_parameter_noinfo_noreturn),
@@ -499,6 +521,15 @@ mod host {
         unsafe { crt_abort() }
     }
 
+    pub(super) fn detach_images() {
+        victory_loader::detach_for_exit_process();
+    }
+
+    pub(super) fn exit_process(code: u32) -> ! {
+        // SAFETY: ends this process with the title's code.
+        unsafe { windows_sys::Win32::System::Threading::ExitProcess(code) }
+    }
+
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
@@ -595,6 +626,12 @@ mod host {
         std::process::abort()
     }
 
+    pub(super) fn detach_images() {}
+
+    pub(super) fn exit_process(code: u32) -> ! {
+        std::process::exit(code as i32)
+    }
+
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
     }
@@ -613,6 +650,23 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's `ExitProcess` detaches the title images before it ends
+    /// the process, and ends it with the title's code. Stand-ins record the
+    /// steps; the exit unwinds instead of ending the test process.
+    #[test]
+    fn a_title_exit_process_detaches_then_ends_with_its_code() {
+        static STEPS: std::sync::Mutex<Vec<Option<u32>>> = std::sync::Mutex::new(Vec::new());
+        fn detach() {
+            STEPS.lock().unwrap().push(None);
+        }
+        fn exit(code: u32) -> ! {
+            STEPS.lock().unwrap().push(Some(code));
+            std::panic::resume_unwind(Box::new(()))
+        }
+        assert!(std::panic::catch_unwind(|| end_process(0x8765_4321, detach, exit)).is_err());
+        assert_eq!(*STEPS.lock().unwrap(), [None, Some(0x8765_4321)]);
+    }
 
     #[test]
     fn disable_thread_library_calls_accepts_pseudo_modules() {

@@ -141,6 +141,14 @@ extern "C" fn detach_all() {
     }
 }
 
+/// The process ends without the CRT's `exit` (a title's `ExitProcess`,
+/// which runs no exit function): as on Windows, every other thread ends
+/// and every attached title image gets `DLL_PROCESS_DETACH`
+/// ([`detach_all`]); the caller then ends the process.
+pub fn detach_for_exit_process() {
+    detach_all();
+}
+
 /// Ends this process when the title images do not detach in time. It does
 /// not use the heap or any lock: a thread that ended can hold them.
 fn end_process() {
