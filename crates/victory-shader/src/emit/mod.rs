@@ -215,6 +215,8 @@ mod flow_tests;
 pub mod host;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
+#[cfg(all(test, windows))]
+mod pair_meeting_tests;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};

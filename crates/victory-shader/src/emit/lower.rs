@@ -189,6 +189,23 @@ impl Drop for PairMeetings {
 /// millisecond of polling or more, short of the driver's reset.
 const MEETING_POLLS: u32 = 1 << 20;
 
+#[cfg(test)]
+thread_local! {
+    /// A test's poll limit for this thread's meetings (else
+    /// [`MEETING_POLLS`]): a much lower one that still gives exact results
+    /// shows how far the waits stay below it.
+    pub(super) static TEST_MEETING_POLLS: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn meeting_polls() -> u32 {
+    #[cfg(test)]
+    if let Some(n) = TEST_MEETING_POLLS.get() {
+        return n;
+    }
+    MEETING_POLLS
+}
+
 /// Whether each block holding an `s_barrier` runs exactly once on every
 /// path from the entry to the end: in no cycle, and no path to an end
 /// passes around it. Every console wave then meets the title's barriers in
@@ -11271,7 +11288,7 @@ impl<'a> Lower<'a> {
         let short = self.s.m.bin(wait, Bin::Sub, now, target);
         let early = self.s.m.cmp(wait, pred::SLT, short, zero);
         let next = self.s.m.bin(wait, Bin::Add, n, one);
-        let limit = self.s.m.i32(MEETING_POLLS);
+        let limit = self.s.m.i32(meeting_polls());
         let more = self.s.m.cmp(wait, pred::IULT, next, limit);
         let again = self.s.m.bin(wait, Bin::And, early, more);
         self.s.m.terminate(wait, Term::CondBr(again, wait, done));
