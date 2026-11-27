@@ -1374,6 +1374,37 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
 }
 
 #[test]
+fn s_lshl_add_shifts_the_first_operand_then_adds() {
+    // s_lshl{1,2,3,4}_add_u32 s6, s0, s1 (SOP2 0x2e..0x31): (s0 << n) + s1.
+    let values = [
+        0u32,
+        1,
+        3,
+        0x1000_0001,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0xFFFF_FFFF,
+    ];
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            cases.push([a, b, 0, 0]);
+        }
+    }
+    for n in 1..=4u32 {
+        let shader = build_valu_cs(&[sop2(0x2d + n as u8, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = (inp[0] << n).wrapping_add(inp[1]);
+            assert_eq!(
+                got, want,
+                "{backend}: s_lshl{n}_add_u32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
+            );
+        });
+    }
+}
+
+#[test]
 fn s_cmpk_compares_against_the_extended_immediate() {
     // s_cmpk_<cond>_<type> s0, imm; s_cselect_b32 s6, 1, 0 (SOP2 0x0a, on SCC);
     // v_mov_b32 v0, s6. The signed forms sign-extend the 16-bit immediate, the
