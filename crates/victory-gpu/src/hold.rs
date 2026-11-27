@@ -41,8 +41,8 @@ const ALWAYS: u32 = 8;
 
 impl ValueWait {
     /// Whether it holds with `read` giving the memory's value: `None` for a
-    /// comparison we do not know (counted by the caller, taken as holding)
-    /// and for memory that cannot be read (taken as not holding).
+    /// comparison we do not know and for memory that cannot be read, which
+    /// the caller counts apart and takes as holding.
     pub(crate) fn holds(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Option<bool> {
         if !(NEVER..=ALWAYS).contains(&self.comparison) {
             return None;
@@ -83,6 +83,8 @@ pub(crate) struct Pumped {
     pub(crate) waited: Vec<(usize, Duration)>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
+    /// Tests of waits on memory that could not be read (taken as holding).
+    pub(crate) unreadable: u32,
 }
 
 /// Every queue's held work.
@@ -146,6 +148,10 @@ impl<S> Held<S> {
                                 match wait.holds(w.read) {
                                     Some(true) => {}
                                     Some(false) => ok = false,
+                                    None if wait.comparison == ALWAYS => {}
+                                    None if (NEVER..=ALWAYS).contains(&wait.comparison) => {
+                                        done.unreadable += 1;
+                                    }
                                     None => done.unknown += 1,
                                 }
                             }
@@ -426,6 +432,33 @@ mod tests {
         held.push(2, Item::Segment("odd", vec![odd]));
         let p = pump(&mut held, &fake);
         assert_eq!((p.segments, p.unknown), (1, 1));
+    }
+
+    /// A wait on memory that cannot be read is counted apart from unknown
+    /// comparisons; like them it does not hold its work back (yet).
+    #[test]
+    fn unreadable_waits_are_counted_apart_and_do_not_hold_work() {
+        let log = RefCell::new(Vec::new());
+        let mut held = Held::default();
+        let always = ValueWait {
+            comparison: ALWAYS,
+            ..ge(0x100, 1)
+        };
+        held.push(2, Item::Segment("work", vec![ge(0x100, 1)]));
+        held.push(3, Item::Segment("always", vec![always]));
+        let mut run = |q: usize, segments: Vec<&'static str>| {
+            log.borrow_mut()
+                .push(format!("q{q}: {}", segments.join(" ")));
+        };
+        let p = held.pump(&mut World {
+            read: &|_, _| None,
+            fence: &|_| 0,
+            run: &mut run,
+            signal: &mut |_, _| {},
+        });
+        // An ALWAYS wait never reads its memory: it is not counted.
+        assert_eq!((p.segments, p.unknown, p.unreadable), (2, 0, 1));
+        assert_eq!(*log.borrow(), ["q2: work", "q3: always"]);
     }
 
     #[test]

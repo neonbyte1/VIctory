@@ -222,12 +222,13 @@ fn pump(held: &mut Holding, why: Why) {
         run: &mut run,
         signal: &mut signal,
     });
-    if pumped.segments > 0 || pumped.unknown > 0 {
+    if pumped.segments > 0 || pumped.unknown > 0 || pumped.unreadable > 0 {
         let mut a = account();
         a.pump += started.elapsed().saturating_sub(ran);
         a.pieces += pumped.pieces;
         a.segments += pumped.segments;
         a.unknown += pumped.unknown;
+        a.unreadable += pumped.unreadable;
         for (queue, waited) in pumped.waited {
             a.released.push((kind(queue), waited, why));
         }
@@ -270,6 +271,8 @@ struct Account {
     /// Segments that waited: queue type, how long, what ran them.
     released: Vec<(u32, std::time::Duration, Why)>,
     unknown: u32,
+    /// Tests of waits on memory that could not be read.
+    unreadable: u32,
     forced: u32,
     mappings: u32,
     /// Time in the pump outside host submissions.
@@ -290,7 +293,13 @@ fn account_frame(frame: u64) {
     let (fence_waits, fence_waited) = crate::fence::take_waited();
     let a = std::mem::take(&mut *account());
     let blocked = held().blocked(&read_value);
-    if a.released.is_empty() && blocked.is_empty() && a.forced == 0 && a.unknown == 0 && a.mappings == 0 {
+    if a.released.is_empty()
+        && blocked.is_empty()
+        && a.forced == 0
+        && a.unknown == 0
+        && a.unreadable == 0
+        && a.mappings == 0
+    {
         return;
     }
     let longest = a.released.iter().map(|r| r.1).max().unwrap_or_default();
@@ -332,14 +341,16 @@ fn account_frame(frame: u64) {
             tracing::info!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "a queue holds work at the present");
         }
     }
-    if a.forced > 0 || a.unknown > 0 || a.mappings > 0 {
+    if a.forced > 0 || a.unknown > 0 || a.unreadable > 0 || a.mappings > 0 {
         tracing::warn!(
             frame,
             forced = a.forced,
             unknown = a.unknown,
+            unreadable = a.unreadable,
             mappings = a.mappings,
             "held work: run without its waits (valve), waits with an unknown comparison (taken as holding), \
-             page mappings done ahead of held work"
+             tests of waits on memory that could not be read (taken as holding), page mappings done ahead \
+             of held work"
         );
     }
 }
