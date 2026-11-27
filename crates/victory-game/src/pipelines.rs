@@ -11,11 +11,12 @@
 //! the states the pack's register images encode, and for rasterisers and
 //! depth-stencil an enumeration of each field's usual values. A description
 //! counts only if its hash is the record's. (Of 25,471 records these name
-//! all three states of 25,329: every rasteriser, from the register images,
+//! all three states of 25,465: every rasteriser, from the register images,
 //! 852 records of which no enumeration reached for their clamped,
-//! fractional slope biases; one-byte changes of the named descriptions and
-//! a blend enumeration named states of 17 and 32 more records, none drawn
-//! with in the runs measured, and were left out.)
+//! fractional slope biases, and all depth-stencil states but 2 (3 records)
+//! once what the registers do not keep is tried; a blend enumeration named
+//! states of 32 more records, none drawn with in the runs measured, and was
+//! left out.)
 //!
 //! Compact layouts (D3D12 enum values throughout):
 //!
@@ -307,28 +308,68 @@ fn stencil_op(v: u32) -> u8 {
     }
 }
 
+/// The depth-stencil states the registers encode, and what they do not
+/// keep: b14 and the depth-bounds test (b15), the write mask of a stencil
+/// that can write nothing (kept as 0), and the ops and funcs of a stencil
+/// that is off (kept as given, the engine's descriptions still name them).
 fn depth_from_registers(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
+    let [control, stencil, ..] = *regs;
+    let (front, back) = stencil_faces(control, stencil);
+    depth_kept(regs, |b| {
+        let mut faces = vec![(b[6..10].to_vec(), b[10..14].to_vec())];
+        if b[3] == 0 {
+            faces.push((front.to_vec(), back.to_vec()));
+        }
+        let mut writes = vec![b[5]];
+        if b[3] == 1 && b[5] == 0 {
+            writes.extend([0xFF, b[4]]);
+        }
+        for (fr, bk) in &faces {
+            for &w in &writes {
+                for tail in 0..4u8 {
+                    let mut c = b;
+                    c[5] = w;
+                    c[6..10].copy_from_slice(fr);
+                    c[10..14].copy_from_slice(bk);
+                    c[14] = tail & 1;
+                    c[15] = tail >> 1;
+                    f(c);
+                }
+            }
+        }
+    });
+}
+
+/// The stencil faces `DB_DEPTH_CONTROL` and `DB_STENCIL_CONTROL` hold: the
+/// back face its own only with back-face stencil on.
+fn stencil_faces(control: u32, stencil: u32) -> ([u8; 4], [u8; 4]) {
+    let front = [
+        stencil_op(stencil),
+        stencil_op(stencil >> 8),
+        stencil_op(stencil >> 4),
+        func(control >> 8),
+    ];
+    let back = if control >> 7 & 1 != 0 {
+        [
+            stencil_op(stencil >> 12),
+            stencil_op(stencil >> 20),
+            stencil_op(stencil >> 16),
+            func(control >> 20),
+        ]
+    } else {
+        front
+    };
+    (front, back)
+}
+
+/// The depth-stencil states as the registers keep them.
+fn depth_kept(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
     let [control, stencil, mask, ..] = *regs;
     let stencil_on = (control & 1) as u8;
     let depth_on = control >> 1 & 1 != 0;
     let off = [1, 1, 1, 8];
     let (front, back, masks) = if stencil_on != 0 {
-        let front = [
-            stencil_op(stencil),
-            stencil_op(stencil >> 8),
-            stencil_op(stencil >> 4),
-            func(control >> 8),
-        ];
-        let back = if control >> 7 & 1 != 0 {
-            [
-                stencil_op(stencil >> 12),
-                stencil_op(stencil >> 20),
-                stencil_op(stencil >> 16),
-                func(control >> 20),
-            ]
-        } else {
-            front
-        };
+        let (front, back) = stencil_faces(control, stencil);
         (front, back, (mask >> 8 & 0xFF, mask >> 16 & 0xFF))
     } else {
         (off, off, (0xFF, 0xFF))
@@ -862,6 +903,36 @@ mod tests {
         assert_eq!(target, [1, 0, 5, 6, 1, 2, 1, 1, 4]);
         assert_eq!(d[8 + 36], 7);
         assert_eq!(w(48 + 32), 4, "second target's logic op");
+    }
+
+    #[test]
+    fn depth_states_try_what_the_registers_do_not_keep() {
+        // Depth on, always, no writes; stencil off, but its control still
+        // holds replace on pass and func equal (2 -> 3) on both faces.
+        let mut regs = [0u32; 14];
+        regs[0] = 0x0000_0272;
+        regs[1] = 0x0000_0030;
+        regs[2] = 0x0100_ff00;
+        let mut all = Vec::new();
+        depth_from_registers(&regs, |b| all.push(b));
+        let faces = [1, 1, 3, 3];
+        assert!(
+            all.iter()
+                .any(|b| b[..4] == [1, 0, 8, 0] && b[6..10] == faces && b[10..14] == faces)
+        );
+        assert!(
+            all.iter().any(|b| b[..4] == [1, 0, 8, 0] && b[15] == 1),
+            "depth bounds"
+        );
+        assert!(all.iter().any(|b| b[14] == 1));
+        // Stencil on, keep everywhere: the register's write mask 0 may be
+        // the description's 0xFF.
+        regs[0] = 0x0000_0273;
+        regs[1] = 0;
+        all.clear();
+        depth_from_registers(&regs, |b| all.push(b));
+        assert!(all.iter().any(|b| b[3] == 1 && b[4..6] == [0xFF, 0]));
+        assert!(all.iter().any(|b| b[3] == 1 && b[4..6] == [0xFF, 0xFF]));
     }
 
     #[test]
