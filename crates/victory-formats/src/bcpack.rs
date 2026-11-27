@@ -13,6 +13,7 @@
 //! kept in `bcpack-tables.bin` beside this file ([`Tables::builtin`]).
 
 use std::fmt;
+use std::mem::MaybeUninit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(pub &'static str);
@@ -487,10 +488,22 @@ fn interleave(a: u8, b: u8) -> u8 {
 
 /// Block `i`'s reference `r`: 0 none, else `r` blocks back, before the first
 /// block into the dictionary.
-fn pick<'a, T>(i: usize, r: usize, history: &'a [T], dictionary: &'a [T], zero: &'a T) -> &'a T {
+fn pick<'a, T>(
+    i: usize,
+    r: usize,
+    history: &'a [MaybeUninit<T>; HISTORY],
+    dictionary: &'a [T],
+    zero: &'a T,
+) -> &'a T {
     match r {
         0 => zero,
-        r if r <= i => &history[(i - r) % HISTORY],
+        r if r <= i => {
+            // SAFETY: slot `(i - r) % HISTORY` was written by block `i - r`
+            // (its residue matches), and no later block has overwritten it:
+            // the next block with that residue is `i - r + HISTORY`, which is
+            // past block `i` because `r <= 255 < HISTORY`.
+            unsafe { history[(i - r) % HISTORY].assume_init_ref() }
+        }
         r => &dictionary[r - i - 1],
     }
 }
@@ -531,7 +544,7 @@ fn plain<'a>(
     residual: impl Fn(&[u8]) -> Plain,
     pack: fn(&Plain, &mut [u8]),
 ) -> Result<(), Error> {
-    let mut history = vec![Plain::default(); HISTORY];
+    let mut history = [MaybeUninit::<Plain>::uninit(); HISTORY];
     let zero = Plain::default();
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, w.paired);
@@ -544,7 +557,7 @@ fn plain<'a>(
         for ((v, r), bits) in v.ix.iter_mut().zip(ix_ref).zip(w.ix) {
             *v = v.wrapping_add(*r) & ((1u8 << bits) - 1);
         }
-        history[i % HISTORY] = v;
+        history[i % HISTORY].write(v);
         pack(&v, block);
     }
     Ok(())
@@ -759,7 +772,7 @@ fn bc7<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     t: &Tables,
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
+    let mut history = [MaybeUninit::<(Bc7Ep, Bc7Ix)>::uninit(); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
@@ -838,7 +851,7 @@ fn bc7<'a>(
                 }
             }
         }
-        history[i % HISTORY] = (ep, ix);
+        history[i % HISTORY].write((ep, ix));
         bc7_pack(&ep, &ix, prec, block);
     }
     Ok(())
@@ -1059,7 +1072,7 @@ fn bc6<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[(Bc6Ep, Bc6Ix)],
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
+    let mut history = [MaybeUninit::<(Bc6Ep, Bc6Ix)>::uninit(); HISTORY];
     let zero = (
         Bc6Ep::default(),
         Bc6Ix {
@@ -1127,7 +1140,7 @@ fn bc6<'a>(
                 ix.ix[p] = add_index(v, bits, rx.ix[p], bc6_index_bits(rx.mode));
             }
         }
-        history[i % HISTORY] = (ep, ix);
+        history[i % HISTORY].write((ep, ix));
         // Fields: the working value has its top bit flipped.
         let field = |k: usize, c: usize| {
             let sh = if k == 0 { shift[0] } else { shift[1 + c] };
@@ -1608,5 +1621,93 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+
+    /// More blocks than the history holds, every block referring to the
+    /// block 255 before it: the first 255 read the dictionary, block 255
+    /// reads block 0, and later blocks read slots the ring has wrapped
+    /// past. The first 255 blocks carry a per-block residual so the base
+    /// values differ; from block 255 the residual is zero, so each of
+    /// those blocks must come back exactly as the block it refers to. A
+    /// wrap bug (an unwritten slot, a stale entry, an off-by-one in the
+    /// distance) shows as an unequal block.
+    #[test]
+    fn references_survive_the_dictionary_transition_and_the_history_wrap() {
+        let t = Tables::parse(&tables()).unwrap();
+        let blocks = 600usize;
+
+        // BC4 (unpaired): distance and index reference in s[1] alone.
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0u8; 12];
+                r[1] = 255;
+                if i < 255 {
+                    r[2] = 2 * (i & 127) as u8;
+                    r[3] = 2 * (i >> 7) as u8;
+                }
+                r
+            })
+            .collect();
+        let src = stream(&t, &BC4_LANES, 1, &records);
+        let mut dst = vec![0u8; blocks * 8];
+        decode(4, &src, &mut dst, &t).unwrap();
+        for i in 255..blocks {
+            assert_eq!(
+                &dst[8 * i..8 * i + 8],
+                &dst[8 * (i - 255)..8 * (i - 255) + 8],
+                "BC4 block {i}"
+            );
+        }
+
+        // BC6 (paired, mode 11): both references at distance 255 via the
+        // 4-bit interleave; endpoints 0 and 1 carry the base residual.
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0u8; 32];
+                r[2] = 0x0f;
+                r[3] = 0x0f;
+                r[30] = 10;
+                if i < 255 {
+                    r[4] = (i & 63) as u8;
+                    r[6] = (i >> 6) as u8;
+                }
+                r
+            })
+            .collect();
+        let src = stream(&t, &[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2, &records);
+        let mut dst = vec![0u8; blocks * 16];
+        decode(6, &src, &mut dst, &t).unwrap();
+        for i in 255..blocks {
+            assert_eq!(
+                &dst[16 * i..16 * i + 16],
+                &dst[16 * (i - 255)..16 * (i - 255) + 16],
+                "BC6 block {i}"
+            );
+        }
+
+        // BC7 (paired, mode 6): both references at distance 255; endpoints
+        // R0 and R1 of subset 0 carry the base residual.
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0u8; 32];
+                r[2] = 0x0f;
+                r[3] = 0x0f;
+                if i < 255 {
+                    r[4] = 2 * (i & 127) as u8;
+                    r[5] = 2 * (i >> 7) as u8;
+                }
+                r
+            })
+            .collect();
+        let src = stream(&t, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2, &records);
+        let mut dst = vec![0u8; blocks * 16];
+        decode(7, &src, &mut dst, &t).unwrap();
+        for i in 255..blocks {
+            assert_eq!(
+                &dst[16 * i..16 * i + 16],
+                &dst[16 * (i - 255)..16 * (i - 255) + 16],
+                "BC7 block {i}"
+            );
+        }
     }
 }
