@@ -1349,6 +1349,21 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut texture: Option<ID3D12Resource> = None;
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
+    // One query serves the placement, the log and the creation:
+    // `ID3D12Device10` is a `QueryInterface`, asked once per texture here, and
+    // its error is kept so the log can say why the interface is missing
+    // without asking a second time.
+    let mut device10_error = None;
+    let device10 = match (!castable_formats.is_empty())
+        .then(|| host.device.cast::<ID3D12Device10>())
+        .transpose()
+    {
+        Ok(device) => device,
+        Err(error) => {
+            device10_error = Some(error);
+            None
+        }
+    };
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
     let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
@@ -1358,8 +1373,8 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         && let Some((heap, p)) = crate::placement::place(&host.device, &plain)
     {
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
-        let made = match host.device.cast::<ID3D12Device10>() {
-            Ok(device) if !formats.is_empty() => {
+        let made = match &device10 {
+            Some(device) if !formats.is_empty() => {
                 let desc1 = desc1_of(&plain);
                 // SAFETY: a range of the heap for this description; the
                 // list of formats lives through the call.
@@ -1392,9 +1407,24 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             }
         }
     }
+    if !castable_formats.is_empty() && device10.is_none() {
+        // The castable list takes `CreateCommittedResource3` (D3D12 1.7):
+        // the runtime in Windows 10 before the Agility SDK has no
+        // `ID3D12Device10`, and every view in another format then gets its
+        // own host texture and a copy at the read.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| match &device10_error {
+            Some(error) => tracing::info!(
+                error = %error,
+                "no ID3D12Device10 (D3D12 1.7): textures are made without castable formats; a view in another format gets its own host texture and a copy"
+            ),
+            None => tracing::info!(
+                "no ID3D12Device10 (D3D12 1.7): textures are made without castable formats; a view in another format gets its own host texture and a copy"
+            ),
+        });
+    }
     if texture.is_none()
-        && !castable_formats.is_empty()
-        && let Ok(device) = host.device.cast::<ID3D12Device10>()
+        && let Some(device) = &device10
     {
         let desc1 = desc1_of(&plain);
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
