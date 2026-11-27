@@ -80,8 +80,11 @@ enum Command {
     /// translator and report what it cannot handle yet.
     Translate {
         paths: Vec<PathBuf>,
-        /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
-        /// else the newest Windows SDK's).
+        /// Check emitted DXIL with the validator from VICTORY_DXIL or the newest Windows SDK.
+        ///
+        /// Set VICTORY_DXIL to the full path to bin\x64\dxil.dll from Microsoft
+        /// DXC v1.8.2502 or newer. Validators before 1.8, including standalone
+        /// DXC builds, can reject shaders with repeated semantic names.
         #[arg(long)]
         validate: bool,
         /// Also create a host D3D12 pipeline for each emitted shader
