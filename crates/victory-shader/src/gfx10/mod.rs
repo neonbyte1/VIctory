@@ -332,6 +332,35 @@ fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         .map(|i| table[i].1)
 }
 
+/// The opcodes of an encoding (for VOP3, only the VOP3-only ones), for
+/// tests that assemble programs.
+#[cfg(test)]
+pub(crate) fn opcodes(encoding: Encoding) -> &'static [(u16, &'static str)] {
+    use opcodes as t;
+    match encoding {
+        Encoding::Sop2 => t::SOP2,
+        Encoding::Sopk => t::SOPK,
+        Encoding::Sop1 => t::SOP1,
+        Encoding::Sopc => t::SOPC,
+        Encoding::Sopp => t::SOPP,
+        Encoding::Smem => t::SMEM,
+        Encoding::Vop2 => t::VOP2,
+        Encoding::Vop1 => t::VOP1,
+        Encoding::Vopc => t::VOPC,
+        Encoding::Vop3 => t::VOP3,
+        Encoding::Vop3p => t::VOP3P,
+        Encoding::Vintrp => t::VINTRP,
+        Encoding::Ds => t::DS,
+        Encoding::Mubuf => t::MUBUF,
+        Encoding::Mtbuf => t::MTBUF,
+        Encoding::Mimg => t::MIMG,
+        Encoding::Exp => &[],
+        Encoding::Flat => t::FLAT,
+        Encoding::Global => t::GLOBAL,
+        Encoding::Scratch => t::SCRATCH,
+    }
+}
+
 fn isa(offset: usize, reason: &'static str) -> ShaderError {
     ShaderError::Isa { offset, reason }
 }
