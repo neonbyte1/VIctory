@@ -490,13 +490,15 @@ mod tests {
 
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
-        let mut info = ImageInfo::parse(&own_image()).unwrap();
-        let rva = info.sections[0].rva + 0x20;
-        assert!(info.rva_to_file_offset(rva).is_some());
+        let mut info = section_image(0x200, 0x200);
+        assert_eq!(info.rva_to_file_offset(0x1020), Some(0x220));
         // Used to overflow (a panic in debug builds, a wrong offset in
         // release ones).
         info.sections[0].file_offset = u32::MAX - 0x10;
-        assert_eq!(info.rva_to_file_offset(rva), None);
+        assert_eq!(info.rva_to_file_offset(0x1000), Some(u32::MAX - 0x10));
+        assert_eq!(info.rva_to_file_offset(0x1010), Some(u32::MAX));
+        assert_eq!(info.rva_to_file_offset(0x1011), None);
+        assert_eq!(info.rva_to_file_offset(0x1020), None);
     }
 
     #[test]
@@ -554,6 +556,88 @@ mod tests {
         d.extend_from_slice(body);
         d.resize(0x400, 0);
         d
+    }
+
+    /// An export-free section at RVA 0x1000, backed at file offset 0x200.
+    fn section_image(virtual_size: u32, raw_size: u32) -> ImageInfo {
+        let mut data = synthetic_image(&[0; 0x200]);
+        let opt = layout::optional_header_offset(&data).unwrap();
+        let export = layout::data_directory_offset(&data, 0).unwrap();
+        data[export..export + 8].fill(0);
+        let sec = opt + 240;
+        data[sec + 8..sec + 12].copy_from_slice(&virtual_size.to_le_bytes());
+        data[sec + 16..sec + 20].copy_from_slice(&raw_size.to_le_bytes());
+        ImageInfo::parse(&data).unwrap()
+    }
+
+    #[test]
+    fn section_rvas_stop_at_the_shorter_of_virtual_and_raw_data() {
+        for (virtual_size, raw_size) in [(0x80, 0x200), (0x200, 0x80)] {
+            let info = section_image(virtual_size, raw_size);
+            // Raw padding beyond VirtualSize and a zero-filled virtual
+            // tail beyond SizeOfRawData are both outside the file mapping.
+            for (rva, expected) in [
+                (0x0FFF, None),
+                (0x1000, Some(0x200)),
+                (0x107F, Some(0x27F)),
+                (0x1080, None),
+                (0x11FF, None),
+                (0x1200, None),
+            ] {
+                assert_eq!(
+                    info.rva_to_file_offset(rva),
+                    expected,
+                    "RVA {rva:#x}, virtual {virtual_size:#x}, raw {raw_size:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section_rvas_use_raw_size_when_virtual_size_is_zero() {
+        let info = section_image(0, 0x200);
+        assert_eq!(info.rva_to_file_offset(0x1000), Some(0x200));
+        assert_eq!(info.rva_to_file_offset(0x11FF), Some(0x3FF));
+        assert_eq!(info.rva_to_file_offset(0x1200), None);
+    }
+
+    #[test]
+    fn section_rvas_skip_empty_sections_and_gaps() {
+        let mut info = section_image(0x180, 0x80);
+        let mut empty = info.sections[0].clone();
+        empty.rva = 0x2000;
+        empty.file_size = 0;
+        let mut later = info.sections[0].clone();
+        later.rva = 0x3000;
+        later.file_offset = 0x280;
+        info.sections.extend([empty, later]);
+        for _ in 0..2 {
+            for (rva, expected) in [
+                (0x1000, Some(0x200)),
+                (0x107F, Some(0x27F)),
+                (0x1080, None),
+                (0x2000, None),
+                (0x217F, None),
+                (0x2FFF, None),
+                (0x3000, Some(0x280)),
+                (0x307F, Some(0x2FF)),
+                (0x3080, None),
+            ] {
+                assert_eq!(info.rva_to_file_offset(rva), expected, "RVA {rva:#x}");
+            }
+            // Lookup must not depend on section-table order.
+            info.sections.reverse();
+        }
+    }
+
+    #[test]
+    fn section_rvas_near_u32_max_do_not_wrap() {
+        let mut info = section_image(0x200, 0x200);
+        info.sections[0].rva = u32::MAX - 0x1F;
+        assert_eq!(info.rva_to_file_offset(u32::MAX - 0x1F), Some(0x200));
+        assert_eq!(info.rva_to_file_offset(u32::MAX), Some(0x21F));
+        assert_eq!(info.rva_to_file_offset(u32::MAX - 0x20), None);
+        assert_eq!(info.rva_to_file_offset(0), None);
     }
 
     #[test]
