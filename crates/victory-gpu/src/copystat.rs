@@ -65,9 +65,11 @@ pub(crate) enum C {
     WrittenPages,
     WrittenAgain,
     /// In change checks: time asking the runtime for other mappings, and
-    /// waiting for the guard lock.
+    /// waiting for the guard lock; rounds of the guard lock the takes made
+    /// (a refresh batch takes its copies' pages in one).
     AliasUs,
     GuardWaitUs,
+    TakeRounds,
     /// Preparing submissions: refresh batches done (copies and change
     /// checks); time in each kind of step (a step that flushes the batch
     /// counts that too); texture uploads for heaps; state preludes.
@@ -382,7 +384,7 @@ pub(crate) fn log(frames: f64) {
          changed, {:.1} MB hashed, {:.1} MB of them changed; watch time: kernel {:.1} ms, view queries {:.1} ms, protecting {:.1} ms; copied whole (not tracked) {:.1} MB in {:.1} ms; snapshots {:.1} MB in {:.1} ms; page faults {:.0} preparing, {:.0} copying back; {:.0} tracked pages marked through another mapping; \
          guards: {:.2} ms in the handler, {:.0} protect calls for {:.0} pages, {:.0} pages opened; \
          {:.0} tracked pages written ({:.0} of them the frame before too); change checks: {:.1} ms \
-         asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
+         asking for other mappings, {:.1} ms waiting for the guard lock, {:.0} guard-lock rounds; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
          heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} pages, {:.0} slots: {:.0} changed, {:.0} of a dead view, {:.0} pages re-checked after {:.0} view deaths), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
@@ -429,6 +431,7 @@ pub(crate) fn log(frames: f64) {
         c[C::WrittenAgain as usize],
         ms(c[C::AliasUs as usize]),
         ms(c[C::GuardWaitUs as usize]),
+        c[C::TakeRounds as usize],
         ms(c[C::FlushUs as usize]),
         ms(c[C::StepRefreshUs as usize]),
         ms(c[C::StepCopyUs as usize]),

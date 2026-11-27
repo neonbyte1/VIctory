@@ -3710,8 +3710,18 @@ impl Batch {
 
     /// Does the refreshes for submission `owner`, once those in flight
     /// whose writes they read have completed (`settle`); returns the bytes
-    /// copied.
+    /// copied. Each copy first reads which of its pages in its range the
+    /// title wrote ([`crate::shadow::plan`]); the pages of all of them are
+    /// then taken in one hold of the guard lock and copied
+    /// ([`crate::shadow::refresh_planned`]). A take per copy cost a round of
+    /// the guard lock each, the lock the title's write faults and copy-back
+    /// take too: a world frame's thousands of rounds mostly waited for it.
+    ///
+    /// A copy that would copy title memory where a submission in flight
+    /// declared its shaders write settles that one first (`settle`) and the
+    /// batch is planned again from the start: nothing was copied.
     fn flush(&mut self, owner: u64, settle: &mut dyn FnMut(u64, Settled)) -> usize {
+        use crate::shadow::{Plan, plan, refresh_planned};
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         let dirty = self.crossed_dirty.take();
@@ -3729,16 +3739,41 @@ impl Batch {
         }
         let _ = dirty;
         self.pending.clear();
-        let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        let refreshes = std::mem::take(&mut self.refreshes);
+        // Per refresh: bytes copied, microseconds (the shared take split
+        // evenly among those that took pages).
+        let mut done = vec![(0, 0); refreshes.len()];
+        let (mut planned, mut at) = (Vec::new(), Vec::new());
+        for (i, (shadow, from, to)) in refreshes.iter().enumerate() {
             let started = std::time::Instant::now();
-            let copied = loop {
-                match shadow.update(owner, from, to - from) {
-                    Ok(copied) => break copied,
-                    Err(o) => settle(o, Settled::Same),
+            let made = loop {
+                match plan(owner, shadow, *from, to - from) {
+                    Plan::Refused(o) => settle(o, Settled::Same),
+                    made => break made,
                 }
             };
+            done[i] = (0, started.elapsed().as_micros() as u64);
+            match made {
+                Plan::Done(copied) => done[i].0 = copied,
+                Plan::Take(p) => {
+                    planned.push(p);
+                    at.push(i);
+                }
+                Plan::Refused(_) => unreachable!("settled above"),
+            }
+        }
+        if !planned.is_empty() {
+            let started = std::time::Instant::now();
+            let copies = refresh_planned(&planned);
             let us = started.elapsed().as_micros() as u64;
+            let share = us.saturating_sub(copies.iter().map(|c| c.1).sum()) / copies.len() as u64;
+            for (i, (copied, us)) in at.into_iter().zip(copies) {
+                done[i] = (copied, done[i].1 + us + share);
+            }
+        }
+        drop(planned);
+        let mut total = 0;
+        for ((shadow, from, to), (copied, us)) in refreshes.into_iter().zip(done) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -5892,6 +5927,51 @@ mod batch {   // `mod tests` is already taken at the top of this file
         assert_eq!(batch.flush(0, &mut nothing_in_flight), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Copies of overlapping title buffers in one batch: each gets the pages
+    /// the title wrote in its range, in the batch's one take, and a write
+    /// after the batch (the page they share guarded again) is seen by both.
+    #[test]
+    fn overlapping_copies_in_one_batch_each_take_the_written_pages() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(6);
+        let (a, b) = ((p, 4 * PAGE), (p + 2 * PAGE, 4 * PAGE));
+        crate::shadow::register(a.0, a.0 as u64, a.1 as u64);
+        crate::shadow::register(b.0, b.0 as u64, b.1 as u64);
+        let copies = (crate::shadow::find(a.0 as u64, a.1 as u64), crate::shadow::find(b.0 as u64, b.1 as u64));
+        let (Some(ca), Some(cb)) = copies else {
+            crate::shadow::unregister(a.0, a.0 as u64);
+            crate::shadow::unregister(b.0, b.0 as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&ca, a.0, a.1);
+        batch.add(&cb, b.0, b.1);
+        assert_eq!(batch.flush(0, &mut nothing_in_flight), a.1 + b.1, "all of both at first");
+        // SAFETY: our pool, guarded since the copies took it: page 3 is both
+        // copies', page 1 the first's, page 5 the second's.
+        unsafe {
+            ((p + 3 * PAGE + 4) as *mut u32).write_volatile(0x33);
+            ((p + PAGE + 4) as *mut u32).write_volatile(0x11);
+            ((p + 5 * PAGE + 4) as *mut u32).write_volatile(0x55);
+        }
+        let mut batch = Batch::default();
+        batch.add(&ca, a.0, a.1);
+        batch.add(&cb, b.0, b.1);
+        assert_eq!(batch.flush(0, &mut nothing_in_flight), 4 * PAGE, "two pages each");
+        for (copy, at, v) in [(&ca, 3, 0x33), (&ca, 1, 0x11), (&cb, 3, 0x33), (&cb, 5, 0x55)] {
+            assert_eq!(copy.read_host((p + at * PAGE + 4) as u64, 1)[0], v, "page {at}");
+        }
+        assert!(ca.clean() && cb.clean());
+        // SAFETY: as above, guarded again by the batch.
+        unsafe { ((p + 3 * PAGE + 8) as *mut u32).write_volatile(0x34) };
+        assert!(!ca.clean() && !cb.clean(), "a write after the batch is seen by both");
+        for (start, _) in [a, b] {
+            crate::shadow::unregister(start, start as u64);
+        }
+        drop((ca, cb));
         crate::watch::tests::free(p);
     }
 }

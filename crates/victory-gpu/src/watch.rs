@@ -669,18 +669,7 @@ impl Tracked {
     pub(crate) fn take_split_unless(&self, from: usize, to: usize, forbidden: &[(usize, usize, u64)]) -> Result<(Runs, Runs), u64> {
         #[cfg(feature = "diagnostics")]
         let _site = at_site(if self.changed.3 { Site::TakeCopy } else { Site::TakeOther });
-        let (from, to) = (from.max(self.start), to.min(self.end));
-        if from >= to {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let pages: Vec<usize> = {
-            #[cfg(feature = "diagnostics")]
-            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-            let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-            #[cfg(feature = "diagnostics")]
-            drop(waited);
-            changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
-        };
+        let pages = self.written(from, to);
         if pages.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -692,19 +681,91 @@ impl Tracked {
         {
             return Err(key);
         }
-        let mut whole: Vec<usize> = pages
+        Ok(take_written(&[Ask { tracked: self, from, to, pages: &pages }]).pop().unwrap_or_default())
+    }
+
+    /// The first half of [`Tracked::take_split`]: the changed pages of
+    /// `[from, to)` (cut to the tracked range), read under the tracker's own
+    /// lock alone. Nothing is taken: they stay changed until
+    /// [`take_written`] takes them.
+    pub(crate) fn written(&self, from: usize, to: usize) -> Vec<usize> {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return Vec::new();
+        }
+        #[cfg(feature = "diagnostics")]
+        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+        let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        drop(waited);
+        changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
+    }
+}
+
+/// One tracker's part of a [`take_written`]: the changed pages `pages`
+/// [`Tracked::written`] found in `[from, to)`.
+pub(crate) struct Ask<'a> {
+    pub(crate) tracked: &'a Tracked,
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+    pub(crate) pages: &'a [usize],
+}
+
+impl Ask<'_> {
+    /// Its range cut to the tracked one.
+    fn range(&self) -> (usize, usize) {
+        (self.from.max(self.tracked.start), self.to.min(self.tracked.end))
+    }
+
+    /// Its pages wholly inside its range (the tracked part of them): those
+    /// it takes. A page only partly inside is copied in part and stays
+    /// changed.
+    fn whole(&self) -> impl Iterator<Item = usize> + '_ {
+        let (start, end) = (self.tracked.start, self.tracked.end);
+        let (from, to) = self.range();
+        self.pages
             .iter()
             .copied()
-            .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
-            .collect();
+            .filter(move |&p| (p * PAGE).max(start) >= from && ((p + 1) * PAGE).min(end) <= to)
+    }
+}
+
+/// The second half of [`Tracked::take_split`], for several trackers in one
+/// hold of the guard lock (a refresh batch's copies,
+/// `crate::shadow::refresh_planned`): the whole pages of every ask are
+/// guarded at all their mappings, each page once and consecutive pages of
+/// all asks in one protection change, and leave the changed set of each
+/// ask's tracker.
+/// Returns per ask (in order) the byte runs of all its pages to copy and
+/// those on pages with nothing mapped, cut to its range.
+///
+/// What a take guarantees holds for each ask: a page leaves a tracker's set
+/// only under the guard lock, once guarded at every mapping (pages that
+/// cannot be stay changed), and the caller copies after this returns; so a
+/// title write before the guard is in the copy, and one after it faults and
+/// marks the page changed again. Writers that do not fault (the kernel's,
+/// ours, remaps) mark under the guard lock: before the page leaves the set
+/// (then in the copy) or after (then changed again). A page written since
+/// [`Tracked::written`] read the set, and not in `pages`, stays changed for
+/// a later take.
+pub(crate) fn take_written(asks: &[Ask<'_>]) -> Vec<(Runs, Runs)> {
+    let mut whole: Vec<usize> = asks.iter().flat_map(Ask::whole).collect();
+    whole.sort_unstable();
+    whole.dedup();
+    let mut unmapped = Vec::new();
+    if !whole.is_empty() {
         // Every address showing the same pages is guarded too. A write in
         // between marks them changed again; the copy, made after, has it.
         #[cfg(feature = "diagnostics")]
         let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
         let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        TAKE_COUNTS.with(|c| c.set((c.get().0 + 1, c.get().1)));
         #[cfg(feature = "diagnostics")]
-        drop(waited);
+        {
+            drop(waited);
+            crate::copystat::add(crate::copystat::C::TakeRounds, 1);
+        }
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(&g, &whole);
@@ -712,26 +773,37 @@ impl Tracked {
         #[cfg(feature = "diagnostics")]
         drop(asked);
         whole.retain(|p| !unguarded.contains(p));
-        let mut unmapped = Vec::new();
-        for page in protect_noting(&mut g, &whole, &mut unmapped) {
-            changed.remove(&page);
-            self.changed.taken(page);
-        }
-        set_dirty(self.changed.2, !changed.is_empty());
-        drop(changed);
-        drop(g);
-        let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
-        for p in pages {
-            let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
-            let runs = if unmapped.contains(&p) { &mut zero } else { &mut copy };
-            match runs.last_mut() {
-                Some((_, end)) if *end == a => *end = b,
-                _ => runs.push((a, b)),
+        // Ascending, as `whole` is.
+        let taken = protect_noting(&mut g, &whole, &mut unmapped);
+        for ask in asks {
+            let c = &ask.tracked.changed;
+            let mut changed = c.0.lock().unwrap_or_else(|e| e.into_inner());
+            for page in ask.whole().filter(|p| taken.binary_search(p).is_ok()) {
+                changed.remove(&page);
+                c.taken(page);
             }
+            set_dirty(c.2, !changed.is_empty());
         }
-        Ok((copy, zero))
+        drop(g);
     }
+    asks.iter()
+        .map(|ask| {
+            let (from, to) = ask.range();
+            let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
+            for &p in ask.pages {
+                let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
+                let runs = if unmapped.binary_search(&p).is_ok() { &mut zero } else { &mut copy };
+                match runs.last_mut() {
+                    Some((_, end)) if *end == a => *end = b,
+                    _ => runs.push((a, b)),
+                }
+            }
+            (copy, zero)
+        })
+        .collect()
+}
 
+impl Tracked {
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed
@@ -1062,6 +1134,13 @@ impl Lease<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per thread (tests): rounds of the guard lock [`take_written`] took,
+    /// and protection changes making pages read-only.
+    static TAKE_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Makes `pages` read-only where not already (in runs), and returns those
 /// now guarded or with nothing mapped (taken either way); a page that is
 /// mapped but cannot be guarded is left out (it stays changed).
@@ -1085,6 +1164,8 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     let set = |from: usize, to: usize| {
         #[cfg(feature = "diagnostics")]
         count_protect(1, (to - from) as u64);
+        #[cfg(test)]
+        TAKE_COUNTS.with(|c| c.set((c.get().0, c.get().1 + 1)));
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
@@ -2393,6 +2474,207 @@ pub(crate) mod tests {
                 median(&mut rounds),
                 p99(&kernel)
             );
+        }
+        drop(trackers);
+        free(p);
+    }
+
+    /// Per ask its runs to copy and to zero; and the guard-lock rounds and
+    /// protection changes the take made on this thread.
+    type Batched = (Vec<(Runs, Runs)>, (u64, u64));
+
+    /// [`take_written`] of `asks` (tracker, from, to) after reading each
+    /// one's written pages, as a refresh batch does.
+    fn take_batch(asks: &[(&Tracked, usize, usize)]) -> Batched {
+        let pages: Vec<Vec<usize>> = asks.iter().map(|&(t, from, to)| t.written(from, to)).collect();
+        let asks: Vec<Ask<'_>> = asks
+            .iter()
+            .zip(&pages)
+            .map(|(&(tracked, from, to), pages)| Ask { tracked, from, to, pages })
+            .collect();
+        let before = TAKE_COUNTS.with(std::cell::Cell::get);
+        let taken = take_written(&asks);
+        let after = TAKE_COUNTS.with(std::cell::Cell::get);
+        (taken, (after.0 - before.0, after.1 - before.1))
+    }
+
+    /// One take for several trackers (nested, overlapping, one starting
+    /// mid-page): each gets the runs of its written pages in its asked
+    /// range; a page they share is guarded once, consecutive pages in one
+    /// protection change, in one round of the guard lock; pages outside an
+    /// ask or only partly in it stay changed; a page written after the
+    /// pages were read and before the take stays changed for a later one.
+    #[test]
+    fn a_batched_take_takes_the_written_pages_of_every_tracker() {
+        let p = pool(8);
+        let a = track_copy(p, 8 * PAGE, true).expect("pool memory is tracked");
+        let b = track_copy(p + 2 * PAGE, 3 * PAGE, true).expect("tracked");
+        let c = track_copy(p + 4 * PAGE + 100, 4 * PAGE - 100, true).expect("tracked");
+        let all = p + 8 * PAGE;
+        let (taken, made) = take_batch(&[(&a, p, all), (&b, p, all), (&c, p, all)]);
+        assert_eq!(
+            taken,
+            [
+                (vec![(p, all)], vec![]),
+                (vec![(p + 2 * PAGE, p + 5 * PAGE)], vec![]),
+                (vec![(p + 4 * PAGE + 100, all)], vec![]),
+            ]
+        );
+        assert!(a.clean() && b.clean() && c.clean(), "every whole page taken");
+        assert_eq!(made, (1, 1), "one round, the 8 pages in one protection change");
+        let write = |at: usize, v: u32| {
+            // SAFETY: a word of our pool; a guarded page faults into the
+            // handler, which opens it.
+            unsafe { (at as *mut u32).write_volatile(v) };
+        };
+        // Page 3: a's and b's; page 6: a's and c's; page 1: a's.
+        write(p + 3 * PAGE + 8, 3);
+        write(p + 6 * PAGE + 8, 6);
+        write(p + PAGE + 8, 1);
+        assert!(!a.clean() && !b.clean() && !c.clean());
+        let (taken, made) = take_batch(&[(&a, p, p + 5 * PAGE), (&b, p, all), (&c, p, all)]);
+        assert_eq!(
+            taken,
+            [
+                (vec![(p + PAGE, p + 2 * PAGE), (p + 3 * PAGE, p + 4 * PAGE)], vec![]),
+                (vec![(p + 3 * PAGE, p + 4 * PAGE)], vec![]),
+                (vec![(p + 6 * PAGE, p + 7 * PAGE)], vec![]),
+            ]
+        );
+        assert_eq!(made, (1, 3), "one round; pages 1, 3 and 6 once each");
+        assert!(b.clean() && c.clean());
+        assert!(!a.clean() && a.changed(p / PAGE + 6), "not asked: a later take's");
+        assert_eq!(take_batch(&[(&a, p, all)]).0, [(vec![(p + 6 * PAGE, p + 7 * PAGE)], vec![])]);
+        // Only part of page 1 asked: copied, and changed still.
+        write(p + PAGE + 8, 2);
+        assert_eq!(take_batch(&[(&a, p + PAGE + 10, p + 2 * PAGE)]).0, [(vec![(p + PAGE + 10, p + 2 * PAGE)], vec![])]);
+        assert!(a.changed(p / PAGE + 1));
+        assert_eq!(take_batch(&[(&a, p, all)]).0, [(vec![(p + PAGE, p + 2 * PAGE)], vec![])]);
+        // Read, then written, then taken: page 4 (b's) faults between, and
+        // stays changed for b after a take of what was read (page 3).
+        write(p + 3 * PAGE + 8, 4);
+        let read = b.written(p, all);
+        assert_eq!(read, [p / PAGE + 3]);
+        write(p + 4 * PAGE + 8, 5);
+        // Page 3 is open: this write lands unseen, before the take guards
+        // it, so a copy made after the take holds it.
+        write(p + 3 * PAGE + 12, 6);
+        let taken = take_written(&[Ask { tracked: &b, from: p, to: all, pages: &read }]);
+        assert_eq!(taken, [(vec![(p + 3 * PAGE, p + 4 * PAGE)], vec![])]);
+        assert!(!b.changed(p / PAGE + 3) && b.changed(p / PAGE + 4) && !b.clean());
+        write(p + 3 * PAGE + 16, 7);
+        assert!(b.changed(p / PAGE + 3), "guarded by the take: a write after it faults");
+        drop((a, b, c));
+        free(p);
+    }
+
+    /// Writers on several threads, through both mappings of twin views
+    /// too, and refresh batches of overlapping trackers (random asked
+    /// ranges, one take for all of them) copying what they take: no title
+    /// write between two refreshes is lost. Once the writers stop, every
+    /// byte a copy holds differently from title memory is on a page its
+    /// tracker still has changed, and a last refresh of every tracker whole
+    /// leaves each copy equal to title memory and clean.
+    #[test]
+    fn batched_refreshes_under_concurrent_writes_lose_no_write() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        /// Stops the writers when dropped, also while a failed assertion
+        /// unwinds (else `thread::scope` would wait for them for ever).
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Relaxed);
+            }
+        }
+        const PAGES: usize = 32;
+        let p = pool(PAGES);
+        let (va, vb) = twin_views(8);
+        let ranges = [
+            (p, PAGES * PAGE),
+            (p + 4 * PAGE, 8 * PAGE),
+            (p + 10 * PAGE + 100, 10 * PAGE - 100),
+            (p + 16 * PAGE, 16 * PAGE - 200),
+            (p + PAGE, PAGE),
+            (va, 8 * PAGE),
+            (vb + 2 * PAGE, 4 * PAGE),
+        ];
+        let trackers: Vec<Tracked> = ranges
+            .iter()
+            .map(|&(at, len)| track_copy(at, len, true).expect("pool and view memory is tracked"))
+            .collect();
+        let mut copies: Vec<Vec<u8>> = ranges.iter().map(|&(_, len)| vec![0; len]).collect();
+        let refresh = |asks: &[(usize, usize, usize)], copies: &mut [Vec<u8>]| {
+            let batch: Vec<(&Tracked, usize, usize)> = asks.iter().map(|&(k, from, to)| (&trackers[k], from, to)).collect();
+            for (&(k, _, _), (copy, zero)) in asks.iter().zip(take_batch(&batch).0) {
+                let start = trackers[k].start;
+                for (a, b) in copy {
+                    assert!(crate::host::read_into(a as *const u8, &mut copies[k][a - start..b - start]));
+                }
+                assert!(zero.is_empty(), "all mapped");
+            }
+        };
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let _stop = StopOnDrop(&stop);
+            for w in 0..8u32 {
+                let stop = &stop;
+                s.spawn(move || {
+                    let mut x = 0x9e37_79b9_u32.wrapping_mul(w + 1);
+                    while !stop.load(Relaxed) {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        let at = match x % 4 {
+                            0 => va + (x as usize >> 4) % (8 * PAGE) / 4 * 4,
+                            1 => vb + (x as usize >> 4) % (8 * PAGE) / 4 * 4,
+                            _ => p + (x as usize >> 4) % (PAGES * PAGE) / 4 * 4,
+                        };
+                        // SAFETY: a word of our pool or views; a guarded
+                        // page faults into the handler, which opens it.
+                        unsafe { (at as *mut u32).write_volatile(x | 1) };
+                    }
+                });
+            }
+            let mut x = 0x1234_5679_u64;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as usize
+            };
+            for _ in 0..if cfg!(debug_assertions) { 300 } else { 3000 } {
+                let mut asks = Vec::new();
+                for (k, &(at, len)) in ranges.iter().enumerate() {
+                    match next() % 4 {
+                        0 => {}
+                        1 => asks.push((k, at, at + len)),
+                        _ => {
+                            let (a, b) = (next() % len, next() % len);
+                            asks.push((k, at + a.min(b), at + a.max(b) + 1));
+                        }
+                    }
+                }
+                refresh(&asks, &mut copies);
+            }
+        });
+        for (k, t) in trackers.iter().enumerate() {
+            for page in t.start / PAGE..t.end.div_ceil(PAGE) {
+                let (a, b) = ((page * PAGE).max(t.start), ((page + 1) * PAGE).min(t.end));
+                let mut memory = vec![0; b - a];
+                assert!(crate::host::read_into(a as *const u8, &mut memory));
+                assert!(
+                    memory == copies[k][a - t.start..b - t.start] || t.changed(page),
+                    "tracker {k}: page {page:#x} differs from its copy and is not changed"
+                );
+            }
+        }
+        let all: Vec<(usize, usize, usize)> = ranges.iter().enumerate().map(|(k, &(at, len))| (k, at, at + len)).collect();
+        refresh(&all, &mut copies);
+        for (k, (t, &(at, len))) in trackers.iter().zip(&ranges).enumerate() {
+            let mut memory = vec![0; len];
+            assert!(crate::host::read_into(at as *const u8, &mut memory));
+            assert!(memory == copies[k], "tracker {k}: the last refresh leaves its copy equal to title memory");
+            assert!(t.clean(), "tracker {k} clean");
         }
         drop(trackers);
         free(p);

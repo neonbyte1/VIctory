@@ -821,7 +821,7 @@ impl Shadow {
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
-    /// it (tracked memory only): [`Shadow::update`] would copy nothing.
+    /// it (tracked memory only): a refresh ([`plan`]) would copy nothing.
     pub(crate) fn clean(&self) -> bool {
         self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
     }
@@ -832,40 +832,31 @@ impl Shadow {
         self.tracked.as_ref().and_then(crate::watch::Tracked::bit)
     }
 
-    /// At submission `owner`'s preparing: copies what changed of `[address,
-    /// address + len)` since it was last copied (all of it if the memory is
-    /// not write-watched). Returns the bytes copied, or `Err(o)`: submission
-    /// `o`, still in flight, declared that its shaders write where this
-    /// would copy title memory over the copy (pages the title changed under
-    /// its ranges, or memory copied whole there). What the GPU writes there
-    /// reaches title memory only when `o` completes, so `o` completes first
-    /// and this is asked again: nothing was copied.
+    /// At submission `owner`'s preparing, the first half of a refresh
+    /// ([`plan`], [`refresh_planned`]): nothing, memory that is not tracked
+    /// copied whole, or the pages the title wrote since the copy took them
+    /// read under its tracker's lock, to be taken with the batch's others.
+    /// `Err(o)`: submission `o`, still in flight, declared that its shaders
+    /// write where this would copy title memory over the copy (pages the
+    /// title changed under its ranges, or memory copied whole there). What
+    /// the GPU writes there reaches title memory only when `o` completes, so
+    /// `o` completes first and this is asked again: nothing was copied.
+    ///
+    /// The host's batches plan every copy and then [`refresh_planned`] them
+    /// all; this alone is for tests.
+    #[cfg(test)]
     pub(crate) fn update(&self, owner: u64, address: usize, len: usize) -> Result<usize, u64> {
-        if self.clean() {
-            return Ok(0);
+        match plan(owner, self, address, len) {
+            Plan::Done(copied) => Ok(copied),
+            Plan::Refused(o) => Err(o),
+            Plan::Take(planned) => Ok(refresh_planned(&[planned]).pop().map_or(0, |(copied, _)| copied)),
         }
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
-            return Ok(0);
-        }
-        // This submission's own ranges, and those of others in flight.
-        let (mut busy, mut others) = (Vec::new(), Vec::new());
-        for s in self.subs.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            for &(a, e, _) in s.pending.iter().filter(|&&(a, e, _)| a < to && e > from) {
-                if s.owner == owner {
-                    busy.push((a, e));
-                } else {
-                    others.push((a, e, s.owner));
-                }
-            }
-        }
-        if self.tracked.is_some() {
-            return self.update_tracked(owner, from, to, !busy.is_empty(), &others);
-        }
-        if let Some(o) = others.iter().map(|r| r.2).max() {
-            return Err(o);
-        }
+    }
+
+    /// A refresh of `[from, to)` (inside the buffer) where the
+    /// memory is not tracked: all of it, around the ranges `busy` shaders
+    /// are writing.
+    fn update_whole(&self, from: usize, to: usize, mut busy: Vec<(usize, usize)>) -> usize {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -883,17 +874,17 @@ impl Shadow {
             if at < to {
                 bytes += self.update_untracked(at, to);
             }
-            return Ok(bytes);
+            return bytes;
         }
-        Ok(self.update_untracked(from, to))
+        self.update_untracked(from, to)
     }
 
-    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where the
-    /// memory is tracked: the pages the title wrote since they were taken,
-    /// in one [`crate::watch::Tracked::take`], so that a page wholly in the
-    /// range is guarded even where shaders write part of it (split at those
-    /// ranges it stayed changed, and [`Shadow::copy_back_marked`] dropped
-    /// what they wrote).
+    /// The rest of a refresh ([`refresh_planned`]) where the memory is tracked, once the
+    /// pages the title wrote since they were taken are taken (`runs` to
+    /// copy, `unmapped` to zero): a page wholly in the range is guarded even
+    /// where shaders write part of it (split at those ranges it stayed
+    /// changed, and [`Shadow::copy_back_marked`] dropped what they wrote).
+    /// The parts off the runtime's memory (`untracked`) are copied whole.
     ///
     /// `busy`: a list of this submission (`owner`) submitted earlier
     /// declared that shaders write in the range. None of its shaders has run
@@ -904,37 +895,10 @@ impl Shadow {
     /// copy-back neither takes them for the GPU's nor puts them back over a
     /// later title write.
     ///
-    /// `others`: ranges `(start, end, owner)` submissions in flight declared
-    /// here. A changed page under one, or memory copied whole there, is not
-    /// taken: `Err` with the latest such owner (decided under the tracker's
-    /// lock, so a page the title writes meanwhile is either seen here or
-    /// left for a later take).
-    fn update_tracked(
-        &self,
-        owner: u64,
-        from: usize,
-        to: usize,
-        busy: bool,
-        others: &[(usize, usize, u64)],
-    ) -> Result<usize, u64> {
-        let Some(t) = &self.tracked else {
-            return Ok(0);
-        };
-        let untracked = t.untracked(from, to);
-        if let Some(o) = others
-            .iter()
-            .filter(|&&(a, e, _)| untracked.iter().any(|&(x, y)| a < y && x < e))
-            .map(|r| r.2)
-            .max()
-        {
-            return Err(o);
-        }
-        let forbidden: Vec<(usize, usize, u64)> = others.iter().map(|&(a, e, o)| (a / PAGE, e.div_ceil(PAGE), o)).collect();
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        let (runs, unmapped) = t.take_split_unless(from, to, &forbidden)?;
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+    /// `runs` and `unmapped`: the copy's pages taken by the batch's one take
+    /// ([`refresh_planned`]); `untracked`: its parts off the runtime's
+    /// memory, copied whole.
+    fn copy_taken(&self, owner: u64, busy: bool, runs: crate::watch::Runs, unmapped: crate::watch::Runs, untracked: &[(usize, usize)]) -> usize {
         let start = self.start as usize;
         let mut subs = busy.then(|| self.subs.lock().unwrap_or_else(|e| e.into_inner()));
         let mut sync_before = |a: usize, b: usize| {
@@ -957,7 +921,7 @@ impl Shadow {
             sync_before(a, b);
         }
         for (a, b) in unmapped {
-            // SAFETY: inside the mapping (`take_split` cuts to the buffer).
+            // SAFETY: inside the mapping (`take_written` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
             self.queue_vram_upload((a - start) as u64, (b - a) as u64);
             sync_before(a, b);
@@ -965,7 +929,7 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
         }
         // Parts on memory that is not the runtime's: whole, as below.
-        for (a, b) in untracked {
+        for &(a, b) in untracked {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             copied += self.copy(a, b);
@@ -977,17 +941,10 @@ impl Shadow {
                 add(C::WholeUs, started.elapsed().as_micros() as u64);
             }
         }
-        #[cfg(feature = "diagnostics")]
-        {
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::Checked, (to - from) as u64);
-            add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-        }
-        Ok(copied)
+        copied
     }
 
-    /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).
+    /// A refresh of untracked `[from, to)` (inside the buffer).
     fn update_untracked(&self, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -1035,6 +992,150 @@ impl Shadow {
         }
         to - from
     }
+}
+
+/// A refresh of a tracked copy whose written pages were read but not taken
+/// yet ([`plan`]).
+pub(crate) struct Planned<'a> {
+    shadow: &'a Shadow,
+    tracked: &'a crate::watch::Tracked,
+    /// The submission whose preparing asked for it (whose snapshot of the
+    /// ranges its shaders write [`Shadow::copy_taken`] keeps up to date).
+    owner: u64,
+    from: usize,
+    to: usize,
+    busy: bool,
+    pages: Vec<usize>,
+    untracked: Vec<(usize, usize)>,
+}
+
+/// What [`plan`] made of a refresh.
+pub(crate) enum Plan<'a> {
+    /// Done already: the bytes copied (nothing written in the range, or
+    /// memory that is not tracked, copied whole).
+    Done(usize),
+    /// Submission `o`, still in flight, declared that its shaders write where
+    /// this would copy title memory over the copy (pages the title changed
+    /// under its ranges, or memory copied whole there). What the GPU writes
+    /// there reaches title memory only when `o` completes, so the caller
+    /// settles `o` and asks again: nothing was copied.
+    Refused(u64),
+    /// Pages to take with the batch's others ([`refresh_planned`]).
+    Take(Planned<'a>),
+}
+
+/// A refresh of `[address, address + len)` up to the take: the pages the
+/// title wrote since the copy took them, read under its tracker's own lock
+/// ([`crate::watch::Tracked::written`]). Memory that is not tracked is
+/// copied whole here.
+///
+/// `owner`: the submission preparing. The ranges of its own submissions in
+/// flight (it is submitted after them, so none of their shaders has run) are
+/// copied as anywhere else; a changed page under another's, or memory copied
+/// whole there, refuses ([`Plan::Refused`]). Decided on the pages read under
+/// the tracker's lock, so a page the title writes meanwhile is either seen
+/// here or left for a later take.
+pub(crate) fn plan(owner: u64, shadow: &Shadow, address: usize, len: usize) -> Plan<'_> {
+    if shadow.clean() {
+        return Plan::Done(0);
+    }
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    let (from, to) = (address.max(start), (address + len).min(end));
+    if from >= to {
+        return Plan::Done(0);
+    }
+    // This submission's own ranges, and those of others in flight.
+    let (mut busy, mut others) = (Vec::new(), Vec::new());
+    for s in shadow.subs.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for &(a, e, _) in s.pending.iter().filter(|&&(a, e, _)| a < to && e > from) {
+            if s.owner == owner {
+                busy.push((a, e));
+            } else {
+                others.push((a, e, s.owner));
+            }
+        }
+    }
+    let Some(tracked) = &shadow.tracked else {
+        if let Some(o) = others.iter().map(|r| r.2).max() {
+            return Plan::Refused(o);
+        }
+        return Plan::Done(shadow.update_whole(from, to, busy));
+    };
+    let untracked = tracked.untracked(from, to);
+    if let Some(o) = others
+        .iter()
+        .filter(|&&(a, e, _)| untracked.iter().any(|&(x, y)| a < y && x < e))
+        .map(|r| r.2)
+        .max()
+    {
+        return Plan::Refused(o);
+    }
+    let forbidden: Vec<(usize, usize, u64)> = others.iter().map(|&(a, e, o)| (a / PAGE, e.div_ceil(PAGE), o)).collect();
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let pages = tracked.written(from, to);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+        add(C::Watches, 1);
+        add(C::Checked, (to - from) as u64);
+    }
+    if let Some(o) = forbidden
+        .iter()
+        .filter(|&&(first, last, _)| pages.iter().any(|p| (first..last).contains(p)))
+        .map(|r| r.2)
+        .max()
+    {
+        return Plan::Refused(o);
+    }
+    if pages.is_empty() && untracked.is_empty() {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Unchanged, (to - from) as u64);
+        return Plan::Done(0);
+    }
+    Plan::Take(Planned {
+        shadow,
+        tracked,
+        owner,
+        from,
+        to,
+        busy: !busy.is_empty(),
+        pages,
+        untracked,
+    })
+}
+
+/// The rest of a batch's refreshes [`plan`] left to take: the
+/// pages of all of them are taken in one hold of the guard lock
+/// ([`crate::watch::take_written`]), then each copy copies its runs. Per
+/// plan (in order): the bytes copied and the microseconds its copies took.
+pub(crate) fn refresh_planned(plans: &[Planned<'_>]) -> Vec<(usize, u64)> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let asks: Vec<crate::watch::Ask<'_>> = plans
+        .iter()
+        .map(|p| crate::watch::Ask {
+            tracked: p.tracked,
+            from: p.from,
+            to: p.to,
+            pages: &p.pages,
+        })
+        .collect();
+    let taken = crate::watch::take_written(&asks);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+    plans
+        .iter()
+        .zip(taken)
+        .map(|(p, (runs, unmapped))| {
+            let started = std::time::Instant::now();
+            let copied = p.shadow.copy_taken(p.owner, p.busy, runs, unmapped, &p.untracked);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unchanged, (p.to - p.from).saturating_sub(copied) as u64);
+            (copied, started.elapsed().as_micros() as u64)
+        })
+        .collect()
 }
 
 impl Drop for Shadow {
