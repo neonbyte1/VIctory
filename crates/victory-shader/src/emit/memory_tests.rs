@@ -453,6 +453,159 @@ fn global_store_values_are_visible_across_waves_after_a_barrier() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+#[test]
+fn global_atomic_fmin_and_fmax_ignore_nan_operands() {
+    let shader = program();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut memory = vec![0u32; 256];
+    let pointer = TITLE + 0x100;
+    memory[2] = pointer as u32;
+    memory[3] = (pointer >> 32) as u32;
+    let (next, far) = (TITLE + 0x1_0010, 0x55_0000_0040u64);
+    memory[4..8].copy_from_slice(&[
+        next as u32,
+        (next >> 32) as u32,
+        far as u32,
+        (far >> 32) as u32,
+    ]);
+    let root_uav = TITLE + 0x200;
+    let view_addresses = vec![0u32; 4 * 5];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        // Verify all four NaN bit patterns leave finite and infinite memory
+        // cells bit-identical, while +/-Inf and -0.0 still participate.
+        let cases = [
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                0x7FC0_0000u32,
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                "+qNaN vs finite",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                0xFFC0_0000,
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                "-qNaN vs finite",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                0x7F80_0001,
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                "+sNaN vs finite",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                0xFF80_0001,
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                "-sNaN vs finite",
+            ),
+            (
+                f32::NEG_INFINITY.to_bits(),
+                f32::INFINITY.to_bits(),
+                0x7FC0_0000,
+                f32::NEG_INFINITY.to_bits(),
+                f32::INFINITY.to_bits(),
+                "+qNaN vs Inf",
+            ),
+            (
+                f32::NEG_INFINITY.to_bits(),
+                f32::INFINITY.to_bits(),
+                0xFFC0_0000,
+                f32::NEG_INFINITY.to_bits(),
+                f32::INFINITY.to_bits(),
+                "-qNaN vs Inf",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                f32::INFINITY.to_bits(),
+                1.0f32.to_bits(),
+                f32::INFINITY.to_bits(),
+                "+Inf updates fmax",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+                (-1.0f32).to_bits(),
+                "-Inf updates fmin",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                (-0.0f32).to_bits(),
+                (-0.0f32).to_bits(),
+                (-0.0f32).to_bits(),
+                "-0.0 updates both",
+            ),
+        ];
+        for (init_min, init_max, op_bits, want_min, want_max, desc) in cases {
+            memory[0x80 / 4] = init_min;
+            memory[0x84 / 4] = init_max;
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                let constants = [TITLE as u32, (TITLE >> 32) as u32, 0, op_bits];
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => constants[u.dword as usize],
+                    RootType::Descriptor => (root_uav >> (32 * u.dword)) as u32,
+                    _ => 0,
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (1, Root::View { srv: true, data: page_table(1, 3) }),
+                            (2, Root::Uav(2 * 4096 / 32)),
+                            (3, Root::View { srv: true, data: view_addresses.clone() }),
+                        ],
+                        views: &[
+                            View::RawUav(9),
+                            View::Memory(&memory),
+                            View::Pair,
+                            View::NullPair,
+                            View::Pair,
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} ({desc}): {e}"));
+            assert_eq!(
+                out[1][0x20], want_min,
+                "{label} ({desc}): global_atomic_fmin got {:#010x}, want {want_min:#010x}",
+                out[1][0x20]
+            );
+            assert_eq!(
+                out[1][0x21], want_max,
+                "{label} ({desc}): global_atomic_fmax got {:#010x}, want {want_max:#010x}",
+                out[1][0x21]
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// A root SRV in a program that does not use title memory is read through
 /// the host's view of its host copy (`emit`, "Root SRVs and root UAVs"): the
 /// view's index and the root address's offset in it come as user data, and

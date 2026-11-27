@@ -958,7 +958,9 @@ impl<'a> Lower<'a> {
         // and max, exchange; subtraction adds the negation. A float minimum
         // or maximum is the signed integer one where the value is positive
         // and the reversed unsigned one where negative (IEEE order of the
-        // bits), as two atomics, each a no-op in the lanes the other serves.
+        // bits), as two atomics, each a no-op in the lanes the other serves;
+        // NaN operands select the neutral element in both passes so they
+        // never overwrite a finite or infinite value in memory.
         let ops: Option<&[(u32, u32)]> = match name.strip_prefix("global_atomic_") {
             None => None,
             Some("add" | "sub") => Some(&[(0, 0)]),
@@ -1043,22 +1045,30 @@ impl<'a> Lower<'a> {
             let zero = self.s.m.i32(0);
             self.s.m.cmp(c, pred::SLT, x, zero)
         };
+        let nan = (ops.len() > 1).then(|| {
+            let abs_mask = self.s.m.i32(0x7FFF_FFFF);
+            let exp_mask = self.s.m.i32(0x7F80_0000);
+            let mag = self.s.m.bin(c, Bin::And, x, abs_mask);
+            self.s.m.cmp(c, pred::IUGT, mag, exp_mask)
+        });
         let returned = match *dst {
             Some(Operand::Vector { reg, .. }) if cache.glc => Some(reg),
             _ => None,
         };
         let mut first = None;
         for (k, &(op, neutral)) in ops.iter().enumerate() {
-            let value = if ops.len() == 1 {
-                x
-            } else {
+            let value = if let Some(nan) = nan {
                 let n = self.s.m.i32(neutral);
-                // The first serves positive values, the second negative ones.
-                if k == 0 {
+                // The first serves positive values, the second negative ones;
+                // NaN uses the neutral element in both passes.
+                let v = if k == 0 {
                     self.s.m.select(self.cur, negative, n, x)
                 } else {
                     self.s.m.select(self.cur, negative, x, n)
-                }
+                };
+                self.s.m.select(self.cur, nan, n, v)
+            } else {
+                x
             };
             let op = self.s.m.i32(op);
             let r = self.s.op(
