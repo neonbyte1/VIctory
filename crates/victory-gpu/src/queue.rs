@@ -655,7 +655,10 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once.
+/// one constant page or of unmapped pages). Waits for any running submission
+/// (under `Host::submitted`, strictly outside `xmem`'s physical-page lock
+/// and `watch`'s guard lock) so pages are not unmapped under a submission's
+/// reads or copy-backs.
 ///
 /// shortcut: done ahead of work the queue still holds (counted in the frame
 /// line); queue it as an item like Signal if that count is not 0.
@@ -683,6 +686,9 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // Not under a submission's reads and writes of title memory.
+    #[cfg(windows)]
+    let _quiet = crate::host::host().map(|h| h.hold_submissions());
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -843,6 +849,32 @@ mod tests {
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(restored, TARGET, "the two planes share one rendering state");
+    }
+
+    /// A page remap waits for the submission running (which holds the
+    /// host's submission lock) instead of unmapping under its reads.
+    #[cfg(windows)]
+    #[test]
+    fn page_mappings_wait_for_a_running_submission() {
+        let Some(host) = crate::host::host() else { return };
+        crate::resource::use_page_mapper(|_, _, _| true);
+        let running = host.hold_submissions();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mapping = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let range = PageRange { kind: 3, start: 0, count: 1 };
+                let batch = PageBatch { destination: 0x10000, count: 1, ranges: &range };
+                let null = std::ptr::null();
+                assert_eq!(copy_page_mappings(null, 1, &batch, 0x20000, 1, 0), S_OK);
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "mapped under a running submission");
+        drop(running);
+        mapping.join().unwrap();
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// Where a queue's signal is: newer layouts have it two slots later.

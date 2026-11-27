@@ -1369,6 +1369,12 @@ impl Host {
         }
     }
 
+    /// No submission runs while the result lives: its title memory is not
+    /// being read or written (a page remap waits here).
+    pub(crate) fn hold_submissions(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
