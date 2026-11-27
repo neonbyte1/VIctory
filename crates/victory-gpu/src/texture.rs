@@ -212,6 +212,16 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
+/// Bytes retained by the texture upload pools and the idle per-thread read buffers.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cached_staging_bytes() -> Option<(u64, usize)> {
+    let chunk_bytes = CHUNKS.try_lock().ok()?.all.len() as u64 * CHUNK;
+    let pool = BUFFERS.try_lock().ok()?;
+    let large_bytes = pool.free_bytes + pool.used.iter().map(|entry| entry.0).sum::<u64>();
+    let read_bytes = RETAINED_SCRATCH.load(std::sync::atomic::Ordering::Relaxed);
+    Some((chunk_bytes + large_bytes, read_bytes))
+}
+
 /// A host copy or resolve that `list` records writes `resource`: from the
 /// submission that runs `list` on, its host texture's contents are the
 /// host's, not title memory's, which stays as it was. Marked when that
@@ -716,14 +726,28 @@ impl Staging {
 /// page fault per 4 KiB (129,000 faults in a frame, run placed1).
 struct Scratch(Vec<u8>);
 
+struct ScratchCache(std::cell::Cell<Vec<u8>>);
+
+#[cfg(feature = "diagnostics")]
+static RETAINED_SCRATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for ScratchCache {
+    fn drop(&mut self) {
+        RETAINED_SCRATCH.fetch_sub(self.0.get_mut().capacity(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 thread_local! {
-    static SCRATCH: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+    static SCRATCH: ScratchCache = const { ScratchCache(std::cell::Cell::new(Vec::new())) };
 }
 
 impl Scratch {
     /// The thread's buffer, at least `size` bytes.
     fn take(size: usize) -> Self {
-        let mut v = SCRATCH.take();
+        let mut v = SCRATCH.with(|cache| cache.0.take());
+        #[cfg(feature = "diagnostics")]
+        RETAINED_SCRATCH.fetch_sub(v.capacity(), std::sync::atomic::Ordering::Relaxed);
         if v.len() < size {
             v.resize(size, 0);
         }
@@ -736,7 +760,15 @@ impl Drop for Scratch {
         // The largest textures' buffers are not kept.
         const KEEP: usize = 32 << 20;
         if self.0.len() <= KEEP {
-            SCRATCH.set(std::mem::take(&mut self.0));
+            SCRATCH.with(|cache| {
+                let retained = std::mem::take(&mut self.0);
+                #[cfg(feature = "diagnostics")]
+                RETAINED_SCRATCH.fetch_add(retained.capacity(), std::sync::atomic::Ordering::Relaxed);
+                let previous = cache.0.replace(retained);
+                #[cfg(feature = "diagnostics")]
+                RETAINED_SCRATCH.fetch_sub(previous.capacity(), std::sync::atomic::Ordering::Relaxed);
+                drop(previous);
+            });
         }
     }
 }
