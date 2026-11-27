@@ -997,6 +997,147 @@ fn v_med3_f32_matches_rdna2_with_nan() {
     });
 }
 
+fn check_half_fma_nearest_even(body: [u32; 2]) {
+    let cases = [
+        ([0x6600, 0x3956, 0x0400, 0], 0x6401), // 1024.5 plus 2^-14
+        ([0x6600, 0x3956, 0, 0], 0x6400), // exact tie, even
+        ([0xe600, 0x3956, 0x8400, 0], 0xe401), // negative midpoint plus a negative tail
+        ([0x6700, 0x3894, 0x8400, 0], 0x6401), // 1025.5 minus 2^-14
+        ([0x6700, 0x3894, 0, 0], 0x6402), // exact tie, even
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    run_cases(&build_valu_cs(&body), &inputs, |backend, i, _, got| {
+        assert_eq!(got & 0xffff, cases[i].1, "{backend}: case {i}");
+    });
+}
+
+#[test]
+fn half_fma_rounds_once_to_nearest_even() {
+    check_half_fma_nearest_even(vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3)));
+}
+
+#[test]
+fn half_fmac_rounds_once_to_nearest_even() {
+    let fmac = (0x036 << 25) | (2 << 9) | u32::from(vgpr(1));
+    check_half_fma_nearest_even([vop1(0x001, 0, vgpr(3)), fmac]);
+}
+
+#[test]
+fn fused_half_keeps_subnormal_operands() {
+    let cases = [
+        ([0x7e00_0001, 0xfc00_fc00, 0x5640_5152, 0], Some(0xfc00)),
+        ([0x0000_fc00, 0x0000_0001, 0x5640_5152, 0], Some(0xfc00)),
+        ([0x0000_8001, 0x0000_fc00, 0x5640_5152, 0], Some(0x7c00)),
+        ([0x0000_0400, 0x0000_fc00, 0x5640_5152, 0], Some(0xfc00)),
+        ([0x0000_0001, 0x0000_6800, 0x5640_0000, 0], Some(0x0800)),
+        ([0x0000_0000, 0x0000_3c00, 0x5640_0001, 0], Some(0x0001)),
+        ([0x0000_8000, 0x0000_fc00, 0x5640_5152, 0], None),
+    ];
+    let inputs: Vec<_> = cases.iter().map(|&(words, _)| words).collect();
+    let initial = vop1(0x001, 0, vgpr(3));
+    let fmac = (0x036 << 25) | (2 << 9) | u32::from(vgpr(1));
+    let [fma, sources] = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3));
+
+    for (form, program) in [("fmac", &[fmac][..]), ("fma", &[fma, sources][..])] {
+        for (rounding, mode) in [("rne", &[][..]), ("rtz", &[0xba80_0881, 3][..])] {
+            let body = [mode, &[initial], program].concat();
+            let shader = build_valu_cs(&body);
+            run_cases(&shader, &inputs, |device, i, _, actual| {
+                assert_eq!(actual >> 16, 0x5640, "{device} {form} {rounding} row {i}");
+                let value = actual & 0xffff;
+                if let Some(expected) = cases[i].1 {
+                    assert_eq!(value, expected, "{device} {form} {rounding} row {i}");
+                } else {
+                    assert!(value & 0x7fff > 0x7c00, "{device} {form} {rounding} row {i}: {value:04x}");
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn half_fma_rounds_once_toward_zero() {
+    let [op, src] = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3));
+    let shader = build_valu_cs(&[0xba80_0881, 3, op, src]); // MODE.FP_ROUND16_64 = RTZ
+    let cases = [
+        ([0x6800, 0x3c00, 0x8400, 0], 0x67ff), // 2048 minus 2^-14
+        ([0x0400, 0xbc00, 0x6800, 0], 0x67ff), // same sum with the addend larger
+        ([0xe800, 0x3c00, 0x0400, 0], 0xe7ff), // negative mirror
+        ([0x6800, 0x3c00, 0, 0], 0x6800),
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        assert_eq!(got & 0xffff, cases[i].1, "{backend}: case {i}");
+    });
+}
+
+#[test]
+fn half_fused_nonfinite_results_survive_rounding() {
+    const F16_NAN: u32 = 0x7e00;
+    let cases = [
+        ([0x7c00, 0x3c00, 0x3c00, 0], 0x7c00),  // +inf + 1
+        ([0x3c00, 0xfc00, 0x3c00, 0], 0xfc00),  // -inf + 1
+        ([0x3c00, 0xbc00, 0x7c00, 0], 0x7c00),  // -1 + inf
+        ([0x3c00, 0x3c00, 0xfc00, 0], 0xfc00),  // 1 - inf
+        ([0x7c00, 0x3c00, 0xfc00, 0], F16_NAN), // inf - inf
+        ([0x7c00, 0, 0x3c00, 0], F16_NAN),      // inf * 0
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    let fmac = (0x036 << 25) | (2 << 9) | u32::from(vgpr(1));
+    let forms = [
+        ("FMA", vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3))),
+        ("FMAC", [vop1(0x001, 0, vgpr(3)), fmac]),
+    ];
+
+    for (form, words) in forms {
+        for (mode, prefix) in [("nearest", &[][..]), ("toward zero", &[0xba80_0881, 3])] {
+            let mut body = prefix.to_vec();
+            body.extend_from_slice(&words);
+            run_cases(&build_valu_cs(&body), &inputs, |backend, i, _, got| {
+                let actual = got & 0xffff;
+                let want = cases[i].1;
+                if want == F16_NAN {
+                    assert_eq!(
+                        actual & F16_NAN,
+                        F16_NAN,
+                        "{backend}: {form} {mode} case {i}: expected a quiet NaN, got {actual:#06x}"
+                    );
+                } else {
+                    assert_eq!(actual, want, "{backend}: {form} {mode} infinity case {i}");
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn half_fma_clamps_in_both_rounding_modes() {
+    let [op, src] = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3));
+    // Expected results in nearest-even and toward-zero order.
+    let cases = [
+        ([0x0001, 0x8001, 0x3c00, 0], [0x3c00, 0x3bff]), // 1 - 2^-48
+        ([0x3c01, 0x3c00, 0x8001, 0], [0x3c00; 2]),      // 1 + 2^-10 - 2^-24
+        ([0x3c00, 0x3c00, 0, 0], [0x3c00; 2]),           // exactly 1
+        ([0x4000, 0x3c00, 0, 0], [0x3c00; 2]),           // 2.0
+        ([0x7bff, 0x3c00, 0, 0], [0x3c00; 2]),           // 65504.0
+        ([0xbc00, 0x3c00, 0, 0], [0; 2]),                // -1.0
+        ([0x7c00, 0x3c00, 0x3c00, 0], [0x3c00; 2]),      // +inf
+        ([0xfc00, 0x3c00, 0x3c00, 0], [0; 2]),           // -inf
+        ([0x7e00, 0x3c00, 0, 0], [0; 2]),                // NaN
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    for (i, (label, mode)) in [("nearest-even", 0), ("toward zero", 3)].into_iter().enumerate() {
+        let shader = build_valu_cs(&[0xba80_0881, mode, op | 1 << 15, src]);
+        run_cases(&shader, &inputs, |backend, case, input, got| {
+            assert_eq!(
+                got & 0xffff,
+                cases[case].1[i],
+                "{backend}: {label} clamped case {case}, inputs {input:x?}"
+            );
+        });
+    }
+}
+
 /// RDNA2 orders -0 below +0 in its maximums and minimums; DXIL's FMax and
 /// FMin compare and select, which can give either zero.
 #[test]

@@ -2348,9 +2348,22 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, r, sign)
     }
 
-    /// Fused f16 multiply-add with one nearest-even rounding. The product
-    /// of two finite f16s is exact in f32. TwoSum recovers the error of the
-    /// f32 addition so a rounded sum at an f16 midpoint can be resolved.
+    /// Saturates an FMA result with ordered comparisons. This avoids losing
+    /// the clamp on AMD when the sum went through an integer correction,
+    /// and maps NaN and negative zero to positive zero.
+    fn clamp01_ordered(&mut self, value: V) -> V {
+        let c = self.cur;
+        let m = &mut self.s.m;
+        let (zero, one) = (m.f32(0), m.f32(0x3F80_0000));
+        let positive = m.cmp(c, pred::OGT, value, zero);
+        let low = m.select(c, positive, value, zero);
+        let below_one = m.cmp(c, pred::OLT, low, one);
+        m.select(c, below_one, low, one)
+    }
+
+    /// Fused f16 multiply-add with one rounding. Two finite f16s have an
+    /// exact product in f32. TwoSum recovers the error in the f32 sum to
+    /// resolve f16 midpoints or correct the direction of truncation.
     fn fma_f16(&mut self, a: V, b: V, addend: V, clamp: bool) -> V {
         let c = self.cur;
         let m = &mut self.s.m;
@@ -2362,7 +2375,26 @@ impl<'a> Lower<'a> {
         let addend_lo = m.bin(c, Bin::Sub, addend, addend_hi);
         let error = m.bin(c, Bin::Add, product_lo, addend_lo);
         // Saturation only changes the sum to an endpoint, neither a midpoint.
-        let sum = if clamp { self.unary(7, sum) } else { sum };
+        if self.mode16 == Some(3) {
+            let bits = self.as_int(sum);
+            let tail = self.as_int(error);
+            let m = &mut self.s.m;
+            let sign_mask = m.i32(0x8000_0000);
+            let sign = m.bin(c, Bin::And, bits, sign_mask);
+            let tail = m.bin(c, Bin::Xor, tail, sign);
+            let tail = self.as_float(tail);
+            let m = &mut self.s.m;
+            let zero = m.f32(0);
+            // Correct the unclamped sum only when f32 rounded away from
+            // zero. NaN tails from non-finite sums fail the ordered test.
+            let inward = m.cmp(c, pred::OLT, tail, zero);
+            let step = m.cast(c, Cast::ZExt, inward, self.s.t.i32);
+            let bits = m.bin(c, Bin::Sub, bits, step);
+            let adjusted = self.as_float(bits);
+            let adjusted = if clamp { self.clamp01_ordered(adjusted) } else { adjusted };
+            return self.narrow16(adjusted);
+        }
+        let sum = if clamp { self.clamp01_ordered(sum) } else { sum };
         let bits = self.as_int(sum);
         let error_bits = self.as_int(error);
         let m = &mut self.s.m;
@@ -7188,16 +7220,43 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// Widens an f16, explicitly preserving subnormal inputs for fused math.
+    fn widen_half(&mut self, h: V, fused: bool) -> V {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let normal = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        if !fused {
+            return normal;
+        }
+        // A half subnormal is an exactly representable normal f32.
+        // Build it from the bits so host half arithmetic cannot flush it.
+        let m = &mut self.s.m;
+        let (magnitude, sign_mask, min_normal, k16) =
+            (m.i32(0x7FFF), m.i32(0x8000), m.i32(0x0400), m.i32(16));
+        let fraction = m.bin(c, Bin::And, h, magnitude);
+        let tiny = m.cmp(c, pred::IULT, fraction, min_normal);
+        let sign = m.bin(c, Bin::And, h, sign_mask);
+        let sign = m.bin(c, Bin::Shl, sign, k16);
+        let fraction = m.cast(c, Cast::UiToFp, fraction, f32t);
+        let unit = m.f32(0x3380_0000); // 2^-24
+        let exact = m.bin(c, Bin::Mul, fraction, unit);
+        let exact = self.as_int(exact);
+        let exact = self.s.m.bin(c, Bin::Or, exact, sign);
+        let exact = self.as_float(exact);
+        self.s.m.select(c, tiny, exact, normal)
+    }
+
     /// An f16 source as an f32 (exact), with its abs/neg modifiers.
     fn half_fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_fsrc_for(inst, k, false)
+    }
+
+    fn half_fsrc_for(&mut self, inst: &Inst, k: usize, fused: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let h = self.half_src(inst, k)?;
-        let f32t = self.s.t.f32;
-        let mut f = self
-            .s
-            .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let mut f = self.widen_half(h, fused);
         if v.abs >> k & 1 != 0 {
             f = self.unary(6, f);
         }
@@ -7364,7 +7423,8 @@ impl<'a> Lower<'a> {
             return float_result(self, r);
         }
         if float3.contains(&name) {
-            let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
+            let fused = matches!(name, "v_fma_f16" | "v_fmac_f16");
+            let (a, b) = (self.half_fsrc_for(inst, 0, fused)?, self.half_fsrc_for(inst, 1, fused)?);
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -7379,12 +7439,11 @@ impl<'a> Lower<'a> {
                 };
                 let m = self.s.m.i32(0xFFFF);
                 let x = self.s.m.bin(c, Bin::And, x, m);
-                self.s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                self.widen_half(x, fused)
             } else {
-                self.half_fsrc(inst, 2)?
+                self.half_fsrc_for(inst, 2, fused)?
             };
-            if name == "v_fma_f16" && self.mode16 != Some(3) {
+            if fused {
                 if v.omod != 0 {
                     return Err("an output modifier on a 16-bit operation");
                 }
@@ -7392,9 +7451,7 @@ impl<'a> Lower<'a> {
                 return self.write_half(inst, half, guard);
             }
             let r = match name {
-                // shortcut: fused f16 multiply-adds as FMad in f32 (the
-                // product is exact; the sum rounds twice).
-                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
                     self.max_min(true, t, acc)
