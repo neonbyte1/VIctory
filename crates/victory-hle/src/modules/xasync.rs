@@ -948,7 +948,10 @@ pub fn pending_with(
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    type Data = Mutex<(
+        Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>,
+        Vec<u8>,
+    )>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
         // boxed state until cleanup frees it.
@@ -959,7 +962,11 @@ pub fn pending_with(
             OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
             OP_BEGIN => {
                 // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let work = unsafe { &*state }
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .take();
                 let (block, state) = (data.block as usize, state as usize);
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
@@ -988,7 +995,13 @@ pub fn pending_with(
     }
     let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
     let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let hr = XAsyncBegin(
+        block,
+        context.cast(),
+        identity,
+        std::ptr::null(),
+        Some(provider),
+    );
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
         drop(unsafe { Box::from_raw(context) });
@@ -1008,10 +1021,47 @@ pub fn result<T>(block: *mut AsyncBlock, identity: *const c_void, out: *mut T) -
     )
 }
 
+/// An initialized native-ABI encoding for an async result. Records encode
+/// their fields explicitly rather than reading their Rust memory layout.
+pub trait ResultBytes {
+    fn into_result_bytes(self) -> Vec<u8>;
+}
+
+impl ResultBytes for u16 {
+    fn into_result_bytes(self) -> Vec<u8> {
+        self.to_ne_bytes().to_vec()
+    }
+}
+
+impl ResultBytes for i64 {
+    fn into_result_bytes(self) -> Vec<u8> {
+        self.to_ne_bytes().to_vec()
+    }
+}
+
+impl<T> ResultBytes for *const T {
+    fn into_result_bytes(self) -> Vec<u8> {
+        (self as usize).to_ne_bytes().to_vec()
+    }
+}
+
+impl<T> ResultBytes for *mut T {
+    fn into_result_bytes(self) -> Vec<u8> {
+        (self as usize).to_ne_bytes().to_vec()
+    }
+}
+
 /// The bytes of a value, for [`finished_with`].
-pub fn bytes<T: Copy>(value: T) -> Vec<u8> {
-    // SAFETY: a `Copy` value is plain data; padding bytes are never read.
-    unsafe { std::slice::from_raw_parts((&raw const value).cast::<u8>(), size_of::<T>()) }.to_vec()
+/// Padded records must provide an explicit encoding:
+///
+/// ```compile_fail
+/// #[derive(Clone, Copy)]
+/// #[repr(C)]
+/// struct Padded { tag: u8, value: u32 }
+/// victory_hle::modules::xasync::bytes(Padded { tag: 1, value: 2 });
+/// ```
+pub fn bytes(value: impl ResultBytes) -> Vec<u8> {
+    value.into_result_bytes()
 }
 
 type Work = extern "system" fn(*mut AsyncBlock) -> HRESULT;
@@ -1213,6 +1263,53 @@ static VTABLE: Methods<31> = Methods([
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn result_bytes_round_trip_scalars_and_handles() {
+        fn round_trip<T: Copy + PartialEq + std::fmt::Debug>(value: T, payload: Vec<u8>) -> T {
+            static CALL: u8 = 0;
+            let identity = (&raw const CALL).cast();
+            let mut block = AsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            assert_eq!(finished_with(&mut block, identity, Ok(payload)), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+            let mut size = 0;
+            assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
+            assert_eq!(size, size_of::<T>());
+            let mut out = std::mem::MaybeUninit::<T>::uninit();
+            assert_eq!(result(&mut block, identity, out.as_mut_ptr()), S_OK);
+            // SAFETY: the successful result copied the encoding of `value`.
+            let out = unsafe { out.assume_init() };
+            assert_eq!(out, value);
+            out
+        }
+
+        for value in [0u16, 3074, u16::MAX] {
+            round_trip(value, bytes(value));
+        }
+        for value in [i64::MIN, -1, 0, i64::MAX] {
+            round_trip(value, bytes(value));
+        }
+        let mut value = 0x1234_5678_u64;
+        let read = &raw const value;
+        let returned = round_trip(read, bytes(read));
+        // SAFETY: this is the original pointer to the live local above.
+        assert_eq!(unsafe { *returned }, value);
+        let write = &raw mut value;
+        let returned = round_trip(write, bytes(write));
+        // SAFETY: the exclusive raw pointer still refers to our local.
+        unsafe { returned.write(42) };
+        assert_eq!(value, 42);
+        round_trip(std::ptr::null::<u8>(), bytes(std::ptr::null::<u8>()));
+        round_trip(
+            std::ptr::null_mut::<u8>(),
+            bytes(std::ptr::null_mut::<u8>()),
+        );
+    }
 
     fn slot<F: Copy>(offset: usize) -> F {
         crate::modules::xgameruntime::method(&OBJECT, offset)
@@ -1562,7 +1659,13 @@ mod tests {
         };
         let identity = 0x77 as *const c_void;
         assert_eq!(
-            XAsyncBegin(&mut block, std::ptr::null_mut(), identity, std::ptr::null(), Some(provider)),
+            XAsyncBegin(
+                &mut block,
+                std::ptr::null_mut(),
+                identity,
+                std::ptr::null(),
+                Some(provider)
+            ),
             S_OK
         );
         assert!(XTaskQueueDispatch(q, WORK, 0));
@@ -1573,11 +1676,20 @@ mod tests {
         let mut value = 0u64;
         let mut used = 0;
         assert_eq!(
-            XAsyncGetResult(&mut block, identity, 8, (&mut value as *mut u64).cast(), &mut used),
+            XAsyncGetResult(
+                &mut block,
+                identity,
+                8,
+                (&mut value as *mut u64).cast(),
+                &mut used
+            ),
             S_OK
         );
         assert_eq!((value, used), (0x1234, 8));
-        assert!(call(&raw mut block).is_none(), "the call ends with its result");
+        assert!(
+            call(&raw mut block).is_none(),
+            "the call ends with its result"
+        );
         XTaskQueueCloseHandle(q);
     }
 

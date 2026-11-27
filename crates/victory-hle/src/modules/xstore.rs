@@ -175,6 +175,47 @@ pub struct GameLicense {
     pub expiration: i64,
 }
 
+impl xasync::ResultBytes for GameLicense {
+    fn into_result_bytes(self) -> Vec<u8> {
+        let mut bytes = vec![0; size_of::<Self>()];
+        let mut field = |offset: usize, value: &[u8]| {
+            bytes[offset..offset + value.len()].copy_from_slice(value);
+        };
+        // Moving even a zero-initialized Rust struct need not preserve its
+        // padding. Write the fields into the final byte buffer instead.
+        field(std::mem::offset_of!(Self, sku_store_id), &self.sku_store_id);
+        field(
+            std::mem::offset_of!(Self, is_active),
+            &[u8::from(self.is_active)],
+        );
+        field(
+            std::mem::offset_of!(Self, is_trial_owned_by_this_user),
+            &[u8::from(self.is_trial_owned_by_this_user)],
+        );
+        field(
+            std::mem::offset_of!(Self, is_disc_license),
+            &[u8::from(self.is_disc_license)],
+        );
+        field(
+            std::mem::offset_of!(Self, is_trial),
+            &[u8::from(self.is_trial)],
+        );
+        field(
+            std::mem::offset_of!(Self, trial_seconds_remaining),
+            &self.trial_seconds_remaining.to_ne_bytes(),
+        );
+        field(
+            std::mem::offset_of!(Self, trial_unique_id),
+            &self.trial_unique_id,
+        );
+        field(
+            std::mem::offset_of!(Self, expiration),
+            &self.expiration.to_ne_bytes(),
+        );
+        bytes
+    }
+}
+
 /// A full, active licence for the game's SKU (`<store id>/0010`, the
 /// store's first SKU), not a trial, without expiry.
 fn game_license() -> GameLicense {
@@ -421,6 +462,56 @@ static VTABLE: Methods<77> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn game_license_result_bytes_follow_the_abi_and_zero_padding() {
+        let license = GameLicense {
+            sku_store_id: [0x5a; 18],
+            is_active: true,
+            is_trial_owned_by_this_user: false,
+            is_disc_license: true,
+            is_trial: true,
+            trial_seconds_remaining: 0x1234_5678,
+            trial_unique_id: [0x6b; 64],
+            expiration: -0x0102_0304_0506_0708,
+        };
+        let payload = xasync::bytes(license);
+        assert_eq!(payload.len(), 104);
+        assert_eq!(&payload[..18], &[0x5a; 18]);
+        assert_eq!(&payload[18..24], &[1, 0, 1, 1, 0, 0]);
+        assert_eq!(&payload[24..28], &0x1234_5678u32.to_ne_bytes());
+        assert_eq!(&payload[28..92], &[0x6b; 64]);
+        assert_eq!(&payload[92..96], &[0; 4]);
+        assert_eq!(&payload[96..], &license.expiration.to_ne_bytes());
+
+        let mut b = block();
+        assert_eq!(
+            xasync::finished_with(&mut b, (&raw const GAME_LICENSE).cast(), Ok(payload)),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        let mut result = std::mem::MaybeUninit::<GameLicense>::uninit();
+        assert_eq!(
+            game_license_result(&OBJECT, &mut b, result.as_mut_ptr()),
+            S_OK
+        );
+        // SAFETY: the successful result initialized every field.
+        let result = unsafe { result.assume_init() };
+        assert_eq!(result.sku_store_id, license.sku_store_id);
+        assert_eq!(result.is_active, license.is_active);
+        assert_eq!(
+            result.is_trial_owned_by_this_user,
+            license.is_trial_owned_by_this_user
+        );
+        assert_eq!(result.is_disc_license, license.is_disc_license);
+        assert_eq!(result.is_trial, license.is_trial);
+        assert_eq!(
+            result.trial_seconds_remaining,
+            license.trial_seconds_remaining
+        );
+        assert_eq!(result.trial_unique_id, license.trial_unique_id);
+        assert_eq!(result.expiration, license.expiration);
+    }
 
     fn block() -> AsyncBlock {
         AsyncBlock {
