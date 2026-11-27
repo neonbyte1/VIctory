@@ -1147,6 +1147,113 @@ fn v_min3_max3_med3_integer_forms_match_rdna2() {
     }
 }
 
+/// Three-XOR swaps on a descriptor table SGPR (via `vcc_lo`, then `s_xor_b64`)
+/// preserve its root origin across lowering and run on hardware and WARP.
+#[test]
+fn three_xor_swap_tracks_table_through_vcc_and_64bit_pair() {
+    let mut words = vec![
+        s_mov_b32(12, 4),         // s12 = s4 (descriptor table)
+        s_mov_b32(106, 193),      // vcc_lo = -1
+        sop2(0x12, 12, 12, 106),  // s_xor_b32 s12, s12, vcc_lo
+        sop2(0x12, 106, 12, 106), // s_xor_b32 vcc_lo, s12, vcc_lo
+        sop2(0x12, 12, 12, 106),  // s_xor_b32 s12, s12, vcc_lo
+        s_mov_b32(14, 106),       // s14 = vcc_lo (descriptor table)
+        s_mov_b32(15, 0x80),      // s15 = 0
+        s_mov_b32(16, 0x80),      // s16 = 0
+        s_mov_b32(17, 0x80),      // s17 = 0
+        sop2(0x13, 14, 14, 16),   // s_xor_b64 s[14:15], s[14:15], s[16:17]
+        sop2(0x13, 16, 14, 16),   // s_xor_b64 s[16:17], s[14:15], s[16:17]
+        sop2(0x13, 14, 14, 16),   // s_xor_b64 s[14:15], s[14:15], s[16:17]
+    ];
+    words.extend_from_slice(&s_load_dwordx4(8, 16));
+    words.push(vop1(0x001, 0, sgpr(0))); // v_mov_b32 v0, s0
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let (p, st) = range::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = st.unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .unwrap();
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+
+    run_cases(&shader, &[[0xCAFE_BEEF, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0xCAFE_BEEF, "{backend}");
+    });
+}
+
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)

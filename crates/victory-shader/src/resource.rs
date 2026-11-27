@@ -577,6 +577,7 @@ impl<'a> Tracer<'a> {
                         let new = match reload
                             .or_else(|| copy_source(inst, k))
                             .or_else(|| self.restored(inst))
+                            .or_else(|| self.xor_cancelled(inst, k, &o))
                         {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
@@ -2221,6 +2222,126 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
     }
 }
 
+impl Tracer<'_> {
+    /// What dword `k` of an `s_xor_b32` or `s_xor_b64` produces when GF(2)
+    /// cancellation over its XOR DAG reduces to at most one non-constant term
+    /// (such as a three-XOR register exchange `a ^= b; b ^= a; a ^= b`).
+    fn xor_cancelled(&self, inst: &Inst, k: usize, o: &[Option<Term>]) -> Option<Moved> {
+        let (a, b) = xor_operands(inst, k)?;
+        let wide = inst.name() == "s_xor_b64";
+        let mut const_acc = 0u32;
+        let mut atoms = Vec::new();
+        let push = |t: Term, c: &mut u32, atoms: &mut Vec<Value>| match t {
+            Term::Const(x) => *c ^= x,
+            Term::Value(v) => atoms.push(v),
+        };
+        push(xor_term(inst, a, k, wide, o)?, &mut const_acc, &mut atoms);
+        push(xor_term(inst, b, k, wide, o)?, &mut const_acc, &mut atoms);
+        cancel_xor_pairs(&mut atoms);
+
+        // Expand at most MAX_XOR_STEPS definitions, always picking the latest
+        // in RPO/instruction order so local swap cancellations finish before
+        // expanding unrelated earlier XOR values.
+        const MAX_XOR_STEPS: usize = 32;
+        for _ in 0..MAX_XOR_STEPS {
+            if atoms.is_empty() {
+                return Some(Moved::Const(const_acc));
+            }
+            if atoms.len() == 1 && const_acc == 0 {
+                return Some(Moved::Value(atoms[0]));
+            }
+            let expand = atoms
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &v)| {
+                    let site = self.defs[v.0 as usize]?;
+                    let def = self.inst(site);
+                    let def_k = def.writes.iter().position(|w| w.1 == v)?;
+                    let (a, b) = xor_operands(def, def_k)?;
+                    Some(((self.rpo[site.0], site.1), idx, def, def_k, a, b))
+                })
+                .max_by_key(|x| x.0);
+            let Some((_, idx, def, def_k, a, b)) = expand else {
+                break;
+            };
+            let def_wide = def.name() == "s_xor_b64";
+            let t0 = xor_term(def, a, def_k, def_wide, o)?;
+            let t1 = xor_term(def, b, def_k, def_wide, o)?;
+            atoms.swap_remove(idx);
+            push(t0, &mut const_acc, &mut atoms);
+            push(t1, &mut const_acc, &mut atoms);
+            cancel_xor_pairs(&mut atoms);
+        }
+        if atoms.is_empty() {
+            Some(Moved::Const(const_acc))
+        } else if atoms.len() == 1 && const_acc == 0 {
+            Some(Moved::Value(atoms[0]))
+        } else {
+            None
+        }
+    }
+}
+
+fn xor_operands(inst: &Inst, k: usize) -> Option<(&Operand, &Operand)> {
+    let dwords = match inst.name() {
+        "s_xor_b32" => 1,
+        "s_xor_b64" => 2,
+        _ => return None,
+    };
+    if k >= dwords {
+        return None;
+    }
+    let Fields::Sop {
+        dst: Some(Operand::Scalar { code, .. }),
+        src,
+        ..
+    } = &inst.fields
+    else {
+        return None;
+    };
+    if *code == NULL || *code + k as u8 == NULL {
+        return None;
+    }
+    let [a, b] = &src[..] else {
+        return None;
+    };
+    Some((a, b))
+}
+
+fn xor_term(inst: &Inst, op: &Operand, k: usize, wide: bool, o: &[Option<Term>]) -> Option<Term> {
+    match *op {
+        Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
+        Operand::Scalar { code, .. } => o[inst.read(Reg::S(code + k as u8))?.0 as usize],
+        Operand::Const(c) if !wide => inline(c).map(Term::Const),
+        Operand::Const(c @ 128..=208) if wide => {
+            let low = inline(c)?;
+            Some(Term::Const(if k == 0 {
+                low
+            } else {
+                ((low as i32) >> 31) as u32
+            }))
+        }
+        Operand::Literal(x) if !wide => Some(Term::Const(x)),
+        _ => None,
+    }
+}
+
+fn cancel_xor_pairs(atoms: &mut Vec<Value>) {
+    atoms.sort_unstable();
+    let mut w = 0;
+    let mut i = 0;
+    while i < atoms.len() {
+        if i + 1 < atoms.len() && atoms[i] == atoms[i + 1] {
+            i += 2;
+        } else {
+            atoms[w] = atoms[i];
+            w += 1;
+            i += 1;
+        }
+    }
+    atoms.truncate(w);
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2471,6 +2592,148 @@ pub(crate) mod tests {
             HwStage::Ps,
         );
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    #[test]
+    fn three_xor_swap_tracks_32bit_64bit_and_vcc_exchanges() {
+        // 32-bit SGPR swap: s2 <-> s8 via s_xor_b32.
+        let r32 = track_words(
+            &[
+                0x8902_0802, // s_xor_b32 s2, s2, s8
+                0x8908_0802, // s_xor_b32 s8, s2, s8
+                0x8902_0802, // s_xor_b32 s2, s2, s8
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF408_0301,
+                0xFA00_0000, // s_load_dwordx4 s[12:15], s[2:3], null
+                0xF408_0404,
+                0xFA00_0000, // s_load_dwordx4 s[16:19], s[8:9], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1), param(Table, 8, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r32.scalar, [((0, 5), at(1, 0)), ((0, 6), at(0, 0))]);
+
+        // 64-bit SGPR pair swap: s[2:3] <-> s[8:9] via s_xor_b64, plus
+        // cancelling inline sign-extended -1.
+        let r64 = track_words(
+            &[
+                0x8982_0802, // s_xor_b64 s[2:3], s[2:3], s[8:9]
+                0x8988_0802, // s_xor_b64 s[8:9], s[2:3], s[8:9]
+                0x8982_0802, // s_xor_b64 s[2:3], s[2:3], s[8:9]
+                0x8982_C102, // s_xor_b64 s[2:3], s[2:3], -1
+                0x8982_C102, // s_xor_b64 s[2:3], s[2:3], -1
+                0xF400_0101,
+                0xFA00_0000, // s_load_dword s4, s[2:3], null
+                0xF400_0144,
+                0xFA00_0000, // s_load_dword s5, s[8:9], null
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 2, 2), param(Descriptor, 8, 2)],
+            HwStage::Ps,
+        );
+        assert_eq!(r64.scalar, [((0, 5), at(1, 0)), ((0, 6), at(0, 0))]);
+
+        // Swap using vcc_lo (code 106) as partner, including uninitialized vcc_lo.
+        let rvcc = track_words(
+            &[
+                0x896A_026A, // s_xor_b32 vcc_lo, vcc_lo, s2
+                0x8902_026A, // s_xor_b32 s2, vcc_lo, s2
+                0x896A_026A, // s_xor_b32 vcc_lo, vcc_lo, s2
+                0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0301,
+                0xFA00_0000, // s_load_dwordx4 s[12:15], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(rvcc.scalar, [((0, 5), at(0, 0))]);
+    }
+
+    #[test]
+    fn three_xor_swap_preserves_phi_origins_and_non_cancelling_xor_stays_opaque() {
+        // Both paths end with s2 holding param 1 (s8): one via 3-XOR swap,
+        // one via s_mov_b32; the phi at the join block settles on param 1.
+        let rphi = track_words(
+            &[
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0004, // s_cbranch_scc1 -> 0x18
+                0x8902_0802, // s_xor_b32 s2, s2, s8
+                0x8908_0802, // s_xor_b32 s8, s2, s8
+                0x8902_0802, // s_xor_b32 s2, s2, s8
+                0xBF82_0001, // s_branch -> 0x1c
+                0xBE82_0308, // 0x18: s_mov_b32 s2, s8
+                0xBE83_0380, // 0x1c: s_mov_b32 s3, 0
+                0xF408_0301,
+                0xFA00_0000, // s_load_dwordx4 s[12:15], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1), param(Table, 8, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(rphi.scalar, [((3, 1), at(1, 0))]);
+
+        // An uncancelled XOR entering a loop and swapped inside settles cleanly.
+        let rloop = track_words(
+            &[
+                0x8902_0908, // s_xor_b32 s2, s8, s9
+                0x8902_0A02, // loop: s_xor_b32 s2, s2, s10
+                0x890A_0A02, // s_xor_b32 s10, s2, s10
+                0x8902_0A02, // s_xor_b32 s2, s2, s10
+                0x8902_0A02, // s_xor_b32 s2, s2, s10
+                0x890A_0A02, // s_xor_b32 s10, s2, s10
+                0x8902_0A02, // s_xor_b32 s2, s2, s10
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_FFF8, // s_cbranch_scc1 -> loop
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0xF408_0305,
+                0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 10, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(rloop.scalar, [((2, 1), at(0, 0))]);
+
+        // Non-cancelling XOR s2 = s8 ^ s9 remains opaque (not a root param)
+        // and mutating a loaded descriptor word fails tracking.
+        let opaque = track_words(
+            &[
+                0x8902_0908, // s_xor_b32 s2, s8, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0301,
+                0xFA00_0000, // s_load_dwordx4 s[12:15], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 8, 1), param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(opaque.scalar, [((0, 2), at(MEMORY, 0))]);
+
+        let code: Vec<u8> = [
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xF408_0004,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[8:9], null
+            0x8900_0700, // s_xor_b32 s0, s0, s7
+            0xF420_0100,
+            0xFA00_0000, // s_buffer_load_dword s4, s[0:3], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 8, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 16,
+                what: "a descriptor changed after loading",
+            }
+        );
     }
 
     #[test]
