@@ -178,6 +178,12 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
                 "{digits} hex digits in one run of \\x/0x literals (embedded data?)"
             ));
         }
+        let bytes = longest_decimal_run(content);
+        if bytes > MAX_ENCODED_RUN {
+            problems.push(format!(
+                "{bytes} byte-range decimal literals in one run (embedded data?)"
+            ));
+        }
     }
     problems
 }
@@ -191,7 +197,6 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
 /// Most hex digits in `\xNN` escapes or `0x` literals with only commas,
 /// whitespace or backslashes between them: a byte string or `xxd -i` array,
 /// which `longest_encoded_run` sees as many 3- or 4-character runs.
-/// shortcut: decimal arrays (`[77, 90, ...]`) still pass, add a literal count if one shows up.
 fn longest_hex_literal_run(content: &[u8]) -> usize {
     let (mut i, mut run, mut longest) = (0, 0, 0);
     while i < content.len() {
@@ -216,6 +221,55 @@ fn longest_hex_literal_run(content: &[u8]) -> usize {
                 i += 1;
             }
         }
+    }
+    longest
+}
+
+/// Most byte-range decimal literals in one run of `[77, 90, ...]` with only
+/// commas and whitespace between them: a `[u8]` array of copied data, whose
+/// 1- to 3-character literals `longest_encoded_run` never sees as one run.
+///
+/// Counted in literals, not digits, so a table of small numbers that a
+/// decoder really needs (`COEF0_LENS`, 272 entries) stays legal; the largest
+/// such table in the tree has 272, well under the limit.
+fn longest_decimal_run(content: &[u8]) -> usize {
+    let (mut i, mut run, mut longest) = (0, 0, 0);
+    while i < content.len() {
+        let digits = content[i..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            if !matches!(content[i], b',' | b' ' | b'\t' | b'\r' | b'\n') {
+                run = 0;
+            }
+            i += 1;
+            continue;
+        }
+        // A bare literal: at most three digits, no leading zero, no type
+        // suffix or fraction after it, nothing but a separator before the
+        // next one. Past three digits it cannot be a byte, and folding a
+        // long run of digits (an address, a hash) would overflow.
+        let followed = content.get(i + digits).copied();
+        let bare = digits <= 3
+            && !(digits > 1 && content[i] == b'0')
+            && matches!(followed, None | Some(b',' | b' ' | b'\t' | b'\r' | b'\n'));
+        let value = if bare {
+            Some(
+                content[i..i + digits]
+                    .iter()
+                    .fold(0u32, |v, b| v * 10 + u32::from(b - b'0')),
+            )
+        } else {
+            None
+        };
+        if matches!(value, Some(v) if v <= 0xFF) {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+        i += digits;
     }
     longest
 }
@@ -295,5 +349,73 @@ mod tests {
             table.join(",\n    ")
         );
         assert!(check("src/table.rs", src.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn rejects_data_smuggled_as_a_decimal_byte_array() {
+        // 4096 bytes as plain decimal literals, the shape a `[u8]` dump of
+        // copied data takes once a formatter has re-spaced it.
+        let lits: Vec<String> = synthetic(4096).map(|b| b.to_string()).collect();
+        let src = format!("pub const DATA: [u8; 4096] = [{}];\n", lits.join(", "));
+        let problem = check("src/data.rs", src.as_bytes());
+        assert!(
+            problem.iter().any(|p| p.contains("decimal literals")),
+            "{} bytes of decimal literals passed: {problem:?}",
+            src.len()
+        );
+
+        // The same bytes wrapped one per line, as `rustfmt` would leave it.
+        let src = format!(
+            "pub const DATA: [u8; 4096] = [\n    {},\n];\n",
+            lits.join(",\n    ")
+        );
+        assert!(
+            !check("src/data.rs", src.as_bytes()).is_empty(),
+            "4096 decimal literals one per line passed"
+        );
+    }
+
+    #[test]
+    fn accepts_tables_of_small_decimals() {
+        // The shape of the trees' own decoder tables: many entries, all
+        // byte-sized, that nothing can be decoded without.
+        let lens: Vec<String> = (0..272u32).map(|i| ((i * 7) % 22).to_string()).collect();
+        let src = format!(
+            "pub(super) const COEF0_LENS: [u8; 272] = [\n    {},\n];\n",
+            lens.join(", ")
+        );
+        assert!(
+            check("crates/victory-formats/src/xma/tables.rs", src.as_bytes()).is_empty(),
+            "a 272-entry byte table was rejected"
+        );
+
+        // Values past a byte are indices, not payload.
+        let syms: Vec<String> = (0..272u32).map(|i| i.to_string()).collect();
+        let src = format!(
+            "pub(super) const COEF0_SYMS: [u16; 272] = [\n    {},\n];\n",
+            syms.join(", ")
+        );
+        assert!(
+            check("crates/victory-formats/src/xma/tables.rs", src.as_bytes()).is_empty(),
+            "a table of indices was rejected"
+        );
+
+        // Type suffixes, fractions and leading zeros are not byte literals.
+        assert!(
+            check(
+                "src/x.rs",
+                format!("let a = [{}];\n", vec!["1u8"; 400].join(", ")).as_bytes()
+            )
+            .is_empty(),
+            "1u8 literals counted as payload"
+        );
+        assert!(
+            check(
+                "src/x.rs",
+                format!("let a = [{}];\n", vec!["0.5"; 400].join(", ")).as_bytes()
+            )
+            .is_empty(),
+            "fractions counted as payload"
+        );
     }
 }
