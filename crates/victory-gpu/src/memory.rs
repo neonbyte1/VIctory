@@ -121,6 +121,18 @@ unsafe impl Sync for Bitmap {}
 /// Reusable zeroed dirty-page bitmap buffers, capped at [`BITMAP_POOL_CAP`].
 static BITMAP_POOL: Mutex<Vec<Bitmap>> = Mutex::new(Vec::new());
 
+/// Serialises the tests that take a page table: [`BITMAP_POOL`] is shared by
+/// the whole process, hands bitmaps back last-in-first-out and is capped, so
+/// a test that checks a reset list gets its bitmap back again must have no
+/// other test taking or returning one in between. Every test that binds a
+/// list (`memory::bind`, directly or through `draw::State::bind`) holds this
+/// lock for its whole run.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Bitmap {
     /// Pops a zeroed bitmap from [`BITMAP_POOL`] or allocates and zeroes a new one.
     fn acquire() -> Option<Self> {
@@ -837,11 +849,6 @@ mod tests {
         let oob = 2 * BLOCK + 1;
         marks[oob / 32] = 1 << (oob % 32);
         assert!(has_missed(&marks, &l));
-    }
-
-    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]

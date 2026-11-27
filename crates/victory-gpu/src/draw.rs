@@ -3986,6 +3986,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, StageIo};
         use victory_shader::{Container, io, ir, resource, structure};
 
+        // `State::bind` takes a page table from the process-wide bitmap
+        // pool; see `memory::gpu_test_lock`.
+        let _guard = crate::memory::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return;
         };

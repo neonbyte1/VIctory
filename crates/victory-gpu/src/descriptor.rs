@@ -1041,6 +1041,9 @@ pub(crate) mod tests {
     /// 16.8 MiB mapping and the copies it names live on).
     #[test]
     fn a_released_view_heap_drops_its_page_table() {
+        // The page table takes a bitmap from the process-wide pool; see
+        // `memory::gpu_test_lock`.
+        let _guard = crate::memory::gpu_test_lock();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
