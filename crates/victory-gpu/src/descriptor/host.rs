@@ -347,6 +347,8 @@ impl HostHeap {
         };
         taken[first..first + n].fill(true);
         *next = ((first + n) % self.dynamic as usize) as u32;
+        // Shaders read texture views there too: their marks are scanned.
+        crate::descriptor::view_slots_reach(self.count + (first + n) as u32);
         Some(self.count + first as u32)
     }
 

@@ -917,8 +917,11 @@ pub(crate) fn take_reads() -> Vec<u32> {
             seen[w] &= !bit;
         }
     }
+    // Slots past every view heap's are no heap's (`descriptor::view_slots`):
+    // their marks are left for a larger heap to find.
+    let used = (crate::descriptor::view_slots().div_ceil(32) as usize).min(words);
     let mut new = Vec::new();
-    for (w, s) in seen.iter_mut().enumerate() {
+    for (w, s) in seen[..used].iter_mut().enumerate() {
         let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
         *s |= fresh;
         while fresh != 0 {
@@ -941,7 +944,9 @@ pub(crate) fn reads_since() -> Vec<u32> {
     for b in [false, true].into_iter().filter_map(bitmap) {
         // SAFETY: the mapped bitmap's read marks; no submission runs.
         let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
-        for (w, word) in bits.iter_mut().enumerate() {
+        // As in `take_reads`: no further than any view heap's slots.
+        let used = (crate::descriptor::view_slots().div_ceil(32) as usize).min(words);
+        for (w, word) in bits[..used].iter_mut().enumerate() {
             let mut x = std::mem::take(word);
             while x != 0 {
                 slots.push(w as u32 * 32 + x.trailing_zeros());

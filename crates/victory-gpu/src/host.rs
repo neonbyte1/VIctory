@@ -457,13 +457,31 @@ pub(crate) mod tests {
 
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
-    /// forgotten, and a forgotten slot's next read is taken again.
+    /// forgotten, and a forgotten slot's next read is taken again; also at
+    /// a dynamic slot past the title's. A mark past every slot in use names
+    /// none and is not taken.
     #[test]
     fn read_marks_of_both_bitmaps_are_taken() {
         let Some(host) = host() else { return };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 64, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
         // No submission takes the marks meanwhile.
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
+        let past = victory_shader::emit::HEAP_VIEWS - 1;
+        assert!(crate::descriptor::view_slots() <= past, "no view heap reaches the last slot");
+        crate::shadow::tests::mark_read(false, past);
+        assert!(!crate::shadow::take_reads().contains(&past), "past every heap's slots");
+        let (plain, memory) = (62, 63);
+        // A dynamic slot (a table made afresh), past the title's 64.
+        let host_heap = crate::descriptor::heap(heap).host().expect("a host view heap");
+        let dynamic = host_heap.dynamic(1).expect("a dynamic slot");
+        assert!(dynamic >= 64);
+        crate::shadow::tests::mark_read(false, dynamic);
+        assert!(crate::shadow::take_reads().contains(&dynamic), "a dynamic slot's read");
+        host_heap.release(dynamic, 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
         let taken = crate::shadow::take_reads();

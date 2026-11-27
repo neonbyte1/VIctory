@@ -124,6 +124,29 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+/// The end of the view slots in use (it only grows): the most slots any
+/// shader-visible view heap has had, or past them the dynamic slots a host
+/// heap has handed out (tables made afresh, whose texture views shaders
+/// read too). Shaders' read marks at or past it name no slot that
+/// [`make_read`] or the eviction stamps act on, so the scans of the marks
+/// after each submission stop there (`crate::shadow::take_reads`), instead
+/// of at `HEAP_VIEWS` (2^21 slots, two 256 KiB bitmaps). A host copy's
+/// pairs are buffer views, which take no read marks.
+#[cfg(windows)]
+static VIEW_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See [`VIEW_SLOTS`].
+#[cfg(windows)]
+pub(crate) fn view_slots() -> u32 {
+    VIEW_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A host heap handed out view slots below `end` ([`VIEW_SLOTS`]).
+#[cfg(windows)]
+pub(crate) fn view_slots_reach(end: u32) {
+    VIEW_SLOTS.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
 /// so `Heap::drop` cannot free the heap concurrently.
@@ -967,6 +990,9 @@ pub(crate) extern "system" fn create_heap(
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        if desc.kind == VIEWS_KIND {
+            VIEW_SLOTS.fetch_max(desc.count, std::sync::atomic::Ordering::Relaxed);
+        }
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
