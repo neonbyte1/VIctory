@@ -1784,4 +1784,119 @@ pub(crate) mod tests {
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
     }
+
+    /// Measurement, not a check (`--ignored`): per 64 KiB page under this
+    /// process's Wine, a guard cycle (one fault into our handler, guarded
+    /// again by a take) against the kernel's write watch (a write faulting
+    /// inside Wine, found and reset by `GetWriteWatch`), and protection
+    /// changes page by page against one per range. Spinning threads stand
+    /// for the title's (a read-only change interrupts every CPU running the
+    /// process).
+    #[test]
+    #[ignore = "measurement"]
+    fn guards_against_write_watch_costs() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, PAGE_READONLY, ResetWriteWatch, VirtualProtect};
+        const PAGES: usize = 1024;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spinners: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let us = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e6 / PAGES as f64;
+        // SAFETY: (every write below) a byte of our pool.
+        let touch = |p: usize| (0..PAGES).for_each(|k| unsafe { ((p + k * PAGE + 8) as *mut u8).write_volatile(1) });
+        // Guards: take (one change for the range), a fault a page, take again.
+        let p = pool(PAGES);
+        let t = track(p, PAGES * PAGE, false).expect("tracked");
+        touch(p);
+        let at = std::time::Instant::now();
+        t.take(p, p + PAGES * PAGE);
+        let first_take = us(at);
+        let at = std::time::Instant::now();
+        touch(p);
+        let faults = us(at);
+        let at = std::time::Instant::now();
+        t.take(p, p + PAGES * PAGE);
+        let take = us(at);
+        // Every other page written: the take guards a range a page.
+        // SAFETY: as above.
+        (0..PAGES).step_by(2).for_each(|k| unsafe { ((p + k * PAGE + 8) as *mut u8).write_volatile(2) });
+        let at = std::time::Instant::now();
+        t.take(p, p + PAGES * PAGE);
+        let take_split = us(at) * 2.0;
+        drop(t);
+        free(p);
+        // Write watch: reset, a write a page, ask and reset.
+        let p = pool(PAGES);
+        touch(p);
+        // SAFETY: our pool.
+        unsafe { ResetWriteWatch(p as *const _, PAGES * PAGE) };
+        let at = std::time::Instant::now();
+        touch(p);
+        let watch_faults = us(at);
+        let mut found = vec![0usize; PAGES * 16];
+        let (mut count, mut granularity) = (found.len(), 0u32);
+        let at = std::time::Instant::now();
+        // SAFETY: room for every 4 KiB page of the pool.
+        let ok = unsafe {
+            GetWriteWatch(1, p as *const _, PAGES * PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+        };
+        let watch_get = us(at);
+        assert_eq!(ok, 0);
+        // Protection changes: page by page, then one for all.
+        let at = std::time::Instant::now();
+        for k in 0..PAGES {
+            let mut old = 0;
+            // SAFETY: our pool.
+            unsafe { VirtualProtect((p + k * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) };
+        }
+        let per_page = us(at);
+        let mut old = 0;
+        // SAFETY: our pool.
+        unsafe { VirtualProtect(p as *const _, PAGES * PAGE, PAGE_READWRITE, &mut old) };
+        let at = std::time::Instant::now();
+        // SAFETY: our pool.
+        unsafe { VirtualProtect(p as *const _, PAGES * PAGE, PAGE_READONLY, &mut old) };
+        let one = at.elapsed().as_secs_f64() * 1e6;
+        // SAFETY: our pool.
+        unsafe { VirtualProtect(p as *const _, PAGES * PAGE, PAGE_READWRITE, &mut old) };
+        free(p);
+        // A sweep: 1 GiB of pool, 1,000 pages written, asked and reset in
+        // one call (what a per-submission journal would do).
+        const BIG: usize = 16384;
+        let p = pool(BIG);
+        // Populated, as the title's pools are: every 4 KiB page written once.
+        // SAFETY: bytes of our pool.
+        (0..BIG * PAGE).step_by(4096).for_each(|at| unsafe { ((p + at) as *mut u8).write_volatile(1) });
+        // SAFETY: our pool.
+        unsafe { ResetWriteWatch(p as *const _, BIG * PAGE) };
+        // SAFETY: bytes of our pool.
+        (0..BIG).step_by(16).for_each(|k| unsafe { ((p + k * PAGE) as *mut u8).write_volatile(1) });
+        let mut found = vec![0usize; 4096];
+        let (mut swept, mut granularity) = (found.len(), 0u32);
+        let at = std::time::Instant::now();
+        // SAFETY: room for 4,096 answers.
+        unsafe { GetWriteWatch(1, p as *const _, BIG * PAGE, found.as_mut_ptr().cast(), &mut swept, &mut granularity) };
+        let sweep = at.elapsed().as_secs_f64() * 1e6;
+        let (mut count2, mut granularity) = (found.len(), 0u32);
+        let at = std::time::Instant::now();
+        // SAFETY: as above.
+        unsafe { GetWriteWatch(1, p as *const _, BIG * PAGE, found.as_mut_ptr().cast(), &mut count2, &mut granularity) };
+        let sweep_clean = at.elapsed().as_secs_f64() * 1e6;
+        free(p);
+        stop.store(true, Ordering::Relaxed);
+        spinners.into_iter().for_each(|s| s.join().unwrap());
+        println!(
+            "per page, {PAGES} pages: guards: first take {first_take:.2} us, fault {faults:.2} us, take of all {take:.2} us, \
+             take of every other {take_split:.2} us; write watch: fault {watch_faults:.2} us, get and reset {watch_get:.2} us \
+             ({count} found); read-only page by page {per_page:.2} us, one call for all {one:.0} us; \
+             sweep of 1 GiB populated: {sweep:.0} us with {swept} found, {sweep_clean:.0} us with {count2}"
+        );
+    }
 }
