@@ -118,7 +118,7 @@ fn decode_aligned(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> 
                 Ok(inst) => inst,
                 Err(e) => return Some(Err(e)),
             };
-            let next = offset + 4 * inst.words.len();
+            let next = offset + 4 * inst.words().len();
             // The instruction found last below `end`, as the tree has it,
             // where it can end at `end` (all a far jump looks for): within
             // the longest instruction's reach.
@@ -151,7 +151,7 @@ fn decode_aligned(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> 
     found.sort_unstable_by_key(|i| i.offset);
     if let Some(w) = found
         .windows(2)
-        .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+        .find(|w| w[0].offset + 4 * w[0].words().len() > w[1].offset)
     {
         return Some(Err(isa(
             w[1].offset,
