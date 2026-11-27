@@ -521,6 +521,7 @@ impl Shared {
             keep
         });
         let (mut named, mut slots) = (Vec::with_capacity(copies.len()), Vec::with_capacity(copies.len()));
+        let mut left_out = false;
         for c in copies {
             let key = Arc::as_ptr(&c) as usize;
             let slot = match self.pairs.get(&key) {
@@ -529,6 +530,7 @@ impl Shared {
                     let Some(slot) = heap.pair() else {
                         static ONCE: std::sync::Once = std::sync::Once::new();
                         ONCE.call_once(|| tracing::warn!("no descriptor slots for a title memory copy's views: it reads as missing"));
+                        left_out = true;
                         continue;
                     };
                     heap.raw_pair_at(slot, Some(&c.buffer), c.range().1.next_multiple_of(4));
@@ -551,7 +553,9 @@ impl Shared {
             blocks,
             owner,
         });
-        self.generation = now;
+        // A copy left out is tried again at the next submission (slots come
+        // back as lists reset), not only when some copy comes or goes.
+        self.generation = if left_out { u64::MAX } else { now };
         stats(|s| s.tables += 1);
     }
 }
@@ -948,6 +952,46 @@ void main(uint3 id : SV_DispatchThreadID) {
             let pso = host.device.CreateComputePipelineState(&desc).unwrap();
             (root, pso)
         }
+    }
+
+    /// A copy that found no view slots at a rewrite is tried again at the
+    /// next submission, not only when some copy comes or goes.
+    #[test]
+    fn a_copy_without_view_slots_is_named_when_slots_come_back() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let heap = HostHeap::new(false, 16).unwrap();
+        let mut s = Shared::new(&heap).unwrap();
+        // Every slot a pair can come from, taken.
+        let mut taken = Vec::new();
+        while let Some(slot) = heap.pair() {
+            taken.push(slot);
+        }
+        let memory = (0..256u64)
+            .map(|k| 0x40_0000_0000 + (k << 28))
+            // SAFETY: a fresh allocation where nothing is mapped, or none.
+            .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .find(|&p| p != 0)
+            .expect("memory below 2^40");
+        crate::shadow::register(memory, memory as u64, PAGE as u64);
+        let copy = crate::shadow::find(memory as u64, PAGE as u64).unwrap();
+        let now = crate::shadow::generation();
+        s.rewrite(&heap, now);
+        assert!(!s.pairs.contains_key(&(Arc::as_ptr(&copy) as usize)), "no slots for it");
+        assert_ne!(s.generation, now, "so the next submission rewrites again");
+        // Slots come back (a list was reset): the copy is named, and the
+        // table is then up to date. (Other tests' copies are named too:
+        // every slot is given back.)
+        for slot in taken {
+            heap.free_pair(slot);
+        }
+        s.rewrite(&heap, now);
+        assert!(s.pairs.contains_key(&(Arc::as_ptr(&copy) as usize)));
+        assert_eq!(s.generation, now);
+        crate::shadow::unregister(memory, memory as u64);
     }
 
     /// A copy's view pair, in view heap `key`'s table.
