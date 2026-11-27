@@ -17,7 +17,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -534,6 +533,7 @@ impl Scheduler {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    let mut scratch = WorkerScratch::new();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -542,7 +542,8 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, &mut scratch);
+        scratch.trim();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -945,8 +946,41 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Maximum capacity retained per scratch buffer on an idle worker after a
+/// request finishes, preventing a single oversized read from pinning memory.
+const SCRATCH_RETAIN_CAP: usize = 8 * 1024 * 1024;
+
+/// Per-worker reusable zlib decompressor state and scratch buffers.
+/// Each worker in [`work`] runs one request at a time, so reusing these avoids
+/// zero-initializing a ~10.5 KiB `DecompressorOxide` and heap-allocating or
+/// zero-filling `source` / `intermediate` buffers on every request.
+struct WorkerScratch {
+    decompressor: Box<miniz_oxide::inflate::core::DecompressorOxide>,
+    source: Vec<u8>,
+    intermediate: Vec<u8>,
+}
+
+impl WorkerScratch {
+    fn new() -> Self {
+        Self {
+            decompressor: Box::new(miniz_oxide::inflate::core::DecompressorOxide::new()),
+            source: Vec::new(),
+            intermediate: Vec::new(),
+        }
+    }
+
+    fn trim(&mut self) {
+        if self.source.capacity() > SCRATCH_RETAIN_CAP {
+            self.source = Vec::new();
+        }
+        if self.intermediate.capacity() > SCRATCH_RETAIN_CAP {
+            self.intermediate = Vec::new();
+        }
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, scratch: &mut WorkerScratch) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -979,21 +1013,29 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let WorkerScratch {
+        decompressor,
+        source: source_buf,
+        intermediate,
+    } = scratch;
+    let source = read_source(request, source_buf).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let inter_size = request.intermediate_size as usize;
+        if intermediate.len() < inter_size {
+            intermediate.resize(inter_size, 0);
+        }
+        let n = inflate(decompressor, source, &mut intermediate[..inter_size])
+            .map_err(|hr| fail(hr, "zlib"))?;
+        &intermediate[..n]
     } else {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+        Some(tables) => bcpack::decode(bc, source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(decompressor, source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1007,12 +1049,34 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
-fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
+fn inflate(
+    decompressor: &mut miniz_oxide::inflate::core::DecompressorOxide,
+    source: &[u8],
+    out: &mut [u8],
+) -> Result<usize, HRESULT> {
+    use miniz_oxide::inflate::TINFLStatus;
+    use miniz_oxide::inflate::core::{decompress, inflate_flags};
+    // Reset only the parser state machine; Huffman tables are overwritten per
+    // deflate block, matching a fresh `DecompressorOxide::new()` without
+    // zeroing ~10.5 KiB on every request.
+    decompressor.init();
+    let flags =
+        inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER;
+    let (status, _read, written) = decompress(decompressor, source, out, 0, flags);
+    match status {
+        TINFLStatus::Done => Ok(written),
+        TINFLStatus::NeedsMoreInput => {
+            tracing::debug!(
+                status = ?TINFLStatus::FailedCannotMakeProgress,
+                "dstorage: zlib stream"
+            );
+            Err(INVALID_DATA)
+        }
+        status => {
             tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+            Err(INVALID_DATA)
+        }
+    }
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -1056,17 +1120,18 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// file into the worker's reusable `scratch` buffer.
+fn read_source<'a>(request: &Request, scratch: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    if scratch.len() < size {
+        scratch.resize(size, 0);
+    }
+    read_into(request, &mut scratch[..size])?;
+    Ok(&scratch[..size])
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -2043,5 +2108,139 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn reused_decompressor_matches_fresh_on_valid_and_error_streams() {
+        let reference = |src: &[u8], out: &mut [u8]| -> Result<usize, HRESULT> {
+            miniz_oxide::inflate::decompress_slice_iter_to_slice(
+                out,
+                std::iter::once(src),
+                true,
+                false,
+            )
+            .map_err(|_| INVALID_DATA)
+        };
+        let mut scratch = WorkerScratch::new();
+        let plain_a = pattern(4096);
+        let plain_b = pattern(65536);
+        let packed_a = miniz_oxide::deflate::compress_to_vec_zlib(&plain_a, 6);
+        let packed_b = miniz_oxide::deflate::compress_to_vec_zlib(&plain_b, 1);
+
+        let mut bad_header = packed_a.clone();
+        bad_header[0] ^= 0xFF;
+
+        let mut bad_adler = packed_a.clone();
+        let last = bad_adler.len() - 1;
+        bad_adler[last] ^= 0x01;
+
+        let truncated = &packed_a[..packed_a.len() / 2];
+
+        let cases: &[(&str, &[u8], usize)] = &[
+            ("exact_small", &packed_a, plain_a.len()),
+            ("short_output_slack", &packed_a, plain_a.len() + 512),
+            ("empty_stream", &[], 64),
+            ("bad_header", &bad_header, plain_a.len()),
+            ("recover_after_bad_header", &packed_b, plain_b.len()),
+            ("bad_adler32", &bad_adler, plain_a.len()),
+            ("recover_after_bad_adler", &packed_a, plain_a.len()),
+            ("truncated", truncated, plain_a.len()),
+            ("recover_after_truncated", &packed_b, plain_b.len()),
+            ("output_too_small", &packed_b, 128),
+            ("recover_after_short_buf", &packed_a, plain_a.len()),
+        ];
+
+        for &(label, src, out_len) in cases {
+            let mut got = vec![0xAA; out_len];
+            let mut want = vec![0xAA; out_len];
+            let r_got = inflate(&mut scratch.decompressor, src, &mut got);
+            let r_want = reference(src, &mut want);
+            assert_eq!(r_got, r_want, "status mismatch on {label}");
+            if let Ok(n) = r_got {
+                assert_eq!(&got[..n], &want[..n], "bytes mismatch on {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn worker_scratch_reuses_capacity_and_trims_outliers() {
+        let mut scratch = WorkerScratch::new();
+        scratch.source.resize(64 * 1024, 0);
+        scratch.intermediate.resize(128 * 1024, 0);
+        let src_ptr = scratch.source.as_ptr();
+        let inter_ptr = scratch.intermediate.as_ptr();
+        scratch.trim();
+        assert_eq!(scratch.source.as_ptr(), src_ptr);
+        assert_eq!(scratch.intermediate.as_ptr(), inter_ptr);
+
+        scratch.source.resize(SCRATCH_RETAIN_CAP + 4096, 0);
+        scratch.intermediate.resize(SCRATCH_RETAIN_CAP + 4096, 0);
+        scratch.trim();
+        assert_eq!(scratch.source.capacity(), 0);
+        assert_eq!(scratch.intermediate.capacity(), 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_dstorage_worker_scratch() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for &(label, plain_len, iters) in &[
+            ("4KiB", 4 * 1024, 8_000usize),
+            ("32KiB", 32 * 1024, 2_000usize),
+            ("256KiB", 256 * 1024, 400usize),
+        ] {
+            let plain = pattern(plain_len);
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            let mut out = vec![0u8; plain_len];
+
+            // Baseline: per-request Vec alloc+zero for source & intermediate + fresh DecompressorOxide.
+            let t0 = Instant::now();
+            let mut sum_old = 0u64;
+            for _ in 0..iters {
+                let mut src = vec![0u8; packed.len()];
+                src.copy_from_slice(&packed);
+                let mut inter = vec![0u8; plain_len];
+                let n = miniz_oxide::inflate::decompress_slice_iter_to_slice(
+                    &mut inter,
+                    std::iter::once(src.as_slice()),
+                    true,
+                    false,
+                )
+                .unwrap();
+                out[..n].copy_from_slice(&inter[..n]);
+                sum_old = sum_old.wrapping_add(u64::from(black_box(out[n - 1])));
+            }
+            let old_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+            // Patched: worker-local reusable DecompressorOxide + source/intermediate scratch.
+            let mut scratch = WorkerScratch::new();
+            let t1 = Instant::now();
+            let mut sum_new = 0u64;
+            for _ in 0..iters {
+                if scratch.source.len() < packed.len() {
+                    scratch.source.resize(packed.len(), 0);
+                }
+                scratch.source[..packed.len()].copy_from_slice(&packed);
+                if scratch.intermediate.len() < plain_len {
+                    scratch.intermediate.resize(plain_len, 0);
+                }
+                let n = inflate(
+                    &mut scratch.decompressor,
+                    &scratch.source[..packed.len()],
+                    &mut scratch.intermediate[..plain_len],
+                )
+                .unwrap();
+                out[..n].copy_from_slice(&scratch.intermediate[..n]);
+                sum_new = sum_new.wrapping_add(u64::from(black_box(out[n - 1])));
+            }
+            let new_ms = t1.elapsed().as_secs_f64() * 1e3;
+            assert_eq!(sum_old, sum_new);
+            eprintln!(
+                "dstorage_scratch[{label} x{iters}]: old={old_ms:.2}ms new={new_ms:.2}ms speedup={:.2}x",
+                old_ms / new_ms
+            );
+        }
     }
 }
