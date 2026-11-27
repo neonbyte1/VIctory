@@ -45,6 +45,16 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+#[cfg(any(windows, test))]
+fn rectangle_vertex_bounds(v: VertexView, count: u32, first: u32) -> Option<u32> {
+    let stride = u64::from(v.stride);
+    let end = (u64::from(first) + u64::from(count)).checked_mul(stride)?;
+    if v.address == 0 || stride == 0 || end > u64::from(v.size) {
+        return None;
+    }
+    u32::try_from(u64::from(count / 3) * 6 * stride).ok()
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
@@ -1701,15 +1711,13 @@ impl State {
             let v = self.vertex[slot as usize];
             let stride = u64::from(v.stride);
             let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some(dst_bytes) = rectangle_vertex_bounds(v, count, first)
+                .filter(|_| crate::shadow::find(from, rects * 3 * stride).is_some())
+            else {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
-            }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            };
+            let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
@@ -1727,7 +1735,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: dst_bytes,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -2249,6 +2257,24 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
+
+    #[test]
+    fn rectangle_vertex_bounds_widens_first_plus_count() {
+        let view = VertexView {
+            address: 0x1000_0000,
+            size: 96,
+            stride: 16,
+        };
+        assert_eq!(rectangle_vertex_bounds(view, 3, 1), Some(96));
+        assert_eq!(rectangle_vertex_bounds(view, 3, u32::MAX - 2), None);
+        assert_eq!(rectangle_vertex_bounds(view, u32::MAX, 1), None);
+        let wide = VertexView {
+            size: u32::MAX,
+            stride: 0x4000_0000,
+            ..view
+        };
+        assert_eq!(rectangle_vertex_bounds(wide, 3, 0), None);
+    }
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root
