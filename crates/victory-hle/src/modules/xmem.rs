@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, GetLastError, HANDLE, INVALID_HANDLE_VALUE, SetLastError,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
@@ -172,8 +172,13 @@ fn virtual_alloc(
     if at.is_null() && constrained && highest < FOUR_GIB {
         at = low_guards::retry(size, || allocate(&mut parameter));
     }
-    if at.is_null() {
-        let error = std::io::Error::last_os_error();
+    // The title reads the host's reason with GetLastError; logging the
+    // refusal (a crash record appended to a file, a log writer) sets the
+    // thread's last error itself, so it is put back before returning.
+    // SAFETY: reads this thread's last error, which VirtualAlloc2 set.
+    let refused = at.is_null().then(|| unsafe { GetLastError() });
+    if let Some(code) = refused {
+        let error = std::io::Error::from_raw_os_error(code as i32);
         if kind & MEM_COMMIT != 0 {
             commit_refused(size, "virtual memory", error);
         } else {
@@ -194,6 +199,10 @@ fn virtual_alloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    if let Some(code) = refused {
+        // SAFETY: sets this thread's last error.
+        unsafe { SetLastError(code) };
     }
     at
 }
@@ -1266,6 +1275,47 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    /// A subscriber whose events set the thread's last error, as a log
+    /// written to a file does (an append to an existing file leaves
+    /// ERROR_ALREADY_EXISTS).
+    struct ClobbersLastError;
+
+    impl tracing::Subscriber for ClobbersLastError {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
+            // SAFETY: sets this thread's last error.
+            unsafe { SetLastError(ERROR_ALREADY_EXISTS) };
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A refused reservation leaves the host's reason for the title to
+    /// read, even when logging the refusal sets the last error.
+    #[test]
+    fn a_refused_reservation_keeps_the_hosts_last_error() {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_ADDRESS;
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4096, MEM_RESERVE, 0, PAGE_READWRITE);
+        assert!(!base.is_null());
+        let (conflict, error) = tracing::subscriber::with_default(ClobbersLastError, || {
+            let conflict = XMemVirtualAlloc(base, 4096, MEM_RESERVE, 0, PAGE_READWRITE);
+            // SAFETY: reads this thread's last error.
+            (conflict, unsafe { GetLastError() })
+        });
+        assert!(conflict.is_null());
+        assert_eq!(error, ERROR_INVALID_ADDRESS);
+        // SAFETY: releases our reservation.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
