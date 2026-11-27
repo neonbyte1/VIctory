@@ -1523,11 +1523,14 @@ pub(crate) struct RunBack {
 }
 
 #[cfg(test)]
+type RunHook = Option<Box<dyn Fn(u8, usize)>>;
+
+#[cfg(test)]
 thread_local! {
     /// Test hook: called with 0 after the pages are read (before the
     /// lease) and 1 once they are open (before the writes), with the run's
     /// first page.
-    pub(crate) static RUN_HOOK: std::cell::RefCell<Option<Box<dyn Fn(u8, usize)>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static RUN_HOOK: std::cell::RefCell<RunHook> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -3029,9 +3032,11 @@ mod run_tests {
         hook(move |at, _| {
             if at == 1 {
                 let mut w = slot.lock().unwrap();
-                // SAFETY: (both) a byte of a title view, guarded: the
-                // handler waits for the lease, then opens it.
+                // SAFETY: a byte of a title view, guarded: the handler
+                // waits for the lease, then opens it.
                 w.push(std::thread::spawn(move || unsafe { ((a + 100) as *mut u8).write_volatile(0x5c) }));
+                // SAFETY: a byte of the same view's other mapping, guarded
+                // the same way.
                 w.push(std::thread::spawn(move || unsafe { ((b + PAGE + 100) as *mut u8).write_volatile(0x5d) }));
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
