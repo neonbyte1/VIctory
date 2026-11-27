@@ -278,6 +278,22 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// `format` and each member of its typeless family: the formats a typed
+/// view of a typeless texture can name (a typeless input is its family's
+/// first, so the range from it holds them all). Each member's linear
+/// twin ([`SRGB`]) counts too: it lies below the family head — B8G8R8A8's
+/// family head is 90, whose members are 87 and 91 — so the range does
+/// not reach it, yet a typeless texture of the head takes its views.
+fn family_members(format: u32) -> impl Iterator<Item = u32> {
+    let first = family(format);
+    std::iter::once(format)
+        .chain((first..).take_while(move |&f| family(f) == first))
+        .flat_map(|f| {
+            let twin = SRGB.iter().find(|&&(s, _)| s == f).map_or(f, |&(_, t)| t);
+            [f, twin]
+        })
+}
+
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
@@ -1148,6 +1164,33 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
+    }
+    // A texture flagged unordered-access must have a format an unordered
+    // view can take — the format itself, a member of its typeless family
+    // (the committed fallback creates a typeless texture and views it
+    // typed), or — where enhanced-barrier creation carries a cast list —
+    // by cast. The cast list only goes with a typeless texture: a
+    // standalone format (one without a typeless family: B5G5R5A1, B5G6R5,
+    // B4G4R4A4 and like elements) is created typed, and
+    // GetResourceAllocationInfo sees the bare description — no cast list —
+    // so the flag stays lethal to NVIDIA there. AMD tolerates the flag on
+    // one that cannot be stored, NVIDIA removes the device for it. Drop
+    // the flag, as a depth target's above — an unordered view of it still
+    // will not make.
+    if d.flags & UNORDERED != 0 {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device10;
+        use windows::core::Interface;
+        let typed = crate::descriptor::host::typed_store;
+        let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
+        let castable_uav = d.flags & DEPTH == 0
+            && typeless
+            && crate::host::host()
+                .is_some_and(|h| h.device.cast::<ID3D12Device10>().is_ok())
+            && castable(d.format).into_iter().any(typed);
+        let family_uav = family_members(d.format).any(typed);
+        if !typed(d.format) && !family_uav && !castable_uav {
+            d.flags &= !UNORDERED;
+        }
     }
     Some(d)
 }
@@ -2475,6 +2518,64 @@ pub(crate) mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
+    /// An unordered-access flag on a texture whose format no unordered
+    /// view can take is refused by the host (NVIDIA removes the device at
+    /// `GetResourceAllocationInfo` for B5G5R5A1), so it is dropped. The
+    /// flag survives when the format itself, a member of its typeless
+    /// family (the committed fallback creates a typeless texture and views
+    /// it typed) or a castable one stores typed.
+    #[test]
+    fn unordered_needs_a_format_unordered_views_take() {
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        use crate::descriptor::host::typed_store;
+        let has = |format: u32| {
+            let desc = ResourceDesc {
+                flags: UNORDERED,
+                ..texture(64, 64, format, 1)
+            };
+            host_desc(&desc).is_some_and(|d| d.flags & UNORDERED != 0)
+        };
+        // Fixed expectations anchored to the legal view, not re-derived
+        // from the rule: where the member a view would name is known, so
+        // is the answer. 86 B5G5R5A1_UNORM and 85 B5G6R5_UNORM have no
+        // typeless family — where the host does not store them typed the
+        // flag removes NVIDIA's device at GetResourceAllocationInfo and
+        // drops; where it reports one (the bit is the legality test
+        // itself) it stays.
+        assert_eq!(family(85), 85);
+        assert_eq!(family(86), 86);
+        assert_eq!(has(86), typed_store(86), "86 keeps it only where it stores typed");
+        assert_eq!(has(85), typed_store(85), "85 like 86");
+        // A typeless B8G8R8A8 (90) texture takes an 87 unordered view
+        // where 87 stores typed — shown on hardware and WARP — so its
+        // sRGB title format 91 keeps the flag there however the device
+        // answers for 90 or 91 (neither does anywhere known).
+        if typed_store(87) {
+            assert!(has(91), "91 keeps it: an 87 view of the typeless copy is legal");
+        }
+        if typed_store(88) {
+            assert!(has(93), "93 keeps it: an 88 view of the typeless copy is legal");
+        }
+        // Without a member a legal view can name, the flag drops rather
+        // than remove the device.
+        if !family_members(90).any(typed_store) {
+            assert!(!has(91), "no legal unordered view for 91: the flag drops");
+        }
+        if !family_members(27).any(typed_store) {
+            assert!(!has(29), "no legal unordered view for 29: the flag drops");
+        }
+        // The ordinary typed formats answer for themselves where the
+        // family head is queried (27's family reaches 28; 60's 60-64).
+        for format in [28, 29, 87, 90, 60, 61] {
+            let legal = typed_store(format) || family_members(format).any(typed_store);
+            if legal {
+                assert!(has(format), "format {format}: a member stores typed");
+            }
+        }
     }
 
     type Release = extern "system" fn(This) -> u32;
