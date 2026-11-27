@@ -659,7 +659,13 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         }
         23..=25 | 89 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
-            [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
+            let rgb = [0, 10, 20].map(|shift| (v >> shift & 0x3ff) as f32);
+            if format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM.0 as u32 {
+                // XR_BIAS encodes 0.0 at 384 and 1.0 at 894.
+                rgb.map(|channel| (channel - 384.0) / 510.0)
+            } else {
+                rgb
+            }
         })),
         26 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
@@ -1029,9 +1035,23 @@ mod tests {
         assert_eq!(super::to_rgba(11, 1, 1, 8, &unorm16), Some(vec![255, 127, 0, 255]));
         // Red 0x3ff, green 0x1ff, blue 0, alpha 3.
         let xr = (0x3ffu32 | 0x1ff << 10 | 3 << 30).to_le_bytes();
-        assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
+        assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 50, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    #[test]
+    fn xr_bias_targets_decode_black_and_extended_range_channels() {
+        let xr = super::DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM.0 as u32;
+        let pixel = |r: u32, g: u32, b: u32| (r | g << 10 | b << 20 | 3 << 30).to_le_bytes();
+        assert_eq!(
+            super::to_rgba(xr, 1, 1, 4, &pixel(384, 384, 384)),
+            Some(vec![0, 0, 0, 255])
+        );
+        assert_eq!(
+            super::to_rgba(xr, 1, 1, 4, &pixel(894, 639, 384)),
+            Some(vec![255, 127, 0, 255])
+        );
     }
 }
 
