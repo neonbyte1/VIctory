@@ -2039,6 +2039,14 @@ mod tests {
             high.contains("dx.op.unary.f32(i32 7"),
             "clamp saturates the result"
         );
+        assert!(
+            !high.contains("legacyF16ToF32"),
+            "modifiers apply in f32 before narrowing"
+        );
+        assert!(
+            !high.contains("legacyF32ToF16"),
+            "narrowing uses narrow16, not legacyF32ToF16"
+        );
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
     }
 
@@ -2527,5 +2535,153 @@ mod tests {
             }
         }
         let _ = tested_orders;
+    }
+
+    /// Pixel shader exercising `v_interp_p2_f16` with `omod` and `clamp` across
+    /// four float channels (with `HW_REG_MODE` set to RTZ when `rtz` is true).
+    /// Converts each low 16-bit result via `v_cvt_f32_u32` so its bit pattern
+    /// exports intact through `R32G32B32A32_FLOAT` without denormal flushing.
+    fn interp_p2_f16_modifier_ps(rtz: bool) -> Result<HostShader, ShaderError> {
+        let mut words = Vec::new();
+        // Zero v2..=v5 first because 16-bit writes preserve the destination's
+        // high half (so reusing v6 directly would leave a first-half tag).
+        for dst in 2..=5u32 {
+            words.push(0x7E00_0000 | (dst << 17) | (0x001 << 9) | 128);
+        }
+        if rtz {
+            // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3 (f16 RTZ)
+            words.extend([0xBA80_0881u32, 3]);
+        }
+        for (dst, ch, omod, clamp) in [
+            (2u32, 0u32, 3u32, false),
+            (3, 1, 1, false),
+            (4, 2, 2, false),
+            (5, 3, 3, true),
+        ] {
+            // v_interp_p1_f32 v6, v0, attr0.<ch>
+            words.push(0xC800_0000 | (6 << 18) | (ch << 8));
+            // v_interp_p2_f16 v<dst>, attr0.<ch>, v1, v6 [omod] [clamp]
+            let w0 = (0x35u32 << 26) | (0x35au32 << 16) | (u32::from(clamp) << 15) | dst;
+            let w1 = (omod << 27) | ((256 + 6) << 18) | ((256 + 1) << 9) | (ch << 6);
+            words.extend([w0, w1]);
+            // v_cvt_f32_u32 v<dst>, v<dst>
+            words.push(0x7E00_0000 | (dst << 17) | (0x006 << 9) | (256 + dst));
+        }
+        words.extend([0xF800_180Fu32, 0x0504_0302, 0xBF81_0000]);
+        let isg1 = rows(&[("TEXCOORD", 0, true)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let input = crate::native::PsInput {
+            mask: 0b1111,
+            ..texcoord(true)
+        };
+        emit_pixel(&words, vec![input], 1 << 1, &isg1, &osg1)
+    }
+
+    #[test]
+    fn v_interp_p2_f16_modifiers_translate_in_both_round_modes() {
+        interp_p2_f16_modifier_ps(false).unwrap();
+        interp_p2_f16_modifier_ps(true).unwrap();
+    }
+
+    /// `v_interp_p2_f16` applies `omod` and `clamp` in f32 before a single
+    /// `narrow16` conversion honoring `HW_REG_MODE`, avoiding premature f16
+    /// overflow/subnormal rounding and `legacyF32ToF16` rounding drift.
+    #[cfg(windows)]
+    #[test]
+    fn v_interp_p2_f16_modifiers_narrow_once_in_mode16() {
+        use super::host::{Draw, Host};
+
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let el = |name: &str, kind, interp, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let mut s = Shader::new(false);
+        let b = s.entry;
+        s.inputs = vec![el("POSITION", 0, 0, 0), el("TEXCOORD", 0, 0, 1)];
+        s.outputs = vec![el("TEXCOORD", 0, 2, 0), el("SV_Position", 3, 4, 1)];
+        for (in_id, out_id) in [(1u32, 0u32), (0, 1)] {
+            for col in 0..4u8 {
+                let load = [s.m.i32(in_id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &load);
+                let store = [s.m.i32(out_id), s.m.i32(0), s.m.i8(col), v];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &store);
+            }
+        }
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        let mut vs = s.finish();
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut vs).unwrap();
+        }
+
+        // ch0: 98304.0 * 0.5 -> 49152.0 (0x7A00), would overflow if narrowed first
+        // ch1: 32768.0 * 2.0 -> 65536.0 (0x7C00 RNE, 0x7BFF RTZ)
+        // ch2: (2^-15 + 2^-25) * 4.0 -> 0x0801, would double-round to 0x0800
+        // ch3: clamp((2^-14 + 3*2^-24) * 0.5) -> 0x0202 RNE, 0x0201 RTZ
+        let c0 = 98304.0f32;
+        let c1 = 32768.0f32;
+        let c2 = f32::from_bits(0x3800_2000);
+        let c3 = f32::from_bits(0x3880_6000);
+        #[rustfmt::skip]
+        let vertices = [
+            -1.0, -1.0, 0.5, 1.0, c0, c1, c2, c3,
+            -1.0,  3.0, 0.5, 1.0, c0, c1, c2, c3,
+             3.0, -1.0, 0.5, 1.0, c0, c1, c2, c3,
+        ];
+
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let root = host.root_signature_for(&[]).unwrap();
+            for (rtz, want) in [
+                (false, [0x7A00u32, 0x7C00, 0x0801, 0x0202]),
+                (true, [0x7A00u32, 0x7BFF, 0x0801, 0x0201]),
+            ] {
+                let ps = interp_p2_f16_modifier_ps(rtz).unwrap();
+                let pso = host
+                    .pipeline_with(&root, &vs, &ps.dxil)
+                    .unwrap_or_else(|e| panic!("{label} rtz={rtz}: pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: 32,
+                            size: (2, 2),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label} rtz={rtz}: draw: {e}"));
+                assert_eq!(texels.len(), 4);
+                for (i, &texel) in texels.iter().enumerate() {
+                    let got = texel.map(|x| x as u32);
+                    assert_eq!(
+                        got, want,
+                        "{label} rtz={rtz} texel {i}: got {got:#06x?}, want {want:#06x?} (raw {texel:?})"
+                    );
+                }
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "expected at least WARP or hardware D3D12 device");
     }
 }

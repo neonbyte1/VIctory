@@ -8594,7 +8594,7 @@ impl<'a> Lower<'a> {
             Some(pack2) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
-                let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
+                let half_f32 = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
                         packed_half(&l.s.inputs, attribute.row, h)
                     } else {
@@ -8604,23 +8604,22 @@ impl<'a> Lower<'a> {
                         return Ok(None);
                     };
                     let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
-                    Ok(Some(l.narrow16(f)))
+                    Ok(Some(l.as_float(x)))
                 };
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
+                    let f = half_f32(self, h + u8::from(attribute.high))?
                         .ok_or("a packed input half no element holds")?;
                     // omod and clamp are part of the f16 instruction; op_sel[3]
                     // picks the destination half.
-                    let lo = self.half_modifiers(inst, lo);
+                    let lo = self.half_modifiers(inst, f);
                     return self.write_half(inst, lo, None);
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let z = self.s.m.i32(0);
-                    let lo = half(self, h)?.unwrap_or(z);
-                    let hi = half(self, h + 1)?.unwrap_or(z);
+                    let lo = half_f32(self, h)?.map_or(z, |f| self.narrow16(f));
+                    let hi = half_f32(self, h + 1)?.map_or(z, |f| self.narrow16(f));
                     let k16 = self.s.m.i32(16);
                     let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
                     self.s.m.bin(c, Bin::Or, lo, hi)
@@ -8773,30 +8772,20 @@ impl<'a> Lower<'a> {
         false
     }
 
-    /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 so the
-    /// half conversion rounds once (the order `write_f` uses).
-    fn half_modifiers(&mut self, inst: &Inst, h: V) -> V {
-        let Fields::Valu(v) = &inst.fields else {
-            return h;
-        };
-        if v.omod == 0 && !v.clamp {
-            return h;
+    /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 before a
+    /// single [`Self::narrow16`] conversion (honoring `self.mode16`).
+    fn half_modifiers(&mut self, inst: &Inst, mut f: V) -> V {
+        if let Fields::Valu(v) = &inst.fields {
+            if v.omod != 0 {
+                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                let k = self.s.m.f32(factor.to_bits());
+                f = self.s.m.bin(self.cur, Bin::Mul, f, k);
+            }
+            if v.clamp {
+                f = self.unary(7, f);
+            }
         }
-        let c = self.cur;
-        let f32t = self.s.t.f32;
-        let mut f = self
-            .s
-            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-        if v.omod != 0 {
-            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
-            let k = self.s.m.f32(factor.to_bits());
-            f = self.s.m.bin(c, Bin::Mul, f, k);
-        }
-        if v.clamp {
-            f = self.unary(7, f);
-        }
-        self.s
-            .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
+        self.narrow16(f)
     }
 
     /// An image instruction, its reads of texture views marked (module
