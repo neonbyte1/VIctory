@@ -558,6 +558,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        // Executions after it read records earlier ones may have written.
+        crate::indirect::stale_window(list);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TitleBarrierCalls, 1);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("barrier kinds {:?}", barriers.iter().map(|b| b.kind).collect::<Vec<_>>()));
         let mut host: Vec<Barrier> = barriers
@@ -1185,8 +1189,19 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and the host queue runs submissions in order, so there is
-/// nothing to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// nothing to record; but an indirect execution after one reads records
+/// the one before may have written: a clamp window that took an execution
+/// that may store takes no more (`crate::indirect::Run`).
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineSyncs, 1);
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::indirect::stale_window(list);
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1677,6 +1692,10 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // Executions after it read records earlier ones may have written.
+        crate::indirect::stale_window(list);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TitleBarrierCalls, 1);
         // Which kinds of barriers (0 global, 1 texture, 2 buffer) and how many.
         #[cfg(feature = "diagnostics")]
         if !_groups.is_null() {

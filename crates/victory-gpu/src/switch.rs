@@ -15,6 +15,17 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// Whether a switch that is on unless its variable is `0` (the off-switch
+/// kept for what the fork ships on, to compare a run against the feature).
+fn value_is_on_unless_zero(value: Option<&OsStr>) -> bool {
+    value != Some(OsStr::new("0"))
+}
+
+/// Whether the environment variable `name` is not `0` (unset: on).
+pub(crate) fn on_unless_zero(name: &str) -> bool {
+    value_is_on_unless_zero(std::env::var_os(name).as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::value_is_on;
@@ -40,6 +51,16 @@ mod tests {
         // Documented as `=1`; anything else that was on before stays on: only `0` is new.
         for value in ["", "true", "yes", "2", "00", " 0", "0 "] {
             assert!(value_is_on(Some(OsStr::new(value))), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_default_on_switch_is_on_unless_zero() {
+        use super::value_is_on_unless_zero;
+        assert!(value_is_on_unless_zero(None), "unset: the feature the fork ships");
+        assert!(!value_is_on_unless_zero(Some(OsStr::new("0"))));
+        for value in ["", "1", "true", "00", " 0", "0 "] {
+            assert!(value_is_on_unless_zero(Some(OsStr::new(value))), "{value:?}");
         }
     }
 }

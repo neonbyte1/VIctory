@@ -1842,14 +1842,12 @@ static LAZY_VIEWS: AtomicU8 = AtomicU8::new(u8::MAX);
 fn lazy_mode() -> u8 {
     match LAZY_VIEWS.load(Ordering::Relaxed) {
         u8::MAX => {
-            let on = |name: &str| std::env::var(name).as_deref() == Ok("1");
-            let off = |name: &str| std::env::var(name).as_deref() == Ok("0");
             // On by default: `VICTORY_OWNER=0` turns it off (lazy view pages
             // then only with `VICTORY_LAZY_VIEWS=1`).
-            let mode = if !off("VICTORY_OWNER") {
+            let mode = if crate::switch::on_unless_zero("VICTORY_OWNER") {
                 2
             } else {
-                u8::from(on("VICTORY_LAZY_VIEWS"))
+                u8::from(crate::switch::on("VICTORY_LAZY_VIEWS"))
             };
             LAZY_VIEWS.store(mode, Ordering::Relaxed);
             mode
