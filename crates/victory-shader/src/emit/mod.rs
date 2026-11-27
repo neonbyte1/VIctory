@@ -245,9 +245,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
-    VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, null_buffer_view, set_view_heap_limit,
-    view_heap_limit,
+    VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_RAW_OFFSET_BITS, VIEW_RAW_OFFSET_SHIFT,
+    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    null_buffer_view, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
