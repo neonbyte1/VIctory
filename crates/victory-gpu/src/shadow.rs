@@ -81,6 +81,9 @@ pub(crate) struct Shadow {
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
     before: Mutex<Snapshot>,
+    /// Title ranges `[from, to)` whose copies [`Shadow::copy_queued`]
+    /// queued, for [`Shadow::queued_made`] (tracked memory only).
+    queued: Mutex<Vec<(usize, usize)>>,
     /// Its first bit in the buffer views' written-pages bitmap, one per
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
@@ -140,7 +143,8 @@ fn give_back(v: Vec<u8>) {
 const POOL_BYTES: usize = 512 << 20;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// written on the submitting thread, and by the refresh workers only inside
+// `crate::copy_pool::run`, which the flush waits for before going on.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -269,6 +273,7 @@ impl Shadow {
             tracked,
             pending: Mutex::default(),
             before: Mutex::default(),
+            queued: Mutex::default(),
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
@@ -630,8 +635,8 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
         let start = self.start as usize;
         let mut before = busy.then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut sync_before = |a: usize, b: usize| {
-            let Some(before) = &mut before else { return };
+        let sync_before = |before: Option<&mut Snapshot>, a: usize, b: usize| {
+            let Some(before) = before else { return };
             let (a, b) = (a - start, b - start);
             for (at, bytes) in before.0.iter_mut() {
                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
@@ -642,15 +647,29 @@ impl Shadow {
                 }
             }
         };
+        // A snapshot over the run takes the copied bytes at once; with none
+        // there (marked ranges keep none) the copy may be queued.
+        let refresh = |before: Option<&mut Snapshot>, a: usize, b: usize| -> usize {
+            let (ra, rb) = (a - start, b - start);
+            match before {
+                Some(before)
+                    if before.0.iter().any(|(at, bytes)| *at < rb && ra < *at + bytes.len()) =>
+                {
+                    let copied = self.copy(a, b);
+                    sync_before(Some(before), a, b);
+                    copied
+                }
+                _ => self.copy_queued(a, b),
+            }
+        };
         let mut copied = 0;
         for (a, b) in runs {
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            copied += refresh(before.as_deref_mut(), a, b);
         }
         for (a, b) in unmapped {
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
-            sync_before(a, b);
+            sync_before(before.as_deref_mut(), a, b);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
         }
@@ -658,8 +677,7 @@ impl Shadow {
         for (a, b) in t.untracked(from, to) {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            copied += refresh(before.as_deref_mut(), a, b);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -681,7 +699,7 @@ impl Shadow {
     fn update_untracked(&self, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        self.copy_queued(from, to);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -689,6 +707,44 @@ impl Shadow {
             add(C::WholeUs, started.elapsed().as_micros() as u64);
         }
         to - from
+    }
+
+    /// As [`Shadow::copy`], queued where the caller collects a
+    /// submission's refreshes ([`crate::copy_pool::queued`]): for copies
+    /// nothing reads back before they are made. What a queued copy took
+    /// goes into the saved bytes of armed pages once it is made
+    /// ([`Shadow::queued_made`]).
+    fn copy_queued(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        let at = unsafe { self.data.add(from - start) };
+        if !crate::copy_pool::copy(at, from as *const u8, to - from) {
+            if let Some(t) = &self.tracked {
+                // SAFETY: `to - from` bytes inside the mapping, just copied.
+                t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
+            }
+        } else if self.tracked.is_some() {
+            self.queued.lock().unwrap_or_else(|e| e.into_inner()).push((from, to));
+        }
+        to - from
+    }
+
+    /// After [`crate::copy_pool::run`] made the copies
+    /// [`Shadow::copy_queued`] queued: what they took goes into the saved
+    /// bytes of the armed pages they cover, as [`Shadow::copy`]'s does.
+    pub(crate) fn queued_made(&self) {
+        let Some(t) = &self.tracked else {
+            return;
+        };
+        let made = std::mem::take(&mut *self.queued.lock().unwrap_or_else(|e| e.into_inner()));
+        let start = self.start as usize;
+        for (from, to) in made {
+            // SAFETY: `to - from` bytes inside the mapping, copied.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+            t.refreshed(from, bytes);
+        }
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
@@ -1740,6 +1796,51 @@ pub(crate) mod tests {
             write(at, v);
         }
         assert!(copy.update(p + 16, 16) > 0 && copy.update(p + PAGE + 16, 16) > 0);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + 24) as u64, &[0x00]);
+        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
+        write(20, 0x66);
+        write(PAGE + 20, 0x77);
+        copy.copy_back_marked(p);
+        copy.copy_back_marked(p + PAGE);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!(
+            [read(10), read(20), read(24), read(40)],
+            [0xaa, 0x66, 0x00, 0x11]
+        );
+        assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
+        copy.copy_back(p, PAGE + 16);
+        unregister(p, p as u64);
+    }
+
+    /// As above with the refreshes queued ([`crate::copy_pool::queued`], as
+    /// `Batch::flush` does): once made, what they took goes into the saved
+    /// bytes too ([`Shadow::queued_made`]).
+    #[test]
+    fn queued_partial_refresh_under_marked_range_updates_saved_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let write = |at: usize, v: u8| {
+            // SAFETY: a byte of our pool.
+            unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        };
+        copy.update(p, len);
+        copy.writing(p, PAGE + 16, true);
+        for (at, v) in [(20, 0x55), (24, 0x44), (40, 0x11), (PAGE + 20, 0x55)] {
+            write(at, v);
+        }
+        let (copied, pieces) = crate::copy_pool::queued(|| {
+            copy.update(p + 16, 16) + copy.update(p + PAGE + 16, 16)
+        });
+        assert!(copied > 0 && !pieces.is_empty(), "queued");
+        crate::copy_pool::run(pieces);
+        copy.queued_made();
         copy.write_host((p + 10) as u64, &[0xaa]);
         copy.write_host((p + 24) as u64, &[0x00]);
         copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
