@@ -794,7 +794,9 @@ fn data_dwords(name: &str) -> u8 {
 }
 
 /// Address dwords of an image opcode: offset, bias, compare, derivatives,
-/// coordinates, then LOD/clamp/mip, packed in pairs with `a16`.
+/// coordinates, then LOD/clamp/mip. `a16` packs two coordinate components per
+/// dword; the `_g16` form packs the gradients instead, and `a16` alone leaves
+/// them at one dword each (RDNA2 supports both, so they are independent).
 fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     // (coordinates, derivatives per direction) for 1D 2D 3D CUBE 1D_ARRAY
     // 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
@@ -831,9 +833,1155 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    // Two gradients per direction, and the packed forms round each direction's
+    // pair up to a whole dword.
+    let gradients = if name.contains("_g16") {
+        2 * derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
+        2 * derivs
+    };
+    let coordinates = if a16 { packed.div_ceil(2) } else { packed };
+    whole + gradients + coordinates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx10::opcodes;
+
+    fn table(encoding: Encoding) -> &'static [(u16, &'static str)] {
+        match encoding {
+            Encoding::Sop2 => opcodes::SOP2,
+            Encoding::Sopk => opcodes::SOPK,
+            Encoding::Sop1 => opcodes::SOP1,
+            Encoding::Sopc => opcodes::SOPC,
+            Encoding::Sopp => opcodes::SOPP,
+            Encoding::Smem => opcodes::SMEM,
+            Encoding::Vop2 => opcodes::VOP2,
+            Encoding::Vop1 => opcodes::VOP1,
+            Encoding::Vopc => opcodes::VOPC,
+            Encoding::Vop3 => opcodes::VOP3,
+            Encoding::Vop3p => opcodes::VOP3P,
+            Encoding::Vintrp => opcodes::VINTRP,
+            Encoding::Ds => opcodes::DS,
+            Encoding::Mubuf => opcodes::MUBUF,
+            Encoding::Mtbuf => opcodes::MTBUF,
+            Encoding::Mimg => opcodes::MIMG,
+            Encoding::Flat => opcodes::FLAT,
+            Encoding::Global => opcodes::GLOBAL,
+            Encoding::Scratch => opcodes::SCRATCH,
+            Encoding::Exp => &[],
+        }
+    }
+
+    fn opcode(encoding: Encoding, name: &str) -> u16 {
+        table(encoding)
+            .iter()
+            .find(|(_, n)| *n == name)
+            .unwrap_or_else(|| panic!("{name} is not {encoding:?}"))
+            .0
+    }
+
+    fn inst_raw(encoding: Encoding, opcode: u16, words: &[u32]) -> Instruction {
+        Instruction {
+            offset: 0,
+            encoding,
+            opcode,
+            name: crate::gfx10::name(encoding, opcode),
+            words: words.to_vec(),
+        }
+    }
+
+    fn inst(encoding: Encoding, name: &str, words: &[u32]) -> Instruction {
+        inst_raw(encoding, opcode(encoding, name), words)
+    }
+
+    /// VOP1/VOP2/VOPC dw0: source 0, then the opcode (VOP1) or src1 (VOP2) and
+    /// the destination.
+    fn vop(vdst: u32, field: u32, src0: u32) -> u32 {
+        src0 | field << 9 | vdst << 17
+    }
+
+    /// VOP3/VOP3P dw0: destination, then abs/neg_hi, opsel, clamp and opcode.
+    fn dw0(opcode: u16, vdst: u32, hi: u32, sel: u32, clamp: bool) -> u32 {
+        vdst | hi << 8 | sel << 11 | u32::from(clamp) << 15 | u32::from(opcode) << 16
+    }
+
+    /// VOP3/VOP3P dw1: three 9-bit sources, then omod/opsel_hi and neg.
+    fn dw1(src: [u32; 3], hi: u32, neg: u32) -> u32 {
+        src[0] | src[1] << 9 | src[2] << 18 | hi << 27 | neg << 29
+    }
+
+    fn sgpr(code: u8, dwords: u8) -> Operand {
+        Operand::Scalar { code, dwords }
+    }
+
+    fn vgpr(reg: u8, dwords: u8) -> Operand {
+        Operand::Vector { reg, dwords }
+    }
+
+    fn valu_raw(encoding: Encoding, opcode: u16, words: &[u32], wave64: bool) -> Valu {
+        let Fields::Valu(v) = inst_raw(encoding, opcode, words).fields(wave64) else {
+            panic!("not a VALU instruction");
+        };
+        v
+    }
+
+    fn valu(encoding: Encoding, name: &str, words: &[u32], wave64: bool) -> Valu {
+        valu_raw(encoding, opcode(encoding, name), words, wave64)
+    }
+
+    #[test]
+    fn source_codes() {
+        assert_eq!(source(0, 1, 0), sgpr(0, 1));
+        assert_eq!(source(127, 4, 0), sgpr(127, 4));
+        // Inline integers 0-64, then -1 to -16.
+        assert_eq!(source(128, 1, 0), Operand::Const(128));
+        assert_eq!(source(192, 1, 0), Operand::Const(192));
+        assert_eq!(source(193, 1, 0), Operand::Const(193));
+        assert_eq!(source(208, 1, 0), Operand::Const(208));
+        // Floats and the read-only special sources.
+        assert_eq!(source(240, 1, 0), Operand::Const(240));
+        assert_eq!(source(254, 1, 0), Operand::Const(254));
+        // 255 takes the literal that follows; 256 and up are VGPRs.
+        assert_eq!(source(255, 2, 0xDEAD_BEEF), Operand::Literal(0xDEAD_BEEF));
+        assert_eq!(source(256, 1, 0), vgpr(0, 1));
+        assert_eq!(source(511, 2, 0), vgpr(255, 2));
+    }
+
+    #[test]
+    fn scalar_alu_widths() {
+        assert_eq!(salu_dwords("s_mov_b32"), (1, 1, 1));
+        assert_eq!(salu_dwords("s_mov_b64"), (2, 2, 2));
+        assert_eq!(salu_dwords("s_and_b64"), (2, 2, 2));
+        assert_eq!(salu_dwords("s_lshl_b64"), (2, 2, 1));
+        assert_eq!(salu_dwords("s_bfm_b64"), (2, 1, 1));
+        assert_eq!(salu_dwords("s_bitreplicate_b64_b32"), (2, 1, 1));
+        assert_eq!(salu_dwords("s_bcnt0_i32_b64"), (1, 2, 2));
+        assert_eq!(salu_dwords("s_flbit_i32_i64"), (1, 2, 2));
+        assert_eq!(salu_dwords("s_cmp_eq_u64"), (2, 2, 2));
+        assert_eq!(salu_dwords("s_sext_i32_i8"), (1, 1, 1));
+    }
+
+    #[test]
+    fn vector_alu_widths() {
+        assert_eq!(valu_dwords("v_add_f32"), (1, [1, 1, 1]));
+        assert_eq!(valu_dwords("v_add_f64"), (2, [2, 2, 2]));
+        assert_eq!(valu_dwords("v_lshlrev_b64"), (2, [1, 2, 2]));
+        assert_eq!(valu_dwords("v_ldexp_f64"), (2, [2, 1, 2]));
+        assert_eq!(valu_dwords("v_mad_u64_u32"), (2, [1, 1, 2]));
+        assert_eq!(valu_dwords("v_mqsad_u32_u8"), (4, [2, 1, 4]));
+        assert_eq!(valu_dwords("v_frexp_exp_i32_f64"), (1, [2, 2, 2]));
+        assert_eq!(valu_dwords("v_cvt_f32_f16"), (1, [1, 1, 1]));
+        assert_eq!(valu_dwords("v_cvt_f64_f32"), (2, [1, 1, 1]));
+        assert_eq!(valu_dwords("v_cvt_f32_f64"), (1, [2, 2, 2]));
+        assert_eq!(valu_dwords("v_cvt_pkrtz_f16_f32"), (1, [1, 1, 1]));
+    }
+
+    #[test]
+    fn data_widths() {
+        assert_eq!(data_dwords("buffer_load_ubyte"), 1);
+        assert_eq!(data_dwords("buffer_load_dword"), 1);
+        assert_eq!(data_dwords("buffer_load_dwordx2"), 2);
+        assert_eq!(data_dwords("flat_load_dwordx3"), 3);
+        assert_eq!(data_dwords("flat_load_dwordx4"), 4);
+        assert_eq!(data_dwords("global_load_sbyte"), 1);
+        assert_eq!(data_dwords("global_load_b64"), 2);
+        assert_eq!(data_dwords("global_load_b96"), 3);
+        assert_eq!(data_dwords("global_load_b128"), 4);
+        assert_eq!(data_dwords("ds_write_b128"), 4);
+        // A compare-and-swap moves both the comparison and the replacement.
+        assert_eq!(data_dwords("buffer_atomic_cmpswap_x2"), 4);
+        assert_eq!(data_dwords("s_atomic_cmpswap_x2"), 4);
+        // Packed 16-bit textels halve the data.
+        assert_eq!(data_dwords("tbuffer_load_format_xy"), 2);
+        assert_eq!(data_dwords("tbuffer_load_format_d16_xyzw"), 2);
+    }
+
+    #[test]
+    fn lds_pairs() {
+        assert!(ds_pair("ds_read2_b32"));
+        assert!(ds_pair("ds_write2_b64"));
+        assert!(ds_pair("ds_wrxchg2st64_rtn_b32"));
+        assert!(!ds_pair("ds_read_b64"));
+        assert!(!ds_pair("ds_write_b128"));
+    }
+
+    #[test]
+    fn image_address_dwords() {
+        // (coordinates, derivatives per direction) for each dimension:
+        // 1D 2D 3D CUBE 1D_ARRAY 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
+        let cases: &[(&str, u8, bool, u8)] = &[
+            ("image_sample", 1, false, 2),
+            ("image_sample", 1, true, 1),
+            ("image_sample", 0, true, 1),
+            ("image_sample", 2, true, 2),
+            // LOD, bias, compare and offsets are whole dwords; a16 leaves them
+            // alone and packs only the coordinates.
+            ("image_sample_l", 1, false, 3),
+            ("image_sample_l", 1, true, 2),
+            ("image_sample_l", 2, true, 2),
+            ("image_sample_b", 1, false, 3),
+            ("image_sample_b", 1, true, 2),
+            ("image_sample_c", 1, true, 2),
+            ("image_sample_c_l", 3, true, 3),
+            ("image_sample_o", 2, true, 3),
+            ("image_sample_lz", 1, false, 2),
+            ("image_gather4", 3, false, 3),
+            ("image_gather4", 3, true, 2),
+            ("image_gather4_l", 1, true, 2),
+            ("image_get_lod", 1, true, 1),
+            // Explicit derivatives: 2 * components, packed only by g16.
+            ("image_sample_d", 0, false, 3),
+            ("image_sample_d", 1, false, 6),
+            ("image_sample_d", 1, true, 5),
+            ("image_sample_d", 2, false, 9),
+            ("image_sample_d_g16", 1, false, 4),
+            ("image_sample_d_g16", 1, true, 3),
+            ("image_sample_d_g16", 2, false, 7),
+            ("image_sample_d_g16", 2, true, 6),
+            ("image_sample_c_d", 1, true, 6),
+            ("image_sample_c_d_g16", 1, false, 5),
+            ("image_sample_c_d_cl", 3, true, 7),
+            // Coarse derivatives and their compare form.
+            ("image_sample_cd", 1, true, 5),
+            ("image_sample_c_cd", 1, true, 6),
+            ("image_sample_cd_cl", 1, false, 7),
+            ("image_sample_cd_cl", 1, true, 6),
+            // Loads, stores, multi-sample and mip chains.
+            ("image_load", 1, false, 2),
+            ("image_load", 1, true, 1),
+            ("image_load_mip", 1, true, 2),
+            ("image_store_mip", 0, false, 2),
+            ("image_store_mip", 0, true, 1),
+            ("image_msaa_load", 6, false, 3),
+            ("image_msaa_load", 6, true, 2),
+            ("image_msaa_load", 7, true, 2),
+            ("image_atomic_add", 1, true, 1),
+            ("image_get_resinfo", 1, false, 1),
+            ("image_get_resinfo", 1, true, 1),
+            ("image_bvh_intersect_ray", 0, false, 11),
+            ("image_bvh_intersect_ray", 0, true, 8),
+            ("image_bvh64_intersect_ray", 0, false, 12),
+            ("image_bvh64_intersect_ray", 0, true, 9),
+        ];
+        for &(name, dim, a16, expected) in cases {
+            assert_eq!(
+                image_addr_dwords(name, dim, a16),
+                expected,
+                "{name} dim {dim} a16 {a16}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_instructions() {
+        // s_and_b64 s[2:3], exec, s[4:5]
+        let Fields::Sop { dst, src, imm } =
+            inst(Encoding::Sop2, "s_and_b64", &[(2 << 16) | (4 << 8) | 126]).fields(false)
+        else {
+            panic!("not SOP");
+        };
+        assert_eq!(dst, Some(sgpr(2, 2)));
+        assert_eq!(src, [sgpr(126, 2), sgpr(4, 2)]);
+        assert_eq!(imm, None);
+
+        // s_add_u32 s0, s1, literal
+        let Fields::Sop { dst, src, .. } =
+            inst(Encoding::Sop2, "s_add_u32", &[255 << 8 | 1, 0xDEAD_BEEF]).fields(false)
+        else {
+            panic!("not SOP");
+        };
+        assert_eq!(dst, Some(sgpr(0, 1)));
+        assert_eq!(src, [sgpr(1, 1), Operand::Literal(0xDEAD_BEEF)]);
+
+        // s_getpc_b64 writes the pair; s_setpc_b64 only reads one.
+        let Fields::Sop { dst, src, .. } =
+            inst(Encoding::Sop1, "s_getpc_b64", &[4 << 16]).fields(false)
+        else {
+            panic!("not SOP");
+        };
+        assert_eq!(dst, Some(sgpr(4, 2)));
+        assert!(src.is_empty());
+        let Fields::Sop { dst, src, .. } = inst(Encoding::Sop1, "s_setpc_b64", &[4]).fields(false)
+        else {
+            panic!("not SOP");
+        };
+        assert_eq!(dst, None);
+        assert_eq!(src, [sgpr(4, 2)]);
+
+        let Fields::Sop { dst, src, .. } =
+            inst(Encoding::Sopc, "s_cmp_eq_u64", &[3 << 8]).fields(false)
+        else {
+            panic!("not SOP");
+        };
+        assert!(dst.is_none());
+        assert_eq!(src, [sgpr(0, 2), sgpr(3, 2)]);
+
+        // SOPK: the destination field becomes a source for compares.
+        let Fields::Sop { dst, src, imm } =
+            inst(Encoding::Sopk, "s_cmpk_lg_u32", &[(5 << 16) | 0x1234]).fields(false)
+        else {
+            panic!("not SOP");
+        };
+        assert_eq!(dst, None);
+        assert_eq!(src, [sgpr(5, 1)]);
+        assert_eq!(imm, Some(0x1234));
+
+        let Fields::Sop { dst, imm, .. } =
+            inst(Encoding::Sopk, "s_call_b64", &[(8 << 16) | 4]).fields(false)
+        else {
+            panic!("not SOP");
+        };
+        assert_eq!(dst, Some(sgpr(8, 2)));
+        assert_eq!(imm, Some(4));
+
+        let Fields::Sop { dst, src, imm } =
+            inst(Encoding::Sopk, "s_setreg_imm32_b32", &[0x10, 1]).fields(false)
+        else {
+            panic!("not SOP");
+        };
+        assert_eq!(dst, None);
+        assert_eq!(src, [Operand::Literal(1)]);
+        assert_eq!(imm, Some(0x10));
+
+        let Fields::Sop { dst, .. } =
+            inst(Encoding::Sopk, "s_movk_i32", &[(6 << 16) | 0xFFFF]).fields(false)
+        else {
+            panic!("not SOP");
+        };
+        assert_eq!(dst, Some(sgpr(6, 1)));
+
+        let op = u32::from(opcode(Encoding::Sopp, "s_waitcnt"));
+        let Fields::Sopp { imm } =
+            inst(Encoding::Sopp, "s_waitcnt", &[(op << 16) | 0xFC7F]).fields(false)
+        else {
+            panic!("not SOPP");
+        };
+        assert_eq!(imm, 0xFC7F);
+    }
+
+    #[test]
+    fn scalar_memory() {
+        // s_load_dwordx2 s[4:5], s[8:9], s3 offset:-8 glc dlc
+        let w0 = 4 | (4 << 6) | (1 << 14) | (1 << 16);
+        let w1 = 0x1F_FFF8 | (3 << 25);
+        let Fields::Smem {
+            data,
+            base,
+            offset,
+            soffset,
+            cache,
+        } = inst(Encoding::Smem, "s_load_dwordx2", &[w0, w1]).fields(false)
+        else {
+            panic!("not SMEM");
+        };
+        assert_eq!(data, Some(sgpr(4, 2)));
+        assert_eq!(base, sgpr(8, 2));
+        assert_eq!(offset, -8);
+        assert_eq!(soffset, sgpr(3, 1));
+        assert_eq!(
+            cache,
+            Cache {
+                glc: true,
+                slc: false,
+                dlc: true
+            }
+        );
+
+        // The offset is 21 bits, signed.
+        let Fields::Smem { offset, .. } =
+            inst(Encoding::Smem, "s_load_dword", &[0, 0x0F_FFFF]).fields(false)
+        else {
+            panic!("not SMEM");
+        };
+        assert_eq!(offset, 1_048_575);
+        let Fields::Smem { offset, .. } =
+            inst(Encoding::Smem, "s_load_dword", &[0, 0x100_000]).fields(false)
+        else {
+            panic!("not SMEM");
+        };
+        assert_eq!(offset, -1_048_576);
+
+        // Buffer descriptors are four SGPRs; memtime returns a pair.
+        let Fields::Smem { data, base, .. } =
+            inst(Encoding::Smem, "s_buffer_load_dwordx4", &[1 | (20 << 6), 0]).fields(false)
+        else {
+            panic!("not SMEM");
+        };
+        assert_eq!(data, Some(sgpr(20, 4)));
+        assert_eq!(base, sgpr(2, 4));
+        let Fields::Smem { data, .. } =
+            inst(Encoding::Smem, "s_memtime", &[12 << 6, 0]).fields(false)
+        else {
+            panic!("not SMEM");
+        };
+        assert_eq!(data, Some(sgpr(12, 2)));
+        let Fields::Smem { data, .. } = inst(Encoding::Smem, "s_dcache_inv", &[0, 0]).fields(false)
+        else {
+            panic!("not SMEM");
+        };
+        assert_eq!(data, None);
+    }
+
+    #[test]
+    fn vop1_sources_and_destinations() {
+        let v = valu(Encoding::Vop1, "v_mov_b32", &[vop(3, 0, 256 + 5)], false);
+        assert_eq!(v.dst, Some(vgpr(3, 1)));
+        assert_eq!(v.src, [vgpr(5, 1)]);
+
+        let v = valu(
+            Encoding::Vop1,
+            "v_readfirstlane_b32",
+            &[vop(5, 0, 256 + 2)],
+            false,
+        );
+        assert_eq!(v.dst, Some(sgpr(5, 1)));
+        assert_eq!(v.src, [vgpr(2, 1)]);
+
+        // No operands: the console compiler keeps a shader hash in the fields.
+        let v = valu(Encoding::Vop1, "v_nop", &[0xFFFF_FFFF, 0xFFFF_FFFF], false);
+        assert_eq!(v, Valu::default());
+    }
+
+    #[test]
+    fn sdwa_fields() {
+        // dst_sel 3, dst_unused 1, clamp, omod 2, src0_sel 1, sext 3, neg 1,
+        // abs 2, src1_sel 4; src0 is an SGPR (S0), src1 a VGPR.
+        let ext = 0x2C99_AB08;
+        let v = valu(Encoding::Vop2, "v_add_f32", &[vop(1, 5, 0xF9), ext], false);
+        assert_eq!(v.dst, Some(vgpr(1, 1)));
+        assert_eq!(v.src, [sgpr(8, 1), vgpr(5, 1)]);
+        let sdwa = v.sdwa.expect("SDWA");
+        assert_eq!((sdwa.dst_sel, sdwa.dst_unused), (3, 1));
+        assert_eq!(sdwa.src_sel, [1, 4]);
+        assert_eq!(sdwa.sext, 3);
+        assert_eq!((v.neg, v.abs), (1, 2));
+        assert!(v.clamp);
+        assert_eq!(v.omod, 2);
+
+        // Bit 31 makes src1 an SGPR: the 8-bit field is the register.
+        let v = valu(
+            Encoding::Vop2,
+            "v_add_f32",
+            &[vop(1, 6, 0xF9), (1 << 31) | 5],
+            false,
+        );
+        assert_eq!(v.src, [vgpr(5, 1), sgpr(6, 1)]);
+    }
+
+    #[test]
+    fn dpp_permutations() {
+        let ext = 4
+            | (0x101 << 8)
+            | (1 << 18)
+            | (1 << 19)
+            | (1 << 20)
+            | (1 << 21)
+            | (1 << 22)
+            | (1 << 23)
+            | (0xA << 24)
+            | (5 << 28);
+        let v = valu(Encoding::Vop2, "v_add_f32", &[vop(2, 6, 0xFA), ext], false);
+        assert_eq!(v.src, [vgpr(4, 1), vgpr(6, 1)]);
+        assert_eq!((v.neg, v.abs), (3, 3));
+        assert_eq!(
+            v.dpp,
+            Some(Dpp::Row {
+                ctrl: 0x101,
+                row_mask: 5,
+                bank_mask: 0xA,
+                bound_ctrl: true,
+                fi: true,
+            })
+        );
+
+        let ext = 4 | (0x12_3456 << 8);
+        let v = valu(Encoding::Vop2, "v_add_f32", &[vop(2, 6, 0xE9), ext], false);
+        assert_eq!(
+            v.dpp,
+            Some(Dpp::Lanes {
+                sel: 0x12_3456,
+                fi: false
+            })
+        );
+        let v = valu(Encoding::Vop2, "v_add_f32", &[vop(2, 6, 0xEA), ext], false);
+        assert_eq!(
+            v.dpp,
+            Some(Dpp::Lanes {
+                sel: 0x12_3456,
+                fi: true
+            })
+        );
+    }
+
+    #[test]
+    fn vop2_implicit_operands() {
+        let v = valu(Encoding::Vop2, "v_cndmask_b32", &[vop(1, 2, 0)], false);
+        assert_eq!(v.src, [sgpr(0, 1), vgpr(2, 1), sgpr(106, 1)]);
+        assert_eq!(v.carry, None);
+        let v = valu(Encoding::Vop2, "v_cndmask_b32", &[vop(1, 2, 0)], true);
+        assert_eq!(v.src[2], sgpr(106, 2));
+
+        let v = valu(
+            Encoding::Vop2,
+            "v_add_co_ci_u32",
+            &[vop(3, 4, 256 + 1)],
+            true,
+        );
+        assert_eq!(v.src, [vgpr(1, 1), vgpr(4, 1), sgpr(106, 2)]);
+        assert_eq!(v.carry, Some(sgpr(106, 2)));
+
+        // v_madmk takes the literal second, v_madak third.
+        let v = valu(
+            Encoding::Vop2,
+            "v_madmk_f32",
+            &[vop(1, 3, 256 + 2), 0x3F00_0000],
+            false,
+        );
+        assert_eq!(
+            v.src,
+            [vgpr(2, 1), Operand::Literal(0x3F00_0000), vgpr(3, 1)]
+        );
+        let v = valu(
+            Encoding::Vop2,
+            "v_madak_f32",
+            &[vop(1, 3, 256 + 2), 0x3F00_0000],
+            false,
+        );
+        assert_eq!(
+            v.src,
+            [vgpr(2, 1), vgpr(3, 1), Operand::Literal(0x3F00_0000)]
+        );
+    }
+
+    #[test]
+    fn compares_write_lane_masks() {
+        let words = [vop(0, 3, 240)];
+        let v = valu(Encoding::Vopc, "v_cmp_gt_f32", &words, false);
+        assert_eq!(v.dst, Some(sgpr(106, 1)));
+        assert_eq!(v.src, [Operand::Const(240), vgpr(3, 1)]);
+        let v = valu(Encoding::Vopc, "v_cmp_gt_f32", &words, true);
+        assert_eq!(v.dst, Some(sgpr(106, 2)));
+        let v = valu(Encoding::Vopc, "v_cmpx_gt_f32", &words, false);
+        assert_eq!(v.dst, Some(sgpr(126, 1)));
+    }
+
+    #[test]
+    fn vop3_modifiers() {
+        let op = opcode(Encoding::Vop3, "v_add_f64");
+        let v = valu(
+            Encoding::Vop3,
+            "v_add_f64",
+            &[dw0(op, 2, 2, 0xA, true), dw1([0x101, 0x102, 0], 1, 3)],
+            false,
+        );
+        assert_eq!(v.dst, Some(vgpr(2, 2)));
+        assert_eq!(v.src, [vgpr(1, 2), vgpr(2, 2)]);
+        assert_eq!((v.neg, v.abs, v.opsel), (3, 2, 0xA));
+        assert!(v.clamp);
+        assert_eq!(v.omod, 1);
+
+        // A VOP3-encoded compare writes an SGPR.
+        let op = opcode(Encoding::Vopc, "v_cmp_gt_f32");
+        let v = valu_raw(
+            Encoding::Vop3,
+            op,
+            &[dw0(op, 6, 0, 0, false), dw1([0x101, 0x102, 0], 0, 0)],
+            true,
+        );
+        assert_eq!(v.dst, Some(sgpr(6, 2)));
+        assert_eq!(v.src, [vgpr(1, 1), vgpr(2, 1)]);
+
+        // VOP3B: bits 14:8 hold the carry-out SGPR instead of abs/opsel.
+        let op = opcode(Encoding::Vop3, "v_div_scale_f32");
+        let w0 = 1 | (6 << 8) | (u32::from(op) << 16);
+        let v = valu(
+            Encoding::Vop3,
+            "v_div_scale_f32",
+            &[w0, dw1([0x101, 0x102, 0x103], 0, 0)],
+            true,
+        );
+        assert_eq!(v.carry, Some(sgpr(6, 2)));
+        assert_eq!(v.src, [vgpr(1, 1), vgpr(2, 1), vgpr(3, 1)]);
+        assert_eq!((v.abs, v.opsel), (0, 0));
+
+        // The literal of a nine-bit source field is the third dword.
+        let v = valu(
+            Encoding::Vop3,
+            "v_div_scale_f32",
+            &[
+                1 | (u32::from(op) << 16),
+                dw1([0x101, 0x102, 255], 0, 0),
+                0x4120_0000,
+            ],
+            false,
+        );
+        assert_eq!(v.src[2], Operand::Literal(0x4120_0000));
+
+        // v_readlane writes an SGPR; v_interp reads an attribute in src0.
+        let op = opcode(Encoding::Vop3, "v_readlane_b32");
+        let v = valu(
+            Encoding::Vop3,
+            "v_readlane_b32",
+            &[dw0(op, 5, 0, 0, false), dw1([0x102, 3, 0], 0, 0)],
+            false,
+        );
+        assert_eq!(v.dst, Some(sgpr(5, 1)));
+        assert_eq!(v.src, [vgpr(2, 1), sgpr(3, 1)]);
+
+        let op = opcode(Encoding::Vop3, "v_interp_p1ll_f16");
+        let code = 5 | (2 << 6) | (1 << 8);
+        let v = valu(
+            Encoding::Vop3,
+            "v_interp_p1ll_f16",
+            &[dw0(op, 1, 0, 0, false), dw1([code, 0x104, 0], 0, 0)],
+            false,
+        );
+        assert_eq!(
+            v.src,
+            [
+                Operand::Attr {
+                    index: 5,
+                    chan: 2,
+                    high: true
+                },
+                vgpr(4, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn vop3p_halves() {
+        let op = opcode(Encoding::Vop3p, "v_pk_add_f16");
+        let v = valu(
+            Encoding::Vop3p,
+            "v_pk_add_f16",
+            &[
+                dw0(op, 1, 7, 5, false) | (1 << 14),
+                dw1([0x101, 0x102, 0], 2, 5),
+            ],
+            false,
+        );
+        assert_eq!(v.src, [vgpr(1, 1), vgpr(2, 1)]);
+        assert_eq!((v.neg, v.neg_hi, v.opsel, v.opsel_hi), (5, 7, 5, 6));
+
+        let op = opcode(Encoding::Vop3p, "v_pk_fma_f16");
+        let v = valu(
+            Encoding::Vop3p,
+            "v_pk_fma_f16",
+            &[dw0(op, 1, 0, 0, false), dw1([0x101, 0x102, 0x103], 0, 0)],
+            false,
+        );
+        assert_eq!(v.src.len(), 3);
+
+        let op = opcode(Encoding::Vop3p, "v_fma_mix_f32");
+        let v = valu(
+            Encoding::Vop3p,
+            "v_fma_mix_f32",
+            &[dw0(op, 1, 0, 0, false), dw1([0x101, 0x102, 0x103], 0, 0)],
+            false,
+        );
+        assert_eq!(v.src.len(), 3);
+    }
+
+    #[test]
+    fn interpolation() {
+        let op = u32::from(opcode(Encoding::Vintrp, "v_interp_p1_f32"));
+        let w0 = (0x32 << 26) | (op << 16) | (2 << 18) | (5 << 10) | (1 << 8) | 4;
+        let Fields::Vintrp { dst, src, attr } =
+            inst(Encoding::Vintrp, "v_interp_p1_f32", &[w0]).fields(false)
+        else {
+            panic!("not VINTRP");
+        };
+        assert_eq!(dst, vgpr(2, 1));
+        assert_eq!(src, vgpr(4, 1));
+        assert_eq!(
+            attr,
+            Operand::Attr {
+                index: 5,
+                chan: 1,
+                high: false
+            }
+        );
+
+        // The destination is the full 8-bit field at 25:18.
+        let w0 = (0x32 << 26) | (op << 16) | (1 << 25) | (2 << 18);
+        let Fields::Vintrp { dst, .. } =
+            inst(Encoding::Vintrp, "v_interp_p1_f32", &[w0]).fields(false)
+        else {
+            panic!("not VINTRP");
+        };
+        assert_eq!(dst, vgpr(130, 1));
+
+        // v_interp_mov's second field is a parameter, not a VGPR.
+        let Fields::Vintrp { src, .. } = inst(
+            Encoding::Vintrp,
+            "v_interp_mov_f32",
+            &[(0x32 << 26) | (1 << 8) | 1],
+        )
+        .fields(false) else {
+            panic!("not VINTRP");
+        };
+        assert_eq!(src, Operand::Const(1));
+    }
+
+    #[test]
+    fn lds_operands() {
+        // ds_read2_b32 v[6:7], v1 offset0:2 offset1:3 gds
+        let Fields::Ds {
+            dst,
+            addr,
+            data,
+            offset0,
+            offset1,
+            gds,
+        } = inst(
+            Encoding::Ds,
+            "ds_read2_b32",
+            &[2 | (3 << 8) | (1 << 17), (6 << 24) | 1],
+        )
+        .fields(false)
+        else {
+            panic!("not DS");
+        };
+        assert_eq!(dst, Some(vgpr(6, 2)));
+        assert_eq!(addr, Some(vgpr(1, 1)));
+        assert!(data.is_empty());
+        assert_eq!((offset0, offset1, gds), (2, 3, true));
+
+        // A 128-bit store is one four-dword range, not four fields.
+        let Fields::Ds { dst, data, .. } =
+            inst(Encoding::Ds, "ds_write_b128", &[0, (2 << 8) | 1]).fields(false)
+        else {
+            panic!("not DS");
+        };
+        assert!(dst.is_none());
+        assert_eq!(data, [vgpr(2, 4)]);
+
+        // ds_append returns a value but takes no address.
+        let Fields::Ds {
+            dst, addr, data, ..
+        } = inst(Encoding::Ds, "ds_append", &[0, 3 << 24]).fields(false)
+        else {
+            panic!("not DS");
+        };
+        assert_eq!(dst, Some(vgpr(3, 1)));
+        assert!(addr.is_none());
+        assert!(data.is_empty());
+
+        // GWS operations have neither an address nor data.
+        let Fields::Ds {
+            dst, addr, data, ..
+        } = inst(Encoding::Ds, "ds_gws_sema_v", &[0, 0]).fields(false)
+        else {
+            panic!("not DS");
+        };
+        assert!(dst.is_none() && addr.is_none() && data.is_empty());
+
+        let Fields::Ds {
+            dst, addr, data, ..
+        } = inst(
+            Encoding::Ds,
+            "ds_add_rtn_u32",
+            &[0, (4 << 24) | (6 << 8) | 5],
+        )
+        .fields(false)
+        else {
+            panic!("not DS");
+        };
+        assert_eq!(dst, Some(vgpr(4, 1)));
+        assert_eq!(addr, Some(vgpr(5, 1)));
+        assert_eq!(data, [vgpr(6, 1)]);
+
+        // Compare-and-swap and the two-address forms take both data fields.
+        let Fields::Ds { data, .. } =
+            inst(Encoding::Ds, "ds_cmpst_b32", &[0, (3 << 16) | (2 << 8) | 1]).fields(false)
+        else {
+            panic!("not DS");
+        };
+        assert_eq!(data, [vgpr(2, 1), vgpr(3, 1)]);
+        let Fields::Ds { dst, data, .. } = inst(
+            Encoding::Ds,
+            "ds_write2_b64",
+            &[0, (3 << 16) | (2 << 8) | 1],
+        )
+        .fields(false) else {
+            panic!("not DS");
+        };
+        assert!(dst.is_none());
+        assert_eq!(data, [vgpr(2, 2), vgpr(3, 2)]);
+    }
+
+    #[test]
+    fn buffer_operands() {
+        let Fields::Buffer {
+            data,
+            addr,
+            rsrc,
+            soffset,
+            offset,
+            offen,
+            idxen,
+            format,
+            lds,
+            tfe,
+            cache,
+        } = inst(
+            Encoding::Mubuf,
+            "buffer_load_dwordx4",
+            &[0xE034_7010, 0x0102_0402],
+        )
+        .fields(false)
+        else {
+            panic!("not a buffer instruction");
+        };
+        assert_eq!(data, Some(vgpr(4, 4)));
+        assert_eq!(addr, vgpr(2, 2));
+        assert_eq!(rsrc, sgpr(8, 4));
+        assert_eq!(soffset, sgpr(1, 1));
+        assert_eq!(offset, 16);
+        assert!(offen && idxen && !lds && !tfe);
+        assert_eq!(format, None);
+        assert_eq!(
+            cache,
+            Cache {
+                glc: true,
+                slc: false,
+                dlc: false
+            }
+        );
+
+        // TFE returns one more dword; lds loads into shared memory.
+        let Fields::Buffer { data, tfe, .. } = inst(
+            Encoding::Mubuf,
+            "buffer_load_dword",
+            &[0, (1 << 23) | (4 << 8) | 2],
+        )
+        .fields(false) else {
+            panic!("not a buffer instruction");
+        };
+        assert!(tfe);
+        assert_eq!(data, Some(vgpr(4, 2)));
+        let Fields::Buffer { lds, .. } =
+            inst(Encoding::Mubuf, "buffer_load_dword", &[1 << 16, 0]).fields(false)
+        else {
+            panic!("not a buffer instruction");
+        };
+        assert!(lds);
+
+        // MTBUF's unified format; format_d16 halves 3d data.
+        let Fields::Buffer {
+            data,
+            addr,
+            rsrc,
+            soffset,
+            offset,
+            format,
+            lds,
+            ..
+        } = inst(
+            Encoding::Mtbuf,
+            "tbuffer_load_format_d16_xyzw",
+            &[
+                (17 << 19) | 16 | (1 << 12) | (1 << 13),
+                (3 << 24) | (4 << 8) | 1 | (2 << 16),
+            ],
+        )
+        .fields(false)
+        else {
+            panic!("not a buffer instruction");
+        };
+        assert_eq!(format, Some(17));
+        assert_eq!(offset, 16);
+        assert!(!lds);
+        assert_eq!(data, Some(vgpr(4, 2)));
+        assert_eq!(addr, vgpr(1, 2));
+        assert_eq!(rsrc, sgpr(8, 4));
+        assert_eq!(soffset, sgpr(3, 1));
+
+        // Stores have no destination; the stored dwords are the data.
+        let Fields::Buffer { data, .. } =
+            inst(Encoding::Mubuf, "buffer_store_dwordx2", &[0, (4 << 8) | 1]).fields(false)
+        else {
+            panic!("not a buffer instruction");
+        };
+        assert_eq!(data, Some(vgpr(4, 2)));
+    }
+
+    #[test]
+    fn image_operands() {
+        // image_sample_lz v[8:9], [v1,v5], s[16:23], s[4:7] dmask:0x7 d16:
+        // three channels pack into two dwords, and the NSA form lists the
+        // addresses one VGPR each.
+        let Fields::Image {
+            data,
+            addr,
+            rsrc,
+            sampler,
+            dmask,
+            dim,
+            unorm,
+            r128,
+            a16,
+            d16,
+            tfe,
+            lwe,
+            cache,
+        } = inst(
+            Encoding::Mimg,
+            "image_sample_lz",
+            &[0xF09C_070A, 0x8024_0801, 0x0000_0005],
+        )
+        .fields(false)
+        else {
+            panic!("not an image instruction");
+        };
+        assert_eq!(data, vgpr(8, 2));
+        assert_eq!(addr, [vgpr(1, 1), vgpr(5, 1)]);
+        assert_eq!(rsrc, sgpr(16, 8));
+        assert_eq!(sampler, Some(sgpr(4, 4)));
+        assert_eq!((dmask, dim), (7, 1));
+        assert!(!unorm && !r128 && !a16 && d16 && !tfe && !lwe);
+        assert_eq!(cache, Cache::default());
+
+        // Most flags at once: dim 3D has three coordinates and six gradients;
+        // the coordinates pack with a16 while the gradients stay whole dwords.
+        let w0 = 0xF000_0000
+            | 0x0F00
+            | 0x10
+            | (1 << 25)
+            | (1 << 16)
+            | (1 << 15)
+            | (1 << 13)
+            | (1 << 12)
+            | (1 << 7);
+        let w1 = 0xC062_0401;
+        let Fields::Image {
+            data,
+            addr,
+            rsrc,
+            sampler,
+            dim,
+            unorm,
+            r128,
+            a16,
+            d16,
+            tfe,
+            lwe,
+            cache,
+            ..
+        } = inst(Encoding::Mimg, "image_sample_d", &[w0, w1]).fields(false)
+        else {
+            panic!("not an image instruction");
+        };
+        assert_eq!(dim, 2);
+        assert!(unorm && r128 && a16 && d16 && tfe && !lwe);
+        assert_eq!(
+            cache,
+            Cache {
+                glc: true,
+                slc: true,
+                dlc: true
+            }
+        );
+        assert_eq!(rsrc, sgpr(8, 4));
+        assert_eq!(sampler, Some(sgpr(12, 4)));
+        assert_eq!(data, vgpr(4, 3));
+        assert_eq!(addr, [vgpr(1, 8)]);
+
+        // lwe appends a dword of its own.
+        let w0 = 0xF000_0000 | 0x10 | (1 << 8) | (1 << 17);
+        let Fields::Image { data, lwe, .. } =
+            inst(Encoding::Mimg, "image_load", &[w0, 0x0002_0401]).fields(false)
+        else {
+            panic!("not an image instruction");
+        };
+        assert!(lwe);
+        assert_eq!(data, vgpr(4, 2));
+
+        // The NSA address dwords carry four VGPRs each.
+        let w0 = 0xF000_0000 | 0x6 | 0x10 | 0x0F00;
+        let Fields::Image { addr, .. } = inst(
+            Encoding::Mimg,
+            "image_sample_d",
+            &[w0, 0x0002_0401, 0x0403_0201, 0x0807_0605, 0],
+        )
+        .fields(false) else {
+            panic!("not an image instruction");
+        };
+        assert_eq!(
+            addr,
+            [
+                vgpr(1, 1),
+                vgpr(1, 1),
+                vgpr(2, 1),
+                vgpr(3, 1),
+                vgpr(4, 1),
+                vgpr(5, 1),
+                vgpr(6, 1),
+                vgpr(7, 1),
+                vgpr(8, 1)
+            ]
+        );
+
+        // Loads take no sampler.
+        let Fields::Image { sampler, .. } =
+            inst(Encoding::Mimg, "image_load", &[0, 0]).fields(false)
+        else {
+            panic!("not an image instruction");
+        };
+        assert_eq!(sampler, None);
+    }
+
+    #[test]
+    fn flat_global_and_scratch() {
+        // flat_load_dwordx3 v[4:6], v[2:3] inst_offset:2047, every cache flag
+        let w0 = 0xDC00_0000 | 2047 | (1 << 12) | (1 << 13) | (1 << 16) | (1 << 17);
+        let Fields::Flat {
+            dst,
+            addr,
+            data,
+            offset,
+            lds,
+            cache,
+            ..
+        } = inst(Encoding::Flat, "flat_load_dwordx3", &[w0, 0x0400_0402]).fields(false)
+        else {
+            panic!("not FLAT");
+        };
+        assert_eq!(dst, Some(vgpr(4, 3)));
+        assert_eq!(addr, Some(vgpr(2, 2)));
+        assert_eq!(data, None);
+        assert_eq!(offset, 2047);
+        assert!(lds);
+        assert_eq!(
+            cache,
+            Cache {
+                glc: true,
+                slc: true,
+                dlc: true
+            }
+        );
+
+        // GLOBAL's offset is 12 bits, signed.
+        let Fields::Flat { offset, .. } = inst(
+            Encoding::Global,
+            "global_load_dwordx2",
+            &[0xDC00_0FFF, (4 << 8) | 2],
+        )
+        .fields(false) else {
+            panic!("not GLOBAL");
+        };
+        assert_eq!(offset, -1);
+        let Fields::Flat { offset, .. } =
+            inst(Encoding::Global, "global_load_dwordx2", &[0xDC00_07FF, 0]).fields(false)
+        else {
+            panic!("not GLOBAL");
+        };
+        assert_eq!(offset, 2047);
+
+        // A null saddr adds a VGPR to the address; scratch always has 32 bits.
+        let Fields::Flat {
+            addr, saddr, data, ..
+        } = inst(
+            Encoding::Global,
+            "global_load_dwordx2",
+            &[0, (125 << 16) | (4 << 8) | 2],
+        )
+        .fields(false)
+        else {
+            panic!("not GLOBAL");
+        };
+        assert_eq!(addr, Some(vgpr(2, 2)));
+        assert_eq!(saddr, Some(sgpr(125, 2)));
+        assert_eq!(data, None);
+
+        let Fields::Flat { addr, saddr, .. } = inst(
+            Encoding::Scratch,
+            "scratch_load_dword",
+            &[0, (125 << 16) | (4 << 8) | 1],
+        )
+        .fields(false) else {
+            panic!("not SCRATCH");
+        };
+        assert_eq!(addr, Some(vgpr(1, 1)));
+        assert_eq!(saddr, Some(sgpr(125, 1)));
+        let Fields::Flat { addr, saddr, .. } = inst(
+            Encoding::Scratch,
+            "scratch_load_dword",
+            &[0, (3 << 16) | (4 << 8) | 1],
+        )
+        .fields(false) else {
+            panic!("not SCRATCH");
+        };
+        assert_eq!(addr, None);
+        assert_eq!(saddr, Some(sgpr(3, 1)));
+
+        // A store has no destination; a returning atomic keeps the old value.
+        let Fields::Flat { dst, data, .. } =
+            inst(Encoding::Global, "global_store_dword", &[0, (4 << 8) | 2]).fields(false)
+        else {
+            panic!("not GLOBAL");
+        };
+        assert!(dst.is_none());
+        assert_eq!(data, Some(vgpr(4, 1)));
+        let Fields::Flat { dst, data, .. } = inst(
+            Encoding::Global,
+            "global_atomic_cmpswap_x2",
+            &[1 << 16, (6 << 24) | (4 << 8) | 1],
+        )
+        .fields(false) else {
+            panic!("not GLOBAL");
+        };
+        assert_eq!(dst, Some(vgpr(6, 2)));
+        assert_eq!(data, Some(vgpr(4, 4)));
+    }
+
+    #[test]
+    fn exports() {
+        let Fields::Exp {
+            target,
+            src,
+            compr,
+            done,
+            vm,
+        } = inst_raw(Encoding::Exp, 0, &[0xF800_1C0F, 0x0000_0302]).fields(false)
+        else {
+            panic!("not EXP");
+        };
+        assert_eq!(target, 0);
+        assert_eq!(
+            src,
+            [
+                Some(vgpr(2, 1)),
+                Some(vgpr(2, 1)),
+                Some(vgpr(3, 1)),
+                Some(vgpr(3, 1))
+            ]
+        );
+        assert!(compr && done && vm);
+
+        let Fields::Exp {
+            target,
+            src,
+            compr,
+            done,
+            vm,
+        } = inst_raw(
+            Encoding::Exp,
+            0,
+            &[
+                0xF800_0000 | 0b0101 | (12 << 4),
+                4 | (5 << 8) | (6 << 16) | (7 << 24),
+            ],
+        )
+        .fields(false)
+        else {
+            panic!("not EXP");
+        };
+        assert_eq!(target, 12);
+        assert_eq!(src, [Some(vgpr(4, 1)), None, Some(vgpr(6, 1)), None]);
+        assert!(!compr && !done && !vm);
     }
 }
