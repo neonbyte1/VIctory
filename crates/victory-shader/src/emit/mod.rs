@@ -1164,6 +1164,9 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let host = match super::host::Host::new(false) {
             Ok(host) => host,
             Err(e) => {

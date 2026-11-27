@@ -278,6 +278,9 @@ mod tests {
         let corner = |x: f32, y: f32| [x, y, 0.5, 1.0, x, y];
         let (tl, bl, br, tr) = (corner(-0.5, 0.5), corner(-0.5, -0.5), corner(0.5, -0.5), corner(0.5, 0.5));
         let orders = [[tl, bl, br], [tl, bl, tr], [bl, tr, tl], [tl, corner(0.0, 0.0), br]];
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for warp in [false, true] {
             let Ok(host) = Host::new(warp) else { continue };
             let root = host.root_signature_for(&[]).unwrap();
