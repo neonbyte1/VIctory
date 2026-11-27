@@ -227,6 +227,26 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
+/// The console's 4K output mode. `VICTORY_MODE=<width>x<height>` reports a
+/// smaller one instead, for hosts whose render targets at 4K do not fit.
+fn mode_size() -> (u32, u32) {
+    const DEFAULT: (u32, u32) = (3840, 2160);
+    let Some(spec) = std::env::var_os("VICTORY_MODE") else {
+        return DEFAULT;
+    };
+    parse_mode(&spec.to_string_lossy()).unwrap_or(DEFAULT)
+}
+
+/// `WIDTHxHEIGHT` with both dimensions inside D3D12's 16384 limit.
+fn parse_mode(spec: &str) -> Option<(u32, u32)> {
+    let (width, height) = spec
+        .trim()
+        .split_once('x')
+        .or_else(|| spec.trim().split_once('X'))?;
+    let (width, height): (u32, u32) = (width.trim().parse().ok()?, height.trim().parse().ok()?);
+    ((1..=16384).contains(&width) && (1..=16384).contains(&height)).then_some((width, height))
+}
+
 /// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
@@ -250,9 +270,10 @@ extern "system" fn modes(
         return MORE_DATA;
     }
     *count = 1;
+    let (width, height) = mode_size();
     let mode = Mode {
-        width: 3840,
-        height: 2160,
+        width,
+        height,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
@@ -337,5 +358,18 @@ mod tests {
             assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
             assert!(out.is_null(), "{method} left a stale output pointer");
         }
+    }
+
+    #[test]
+    fn output_mode_override_parses_or_falls_back() {
+        assert_eq!(super::parse_mode("1920x1080"), Some((1920, 1080)));
+        assert_eq!(super::parse_mode(" 1280 X 720 "), Some((1280, 720)));
+        assert_eq!(super::parse_mode("3840x2160"), Some((3840, 2160)));
+        // Zero, past D3D12's limit, or not a size: the 4K default stays.
+        assert_eq!(super::parse_mode("0x1080"), None);
+        assert_eq!(super::parse_mode("3840x0"), None);
+        assert_eq!(super::parse_mode("16385x1080"), None);
+        assert_eq!(super::parse_mode("1080p"), None);
+        assert_eq!(super::parse_mode("1920"), None);
     }
 }
