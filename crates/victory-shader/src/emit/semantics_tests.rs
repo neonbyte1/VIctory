@@ -2841,7 +2841,75 @@ fn scalar_probes() -> Vec<Probe> {
         ab,
         |i| vec![u32::from(i[0] < i[1])],
     ));
+    p.extend(scalar_64_probes());
     p
+}
+
+/// The 64-bit scalar logic and shift ops (RDNA2 ISA, SOP2): operands are
+/// `s[16:17]` and `s[18:19]`, the result `s[20:21]`; SCC is whether it is
+/// nonzero. Shifts read six bits of the count.
+fn scalar_64_probes() -> Vec<Probe> {
+    const EDGES: [u64; 8] = [
+        0,
+        1,
+        0xFFFF_FFFF,
+        0x1_0000_0000,
+        0x8000_0000_0000_0000,
+        u64::MAX,
+        0x1234_5678_9ABC_DEF0,
+        0xD2F9_0159_0BAD_F00D,
+    ];
+    let split = |x: u64| [x as u32, (x >> 32) as u32];
+    let logic: Vec<[u32; 4]> = EDGES
+        .iter()
+        .flat_map(|&a| {
+            EDGES.iter().map(move |&b| {
+                let (a, b) = (split(a), split(b));
+                [a[0], a[1], b[0], b[1]]
+            })
+        })
+        .collect();
+    let shifts: Vec<[u32; 4]> = EDGES
+        .iter()
+        .flat_map(|&a| {
+            [0u32, 1, 31, 32, 33, 63, 64, 65, 0xFFFF_FFC1].map(move |n| {
+                let a = split(a);
+                [a[0], a[1], n, OLD]
+            })
+        })
+        .collect();
+    let probe = |op: u16, inputs: Vec<[u32; 4]>, f: fn(u64, u64) -> u64| {
+        scalar(
+            [
+                sop2(op, 20, s(16), s(18)),
+                sop2(0x0A, 22, int(1), int(0)),
+                vop1(0x01, 5, s(20)),
+                vop1(0x01, 6, s(21)),
+                vop1(0x01, 7, s(22)),
+            ],
+            inputs,
+            move |i| {
+                let r = f(
+                    u64::from(i[0]) | u64::from(i[1]) << 32,
+                    u64::from(i[2]) | u64::from(i[3]) << 32,
+                );
+                vec![r as u32, (r >> 32) as u32, u32::from(r != 0)]
+            },
+        )
+    };
+    vec![
+        probe(0x0F, logic.clone(), |a, b| a & b),
+        probe(0x11, logic.clone(), |a, b| a | b),
+        probe(0x13, logic.clone(), |a, b| a ^ b),
+        probe(0x15, logic.clone(), |a, b| a & !b),
+        probe(0x17, logic.clone(), |a, b| a | !b),
+        probe(0x19, logic.clone(), |a, b| !(a & b)),
+        probe(0x1B, logic.clone(), |a, b| !(a | b)),
+        probe(0x1D, logic, |a, b| !(a ^ b)),
+        probe(0x1F, shifts.clone(), |a, n| a << (n & 63)),
+        probe(0x21, shifts.clone(), |a, n| a >> (n & 63)),
+        probe(0x23, shifts, |a, n| ((a as i64) >> (n & 63)) as u64),
+    ]
 }
 
 #[test]
