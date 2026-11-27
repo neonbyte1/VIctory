@@ -890,6 +890,25 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     (record.tag == tag).then_some(record)
 }
 
+/// What follows the description, read only as a hint: a title that passes
+/// the plain description may have nothing mapped after it (none: zeros).
+fn placement_after(desc_ptr: *const HeapDesc) -> Placement {
+    #[cfg(windows)]
+    {
+        let mut bytes = [0u8; size_of::<Placement>()];
+        if !crate::host::read_into(desc_ptr.wrapping_add(1).cast(), &mut bytes) {
+            return Placement { address: 0, size: 0 };
+        }
+        let [a, s] = [0, 8].map(|i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap()));
+        Placement { address: a, size: s }
+    }
+    #[cfg(not(windows))]
+    // SAFETY: as above, on the hope that the title has its own memory there.
+    unsafe {
+        desc_ptr.add(1).cast::<Placement>().read_unaligned()
+    }
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_heap(
     _: This,
@@ -905,9 +924,7 @@ pub(crate) extern "system" fn create_heap(
     else {
         return E_INVALIDARG;
     };
-    // SAFETY: read only as a hint: a title that passes the plain
-    // description has its own stack or data after it.
-    let placement = unsafe { desc_ptr.add(1).cast::<Placement>().read_unaligned() };
+    let placement = placement_after(desc_ptr);
     // shortcut: a placement is recognised by its size matching the count,
     // since the plain and extended descriptions share the slot and the
     // interface version; find the flag that tells them apart if a title
@@ -1040,6 +1057,36 @@ pub(crate) mod tests {
         assert!(crate::memory::has_table(key));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
         assert!(!crate::memory::has_table(key), "released with its heap");
+    }
+
+    /// An older title's plain description at the end of its mapped memory:
+    /// nothing is read past it.
+    #[cfg(windows)]
+    #[test]
+    fn a_plain_description_at_the_end_of_mapped_memory_is_read_whole() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            VirtualProtect,
+        };
+        // SAFETY: a fresh allocation of two pages, the second made
+        // inaccessible; freed below.
+        let page = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p.is_null());
+            let mut old = 0;
+            assert!(VirtualProtect(p.cast::<u8>().add(4096).cast(), 4096, PAGE_NOACCESS, &mut old) != 0);
+            p.cast::<u8>()
+        };
+        let desc = HeapDesc { kind: 0, count: 8, flags: 0, nodes: 0 };
+        // SAFETY: the last 16 bytes of the first page.
+        let at = unsafe { page.add(4096 - size_of::<HeapDesc>()) }.cast::<HeapDesc>();
+        // SAFETY: as above.
+        unsafe { at.write(desc) };
+        let mut h = std::ptr::null();
+        assert_eq!(create_heap(std::ptr::null(), at, &HEAP_IIDS[0], &mut h), S_OK);
+        assert!(!h.is_null());
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 
     #[test]
