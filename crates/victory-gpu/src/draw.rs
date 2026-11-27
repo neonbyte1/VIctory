@@ -148,8 +148,9 @@ impl Drop for State {
 const MEMORY_HEAP: usize = crate::memory::OURS;
 
 /// The sampler heap we bind when the title binds none (a value no title heap
-/// address takes).
-const SAMPLERS_OURS: usize = usize::MAX;
+/// address takes). Not `usize::MAX`: with [`MEMORY_HEAP`] that would be
+/// the heaps [`State::host_state_lost`] says the host list has none of.
+const SAMPLERS_OURS: usize = usize::MAX - 1;
 
 /// Dynamic slots taken at a time for root views.
 const ROOT_VIEW_RUN: u32 = 256;
@@ -2242,6 +2243,21 @@ mod tests {
         );
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
+    }
+
+    /// Once the host list's state is lost (a cut into a new host list, which
+    /// starts with no heaps, or commands of another recorder), the next draw
+    /// or dispatch binds its heaps again, ours of both kinds too.
+    #[test]
+    fn heaps_are_bound_again_after_the_host_state_is_lost() {
+        let mut state = State::default();
+        state.host_state_lost();
+        for title in [[0, 0], [0x10, 0], [0, 0x20], [0x10, 0x20]] {
+            for memory_heap in [false, true] {
+                let want = State::wanted(title, memory_heap);
+                assert_ne!(want, state.host_heaps, "{title:x?}, memory heap {memory_heap}");
+            }
+        }
     }
     use crate::object::{HRESULT, S_OK};
 
