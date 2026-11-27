@@ -2041,27 +2041,23 @@ pub(crate) mod tests {
         };
         copy.update(p, PAGE);
         let list = host.new_list().unwrap();
-        let copy_w = Arc::clone(&copy);
-        let vram_gpu = b.gpu;
-        list.defer_host(move || {
-            copy_w.write_host(p as u64, &0x1337_c0deu32.to_le_bytes());
-        });
+        // The shader's write, on the GPU into the copy (with copies in video
+        // memory the mirror holds what the copy held before the submission).
+        let (up, up_ptr) = host.upload_buffer(8).expect("upload bit and word");
+        // SAFETY: mapped 8-byte upload buffer.
+        unsafe { up_ptr.cast::<[u32; 2]>().write_volatile([1u32 << (base % 32), 0x1337_c0de]) };
+        list.keep(&up);
         // Set the VIEW_WRITES mark bit directly on GPU (or RAM when UMA) without Step::GpuWrite.
         let word_off = ((base / 32) * 4) as u64;
-        let bit_mask = 1u32 << (base % 32);
-        let (up, up_ptr) = host.upload_buffer(4).expect("upload bit");
-        // SAFETY: mapped 4-byte upload buffer.
-        unsafe { up_ptr.cast::<u32>().write_volatile(bit_mask) };
-        list.keep(&up);
         // SAFETY: open command list and valid buffer regions.
         unsafe {
+            list.list.CopyBufferRegion(&copy.buffer, copy.base, &up, 4, 4);
             if let Some(vram) = &b.vram {
                 list.list.CopyBufferRegion(vram, word_off, &up, 0, 4);
             } else {
                 list.list.CopyBufferRegion(&b._buffer, word_off, &up, 0, 4);
             }
         }
-        let _ = vram_gpu;
         list.close();
         host.execute(&[&list]);
         // SAFETY: our pool page.
