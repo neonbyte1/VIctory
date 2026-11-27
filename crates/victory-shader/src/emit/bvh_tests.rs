@@ -39,10 +39,14 @@ impl Ray {
 /// The instruction's four result dwords for the node `w` (its dwords, 28 for
 /// a box32 node, 16 otherwise) behind a pointer of type `ty`.
 fn intersect(w: &[u32], ty: u32, ray: &Ray) -> [u32; 4] {
+    intersect_mode(w, ty, ray, true)
+}
+
+fn intersect_mode(w: &[u32], ty: u32, ray: &Ray, sort_boxes: bool) -> [u32; 4] {
     match ty & 7 {
         0..=3 => triangle(w, ty & 7, ray),
-        4 => boxes(w, true, ray),
-        5 => boxes(w, false, ray),
+        4 => boxes_mode(w, true, ray, sort_boxes),
+        5 => boxes_mode(w, false, ray, sort_boxes),
         _ => [INVALID; 4],
     }
 }
@@ -60,6 +64,10 @@ fn half(bits: u32) -> f32 {
 }
 
 fn boxes(w: &[u32], box16: bool, ray: &Ray) -> [u32; 4] {
+    boxes_mode(w, box16, ray, true)
+}
+
+fn boxes_mode(w: &[u32], box16: bool, ray: &Ray, sort: bool) -> [u32; 4] {
     let mut child = [INVALID; 4];
     let mut key = [0f32; 4];
     for i in 0..4 {
@@ -98,6 +106,9 @@ fn boxes(w: &[u32], box16: bool, ray: &Ray) -> [u32; 4] {
             child[i] = w[i];
         }
         key[i] = near;
+    }
+    if !sort {
+        return child;
     }
     for (a, b) in [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)] {
         if child[b] != INVALID && key[b] < key[a] || child[a] == INVALID {
@@ -177,6 +188,17 @@ fn boxes_come_sorted_by_distance_misses_last() {
     assert_eq!(boxes(&w, false, &along_x()), [3, 1, INVALID, INVALID]);
     let w = box32([unit(3.0), unit(2.0), unit(1.0), unit(0.0)]);
     assert_eq!(boxes(&w, false, &along_x()), [4, 3, 2, 1]);
+}
+
+#[test]
+fn unsorted_boxes_keep_child_slot_order() {
+    let w = box32([unit(30.0), EMPTY, unit(10.0), unit(-5.0)]);
+    assert_eq!(
+        boxes_mode(&w, false, &along_x(), false),
+        [1, INVALID, 3, INVALID]
+    );
+    let w = box32([unit(3.0), unit(2.0), unit(1.0), unit(0.0)]);
+    assert_eq!(boxes_mode(&w, false, &along_x(), false), [1, 2, 3, 4]);
 }
 
 #[test]
@@ -464,12 +486,29 @@ fn sop2(op: u32, sdst: u8, src0: u8, src1: u8) -> u32 {
 
 const LITERAL: u8 = 255;
 
+#[derive(Clone, Copy)]
+struct Config {
+    wide: bool,
+    a16: bool,
+    sort_boxes: bool,
+    memory: bool,
+}
+
 /// A synthetic wave32 program of 256 threads: lane n reads its ray from the
 /// root SRV at s[0:1] (16 dwords at byte 64n: pointer, extent, origin,
-/// direction, inverse direction, pointer high), intersects it with a
+/// direction, inverse direction, pointer high — or with `a16`, direction and
+/// inverse direction packed as 3 dwords of f16 pairs), intersects it with a
 /// descriptor based at that SRV, and stores the four dwords to the raw UAV
 /// at table entry 0 (s2), at byte 16n.
-fn program(wide: bool) -> Vec<u32> {
+fn program(cfg: Config) -> Vec<u32> {
+    program_with_flags(
+        cfg,
+        if cfg.sort_boxes { 0x8000_0000 } else { 0 },
+        8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
+    )
+}
+
+fn program_with_flags(cfg: Config, w1_flags: u32, w3: u32) -> Vec<u32> {
     let global_load_x4 =
         |vdst: u32, offset: u32| [0x37 << 26 | 0x0E << 18 | 2 << 14 | offset, 1 | vdst << 24];
     let mut w = vec![
@@ -483,22 +522,30 @@ fn program(wide: bool) -> Vec<u32> {
     for (k, v) in [2, 6, 10].into_iter().enumerate() {
         w.extend(global_load_x4(v, 16 * k as u32));
     }
+    w.push(sop2(0x21, 12, 0, 128 + 8)); // s_lshr_b64 s[12:13], s[0:1], 8
+    if w1_flags != 0 {
+        w.extend([
+            sop2(0x10, 13, 13, LITERAL), // s_or_b32 s13, s13, w1_flags
+            w1_flags,
+        ]);
+    }
     w.extend([
-        sop2(0x21, 12, 0, 128 + 8),  // s_lshr_b64 s[12:13], s[0:1], 8
-        sop2(0x10, 13, 13, LITERAL), // s_or_b32 s13, s13, 0x80000000
-        0x8000_0000,
         s_mov(14, 193), // -1
-        // Type 8, barycentrics, the page-size hint, no bound.
         s_mov(15, LITERAL),
-        8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
+        w3,
     ]);
-    // Result v[20:23], descriptor s[12:15].
-    let rest = 20 << 8 | (12 >> 2) << 16;
-    if wide {
+    // Result v[20:23], descriptor s[12:15], optional a16 in w1 bit 30.
+    let rest = u32::from(cfg.a16) << 30 | 20 << 8 | (12 >> 2) << 16;
+    if cfg.wide {
         // NSA: pointer low, high, then the ray from v3.
-        let regs = [2u32, 13, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        w.extend([0xF19C_9F07, rest | regs[0]]);
-        for k in 0..3 {
+        let regs: Vec<u32> = if cfg.a16 {
+            vec![2, 13, 3, 4, 5, 6, 7, 8, 9]
+        } else {
+            vec![2, 13, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        };
+        let nsize = if cfg.a16 { 2u32 } else { 3u32 };
+        w.extend([0xF19C_9F01 | nsize << 1, rest | regs[0]]);
+        for k in 0..nsize as usize {
             let reg = |j: usize| regs.get(1 + 4 * k + j).map_or(0, |r| r << (8 * j));
             w.push((0..4).map(reg).fold(0, |a, b| a | b));
         }
@@ -516,8 +563,8 @@ fn program(wide: bool) -> Vec<u32> {
     w
 }
 
-fn build(wide: bool, memory: bool) -> HostShader {
-    let native = NativeProgram {
+fn native_program(code: &[u32], memory: bool) -> NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
@@ -569,8 +616,12 @@ fn build(wide: bool, memory: bool) -> HostShader {
             rsrc2: 3 << 1,
             threads: [256, 1, 1],
         }),
-        code: program(wide).iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+fn build(cfg: Config) -> HostShader {
+    let native = native_program(&program(cfg), cfg.memory);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
@@ -578,7 +629,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         res.descriptors
             .iter()
             .any(|d| matches!(d.source, resource::Source::Built { .. })),
-        !memory,
+        !cfg.memory,
         "the BVH's base traced to the root SRV, or read from the operand"
     );
     let io = io::raise(&p, &native).expect("io::raise");
@@ -623,14 +674,39 @@ fn build(wide: bool, memory: bool) -> HostShader {
 
 const LANES: usize = 256;
 
+/// IEEE-754 binary16 bits for `x` (preserving +-0, +-inf, NaN, and rounding
+/// finite values to nearest-even).
+fn f32_to_half(x: f32) -> u32 {
+    let bits = x.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7F_FFFF;
+    if exp == 0xFF {
+        return sign | 0x7C00 | if frac != 0 { 0x0200 | (frac >> 13) } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = (frac | 0x80_0000) >> (14 - e);
+        return sign | ((m + 1) >> 1);
+    }
+    let half = sign | ((e as u32) << 10) | (frac >> 13);
+    let rem = frac & 0x1FFF;
+    if rem > 0x1000 || (rem == 0x1000 && (half & 1) != 0) {
+        half + 1
+    } else {
+        half
+    }
+}
+
 /// f16 bits of a multiple of 1/16 in [-64, 64] (exact).
 fn to_half(x: f32) -> u32 {
-    if x == 0.0 {
-        return 0;
-    }
-    let bits = x.to_bits();
-    let e = (bits >> 23 & 0xFF) as i32 - 127 + 15;
-    (bits >> 16 & 0x8000) | (e as u32) << 10 | (bits >> 13 & 0x3FF)
+    f32_to_half(x)
 }
 
 /// One random case: the node's dwords (32), its pointer type, the ray.
@@ -712,12 +788,16 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
     (w, ty, ray)
 }
 
-fn run_cases(wide: bool, batches: usize, memory: bool) {
-    let shader = build(wide, memory);
+fn run_cases(cfg: Config, batches: usize) {
+    let shader = build(cfg);
     // A program with the BVH instruction reads its root SRV as title
     // memory too.
     assert!(shader.memory);
-    let mut rng = Rng(if wide { 77 } else { 7 });
+    let seed = 7u64
+        ^ (u64::from(cfg.wide) * 70)
+        ^ (u64::from(cfg.a16) * 1009)
+        ^ (u64::from(!cfg.sort_boxes) * 9001);
+    let mut rng = Rng(seed);
     let batches: Vec<Vec<(Vec<u32>, u32, Ray)>> = (0..batches)
         .map(|_| (0..LANES).map(|_| case(&mut rng)).collect())
         .collect();
@@ -737,8 +817,8 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
         for u in &shader.user_data {
             ud[u.index as usize] = match (u.root, u.slot) {
                 (RootType::Table, 1) => 0,
-                (RootType::Constants, 0) if memory => (TITLE >> (32 * u.dword)) as u32,
-                (RootType::Descriptor, 0) if !memory => (TITLE >> (32 * u.dword)) as u32,
+                (RootType::Constants, 0) if cfg.memory => (TITLE >> (32 * u.dword)) as u32,
+                (RootType::Descriptor, 0) if !cfg.memory => (TITLE >> (32 * u.dword)) as u32,
                 _ => panic!("{u:?}"),
             };
         }
@@ -754,8 +834,24 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
                 r[1] = ray.extent.to_bits();
                 for k in 0..3 {
                     r[2 + k] = ray.origin[k].to_bits();
-                    r[5 + k] = ray.dir[k].to_bits();
-                    r[8 + k] = ray.inv[k].to_bits();
+                }
+                if cfg.a16 {
+                    let h = [
+                        f32_to_half(ray.dir[0]),
+                        f32_to_half(ray.dir[1]),
+                        f32_to_half(ray.dir[2]),
+                        f32_to_half(ray.inv[0]),
+                        f32_to_half(ray.inv[1]),
+                        f32_to_half(ray.inv[2]),
+                    ];
+                    r[5] = h[0] | h[1] << 16;
+                    r[6] = h[2] | h[3] << 16;
+                    r[7] = h[4] | h[5] << 16;
+                } else {
+                    for k in 0..3 {
+                        r[5 + k] = ray.dir[k].to_bits();
+                        r[8 + k] = ray.inv[k].to_bits();
+                    }
                 }
                 let at = LANES * 16 + 32 * n;
                 data[at..at + 28].copy_from_slice(w);
@@ -785,9 +881,23 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             for (n, (w, ty, ray)) in cases.iter().enumerate() {
-                let want = intersect(w, *ty, ray);
+                let effective = if cfg.a16 {
+                    Ray {
+                        extent: ray.extent,
+                        origin: ray.origin,
+                        dir: ray.dir.map(|x| half(f32_to_half(x))),
+                        inv: ray.inv.map(|x| half(f32_to_half(x))),
+                    }
+                } else {
+                    *ray
+                };
+                let want = intersect_mode(w, *ty, &effective, cfg.sort_boxes);
                 let got = &out[0][4 * n..4 * n + 4];
-                assert_eq!(got, want, "{label}: type {ty}, {ray:?}, node {w:08x?}");
+                assert_eq!(
+                    got, want,
+                    "{label}: type {ty}, a16={}, sort={}, {effective:?}, node {w:08x?}",
+                    cfg.a16, cfg.sort_boxes
+                );
                 match ty {
                     0..=3 => tris += usize::from(f32::from_bits(want[0]).is_finite()),
                     4 | 5 => hits += want.iter().filter(|&&c| c != INVALID).count(),
@@ -803,12 +913,28 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
 
 #[test]
 fn intersections_on_the_gpu_equal_the_reference() {
-    run_cases(false, 16, false);
+    run_cases(
+        Config {
+            wide: false,
+            a16: false,
+            sort_boxes: true,
+            memory: false,
+        },
+        16,
+    );
 }
 
 #[test]
 fn intersections_with_64_bit_pointers_on_the_gpu_equal_the_reference() {
-    run_cases(true, 8, false);
+    run_cases(
+        Config {
+            wide: true,
+            a16: false,
+            sort_boxes: true,
+            memory: false,
+        },
+        8,
+    );
 }
 
 /// The title address of the rays and nodes in the title-memory runs.
@@ -833,6 +959,91 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
 /// rays) read through title memory.
 #[test]
 fn intersections_on_nodes_in_title_memory_equal_the_reference() {
-    run_cases(false, 4, true);
-    run_cases(true, 4, true);
+    run_cases(
+        Config {
+            wide: false,
+            a16: false,
+            sort_boxes: true,
+            memory: true,
+        },
+        4,
+    );
+    run_cases(
+        Config {
+            wide: true,
+            a16: false,
+            sort_boxes: true,
+            memory: true,
+        },
+        4,
+    );
+}
+
+/// `a16` packs ray direction and inverse direction as six f16 values in three
+/// dwords (8 address dwords for 32-bit pointers, 9 via NSA for 64-bit).
+#[test]
+fn intersections_with_a16_on_the_gpu_equal_the_reference() {
+    for memory in [false, true] {
+        for wide in [false, true] {
+            run_cases(
+                Config {
+                    wide,
+                    a16: true,
+                    sort_boxes: true,
+                    memory,
+                },
+                4,
+            );
+        }
+    }
+}
+
+/// Clearing descriptor bit 63 (`box_sort_en = 0`) skips the distance sort
+/// network and returns child pointers in their original slot order, for both
+/// root descriptors (`Source::Built`) and raw title-memory descriptors.
+#[test]
+fn unsorted_box_intersections_on_the_gpu_equal_the_reference() {
+    for memory in [false, true] {
+        for a16 in [false, true] {
+            run_cases(
+                Config {
+                    wide: false,
+                    a16,
+                    sort_boxes: false,
+                    memory,
+                },
+                4,
+            );
+        }
+    }
+}
+
+/// Descriptor flags that are not emulated (box growth, triangle return mode 0)
+/// remain refused by name.
+#[test]
+fn other_bvh_descriptor_flags_are_still_refused() {
+    let base = Config {
+        wide: false,
+        a16: false,
+        sort_boxes: true,
+        memory: false,
+    };
+    let cases = [
+        // Non-zero box growth (bits 55..62 = dword 1 bits 23..30).
+        (0x8080_0000u32, 8 << 28 | 1 << 24 | 1 << 27 | 0x3FF),
+        // Triangle return mode 0 (dword 3 bit 24 cleared).
+        (0x8000_0000u32, 8 << 28 | 1 << 27 | 0x3FF),
+    ];
+    for (w1_flags, w3) in cases {
+        let native = native_program(&program_with_flags(base, w1_flags, w3), false);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let err = resource::track(&p, &native.layout, native.stage, Some(&st))
+            .expect_err("unsupported BVH descriptor flags must be refused");
+        assert!(
+            err.to_string()
+                .contains("a BVH descriptor with other flags"),
+            "unexpected error for ({w1_flags:#x}, {w3:#x}): {err}"
+        );
+    }
 }

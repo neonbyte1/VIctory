@@ -1339,11 +1339,12 @@ impl<'a> Tracer<'a> {
 
     /// The descriptor of `image_bvh*_intersect_ray`: no view, but the BVH's
     /// address over 256 (dword 0 and the low byte of dword 1) and flags (see
-    /// `emit`'s BVH lowering). Only the flags it emulates pass: box sorting,
-    /// no box growth, no node bound, triangles returning barycentrics. The
-    /// address is a [`Source::Built`] around a root parameter's when the code
-    /// shifted one into place (`s_lshr_b64 ..., 8`), else `None`: the nodes
-    /// are then at a raw GPU address.
+    /// `emit`'s BVH lowering). Only the flags it emulates pass: box sorting
+    /// on or off, no box growth, no node bound, triangles returning
+    /// barycentrics (the page-size hint either way). The address is a
+    /// [`Source::Built`] around a root parameter's when the code shifted one
+    /// into place (`s_lshr_b64 ..., 8`), else `None`: the nodes are then at a
+    /// raw GPU address.
     fn bvh_descriptor(&self, inst: &Inst, op: &Operand) -> Result<Option<Source>, &'static str> {
         const WHY: &str = "a BVH descriptor with other flags";
         let Operand::Scalar { code, dwords: 4 } = *op else {
@@ -1358,16 +1359,33 @@ impl<'a> Tracer<'a> {
             return Err(WHY);
         };
         // Dword 1 holds address bits 32-39 under the flags: a constant, or
-        // the high half of the shift with the flags set.
+        // the high half of the shift with any constant flag bits set (or none
+        // when box sorting is off).
         let (high, flags) = match word(1)? {
             Term::Const(c) => (None, c & !0xFF),
-            Term::Value(v) => match self.set_bits(v) {
-                Some((Term::Value(x), bits)) => (Some(x), bits),
-                _ => return Err(WHY),
-            },
+            Term::Value(mut cur) => {
+                let mut bits = 0u32;
+                let mut high = Some(cur);
+                while let Some((next, b)) = self.set_bits(cur) {
+                    bits |= b;
+                    match next {
+                        Term::Value(x) => {
+                            cur = x;
+                            high = Some(x);
+                        }
+                        Term::Const(c) => {
+                            bits |= c & !0xFF;
+                            high = None;
+                            break;
+                        }
+                    }
+                }
+                (high, bits)
+            }
         };
-        // Bit 123 (dword 3 bit 27) is a page-size hint.
-        if flags != 0x8000_0000 || w2 != u32::MAX || w3 & !(1 << 27) != 0x8100_03FF {
+        // Bit 63 (dword 1 bit 31) enables box sorting; bit 123 (dword 3 bit
+        // 27) is a page-size hint.
+        if flags & !0x8000_0000 != 0 || w2 != u32::MAX || w3 & !(1 << 27) != 0x8100_03FF {
             return Err(WHY);
         }
         let shifted = match word(0)? {
