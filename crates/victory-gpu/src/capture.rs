@@ -618,6 +618,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
+    let i16_at = |b: &[u8], i: usize| i16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
     if matches!(format, 42 | 43) {
         let words = (0..h)
@@ -665,20 +666,23 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
         })),
         9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
-        11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
+        11..=12 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
+        13..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(i16_at(b, i))))),
         33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
         1..=2 => (16, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
         })),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
-        35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
+        35..=36 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
+        37..=38 => (4, Box::new(move |b| [f32::from(i16_at(b, 0)), f32::from(i16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.
         39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
-        55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
+        55..=57 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
+        58..=59 => (2, Box::new(move |b| [f32::from(i16_at(b, 0)); 3])),
         60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
         _ => return None,
     };
@@ -952,6 +956,43 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn signed_r16_colours_do_not_brighten_negative_components() {
+        let rgba: Vec<_> = [-1i16, 1024, 512, 0]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        for format in [13, 14] {
+            assert_eq!(
+                super::to_rgba(format, 1, 1, 8, &rgba),
+                Some(vec![0, 255, 127, 255]),
+            );
+        }
+        for format in [37, 38] {
+            assert_eq!(
+                super::to_rgba(format, 1, 1, 4, &rgba[..4]),
+                Some(vec![0, 255, 0, 255]),
+            );
+        }
+        let unsigned = super::to_rgba(12, 1, 1, 8, &rgba).unwrap();
+        assert_eq!(unsigned, [255, 3, 1, 255]);
+    }
+
+    #[test]
+    fn signed_r16_luma_keeps_negative_zero_and_positive_in_order() {
+        let mut rows: Vec<_> = [i16::MIN, 0, i16::MAX]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        rows.extend([0xff; 2]);
+        for format in [58, 59] {
+            assert_eq!(
+                super::to_rgba(format, 3, 1, 8, &rows),
+                Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]),
+            );
+        }
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
