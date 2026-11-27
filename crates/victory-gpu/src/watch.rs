@@ -943,10 +943,12 @@ impl Lease<'_> {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::OpenPages, guarded.len() as u64);
                 for page in guarded {
-                    // Out of `protected` at once: a write fault that read the
-                    // page before the lock finds it unguarded after, and
-                    // drops what it read ([`OPENED`]'s check).
+                    // Out of `protected`, and its count goes up: a write
+                    // fault that read the page before the lock drops what it
+                    // read ([`OPENED`]'s check), also if the lease is over
+                    // and the page guarded again by the time it looks.
                     g.protected.remove(&page);
+                    self::opened(page).fetch_add(1, Ordering::Relaxed);
                 }
             } else {
                 // Across allocations: page by page.
