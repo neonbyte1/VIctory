@@ -557,8 +557,21 @@ fn pump(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
-            return;
+        let mut empty = 0;
+        while voice.pcm.len() < SAMPLES_PER_BLOCK {
+            let before = voice.pcm.len();
+            if !decode(context, voice) {
+                if voice.pcm.is_empty() {
+                    return;
+                }
+                break;
+            }
+            if voice.pcm.len() == before {
+                empty += 1;
+                if empty >= 16 {
+                    return;
+                }
+            }
         }
         // The write block is the title's too: taken modulo the ring before
         // the first write, which would otherwise land past the ring's end.
@@ -1361,6 +1374,90 @@ mod tests {
         // No loops left: both frames whole, and on to the third.
         assert_eq!(step(third), 4 * subframe);
         ApuFree(input);
+    }
+
+    /// Refilling `voice.pcm` in `pump` must keep decoding across calls that
+    /// produce zero samples (an empty buffer-0 transitioning to buffer-1, or a
+    /// start-skip covering a full 4-subframe frame) instead of emitting a
+    /// spurious silent output block.
+    #[test]
+    fn pump_refills_across_empty_decode_steps_without_spurious_silence() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+
+        let drain_all = |words: &mut [u32; 16], skip: usize| -> usize {
+            let context = Context(words.as_mut_ptr());
+            let mut voice = Voice {
+                decoder: None,
+                pcm: VecDeque::new(),
+                skip,
+                ended: false,
+                trace: Trace {
+                    since: Instant::now(),
+                    produced: 0,
+                    taken: 0,
+                    takes: 0,
+                    partial_takes: 0,
+                    frames: 0,
+                    bad_frames: 0,
+                    peak: 0,
+                    ended_ms: None,
+                },
+            };
+            for _ in 0..32 {
+                pump(context, &mut voice);
+                if voice.ended {
+                    break;
+                }
+                // Advance the read pointer to free the 4-block ring.
+                let write = context.field(0, 27, 5);
+                context.set_field(9, 0, 5, write);
+                context.set_field(1, 31, 1, 1);
+            }
+            assert!(voice.ended);
+            voice.trace.produced
+        };
+
+        // Case 1: input 0 is valid with 0 packets and input 1 holds the
+        // 6-frame stream (24 blocks + 2-block overlap tail = 26 blocks).
+        let mut words = [0u32; 16];
+        words[0] = (0b11 << 20) | (4 << 22); // buf0=0 packets, both valid, ring=4
+        words[1] = 2 | (3 << 27) | (1 << 31); // buf1=2 packets, 48 kHz, writable
+        words[2] = 32;
+        words[5] = input_apu;
+        words[6] = input_apu;
+        words[7] = output_apu;
+        assert_eq!(
+            drain_all(&mut words, 0),
+            26 * SAMPLES_PER_BLOCK,
+            "switching from empty buffer 0 to buffer 1 must not emit a silent block"
+        );
+
+        // Case 2: start-skip of 4 subframes drops frame 0 whole, leaving 5
+        // frames + 2-block overlap tail = 22 blocks (not 23).
+        let mut words = [0u32; 16];
+        words[0] = 2 | (1 << 20) | (4 << 22); // buf0=2 packets, valid, ring=4
+        words[1] = (4 << 24) | (3 << 27) | (1 << 31); // start_skip=4, 48 kHz, writable
+        words[2] = 32;
+        words[5] = input_apu;
+        words[7] = output_apu;
+        assert_eq!(
+            drain_all(&mut words, 4 * xma::SUBFRAME_SAMPLES),
+            22 * SAMPLES_PER_BLOCK,
+            "skipping a whole frame must not emit a silent block"
+        );
+
+        ApuFree(input);
+        ApuFree(output);
     }
 
     #[test]
