@@ -662,6 +662,12 @@ impl<'a> Tracer<'a> {
     /// Layout index and dword of the root parameter `reg` holds on entry.
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
+        // Compute has at most 16 user SGPRs (`s0..s15`); `user_data >= 16`
+        // spills to the root signature's memory, while `s16+` hold system
+        // inputs (thread-group id, group info).
+        if self.stage == HwStage::Cs && code >= 16 {
+            return None;
+        }
         self.layout.iter().enumerate().find_map(|(i, p)| {
             let first = self.stage.user_sgpr(p.user_data);
             let dword = u32::from(code).checked_sub(first.into())?;
@@ -3066,6 +3072,195 @@ pub(crate) mod tests {
         let mut params: Vec<_> = r.params.iter().map(|p| (p.1, p.2)).collect();
         params.sort_unstable();
         assert_eq!(params, [(1, 0), (1, 1)]);
+    }
+
+    /// Compute shaders only receive user data in `s0..s15`; spilled parameters
+    /// (`user_data >= 16`) live in memory, while `s16+` hold system inputs
+    /// such as `SV_GroupID`. `param_of` must not claim `s16+` for spilled
+    /// parameters, or `SV_GroupID` is rejected as a root-parameter offset or
+    /// silently replaced by `user_data[16+]`.
+    #[test]
+    fn compute_spilled_params_do_not_claim_system_sgprs() {
+        let code: Vec<u8> = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0x8703_FF01,
+            0x0000_00FF, // s_and_b32 s3, s1, 0xff
+            0xF400_0101,
+            0xFA00_0000, // s_load_dword s4, s[2:3], 0x0 (user data 16)
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0x2000_0000, // s_load_dwordx4 s[8:11], s[6:7], s16 (system SGPR offset)
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let s16_in = p.inputs.iter().find(|i| i.0 == Reg::S(16)).unwrap().1;
+        let s6_in = p.inputs.iter().find(|i| i.0 == Reg::S(6)).unwrap().1;
+        let r = track(
+            &p,
+            &[param(Table, 6, 1), param(Table, 16, 1)],
+            HwStage::Cs,
+            lanes(&p).as_ref(),
+        )
+        .unwrap();
+        assert!(
+            !r.params.iter().any(|&(v, _, _)| v == s16_in),
+            "system SGPR s16 must not be mapped to a spilled root parameter"
+        );
+        let spilled_s4 = r
+            .params
+            .iter()
+            .find(|&&(_, param, dword)| (param, dword) == (1, 0))
+            .expect("spilled parameter loaded from s[0:1]")
+            .0;
+        assert_ne!(spilled_s4, s16_in);
+        let mut params = r.params.clone();
+        params.sort_unstable_by_key(|&(_, param, dword)| (param, dword));
+        assert_eq!(params, [(s6_in, 0, 0), (spilled_s4, 1, 0)]);
+        assert_eq!(
+            r.scalar,
+            [
+                ((0, 2), at(USER_DATA, 0x40)),
+                (
+                    (0, 4),
+                    Address {
+                        param: 0,
+                        offset: 0,
+                        dynamic: Some(s16_in),
+                    },
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_group_id_in_s16_survives_spilled_root_constants() {
+        use crate::io::Input;
+        use crate::native::{ComputeIo, NativeProgram, ResourceType, StageIo, UsedResource};
+
+        // Compute shader with 16 user SGPRs (`s0..s15`), `GroupId.x` in `s16`,
+        // a UAV table in `s2`, and a spilled root constant at `user_data = 16`.
+        // Each workgroup `g` stores `g + user_data[16]` to UAV dword `g`.
+        let words: &[u32] = &[
+            0xBE84_0302, // s_mov_b32 s4, s2
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xBE86_0300, // s_mov_b32 s6, s0
+            0x8707_FF01,
+            0x0000_00FF, // s_and_b32 s7, s1, 0xff
+            0xF400_0303,
+            0xFA00_0000, // s_load_dword s12, s[6:7], 0x0 (user data 16)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x800D_0C10, // s_add_u32 s13, s16, s12
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0x7E04_0210, // v_mov_b32 v2, s16
+            0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+            0xE070_1000,
+            0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    slot: 0,
+                    ..param(Table, 2, 1)
+                },
+                RootParam {
+                    slot: 1,
+                    ..param(Constants, 16, 2)
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 2,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (16 << 1) | (1 << 7),
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let s16_in = p.inputs.iter().find(|i| i.0 == Reg::S(16)).unwrap().1;
+        assert!(
+            io.inputs.contains(&(s16_in, Input::GroupId(0))),
+            "s16 must be raised as GroupId(0)"
+        );
+        assert!(
+            !res.params.iter().any(|&(v, _, _)| v == s16_in),
+            "s16 must not be claimed by the spilled root constant"
+        );
+        let empty = crate::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).unwrap();
+        assert!(shader.user_data.contains(&crate::emit::UserData {
+            index: 16,
+            slot: 1,
+            root: Constants,
+            dword: 0,
+        }));
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+
+        // Without loading from `s[0:1]`, reading `s16` alone must NOT pull
+        // spilled `user_data[16]` into `shader.user_data` (it lowers via
+        // `Input::GroupId(0)` instead).
+        let s16_only_words: &[u32] = &[
+            0xBE84_0302, // s_mov_b32 s4, s2
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_0210, // v_mov_b32 v1, s16
+            0x3404_0282, // v_lshlrev_b32 v2, 2, v1
+            0xE070_1000,
+            0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+            S_ENDPGM,
+        ];
+        let s16_only = NativeProgram {
+            code: s16_only_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            ..native
+        };
+        let p2 = crate::ir::build(&s16_only.code, s16_only.wave64, s16_only.vgprs).unwrap();
+        let st2 = crate::structure::structure(&p2).unwrap();
+        let res2 = track(&p2, &s16_only.layout, s16_only.stage, Some(&st2)).unwrap();
+        let io2 = crate::io::raise(&p2, &s16_only).unwrap();
+        let shader2 = crate::emit::emit(&empty, &s16_only, &p2, &st2, &io2, &res2).unwrap();
+        assert!(
+            !shader2.user_data.iter().any(|u| u.index >= 16),
+            "reading GroupId in s16 must not reference spilled user_data[16]: {:?}",
+            shader2.user_data
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader2.dxil.clone())
+                .expect("DXIL validation failed");
+        }
     }
 
     /// Pointers the program loads or takes from root constants address
