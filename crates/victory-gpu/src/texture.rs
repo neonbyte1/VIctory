@@ -14,9 +14,8 @@
 //! Textures read through descriptor tables are brought up to date, and for
 //! shaders that index the heap themselves every texture with a resource
 //! object the heap views (`crate::bindless`); textures the title placed in
-//! memory itself are not made for the heap (see `descriptor::host`). Plane
-//! 0 is uploaded (every mip and array slice), depth and stencil planes are
-//! not.
+//! memory itself are not made for the heap (see `descriptor::host`). Uploads
+//! cover each compatible plane, mip and array slice.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -45,9 +44,11 @@ pub(crate) struct Staging {
     size: u64,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
-    layout: victory_formats::texture::Layout,
+    layout: victory_formats::texture::Texture,
     /// Mips per array slice.
     mips: u32,
+    /// Mips and array slices in one native plane.
+    subresources_per_plane: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -894,7 +895,7 @@ impl Staging {
             tracing::debug!(
                 memory = ?self.memory,
                 size,
-                desc = ?self.layout.desc,
+                desc = ?self.layout.planes[0].layout.desc,
                 "a sampled texture's memory is not committed"
             );
             // Never uploaded: zeros, as a committed texture starts (one in
@@ -936,16 +937,21 @@ impl Staging {
             if tiled.iter().all(|&b| b == 0) {
                 tracing::debug!(
                     memory = ?self.memory,
-                    desc = ?self.layout.desc,
+                    desc = ?self.layout.planes[0].layout.desc,
                     "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
                 );
             } else {
-                tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
+                tracing::debug!(memory = ?self.memory, desc = ?self.layout.planes[0].layout.desc, "a sampled texture detiled");
             }
         }
         for &i in subresources {
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
-            let (mip, slice) = (i % self.mips, i / self.mips);
+            // D3D12 orders mips first, then array slices, then planes.
+            let subresource = i % self.subresources_per_plane;
+            let (mip, slice) = (subresource % self.mips, subresource / self.mips);
+            let plane = &self.layout.planes[(i / self.subresources_per_plane) as usize];
+            let start = plane.offset as usize;
+            let tiled = &tiled[start..start + plane.layout.size as usize];
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
@@ -954,7 +960,7 @@ impl Staging {
             // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
             if let Err(e) =
-                self.layout
+                plane.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
@@ -1088,26 +1094,53 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
-    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
-    else {
+    let Some(mut layout) = crate::resource::texture_layout(&desc) else {
         once!(
             ?desc,
             "texture contents without a console layout not uploaded"
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
+    if layout.planes.iter().any(|plane| plane.layout.desc.swizzle.xor()) {
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+    let subresources_per_plane = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
         u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
     };
+    if layout.planes.len() > 1 {
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+            Format: d.Format,
+            ..Default::default()
+        };
+        // SAFETY: a live device and a correctly sized format query.
+        let supported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_INFO,
+                (&raw mut info).cast(),
+                size_of_val(&info) as u32,
+            )
+        }
+        .is_ok();
+        // Console D16S8 uses a float host depth plane. Keep its existing
+        // upload path until there is a CPU conversion for that layout.
+        let matching_layout = victory_formats::texture::format(d.Format.0 as u32)
+            .is_some_and(|f| f.stencil && f.bytes == layout.planes[0].layout.desc.element_bytes);
+        let count = if supported && matching_layout {
+            usize::from(info.PlaneCount).max(1)
+        } else {
+            1
+        };
+        layout.planes.truncate(count);
+        let last = layout.planes.last()?;
+        layout.size = last.offset + last.layout.size;
+    }
+    let count = subresources_per_plane * layout.planes.len() as u32;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
@@ -1131,13 +1164,23 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
-    let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let spans = layout
+        .planes
+        .iter()
+        .flat_map(|plane| {
+            let offset = plane.offset as usize;
+            let mut ranges = spans(&plane.layout, subresources_per_plane, u32::from(d.MipLevels));
+            ranges.resize(subresources_per_plane as usize, (0, plane.layout.size as usize));
+            ranges.into_iter().map(move |(a, b)| (offset + a, offset + b))
+        })
+        .collect();
     let s = Arc::new(Staging {
         size: total,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        subresources_per_plane,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,
