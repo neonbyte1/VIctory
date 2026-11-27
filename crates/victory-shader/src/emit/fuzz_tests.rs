@@ -714,6 +714,6 @@ fn device(adapter: Option<u32>) -> Result<Host, String> {
         if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
             return Err("below SM 6.6".into());
         }
-        Ok(Host { device })
+        Ok(Host::from_device(device))
     }
 }
