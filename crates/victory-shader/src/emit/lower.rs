@@ -7711,7 +7711,10 @@ impl<'a> Lower<'a> {
             // shortcut: no constant operand seen; its high half is not known.
             return Err("a constant operand of v_pk_fmac_f16");
         }
-        let x = self.operand(inst, &op)?;
+        let x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => self.operand(inst, &op)?,
+        };
         let c = self.cur;
         let x = if high {
             let k16 = self.s.m.i32(16);
