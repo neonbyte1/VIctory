@@ -6573,7 +6573,7 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
-            "v_dot4_i32_i8" => {
+            "v_dot4_i32_i8" | "v_dot8_i32_i4" => {
                 // VOP3P: op_sel picks the half each multiplicand's low half
                 // reads, op_sel_hi its high half's; the accumulator is read
                 // whole (as AMD's compilers fold constants into it).
@@ -6598,6 +6598,24 @@ impl<'a> Lower<'a> {
                     xs.push(self.s.m.bin(c, Bin::Or, if lo { top } else { bottom }, hi));
                 }
                 let acc = s(self, 2)?;
+                if name == "v_dot8_i32_i4" {
+                    // Eight signed nibble products and the accumulator,
+                    // wrapping (RDNA2 ISA): each nibble is moved to the top
+                    // and shifted back arithmetically to extend its sign.
+                    let k28 = self.s.m.i32(28);
+                    let mut sum = acc;
+                    for n in 0..8 {
+                        let up = self.s.m.i32(28 - 4 * n);
+                        let mut f = [xs[0], xs[1]];
+                        for x in &mut f {
+                            let t = self.s.m.bin(c, Bin::Shl, *x, up);
+                            *x = self.s.m.bin(c, Bin::AShr, t, k28);
+                        }
+                        let p = self.s.m.bin(c, Bin::Mul, f[0], f[1]);
+                        sum = self.s.m.bin(c, Bin::Add, sum, p);
+                    }
+                    return int(self, sum);
+                }
                 let i32_ty = self.s.t.i32;
                 let r = self.s.op(
                     c,
@@ -11644,6 +11662,22 @@ mod tests {
             let words = [0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18];
             lowers_valu(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x}: {e}"));
         }
+    }
+
+    #[test]
+    fn signed_nibble_dot_product_decodes_and_lowers() {
+        // VOP3P 0x18 `v_dot8_i32_i4 v0, v1, v2, v3` with op_sel_hi set (v0
+        // is stored, so the product is not dead).
+        let words: [u32; 2] = [0xCC18_4000, 0x101 | 0x102 << 9 | 0x103 << 18 | 3 << 27];
+        let code: Vec<u8> = [words[0], words[1], S_ENDPGM]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let decoded = crate::gfx10::decode(&code).unwrap();
+        assert_eq!(decoded[0].name(), Some("v_dot8_i32_i4"));
+        lowers_valu(&words).unwrap();
+        // Saturation is not modelled: refused, not computed wrongly.
+        assert!(lowers_valu(&[words[0] | 1 << 15, words[1]]).is_err());
     }
 
     #[test]

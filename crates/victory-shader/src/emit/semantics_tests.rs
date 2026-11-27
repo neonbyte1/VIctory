@@ -2519,6 +2519,50 @@ fn byte_dot_products_match_the_hardware() {
     ]));
 }
 
+/// `v_dot8_i32_i4`: eight signed nibble products and the accumulator,
+/// wrapping (RDNA2 ISA), with `op_sel_hi` as assemblers write it (all set).
+#[test]
+fn nibble_dot_products_match_the_hardware() {
+    let nibbles = [
+        0u32,
+        0x1234_5678,
+        0x7777_7777,
+        0x8888_8888,
+        0xF0F0_F0F0,
+        0x89AB_CDEF,
+        0xFFFF_FFFF,
+    ];
+    let inputs = triples(
+        &nibbles,
+        &nibbles,
+        &[0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FF00],
+    );
+    assert_clean(check(&[probe(
+        vop3p(0x18, 5, [v(1), v(2), v(3)], 0, 7, [0, 0]),
+        inputs,
+        INT,
+        move |i| vec![dot8_i4(i[0], i[1], i[2])],
+    )]));
+}
+
+/// The CPU model of `v_dot8_i32_i4`.
+fn dot8_i4(a: u32, b: u32, c: u32) -> u32 {
+    let nibble = |x: u32, k: u32| ((x << (28 - 4 * k)) as i32) >> 28;
+    (0..8).fold(c as i32, |s, k| s.wrapping_add(nibble(a, k) * nibble(b, k))) as u32
+}
+
+#[test]
+fn nibble_dot_model_follows_the_isa() {
+    // Every nibble -8 (0x8): 8 * 64 = 512.
+    assert_eq!(dot8_i4(0x8888_8888, 0x8888_8888, 0), 512);
+    // -1 * 7 in every lane: -56, plus the accumulator.
+    assert_eq!(dot8_i4(0xFFFF_FFFF, 0x7777_7777, 100), 44);
+    // Only the lowest nibble pair: 3 * -2.
+    assert_eq!(dot8_i4(0x0000_0003, 0x0000_000E, 0) as i32, -6);
+    // The sum wraps in 32 bits.
+    assert_eq!(dot8_i4(0x8888_8888, 0x8888_8888, 0x7FFF_FFFF), 0x8000_01FF);
+}
+
 // ---- SDWA ----
 
 /// SDWA operand selection and destination placement in the forms the title
