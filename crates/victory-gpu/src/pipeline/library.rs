@@ -44,7 +44,54 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    DIR.get_or_init(|| {
+        sweep_staging(&dir, std::process::id(), STAGING_KEPT);
+        dir
+    });
+}
+
+/// How long another process's staging file is left alone: the folder is
+/// shared, and a running instance may be writing it.
+const STAGING_KEPT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Removes the staging files of cut writes (`write_atomically`) from `dir`:
+/// those of process `pid` now (no write of this run has started yet), other
+/// processes' once untouched for `kept`. A cut write leaves its file, and no
+/// later write reuses the name.
+fn sweep_staging(dir: &std::path::Path, pid: u32, kept: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(writer) = name.to_str().and_then(staging_pid) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let age = meta.modified().ok().and_then(|t| t.elapsed().ok());
+        if writer == pid || age.is_some_and(|age| age >= kept) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The process whose staging file `name` is (`<file>.tmp-<pid>-<n>` of a
+/// file this module writes), if it is one.
+fn staging_pid(name: &str) -> Option<u32> {
+    let rest = [LIBRARY_FILE, EARLY_FILE, PREBUILT_FILE]
+        .into_iter()
+        .find_map(|file| name.strip_prefix(file)?.strip_prefix(".tmp-"))?;
+    let (pid, n) = rest.split_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(pid) || !digits(n) {
+        return None;
+    }
+    pid.parse().ok()
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -912,6 +959,49 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    /// Staging files of cut writes go: this process's at once, others'
+    /// once old; the files themselves and anything else stay.
+    #[test]
+    fn stale_staging_files_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - 2 * STAGING_KEPT;
+        let file = |name: &str, modified: Option<std::time::SystemTime>| {
+            let f = std::fs::File::create(dir.path().join(name)).unwrap();
+            if let Some(t) = modified {
+                f.set_modified(t).unwrap();
+            }
+        };
+        let gone = [
+            "host-pipelines.bin.tmp-7-0",
+            "early-pipelines.txt.tmp-7-3",
+            "host-pipelines.bin.tmp-8-1",
+            "prebuilt-pipelines.txt.tmp-9-12",
+        ];
+        let kept = [
+            "host-pipelines.bin",
+            "early-pipelines.txt",
+            "host-pipelines.bin.tmp-8-2", // another process's, recent
+            "host-pipelines.bin.tmp-7-x", // not a staging name
+            "host-pipelines.bin.tmp-7",   // not a staging name
+            "other.bin.tmp-7-0",          // not a file of ours
+        ];
+        file(gone[0], None);
+        file(gone[1], None);
+        file(gone[2], Some(old));
+        file(gone[3], Some(old));
+        for name in kept {
+            file(name, (!name.contains("tmp-8-2")).then_some(old));
+        }
+        std::fs::create_dir(dir.path().join("host-pipelines.bin.tmp-9-0")).unwrap();
+        sweep_staging(dir.path(), 7, STAGING_KEPT);
+        for name in gone {
+            assert!(!dir.path().join(name).exists(), "{name} swept");
+        }
+        for name in kept.into_iter().chain(["host-pipelines.bin.tmp-9-0"]) {
+            assert!(dir.path().join(name).exists(), "{name} kept");
+        }
     }
 
     #[test]
