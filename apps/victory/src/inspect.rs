@@ -51,12 +51,13 @@ pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
     println!("\nsections");
     for s in &info.sections {
         println!(
-            "  {:<8} rva {:#010x} vsize {:#010x} raw {:#010x} flags {:#010x}",
+            "  {:<8} rva {:#010x} vsize {:#010x} raw {:#010x} flags {:#010x}{}",
             s.name.trim_end_matches('\0'),
             s.rva,
             s.virtual_size,
             s.file_size,
-            s.characteristics
+            s.characteristics,
+            section_flags(s.characteristics)
         );
     }
 
@@ -163,9 +164,69 @@ fn dll_flags(v: u16) -> String {
     }
 }
 
+/// The section's access as `rwx`, then its other named flags; bits without a
+/// name here (alignment, linker-only ones) are shown in hex.
+fn section_flags(v: u32) -> String {
+    use layout::section_flags::*;
+    let access = [(MEM_READ, 'r'), (MEM_WRITE, 'w'), (MEM_EXECUTE, 'x')];
+    let names = [
+        (CNT_CODE, "code"),
+        (CNT_INITIALIZED_DATA, "initialized-data"),
+        (CNT_UNINITIALIZED_DATA, "uninitialized-data"),
+        (MEM_DISCARDABLE, "discardable"),
+        (MEM_NOT_CACHED, "not-cached"),
+        (MEM_NOT_PAGED, "not-paged"),
+        (MEM_SHARED, "shared"),
+    ];
+    let mut set = vec![
+        access
+            .iter()
+            .map(|&(f, c)| if v & f != 0 { c } else { '-' })
+            .collect::<String>(),
+    ];
+    set.extend(
+        names
+            .iter()
+            .filter(|(f, _)| v & f != 0)
+            .map(|(_, n)| (*n).to_string()),
+    );
+    let unnamed = access
+        .iter()
+        .map(|&(f, _)| f)
+        .chain(names.iter().map(|&(f, _)| f))
+        .fold(v, |rest, f| rest & !f);
+    if unnamed != 0 {
+        set.push(format!("{unnamed:#010x}"));
+    }
+    format!("  ({})", set.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section_flags_names_the_title_sections() {
+        // Sections of the title executable of Series 1.0.2.1.
+        assert_eq!(section_flags(0x6000_0020), "  (r-x, code)"); // .text
+        assert_eq!(section_flags(0x4000_0040), "  (r--, initialized-data)"); // .rdata
+        assert_eq!(section_flags(0xc000_0040), "  (rw-, initialized-data)"); // .data
+        assert_eq!(
+            section_flags(0x4200_0040),
+            "  (r--, initialized-data, discardable)"
+        ); // .reloc
+        assert_eq!(section_flags(0), "  (---)"); // .retplne
+    }
+
+    #[test]
+    fn section_flags_shows_bits_without_a_name() {
+        // An alignment field (object files only) and a linker flag.
+        assert_eq!(section_flags(0x6050_0820), "  (r-x, code, 0x00500800)");
+        assert_eq!(
+            section_flags(0xf000_0080),
+            "  (rwx, uninitialized-data, shared)"
+        );
+    }
 
     #[test]
     fn dll_flags_names_every_bit_the_title_sets() {
