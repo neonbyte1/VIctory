@@ -141,10 +141,17 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
 
 /// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
 fn default_dir(name: &str) -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    default_dir_from(name, |k| std::env::var_os(k))
+}
+
+fn default_dir_from(
+    name: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let get = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = get("LOCALAPPDATA")
+        .or_else(|| get("XDG_CACHE_HOME"))
+        .or_else(|| get("HOME").map(|h| h.join(".cache")))
         .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
     Ok(base.join("victory").join(name))
 }
@@ -275,5 +282,28 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.data_subdir("x").is_err());
+    }
+
+    #[test]
+    fn default_dir_ignores_empty_user_env_vars() {
+        let dir = default_dir_from("cache", |k| match k {
+            "LOCALAPPDATA" | "XDG_CACHE_HOME" => Some(OsString::new()),
+            "HOME" => Some(OsString::from("/tmp/victory-home")),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            dir,
+            PathBuf::from("/tmp/victory-home")
+                .join(".cache")
+                .join("victory")
+                .join("cache")
+        );
+
+        let missing = default_dir_from("cache", |k| match k {
+            "LOCALAPPDATA" | "XDG_CACHE_HOME" | "HOME" => Some(OsString::new()),
+            _ => None,
+        });
+        assert!(missing.is_err());
     }
 }
