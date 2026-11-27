@@ -2493,6 +2493,12 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Tests: how much work runs after the list has run (`defer_after`).
+    #[cfg(test)]
+    pub(crate) fn work_after(&self) -> usize {
+        self.deferred().after.len()
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
