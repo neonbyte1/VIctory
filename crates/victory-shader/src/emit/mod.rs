@@ -1243,6 +1243,82 @@ mod tests {
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
     }
 
+    /// A vertex shader whose row 2 packs a user semantic beside the second
+    /// clip distance. In `experimental` the user element is declared first,
+    /// while the second clip distance's name offset is the first clip
+    /// distance's, written before either of them.
+    #[cfg(windows)]
+    fn packed_clip_signature(experimental: bool) -> Vec<u8> {
+        let mut s = Shader::new(false);
+        let el = |name: &str, index: u32, kind: u8, row: u32, col: u8, cols: u8, usage: u8| {
+            SigElement {
+                name: name.into(),
+                index,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(row),
+                col,
+                cols,
+                usage,
+                half: false,
+            }
+        };
+        let position = el("SV_Position", 0, 3, 0, 0, 4, 15);
+        let clip0 = el("SV_ClipDistance", 0, 6, 1, 0, 1, 1);
+        let texcoord = el("TEXCOORD", 0, 0, 2, 0, 2, 3);
+        let clip1 = el("SV_ClipDistance", 1, 6, 2, 2, 1, 1);
+        s.outputs.push(position);
+        s.outputs.push(clip0);
+        if experimental {
+            s.outputs.push(texcoord);
+            s.outputs.push(clip1);
+        } else {
+            s.outputs.push(clip1);
+            s.outputs.push(texcoord);
+        }
+        let widths: Vec<u8> = s.outputs.iter().map(|e| e.cols).collect();
+        let b = s.entry;
+        for (id, cols) in widths.iter().enumerate() {
+            for c in 0..*cols {
+                let args = [
+                    s.m.i32(id as u32),
+                    s.m.i32(0),
+                    s.m.i8(c),
+                    s.m.f32(1.0f32.to_bits()),
+                ];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+        }
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        s.finish()
+    }
+
+    /// Validator 1.6 orders rows of one register by semantic name offset.
+    /// A later system-value element can reuse an earlier name offset, so a
+    /// stable register-only sort can write it after a user element whose
+    /// name lies between the two system-value names.
+    #[test]
+    #[cfg(windows)]
+    fn packed_signature_rows_follow_system_value_name_order() {
+        let path = super::validator::Validator::default_path();
+        let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        let mut control = packed_clip_signature(false);
+        v.validate(&mut control)
+            .unwrap_or_else(|e| panic!("control: {e}"));
+        eprintln!("control validated bytes={}", control.len());
+        let mut experimental = packed_clip_signature(true);
+        v.validate(&mut experimental)
+            .unwrap_or_else(|e| panic!("shared clip-distance name order: {e}"));
+        eprintln!(
+            "shared clip-distance name order validated bytes={}",
+            experimental.len()
+        );
+    }
+
     /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
     const TRIANGLE: u32 = 1 << 10 | 2 << 20;
     /// The edge flags of the three corners (bits 9, 19 and 29).
