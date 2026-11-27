@@ -158,6 +158,7 @@ victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
+victory shader-coverage <runtime.log> [paths...]
 victory config
 ```
 
@@ -166,6 +167,8 @@ default worker count.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
+
+`shader-coverage` compares failures in a UTF-8 runtime log (keep it outside the repository) with offline shader emission, using the same build and settings; unmatched hashes are not proof of absence.
 
 ### Windows shader-test validator
 
