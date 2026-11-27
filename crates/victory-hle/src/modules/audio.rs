@@ -668,7 +668,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
             );
         }
     }
-    let mut next = frame.next.unwrap_or(0);
+    let mut next = frame.next;
     let loops = context.field(0, 12, 8);
     let loop_end = context.field(4, 0, 26) as usize;
     let ends_loop = loop_end != 0
@@ -678,7 +678,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     if looping {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
         pcm.truncate(keep);
-        next = context.field(3, 0, 26) as usize;
+        next = Some(context.field(3, 0, 26) as usize);
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
         }
@@ -691,10 +691,10 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         // this one, its last.
         voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
     }
-    if next == 0 {
+    if next.is_none() {
         context.set_field(0, 20 + current, 1, 0);
     }
-    context.set_field(2, 0, 26, next as u32);
+    context.set_field(2, 0, 26, next.unwrap_or(0) as u32);
     true
 }
 
@@ -1375,6 +1375,15 @@ mod tests {
     /// Each end of the loop is cut in its own frame.
     #[test]
     fn a_loop_skips_subframes_of_its_first_frame() {
+        check_loop_start(32);
+    }
+
+    #[test]
+    fn a_loop_to_the_start_of_the_buffer_keeps_the_input_valid() {
+        check_loop_start(0);
+    }
+
+    fn check_loop_start(loop_start: u32) {
         let _serial = lock(&CONTEXT_TESTS);
         let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
         assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
@@ -1394,7 +1403,7 @@ mod tests {
             1 << 31 | 3 << 27 | end_subframe << 12 | skip_subframes << 17,
         );
         context.set(2, first);
-        context.set(3, first);
+        context.set(3, loop_start);
         context.set(4, second);
         context.set(5, input_apu);
         let mut voice = test_voice();
@@ -1408,7 +1417,8 @@ mod tests {
         // Before the loop: the first frame whole.
         assert_eq!(step(second), 4 * subframe);
         // The loop's last frame: its first two subframes, then back.
-        assert_eq!(step(first), 2 * subframe, "the loop's last frame");
+        assert_eq!(step(loop_start), 2 * subframe, "the loop's last frame");
+        assert_eq!(context.field(0, 20, 1), 1, "the loop still needs input 0");
         assert_eq!(context.field(0, 12, 8), 0, "one loop, taken");
         // The loop's first frame again: without its first two subframes.
         assert_eq!(step(second), 2 * subframe, "the loop's first frame");
