@@ -2127,6 +2127,13 @@ impl Host {
         let declared: Vec<Declared> = runs.iter().flat_map(|l| l.declared()).collect();
         if overlap {
             crate::shadow::fly(owner, runs.iter().flat_map(|l| l.flying()).collect());
+            // Held waits for its bottom-of-pipe values may read them now
+            // (`crate::early`): later submissions run after it on this queue.
+            // In the order `Host::finish` writes them.
+            if crate::early::on() {
+                let writes: Vec<_> = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+                crate::early::fly(owner, barrier, &writes);
+            }
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::PreparedOverlapping, u64::from(!submitted.flight.is_empty()));
@@ -2387,6 +2394,7 @@ impl Host {
         // What it wrote is in title memory now: later preparings read it
         // there.
         crate::shadow::land(record.owner);
+        crate::early::land(record.owner);
         // Host objects given up before the submission had their last
         // holder in it.
         let InFlight {

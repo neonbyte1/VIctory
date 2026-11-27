@@ -250,7 +250,11 @@ fn pump(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
-    let read = read_value;
+    // With early release, waits read the values of bottom-of-pipe writes in
+    // flight over title memory (`crate::early`).
+    let early = crate::early::on();
+    let overlaid = |address: u64, bytes: u8| crate::early::read(address, bytes, &read_value);
+    let read: &dyn Fn(u64, u8) -> Option<u64> = if early { &overlaid } else { &read_value };
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
@@ -266,24 +270,28 @@ fn pump(held: &mut Holding, why: Why) {
     // Behind the queue's work submitted before it, which may still run.
     let mut signal = |queue: usize, f: usize, value: u64| host.signal_after(queue, f, value);
     let pumped = held.pump(&mut crate::hold::World {
-        read: &read,
+        read,
+        memory: if early { Some(&read_value) } else { None },
         fence: &fence,
         run: &mut run,
         signal: &mut signal,
     });
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::EarlyReleased, u64::from(pumped.early));
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
         a.pump += started.elapsed().saturating_sub(ran);
         a.pieces += pumped.pieces;
         a.segments += pumped.segments;
         a.unknown += pumped.unknown;
+        a.early += pumped.early;
         for (queue, waited) in pumped.waited {
             a.released.push((kind(queue), waited, why));
         }
     }
     // Once work stays held, a timer tests it every 2 ms: memory the title
     // writes from the CPU, or the valve, may let it go with no call of ours.
-    if held.blocked(&read).is_empty() {
+    if held.blocked(&read_value).is_empty() {
         return;
     }
     static TIMER: std::sync::Once = std::sync::Once::new();
@@ -325,6 +333,9 @@ struct Account {
     presents_held: u32,
     /// Time in the pump outside host submissions.
     pump: std::time::Duration,
+    /// Segments released on values of writes in flight (`crate::early`)
+    /// that title memory alone held.
+    early: u32,
 }
 
 #[cfg(windows)]
@@ -365,10 +376,12 @@ fn account_frame(frame: u64) {
         fence_waits,
         fence_wait_ms = fence_waited.as_secs_f64() * 1e3,
         presents_held = a.presents_held,
+        released_early = a.early,
         "held work this frame (submissions; host submissions, segments; lists cut at waits; lists reset or released \
          while held, each keeping its own host list; segments that waited, and how many each reason released \
          {by:?}; time in the pump outside host submissions; events the          title waited on for fence values and their summed waits; \
-         PresentX calls queued behind held work); held at the present: {}",
+         PresentX calls queued behind held work; segments released on values in flight, VICTORY_EARLY_RELEASE); \
+         held at the present: {}",
         blocked.len()
     );
     tracing::debug!(

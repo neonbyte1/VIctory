@@ -29,6 +29,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod early;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;

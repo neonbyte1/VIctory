@@ -220,8 +220,20 @@ pub(crate) enum C {
     SettleTexture,
     SettleCopy,
     SettleUs,
+    /// Early release (`crate::early`, `VICTORY_EARLY_RELEASE`): held
+    /// segments released on values of writes in flight that title memory
+    /// alone held; value writes registered in flight; refusals (counted
+    /// once per word and writes in flight) by why: the word changed since,
+    /// a later writer through a copy, a barrier, a timestamp, another size.
+    EarlyReleased,
+    EarlyWrites,
+    EarlyRefusedCpu,
+    EarlyRefusedWriter,
+    EarlyRefusedBarrier,
+    EarlyRefusedStamp,
+    EarlyRefusedSize,
 }
-const COUNTERS: usize = 127;
+const COUNTERS: usize = 134;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -542,6 +554,18 @@ pub(crate) fn log(frames: f64) {
         c[C::SettleTexture as usize],
         c[C::SettleCopy as usize],
         ms(c[C::SettleUs as usize]),
+    );
+    tracing::info!(
+        "  early release per frame: {:.1} held segments released on values in flight, of {:.1} bottom-of-pipe \
+         value writes in flight; refused (title memory read): {:.1} word changed since, {:.1} a later writer \
+         through a copy, {:.1} a barrier, {:.1} a timestamp, {:.1} another size",
+        c[C::EarlyReleased as usize],
+        c[C::EarlyWrites as usize],
+        c[C::EarlyRefusedCpu as usize],
+        c[C::EarlyRefusedWriter as usize],
+        c[C::EarlyRefusedBarrier as usize],
+        c[C::EarlyRefusedStamp as usize],
+        c[C::EarlyRefusedSize as usize],
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

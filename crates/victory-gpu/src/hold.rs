@@ -88,6 +88,9 @@ pub(crate) struct Pumped {
     pub(crate) waited: Vec<(usize, Duration)>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
+    /// Segments released on values of writes in flight (`crate::early`)
+    /// that title memory alone would have held.
+    pub(crate) early: u32,
 }
 
 /// Every queue's held work.
@@ -115,6 +118,12 @@ impl<S> Held<S> {
 pub(crate) struct World<'a, S> {
     /// A memory value (address, bytes).
     pub(crate) read: &'a dyn Fn(u64, u8) -> Option<u64>,
+    /// Title memory alone (address, bytes), when `read` gives the values
+    /// of writes in flight over it (`crate::early`): then the segments of a
+    /// queue gathered so far run before a later one's waits are tested, so
+    /// that they read what those write (upstream PR #3381), and segments
+    /// released only by such values are counted.
+    pub(crate) memory: Option<&'a dyn Fn(u64, u8) -> Option<u64>>,
     /// A fence's value.
     pub(crate) fence: &'a dyn Fn(usize) -> u64,
     /// Runs a piece (a queue, its segments in order); it completes later,
@@ -147,6 +156,10 @@ impl<S> Held<S> {
                     let ready = match items.front_mut() {
                         None => false,
                         Some((Item::Segment(_, waits), since, fresh)) => {
+                            if w.memory.is_some() && !waits.is_empty() && !piece.is_empty() {
+                                (w.run)(*queue, std::mem::take(&mut piece));
+                                done.pieces += 1;
+                            }
                             let mut ok = true;
                             for wait in waits.iter() {
                                 match wait.holds(w.read) {
@@ -159,6 +172,12 @@ impl<S> Held<S> {
                                 *fresh = false;
                             } else if !*fresh {
                                 done.waited.push((*queue, since.elapsed()));
+                            }
+                            if ok
+                                && let Some(memory) = w.memory
+                                && waits.iter().any(|wait| wait.holds(memory) == Some(false))
+                            {
+                                done.early += 1;
                             }
                             ok
                         }
@@ -257,6 +276,8 @@ mod tests {
     use std::collections::HashMap;
 
     /// Memory, fences and a log of what ran, for a recording executor.
+    /// With `early`, what a piece writes is pending (in flight) until
+    /// [`Fake::complete`], and waits read it over memory (`crate::early`).
     #[derive(Default)]
     struct Fake {
         memory: HashMap<u64, u64>,
@@ -264,6 +285,16 @@ mod tests {
         log: Vec<String>,
         /// Bottom-of-pipe writes of each segment: (address, value).
         writes: HashMap<&'static str, Vec<(u64, u64)>>,
+        early: bool,
+        pending: HashMap<u64, u64>,
+    }
+
+    impl Fake {
+        /// What is in flight completes: its writes land in memory.
+        fn complete(&mut self) {
+            let pending: Vec<(u64, u64)> = self.pending.drain().collect();
+            self.memory.extend(pending);
+        }
     }
 
     fn ge(address: u64, reference: u64) -> ValueWait {
@@ -271,13 +302,18 @@ mod tests {
     }
 
     fn pump(held: &mut Held<&'static str>, fake: &RefCell<Fake>) -> Pumped {
-        let read = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
+        let memory = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
+        let read = |a: u64, b| fake.borrow().pending.get(&a).copied().or_else(|| memory(a, b));
         let fence = |f: usize| *fake.borrow().fences.get(&f).unwrap_or(&0);
         let mut run = |q: usize, segments: Vec<&'static str>| {
             let mut f = fake.borrow_mut();
             for s in &segments {
                 for (a, v) in f.writes.get(s).cloned().unwrap_or_default() {
-                    f.memory.insert(a, v);
+                    if f.early {
+                        f.pending.insert(a, v);
+                    } else {
+                        f.memory.insert(a, v);
+                    }
                 }
             }
             f.log.push(format!("q{q}: {}", segments.join(" ")));
@@ -287,7 +323,60 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+        let early = fake.borrow().early;
+        held.pump(&mut World {
+            read: &read,
+            memory: if early { Some(&memory) } else { None },
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        })
+    }
+
+    /// With early release, a segment's waits are tested after the segments
+    /// before it in its queue ran: they read what those will write (in
+    /// flight), not the stale value in memory (upstream PR #3381's case: a
+    /// label starts at 1, the first segment sets it to 0, the second waits
+    /// for 1).
+    #[test]
+    fn with_early_release_a_wait_reads_what_earlier_segments_of_its_queue_will_write() {
+        let fake = RefCell::new(Fake { early: true, ..Fake::default() });
+        fake.borrow_mut().memory.insert(0x100, 1);
+        fake.borrow_mut().writes.insert("reset", vec![(0x100, 0)]);
+        let eq = ValueWait { address: 0x100, bytes: 8, comparison: EQUAL, reference: 1, mask: u64::MAX };
+        let mut held = Held::default();
+        held.push(1, Item::Segment("reset", vec![]));
+        held.push(1, Item::Segment("after", vec![eq]));
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: reset"], "the wait reads the 0 in flight");
+        assert_eq!((p.pieces, p.early), (1, 0));
+        fake.borrow_mut().complete();
+        pump(&mut held, &fake);
+        assert!(held.holds_work(1), "0 landed");
+        fake.borrow_mut().memory.insert(0x100, 1);
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: reset", "q1: after"]);
+        assert_eq!(p.early, 0, "released by memory");
+    }
+
+    /// With early release, the compute queue's list waiting for a value the
+    /// graphics queue's list writes runs right after that list, with the
+    /// value still in flight (counted), and memory gets it only when it
+    /// completes; a segment with no waits joins the piece before it.
+    #[test]
+    fn with_early_release_a_wait_runs_behind_its_writer_in_flight() {
+        let fake = RefCell::new(Fake { early: true, ..Fake::default() });
+        fake.borrow_mut().writes.insert("draw", vec![(0x100, 7)]);
+        let mut held = Held::default();
+        held.push(2, Item::Segment("depth", vec![ge(0x100, 7)]));
+        held.push(2, Item::Segment("more", vec![]));
+        held.push(1, Item::Segment("draw", vec![]));
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: draw", "q2: depth more"]);
+        assert_eq!((p.pieces, p.segments, p.early), (2, 3, 1));
+        assert_eq!(fake.borrow().memory.get(&0x100), None, "not in memory before it completes");
+        fake.borrow_mut().complete();
+        assert_eq!(fake.borrow().memory.get(&0x100), Some(&7));
     }
 
     #[test]
@@ -418,6 +507,7 @@ mod tests {
             };
             held.pump(&mut World {
                 read: &read,
+                memory: None,
                 fence: &|_| 0,
                 run: &mut run,
                 signal: &mut |_, _, _| {},
