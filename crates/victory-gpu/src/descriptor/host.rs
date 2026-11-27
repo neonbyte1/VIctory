@@ -861,6 +861,14 @@ impl HostHeap {
     /// (local://HeapDirty.md).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
         use std::sync::atomic::Ordering::Relaxed;
+        // Slots the host has no room for are not mirrored ([`HostHeap::mirror`]
+        // refuses them), so they are not read either: the title writes ~96
+        // pages of them a world frame, and scanning and mirroring those was
+        // 44 % of the sync's pages (local://HeapDirty.md).
+        let last = last.min(self.count);
+        if first >= last {
+            return;
+        }
         let at = |i: u32| start + u64::from(i) * step;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::SyncPages, 1);

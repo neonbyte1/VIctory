@@ -188,12 +188,15 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                // Slots past the host heap's count (the host's limit, on
+                // NVIDIA) have no host slot: the title writes ~96 pages of
+                // them a world frame (6 MB, 44 % of the pages the watch
+                // marks), and mirroring one made nothing. Left out of the
+                // scan here, which is where the waste was.
+                let last = last.min(u64::from(host.count()));
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                crate::copystat::add(crate::copystat::C::SyncSlots, last.saturating_sub(first));
+                host.sync_slots(first as u32, last as u32, start, step);
             }
         }
     }
