@@ -2313,8 +2313,13 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
     if !out.is_null() {
+        let mut desc = resource(this).desc;
+        // GetDesc reports the effective alignment of an ordinary buffer.
+        if desc.dimension == BUFFER && desc.alignment == 0 {
+            desc.alignment = KIB_64;
+        }
         // SAFETY: checked non-null; the title passes room for a description.
-        unsafe { out.write(resource(this).desc) };
+        unsafe { out.write(desc) };
     }
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
@@ -2633,6 +2638,66 @@ pub(crate) mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn buffer_get_desc_reports_the_effective_alignment() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+
+        let host = crate::host::host();
+        let native_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let null = std::ptr::null();
+        for requested in [KIB_64, 0] {
+            let native_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Alignment: requested,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+            };
+            let native = host.map(|host| {
+                let mut reference: Option<ID3D12Resource> = None;
+                // SAFETY: the buffer description and output slot are valid.
+                unsafe {
+                    host.device.CreateCommittedResource(
+                        &native_heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &native_desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut reference,
+                    ).unwrap();
+                    reference.unwrap().GetDesc().Alignment
+                }
+            });
+
+            let input = ResourceDesc { alignment: requested, ..buffer(256) };
+            let mut resource = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &input, 0, null.cast(), &RESOURCE_IIDS[0], &mut resource),
+                S_OK,
+            );
+            let mut out = buffer(0);
+            slot::<extern "system" fn(This, *mut ResourceDesc)>(resource, 0x50)(resource, &mut out);
+            assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
+            if let Some(native) = native {
+                println!("buffer alignment: input {requested}, native {native}, guest {}", out.alignment);
+                assert_eq!(native, KIB_64);
+            }
+            assert_eq!(out.alignment, KIB_64, "requested alignment {requested}");
         }
     }
 
