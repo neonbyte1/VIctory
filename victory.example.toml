@@ -1,5 +1,7 @@
 # Copy to `victory.toml` (git-ignored) and point it at YOUR files.
-# Every path must be OUTSIDE the repository; the tools refuse otherwise.
+# Every path must be OUTSIDE the repository. Derived data (cache_dir,
+# data_dir) is refused inside it; `victory config` flags any path
+# that points inside it.
 # Environment variables (shown below) take precedence over this file.
 # VICTORY_CONFIG selects a different config file.
 
