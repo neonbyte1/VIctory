@@ -1107,6 +1107,8 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        // Writes buffers: no indirect draw after it joins a window before.
+        crate::indirect::end_window(list);
         let Some(view) = crate::descriptor::view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
@@ -1158,6 +1160,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1290,6 +1293,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -1651,6 +1655,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -1755,6 +1760,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1886,7 +1892,9 @@ impl State {
         // list's prelude together with the list's other hoisted clamps, so
         // its pipeline is bound before the clamp is known and the clamp
         // pass is recorded once per submission instead of dispatched here.
-        let (clamped, clamped_at, hoisted) = if kind != DISPATCH
+        // `kept`: the clamped records stay readable as arguments after the
+        // execution (hoisted, or in a window), so no transition back.
+        let (clamped, clamped_at, kept) = if kind != DISPATCH
             && !pipeline_writes_uav(p)
             && crate::indirect::can_hoist(list, args_gpu, spec)
         {
@@ -1933,13 +1941,43 @@ impl State {
             }
         } else {
             list.end_hoisted_indirect();
-            // Bounded first: the clamp binds a compute pipeline of its own.
-            let Some(clamped) = crate::indirect::bound(list, args_gpu, spec, is_spread) else {
-                why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                return false;
+            // Draws whose shaders store to no buffer may be clamped in a
+            // window with the indirect draws next to them (#3197,
+            // `crate::indirect::windowed`).
+            let joins = crate::indirect::windows_on() && kind != DISPATCH && {
+                let stores = may_store(p);
+                #[cfg(feature = "diagnostics")]
+                if stores {
+                    crate::copystat::add(crate::copystat::C::ClampStoring, 1);
+                }
+                !stores
             };
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+            let window = joins
+                .then(|| {
+                    let (start, _) = args.range();
+                    crate::indirect::windowed(list, args.gpu(start), arguments - start, spec)
+                })
+                .flatten();
+            let (clamped, at, windowed) = match window {
+                Some((out, at, opened)) => {
+                    // Its pass bound a compute pipeline of its own.
+                    if opened {
+                        self.host_pipeline = 0;
+                        self.host_roots[1] = 0;
+                    }
+                    (out, at, true)
+                }
+                None => {
+                    // Bounded first: the clamp binds a compute pipeline of its own.
+                    let Some(clamped) = crate::indirect::bound(list, args_gpu, spec, is_spread) else {
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    };
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                    (clamped, 0, false)
+                }
+            };
             let ran = match kind {
                 DRAW | INDEXED => {
                     (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -1952,7 +1990,9 @@ impl State {
                 _ => false,
             };
             if !ran {
-                crate::indirect::done(list, &clamped);
+                if !windowed {
+                    crate::indirect::done(list, &clamped);
+                }
                 #[cfg(feature = "diagnostics")]
                 why(&format!(
                     "prepare failed (compute {}, mesh {}): {}",
@@ -1962,7 +2002,7 @@ impl State {
                 ));
                 return false;
             }
-            (clamped, 0, false)
+            (clamped, at, windowed)
         };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -1992,7 +2032,7 @@ impl State {
                 crate::capture::read_indirect(list, (&clamped, clamped_at), count, (kind, stride, max), name, always);
             }
         }
-        if !hoisted {
+        if !kept {
             crate::indirect::done(list, &clamped);
         }
         if kind == DISPATCH {
@@ -2002,6 +2042,24 @@ impl State {
         }
         true
     }
+}
+
+/// Whether a pipeline's shaders may store to memory (buffers among it):
+/// unordered views, in tables, roots or the heap, marked view writes, or
+/// title memory through the page table. Such a draw ends a window of
+/// clamped indirect draws (`crate::indirect::windowed`).
+fn may_store(p: &crate::pipeline::host::HostPipeline) -> bool {
+    p.marks.is_some()
+        || p.stages.iter().any(|s| {
+            let t = s.translated();
+            !s.root_uavs.is_empty()
+                || s.memory_dirty.is_some()
+                || t.host.heap_writes
+                || t.host.view_marks
+                || t.host.memory_writes
+                || !t.host.root_uavs.is_empty()
+                || t.used.iter().any(|u| u.kind == ResourceType::Uav)
+        })
 }
 
 /// The host command signature for one argument of `kind` with records

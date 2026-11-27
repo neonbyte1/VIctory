@@ -895,6 +895,9 @@ pub(crate) struct HostList {
     /// Indirect argument clamps hoisted from this list's initial non-writing
     /// prefix into its submission prelude (`crate::indirect::HoistedClamps`).
     hoisted_indirect: Mutex<crate::indirect::HoistedClamps>,
+    /// The window of indirect draws clamped together (`crate::indirect`,
+    /// `VICTORY_CLAMP_WINDOW`).
+    clamp_window: Mutex<crate::indirect::Window>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1534,6 +1537,7 @@ impl Host {
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
                 hoisted_indirect: Mutex::default(),
+                clamp_window: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2553,6 +2557,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.end_hoisted_indirect();
+        crate::indirect::end_window(self);
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -2576,6 +2581,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.marks.store(false, Ordering::Relaxed);
         self.heap_writes.store(false, Ordering::Relaxed);
+        crate::indirect::forget_windows(self);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3168,6 +3174,11 @@ impl HostList {
             self.keep(&old);
         }
         Some(made)
+    }
+
+    /// The list's window of indirect draws clamped together.
+    pub(crate) fn clamp_window(&self) -> std::sync::MutexGuard<'_, crate::indirect::Window> {
+        self.clamp_window.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keeps `object` alive until the list is reset.
