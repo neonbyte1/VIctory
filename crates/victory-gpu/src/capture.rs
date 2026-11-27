@@ -4,6 +4,7 @@
 //! size. Only in builds with diagnostics.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -45,14 +46,26 @@ static WORLD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// Frame `n` was presented: notes the world's first frame.
 pub(crate) fn presented(n: u64) {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let drawn = crate::draw::drawn();
-    let draws = drawn - LAST.swap(drawn, Relaxed).min(drawn);
+    let draws = draws_since_last_present(&LAST, crate::draw::drawn());
     if draws >= 500 && WORLD.get().is_none() && !world_offsets().is_empty() {
         let _ = WORLD.set(n);
         tracing::info!(frame = n, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
     }
+}
+
+fn draws_since_last_present(last: &AtomicU64, drawn: u64) -> u64 {
+    drawn.saturating_sub(last.fetch_max(drawn, Relaxed))
+}
+
+#[test]
+fn stale_draw_samples_do_not_trigger_world_capture_early() {
+    let last = AtomicU64::new(0);
+    assert_eq!(draws_since_last_present(&last, 480), 480);
+    assert_eq!(draws_since_last_present(&last, 600), 120);
+    assert_eq!(draws_since_last_present(&last, 480), 0);
+    assert_eq!(draws_since_last_present(&last, 995), 395);
+    assert_eq!(draws_since_last_present(&last, 1495), 500);
 }
 
 /// Whether frame `n` is saved.
