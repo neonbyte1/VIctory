@@ -50,9 +50,13 @@ pub struct BindReport {
 }
 
 /// Writes the prepared copy into `dir` and maps it with the Windows loader.
+/// `original_name` is the title's own exe/DLL file name, used by diagnostics
+/// rather than the content-hashed name of the prepared copy.
 ///
 /// `dir` receives derived game data, so it must be outside the repository.
-pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
+pub fn load(prepared: &PreparedImage, dir: &Path, original_name: &str) -> Result<LoadedImage> {
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = original_name;
     victory_core::ensure_outside_repo(dir)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(prepared.file_name());
@@ -79,6 +83,15 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         path,
         info: prepared.info.clone(),
     };
+    // Debugging aid (README): VICTORY_PATCH entries naming this module write
+    // their bytes now — mapped and relocated, before TLS redirection and
+    // import binding — and are logged with the bytes they replaced.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::patch::apply(
+        loaded.base(),
+        loaded.info.size_of_image as usize,
+        original_name,
+    );
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
@@ -153,7 +166,8 @@ fn map_dll(
     }
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
-    let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
+    let image =
+        load(&prepared, dirs.1, &name).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));
     Ok(())

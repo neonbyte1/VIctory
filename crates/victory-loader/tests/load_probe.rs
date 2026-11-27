@@ -132,7 +132,7 @@ fn loads_binds_and_calls_probe() {
     );
 
     let dir = tempfile::tempdir().unwrap();
-    let image = victory_loader::load(&prepared, dir.path()).unwrap();
+    let image = victory_loader::load(&prepared, dir.path(), "hle_probe.dll").unwrap();
 
     // The "title" ships victory-probe-title.dll: any real DLL will do.
     let title_dir = tempfile::tempdir().unwrap();
@@ -246,6 +246,56 @@ fn loads_binds_and_calls_probe() {
         assert_eq!(f(), 1);
         image.unload();
     }
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn patch_lookup_uses_the_original_module_name() {
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            // SAFETY: this test restores the process environment it changed.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("VICTORY_PATCH", value),
+                    None => std::env::remove_var("VICTORY_PATCH"),
+                }
+            }
+        }
+    }
+
+    let original = std::fs::read(build_probe()).unwrap();
+    let prepared = prepare(&original).unwrap();
+    let rva = prepared
+        .info
+        .exports
+        .iter()
+        .find(|export| export.name.as_deref() == Some("probe_pid"))
+        .and_then(|export| export.rva)
+        .unwrap();
+    assert_ne!(prepared.file_name(), "game.exe");
+
+    // Both entries replace `probe_pid` with `mov eax, IMM32; ret`. The old
+    // lookup applies the content-hashed entry and returns 99; the original
+    // title name must win and return 42 (with case-insensitive matching).
+    let spec = format!(
+        "GaMe.ExE:{rva:x}:b82a000000c3,{}:{rva:x}:b863000000c3",
+        prepared.file_name()
+    );
+    let _restore = RestoreEnv(std::env::var_os("VICTORY_PATCH"));
+    // SAFETY: restored above, including when the test panics.
+    unsafe { std::env::set_var("VICTORY_PATCH", spec) };
+    let dir = tempfile::tempdir().unwrap();
+    let image = victory_loader::load(&prepared, dir.path(), "game.exe").unwrap();
+    let address = image.export("probe_pid").unwrap();
+    // SAFETY: the patch gives this export the signature `extern "system" fn() -> u32`.
+    let actual = unsafe {
+        let f: extern "system" fn() -> u32 = std::mem::transmute(address);
+        f()
+    };
+    // SAFETY: no title code is running, and the image was never attached.
+    unsafe { image.unload() };
+    assert_eq!(actual, 42);
 }
 
 #[test]
