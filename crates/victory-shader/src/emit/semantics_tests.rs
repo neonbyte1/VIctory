@@ -3091,6 +3091,36 @@ fn floor_conversions_match_the_hardware() {
     defect(conversion_probes(), FLOOR_CVT);
 }
 
+/// `abs` and `neg` act on the sign bit alone, of a NaN too (RDNA2 ISA: the
+/// input modifiers clear or flip bit 31). The floor conversions show a
+/// NaN's sign, as they saturate it by its sign. Was a defect: `neg` was
+/// `-0.0 - x`, which leaves the sign of a NaN to the host (WARP keeps it).
+#[test]
+fn source_modifiers_set_the_sign_of_a_nan() {
+    let xs = unary(F32_EDGES);
+    let mut p = Vec::new();
+    for (op, half) in [(0x18D_u16, false), (0x18C, true)] {
+        for m in source_mods().into_iter().filter(|m| m.abs | m.neg == 1) {
+            p.push(probe(
+                vop3(op, 5, [v(1), 0, 0], m),
+                xs.clone(),
+                INT,
+                move |i| {
+                    let mut x = i[0];
+                    if m.abs != 0 {
+                        x &= 0x7FFF_FFFF;
+                    }
+                    if m.neg != 0 {
+                        x ^= 0x8000_0000;
+                    }
+                    vec![to_i32_floor(x, half)]
+                },
+            ));
+        }
+    }
+    assert_clean(check(&p));
+}
+
 /// `v_med3_f32` orders -0 below +0, as its min and max do. Was a defect:
 /// plain DXIL `FMin`/`FMax` gave either zero (the adapters differed).
 #[test]
