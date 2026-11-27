@@ -347,8 +347,15 @@ impl RtvRecord {
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        if self.described != 0 {
+            return self.explicit_desc();
+        }
+        let format = crate::resource::pc_format(crate::resource::view_format(self.resource)?);
+        let host = crate::resource::host_resource(self.resource)?;
+        // SAFETY: a live host texture.
+        let d = unsafe { host.GetDesc() };
+        Some(default_rtv_desc(&d, DXGI_FORMAT(format as i32)))
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -356,31 +363,179 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        if self.described != 0 {
+            return self.explicit_desc();
+        }
+        let format = crate::resource::pc_format(crate::resource::view_format(self.resource)?);
+        let host = crate::resource::host_resource(self.resource)?;
+        // SAFETY: a live host texture.
+        let d = unsafe { host.GetDesc() };
+        Some(default_dsv_desc(&d, DXGI_FORMAT(format as i32)))
     }
 
-    /// The description words as a host type, the format as the host has it.
-    /// Without one, a typeless host copy gets a 2D view (`dimension`) in
-    /// the title's format, which the host needs spelled out.
+    /// Explicit view description words in the host's layout, with the format
+    /// translated to PC.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
+    fn explicit_desc<T>(&self) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
-        let mut words = if self.described != 0 {
-            self.desc
-        } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
-        };
+        let mut words = self.desc;
         words[0] = crate::resource::pc_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+    }
+}
+
+/// Builds a default RTV description matching `d`'s dimension, array size, and
+/// MSAA sample count when a promoted-typeless host texture has a null RTV desc.
+#[cfg(windows)]
+fn default_rtv_desc(
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let array = u32::from(d.DepthOrArraySize);
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if array > 1 => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE1DARRAY,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_RTV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE1D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_RTV { MipSlice: 0 },
+            },
+        },
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE3D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_RTV {
+                    MipSlice: 0,
+                    FirstWSlice: 0,
+                    WSize: u32::MAX,
+                },
+            },
+        },
+        _ if d.SampleDesc.Count > 1 && array > 1 => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_RTV {
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        _ if d.SampleDesc.Count > 1 => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DMS,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2DMS: D3D12_TEX2DMS_RTV::default(),
+            },
+        },
+        _ if array > 1 => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_RTV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                    PlaneSlice: 0,
+                },
+            },
+        },
+        _ => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_RTV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        },
+    }
+}
+
+/// Builds a default DSV description matching `d`'s dimension, array size, and
+/// MSAA sample count when a promoted-typeless host texture has a null DSV desc.
+#[cfg(windows)]
+fn default_dsv_desc(
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let array = u32::from(d.DepthOrArraySize);
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if array > 1 => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE1DARRAY,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_DSV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE1D,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_DSV { MipSlice: 0 },
+            },
+        },
+        _ if d.SampleDesc.Count > 1 && array > 1 => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_DSV {
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        _ if d.SampleDesc.Count > 1 => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DMS,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2DMS: D3D12_TEX2DMS_DSV::default(),
+            },
+        },
+        _ if array > 1 => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        _ => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_DSV { MipSlice: 0 },
+            },
+        },
     }
 }
 
@@ -1054,5 +1209,61 @@ pub(crate) mod tests {
             release(h);
             assert!(queued, "the descriptor write reached the heap at the reused address");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn null_rtv_and_dsv_descs_match_resource_dimension_and_msaa() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+
+        let make_res = |dim, depth_or_array, samples| D3D12_RESOURCE_DESC {
+            Dimension: dim,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: depth_or_array,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: samples,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let fmt = DXGI_FORMAT(29);
+        let dfmt = DXGI_FORMAT(40);
+
+        let rtv_ms = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 4), fmt);
+        assert_eq!(rtv_ms.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DMS);
+
+        let rtv_ms_arr = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4), fmt);
+        assert_eq!(rtv_ms_arr.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY);
+        // SAFETY: ViewDimension is TEXTURE2DMSARRAY.
+        assert_eq!(unsafe { rtv_ms_arr.Anonymous.Texture2DMSArray.ArraySize }, 4);
+
+        let rtv_arr = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6, 1), fmt);
+        assert_eq!(rtv_arr.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: ViewDimension is TEXTURE2DARRAY.
+        assert_eq!(unsafe { rtv_arr.Anonymous.Texture2DArray.ArraySize }, 6);
+
+        let rtv_3d = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8, 1), fmt);
+        assert_eq!(rtv_3d.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE3D);
+        // SAFETY: ViewDimension is TEXTURE3D.
+        assert_eq!(unsafe { rtv_3d.Anonymous.Texture3D.WSize }, u32::MAX);
+
+        let rtv_1d_arr = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 3, 1), fmt);
+        assert_eq!(rtv_1d_arr.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE1DARRAY);
+        // SAFETY: ViewDimension is TEXTURE1DARRAY.
+        assert_eq!(unsafe { rtv_1d_arr.Anonymous.Texture1DArray.ArraySize }, 3);
+
+        let dsv_ms = default_dsv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 4), dfmt);
+        assert_eq!(dsv_ms.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2DMS);
+
+        let dsv_arr = default_dsv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 1), dfmt);
+        assert_eq!(dsv_arr.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: ViewDimension is TEXTURE2DARRAY.
+        assert_eq!(unsafe { dsv_arr.Anonymous.Texture2DArray.ArraySize }, 4);
+
+        let dsv_1d = default_dsv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1, 1), dfmt);
+        assert_eq!(dsv_1d.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE1D);
     }
 }
