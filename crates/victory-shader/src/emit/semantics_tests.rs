@@ -3199,6 +3199,31 @@ fn f16_results_round_as_the_mode_says() {
     })]));
 }
 
+#[test]
+fn whole_wave_sections_keep_rounding_mode_changes() {
+    let save = 0xBE86_3DC1; // s_or_saveexec_b32 s6, -1
+    let restore = 0xBEFE_0306; // s_mov_b32 exec_lo, s6
+    let body = [
+        save,
+        0xBFA4_000C, // s_round_mode: f16 toward zero
+        restore,
+        vop1(0x0A, 5, v(1)),
+        save,
+        0xBA80_0881, // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0
+        0,
+        restore,
+        vop1(0x0A, 6, v(1)),
+    ];
+    let inputs = unary(&[0x3F7F_FFFF, 0xBF7F_FFFF]);
+    assert_clean(check(&[probe(body, inputs, F16, |i| {
+        let f = f64::from(fl(i[0]));
+        vec![
+            i[3] & 0xFFFF_0000 | to_f16(f, true),
+            i[3] & 0xFFFF_0000 | to_f16(f, false),
+        ]
+    })]));
+}
+
 /// The check `victory-gpu` runs at device creation: the RX 6700 XT fuses
 /// the lowering's multiply-add, WARP does not.
 #[test]
