@@ -371,6 +371,11 @@ fn retake_dropped() {
     }
 }
 
+#[cfg(test)]
+pub(super) fn completed_title_frames() -> u64 {
+    FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Logs what title memory did since the last call, if anything: a line per
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {

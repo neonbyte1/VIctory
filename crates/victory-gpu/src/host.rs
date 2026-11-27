@@ -398,6 +398,20 @@ pub(crate) mod tests {
         pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    #[test]
+    fn only_accepted_presents_count_toward_fps_but_every_attempt_ends_the_title_frame() {
+        use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_FAIL, S_OK};
+        let mut meter = super::Meter::new();
+        let before = crate::memory::completed_title_frames();
+        for (status, shown) in [(DXGI_STATUS_OCCLUDED, false), (E_FAIL, false), (S_OK, true)] {
+            assert_eq!(meter.end_frame(status), shown);
+        }
+        assert_eq!((meter.frames, meter.presented, meter.report_frames), (3, 1, 3));
+        // Other tests can present concurrently. Each of our attempts must advance the
+        // clock that ends withholding of title-memory writes.
+        assert!(crate::memory::completed_title_frames().wrapping_sub(before) >= 3);
+    }
+
     /// The barriers built on this thread since the last call.
     pub(crate) fn issued() -> Vec<(usize, u32, u32)> {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
@@ -3594,7 +3608,10 @@ struct Presenter {
 /// every few seconds.
 struct Meter {
     since: std::time::Instant,
+    /// Title frames in the reporting interval, including occluded presents.
     frames: u32,
+    /// Swap-chain presents accepted during the same interval.
+    presented: u32,
     report_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
@@ -3608,6 +3625,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            presented: 0,
             report_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
@@ -3615,8 +3633,10 @@ impl Meter {
         }
     }
 
-    /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    /// End the title frame even when DXGI could not display it.
+    fn end_frame(&mut self, status: windows::core::HRESULT) -> bool {
+        let shown = status == windows::Win32::Foundation::S_OK;
+        self.presented += u32::from(shown);
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
@@ -3624,13 +3644,17 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         self.report_frames += 1;
+        shown
+    }
+
+    fn report(&mut self, hwnd: HWND) {
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
-        let fps = frames / elapsed.as_secs_f64();
+        let fps = f64::from(std::mem::take(&mut self.presented)) / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
@@ -3654,7 +3678,7 @@ impl Meter {
             // Outside the submissions: in none of the times above.
             let waited = crate::pipeline::take_waited_ms() / report_frames;
             tracing::info!(
-                "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
+                "{fps:.1} fps, {ms:.1} ms/title frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
@@ -3730,7 +3754,7 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/title frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -4058,8 +4082,12 @@ impl Host {
                 inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let shown = p.meter.end_frame(status);
+            p.meter.report(p.hwnd);
+            if !shown {
+                return None;
+            }
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
