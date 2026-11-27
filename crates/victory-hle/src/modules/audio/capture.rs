@@ -7,11 +7,18 @@
 //! in the title's process raises that process's timer resolution, which
 //! changes how the title's own waits behave.
 
+#[cfg(feature = "diagnostics")]
 use std::fs::File;
+#[cfg(feature = "diagnostics")]
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(feature = "diagnostics")]
 use std::path::Path;
+#[cfg(feature = "diagnostics")]
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "diagnostics")]
+use windows::Win32::Foundation::WAIT_OBJECT_0;
+#[cfg(feature = "diagnostics")]
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
@@ -22,20 +29,24 @@ use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVE_FORMAT_PCM, WAVEFORMATEX,
 };
+#[cfg(feature = "diagnostics")]
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::Win32::Foundation::WAIT_OBJECT_0;
+#[cfg(feature = "diagnostics")]
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, Sleep, WaitForSingleObject,
 };
+#[cfg(feature = "diagnostics")]
 use windows::core::{HRESULT, IUnknown, Interface, Ref, implement};
 
 const RATE: u32 = 48_000;
 const FRAME_BYTES: usize = 4;
 
 /// Activation completes asynchronously; the recording thread polls for it.
+#[cfg(feature = "diagnostics")]
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct Activated;
 
+#[cfg(feature = "diagnostics")]
 impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
     fn ActivateCompleted(
         &self,
@@ -46,11 +57,13 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
 }
 
 /// Names the process to record, in the recorder's environment.
+#[cfg(feature = "diagnostics")]
 const TARGET: &str = "VICTORY_AUDIO_CAPTURE_OF";
 
 /// Starts the recorder if `VICTORY_AUDIO_CAPTURE` names a file. With this
 /// module's debug log, also logs once a second what a `Sleep(1)` takes in
 /// this process (the title's millisecond waits get the same).
+#[cfg(feature = "diagnostics")]
 pub fn start() {
     if tracing::enabled!(tracing::Level::DEBUG) {
         let _ = std::thread::Builder::new()
@@ -79,6 +92,7 @@ pub fn start() {
 
 /// In the recorder (a child started by [`start`]): records until the
 /// target exits and returns true; false in any other process.
+#[cfg(feature = "diagnostics")]
 pub fn child() -> bool {
     let (Some(pid), Some(path)) = (
         std::env::var(TARGET).ok().and_then(|p| p.parse().ok()),
@@ -93,7 +107,9 @@ pub fn child() -> bool {
 }
 
 fn header(frames: u64) -> [u8; 44] {
-    let data = u32::try_from(frames * FRAME_BYTES as u64).unwrap_or(u32::MAX - 36);
+    let data = frames
+        .saturating_mul(FRAME_BYTES as u64)
+        .min(u64::from(u32::MAX - 36)) as u32;
     let mut h = [0u8; 44];
     let fields: [(&[u8], usize); 11] = [
         (b"RIFF", 0),
@@ -115,6 +131,37 @@ fn header(frames: u64) -> [u8; 44] {
     h
 }
 
+fn silence_frames(written: u64, first: &mut Option<u64>, qpc: u64, flags: u32) -> u64 {
+    if flags & windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 {
+        return 0;
+    }
+    let start = *first.get_or_insert_with(|| {
+        let offset =
+            u64::try_from(u128::from(written) * 10_000_000 / u128::from(RATE)).unwrap_or(u64::MAX);
+        qpc.saturating_sub(offset)
+    });
+    let Some(elapsed) = qpc.checked_sub(start) else {
+        return 0;
+    };
+    let at = (u128::from(elapsed) * u128::from(RATE) / 10_000_000) as u64;
+    if at > written.saturating_add(u64::from(RATE / 500)) {
+        at - written
+    } else {
+        0
+    }
+}
+
+fn write_zeros(writer: &mut impl std::io::Write, mut bytes: u64) -> std::io::Result<()> {
+    static ZEROS: [u8; 16 * 1024] = [0; 16 * 1024];
+    while bytes > 0 {
+        let chunk = bytes.min(ZEROS.len() as u64) as usize;
+        writer.write_all(&ZEROS[..chunk])?;
+        bytes -= chunk as u64;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "diagnostics")]
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
@@ -192,26 +239,26 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
                 // Where this packet belongs, from its time stamp (100 ns).
-                let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
-                if at > written + u64::from(RATE / 500) {
+                let silence = silence_frames(written, &mut first, qpc, flags);
+                if silence > 0 {
                     tracing::debug!(
-                        ms = (at - written) * 1000 / u64::from(RATE),
+                        ms = (u128::from(silence) * 1000 / u128::from(RATE)) as u64,
                         "audio capture: nothing played"
                     );
-                    let silence = vec![0u8; (at - written) as usize * FRAME_BYTES];
-                    file.write_all(&silence)?;
-                    written = at;
+                    write_zeros(&mut file, silence.saturating_mul(FRAME_BYTES as u64))?;
+                    written = written.saturating_add(silence);
                 }
-                let bytes = frames as usize * FRAME_BYTES;
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                    file.write_all(&vec![0u8; bytes])?;
+                let bytes = u64::from(frames) * FRAME_BYTES as u64;
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
+                    write_zeros(&mut file, bytes)?;
                 } else {
-                    file.write_all(std::slice::from_raw_parts(data, bytes))?;
+                    let len = usize::try_from(bytes)?;
+                    file.write_all(std::slice::from_raw_parts(data, len))?;
                 }
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && written > 0 {
                     tracing::debug!("audio capture: discontinuity");
                 }
-                written += u64::from(frames);
+                written = written.saturating_add(u64::from(frames));
                 capture.ReleaseBuffer(frames)?;
             }
             if ended || patched.elapsed() >= Duration::from_secs(1) {
@@ -225,5 +272,74 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_errors_and_backwards_qpc_do_not_underflow_or_anchor_zero() {
+        let ts_err = windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32;
+        let mut first = None;
+
+        assert_eq!(silence_frames(0, &mut first, 0, ts_err), 0);
+        assert_eq!(first, None);
+
+        assert_eq!(silence_frames(480, &mut first, 50_000_000, 0), 0);
+        assert_eq!(first, Some(49_900_000));
+
+        assert_eq!(silence_frames(480, &mut first, 10_000_000, 0), 0);
+        assert_eq!(silence_frames(480, &mut first, 90_000_000, ts_err), 0);
+        assert_eq!(first, Some(49_900_000));
+
+        assert_eq!(silence_frames(960, &mut first, 49_900_000 + 220_000, 0), 0);
+        assert_eq!(
+            silence_frames(960, &mut first, 49_900_000 + 10_000_000, 0),
+            48_000 - 960
+        );
+
+        let mut max_first = Some(0);
+        let expected = ((u128::from(u64::MAX) * u128::from(RATE)) / 10_000_000) as u64;
+        assert_eq!(silence_frames(0, &mut max_first, u64::MAX, 0), expected);
+    }
+
+    #[test]
+    fn write_zeros_streams_exact_byte_count() {
+        let mut buf = Vec::new();
+        write_zeros(&mut buf, 40_000).unwrap();
+        assert_eq!(buf.len(), 40_000);
+        assert!(buf.iter().all(|&b| b == 0));
+
+        let mut empty = Vec::new();
+        write_zeros(&mut empty, 0).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn header_clamps_data_and_riff_sizes_without_overflow() {
+        let riff_size = |h: &[u8; 44]| u32::from_le_bytes(h[4..8].try_into().unwrap());
+        let data_size = |h: &[u8; 44]| u32::from_le_bytes(h[40..44].try_into().unwrap());
+
+        let h0 = header(0);
+        assert_eq!(riff_size(&h0), 36);
+        assert_eq!(data_size(&h0), 0);
+
+        let h100 = header(100);
+        assert_eq!(riff_size(&h100), 436);
+        assert_eq!(data_size(&h100), 400);
+
+        let near_max = header(u64::from(u32::MAX) / 4);
+        assert_eq!(riff_size(&near_max), u32::MAX);
+        assert_eq!(data_size(&near_max), u32::MAX - 36);
+
+        let over_riff = header(u64::from(u32::MAX - 36) / 4 + 1);
+        assert_eq!(riff_size(&over_riff), u32::MAX);
+        assert_eq!(data_size(&over_riff), u32::MAX - 36);
+
+        let max = header(u64::MAX);
+        assert_eq!(riff_size(&max), u32::MAX);
+        assert_eq!(data_size(&max), u32::MAX - 36);
     }
 }
