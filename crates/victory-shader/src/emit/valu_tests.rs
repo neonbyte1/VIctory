@@ -3211,6 +3211,83 @@ fn src_scc_reads_as_zero_or_one() {
     }
 }
 
+#[test]
+fn s_sext_i32_has_single_dword_operands_and_preserves_scc_in_ir() {
+    for (word, name) in [
+        (0xBE86_1900, "s_sext_i32_i8"),
+        (0xBE86_1A00, "s_sext_i32_i16"),
+    ] {
+        let words = [0xBF06_8181, word, s_mov_b32(7, 253), S_ENDPGM];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = ir::build(&code, false, 16).unwrap();
+        let insts = &p.blocks[0].insts;
+        let sext = &insts[1];
+        assert_eq!(sext.name(), name);
+        assert_eq!(sext.reads.len(), 1);
+        assert!(sext.read(ir::Reg::S(0)).is_some());
+        assert_eq!(sext.writes.len(), 1);
+        assert!(sext.write(ir::Reg::S(6)).is_some());
+        let scc = insts[0].write(ir::Reg::Scc).unwrap();
+        assert_eq!(insts[2].read(ir::Reg::Scc), Some(scc));
+    }
+}
+
+#[test]
+fn s_sext_i32_lowers_without_int64_and_preserves_scc_on_gpu() {
+    let cases = [
+        (
+            0xBE86_1900,
+            [
+                (0x0000_0000, 0),
+                (0x1234_567F, 0x0000_007F),
+                (0x0000_0080, 0xFFFF_FF80),
+                (0x1234_56FF, 0xFFFF_FFFF),
+                (0xFFFF_FF01, 0x0000_0001),
+            ],
+        ),
+        (
+            0xBE86_1A00,
+            [
+                (0x0000_0000, 0),
+                (0xABCD_7FFF, 0x0000_7FFF),
+                (0x0000_8000, 0xFFFF_8000),
+                (0x1234_FFFF, 0xFFFF_FFFF),
+                (0xFFFF_0001, 0x0000_0001),
+            ],
+        ),
+    ];
+    // The shader builder validates and checks the container hash when the DLL loads.
+    if let Some(path) = std::env::var_os("VICTORY_DXIL") {
+        validator::Validator::load(Some(std::path::Path::new(&path)))
+            .expect("load configured DXIL validator");
+    }
+    for (word, pairs) in cases {
+        let inputs: Vec<_> = pairs
+            .iter()
+            .flat_map(|&(input, _)| [[input, 0, 0, 0], [input, 1, 0, 0]])
+            .collect();
+        // s_cmp_eq_u32 s1, 1; s_sext_i32_* s6, s0; v_mov_b32 v0, s6 or src_scc.
+        for src in [sgpr(6), 253] {
+            let shader = build_valu_cs(&[0xBF06_8101, word, vop1(1, 0, src)]);
+            let container = crate::Container::parse(&shader.dxil).unwrap();
+            let features = container.part(crate::FourCC::SFI0).unwrap();
+            let flags = u64::from_le_bytes(features.data.try_into().unwrap());
+            assert_eq!(flags & 0x8000, 0, "Int64 feature for {word:#010x}");
+            run_cases(&shader, &inputs, |backend, i, input, got| {
+                let want = if src == sgpr(6) {
+                    pairs[i / 2].1
+                } else {
+                    input[1]
+                };
+                assert_eq!(
+                    got, want,
+                    "{backend}: {word:#010x}, src {src}, input {input:x?}"
+                );
+            });
+        }
+    }
+}
+
 /// A register array indexed through M0 whose upper registers hold
 /// descriptor words, which have no host value: the indices are clamped
 /// (`v_med3_u32`, `v_and_b32`), so the moves reach only v8-v11, and the

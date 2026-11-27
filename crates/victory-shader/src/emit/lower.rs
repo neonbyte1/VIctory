@@ -4201,6 +4201,12 @@ impl<'a> Lower<'a> {
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
                 (self.s.m.select(c, neg, n, a), None)
             }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let shift = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let high = self.s.m.bin(c, Bin::Shl, a, shift);
+                (self.s.m.bin(c, Bin::AShr, high, shift), None)
+            }
             "s_bitset0_b32" | "s_bitset1_b32" => {
                 // Sets (clears) bit src[4:0] of the destination it reads.
                 let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
