@@ -1544,6 +1544,14 @@ impl State {
                 crate::list::ensure_state(list, r as This, UNORDERED);
                 let Some((buffer, f)) = read else { continue };
                 list.keep(&buffer);
+                let Some((element, block)) = crate::resource::element(f.Footprint.Format.0 as u32)
+                else {
+                    continue;
+                };
+                let pitch = f.Footprint.RowPitch as usize;
+                let rows = u64::from(f.Footprint.Height).div_ceil(block) as usize;
+                let row_bytes = (u64::from(f.Footprint.Width).div_ceil(block) * element) as usize;
+                let len = (rows - 1) * pitch + row_bytes;
                 struct Readback(ID3D12Resource);
                 // SAFETY: D3D12 objects are free-threaded.
                 unsafe impl Send for Readback {}
@@ -1553,15 +1561,17 @@ impl State {
                 let who = format!("{} s{}+{} {r:#x} {}x{}x{} f{}", stage.shader.hash, u.slot, u.table_offset_dwords, d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
                 list.defer_after(move || {
                     let mut data = std::ptr::null_mut();
-                    // SAFETY: the list has run; the mapping spans the first slice.
+                    // SAFETY: the list has run. The first slice ends with its last
+                    // unpadded row, within the mapped readback buffer.
                     unsafe {
                         if buffer.0.Map(0, None, Some(&mut data)).is_err() {
                             return;
                         }
-                        let n = (f.Footprint.RowPitch * f.Footprint.Height) as usize / 4;
-                        let w = std::slice::from_raw_parts(data.cast::<u32>(), n);
-                        let set = w.iter().filter(|&&x| x != 0).count();
-                        let first: Vec<f32> = w.iter().take(8).map(|&x| f32::from_bits(x)).collect();
+                        let bytes = std::slice::from_raw_parts(
+                            data.cast::<u8>().add(f.Offset as usize),
+                            len,
+                        );
+                        let (n, set, first) = written_texture_words(bytes, pitch, row_bytes);
                         tracing::info!(target: "victory_gpu::trace", "written {who} right after the dispatch: {set} of {n} dwords set, first {first:?}");
                         buffer.0.Unmap(0, None);
                     }
@@ -2153,9 +2163,52 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
+#[cfg(feature = "diagnostics")]
+fn written_texture_words(bytes: &[u8], pitch: usize, row_bytes: usize) -> (usize, usize, Vec<f32>) {
+    let words = bytes
+        .chunks(pitch)
+        .flat_map(|row| row[..row_bytes].chunks(4))
+        .map(|texels| {
+            let mut word = [0; 4];
+            word[..texels.len()].copy_from_slice(texels);
+            u32::from_le_bytes(word)
+        });
+    let total = bytes.len().div_ceil(pitch) * row_bytes.div_ceil(4);
+    let set = words.clone().filter(|&word| word != 0).count();
+    let first = words.take(8).map(f32::from_bits).collect();
+    (total, set, first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn written_texture_probe_counts_texels_without_row_padding() {
+        let values = [0.0f32, 0.25, 0.5, 1.0];
+        let pitch = 256;
+        let row_bytes = 8;
+        let mut readback = vec![0x7f; 2 * pitch];
+        for (row, texels) in readback
+            .chunks_exact_mut(pitch)
+            .zip(values.as_chunks::<2>().0)
+        {
+            let (words, _) = row[..row_bytes].as_chunks_mut::<4>();
+            for (word, value) in words.iter_mut().zip(texels) {
+                *word = value.to_le_bytes();
+            }
+        }
+        for data in [&readback[..], &readback[..pitch + row_bytes]] {
+            let (total, set, first) = written_texture_words(data, pitch, row_bytes);
+            assert_eq!((total, set), (4, 3));
+            assert_eq!(first, values);
+        }
+
+        let (_, set, first) = written_texture_words(&[0x34, 0x12], pitch, 2);
+        assert_eq!(set, 1);
+        assert_eq!(first, [f32::from_bits(0x1234)]);
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
