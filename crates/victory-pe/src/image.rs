@@ -121,6 +121,9 @@ impl CodeViewInfo {
 /// Upper bound on TLS callbacks we are willing to walk (defends against garbage).
 const MAX_TLS_CALLBACKS: usize = 1024;
 
+/// Size of `IMAGE_TLS_DIRECTORY64`.
+const TLS_DIRECTORY_SIZE: u32 = size_of::<pe::ImageTlsDirectory64>() as u32;
+
 impl ImageInfo {
     /// Parses a complete PE32+ x86-64 image from its file bytes.
     pub fn parse(data: &[u8]) -> Result<Self, PeError> {
@@ -404,6 +407,16 @@ fn parse_tls(
     if directory_rva == 0 {
         return Ok(None);
     }
+    // Header values are untrusted. The loader reads the directory's index
+    // field from the mapped image, so all of the directory must lie inside it.
+    if directory_rva
+        .checked_add(TLS_DIRECTORY_SIZE)
+        .is_none_or(|end| end > size_of_image)
+    {
+        return Err(PeError::Malformed(format!(
+            "TLS directory at {directory_rva:#x} runs outside the image"
+        )));
+    }
     let sections = file.section_table();
     let tls = sections
         .pe_data_at(data, directory_rva)
@@ -609,6 +622,61 @@ mod tests {
             info.is_ok(),
             "section with zero raw size should be accepted"
         );
+    }
+
+    /// `synthetic_image` with no exports, its section moved to end with the
+    /// image (RVA 0x1E00..0x2000), and a TLS directory without callbacks
+    /// declared at `directory_rva`.
+    fn image_with_tls_directory(directory_rva: u32) -> Vec<u8> {
+        let mut data = synthetic_image(&[0; 0x200]);
+        let opt = 0x58;
+        let export = opt + layout::OPT_DATA_DIRECTORY;
+        data[export..export + layout::DATA_DIRECTORY_SIZE].fill(0);
+        let tls = export + pe::IMAGE_DIRECTORY_ENTRY_TLS * layout::DATA_DIRECTORY_SIZE;
+        data[tls..tls + 4].copy_from_slice(&directory_rva.to_le_bytes());
+        data[tls + 4..tls + 8].copy_from_slice(&TLS_DIRECTORY_SIZE.to_le_bytes());
+        let sec = opt + 240;
+        data[sec + 12..sec + 16].copy_from_slice(&0x1E00u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn accepts_tls_directory_ending_at_the_image_end() {
+        // 40 bytes from 0x1FD8 end at 0x2000, the size of the image.
+        let data = image_with_tls_directory(0x1FD8);
+
+        let tls = ImageInfo::parse(&data).unwrap().tls.unwrap();
+
+        assert_eq!(tls.directory_rva, 0x1FD8);
+        assert_eq!(tls.callbacks_va, 0);
+    }
+
+    #[test]
+    fn rejects_tls_directory_running_past_the_image_end() {
+        let data = image_with_tls_directory(0x1FD9);
+
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(reason))
+                if reason == "TLS directory at 0x1fd9 runs outside the image"
+        ));
+    }
+
+    #[test]
+    fn rejects_tls_directory_running_past_the_rva_range() {
+        let mut data = image_with_tls_directory(0xFFFF_FFF0);
+        // The largest image, and the section under the directory: its end is
+        // past 4 GiB, which no image size admits.
+        let opt = 0x58;
+        data[opt + 56..opt + 60].copy_from_slice(&u32::MAX.to_le_bytes());
+        let sec = opt + 240;
+        data[sec + 12..sec + 16].copy_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(reason))
+                if reason == "TLS directory at 0xfffffff0 runs outside the image"
+        ));
     }
 
     #[test]
