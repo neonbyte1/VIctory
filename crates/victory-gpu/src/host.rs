@@ -2932,35 +2932,43 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    let (success, done) = copy_in_kernel(src, dst, len);
+    success && done == len
+}
+
+fn copy_in_kernel(src: *const u8, dst: *mut u8, len: usize) -> (bool, usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let copied =
+        unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) };
+    (copied != 0, done.min(len))
 }
 
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
-///
-/// Through [`read`]: the kernel refuses an unmapped destination page as it
-/// does a source page. `WriteProcessMemory` makes the same copy, but asks
-/// for the destination's region first, at `VirtualQuery`'s cost (see
-/// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
-/// per frame.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
-    if len == 0 || write(dst as usize, len) {
-        return;
+/// wrote). Try the whole span first, as a protection query for each copy
+/// cost 39 ms per world frame. Split only the undelivered tail.
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    let base = dst as usize;
+    if len == 0 || base.checked_add(len).is_none() {
+        return 0;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
-        }
+    let write = |at: usize, n: usize| {
+        copy_in_kernel(src.wrapping_add(at - base), at as *mut u8, n).1
+    };
+    let first = write(base, len);
+    let mut written = first;
+    for_pieces(base + first, len - first, 64 << 10, |at, n| {
+        let part = write(at, n);
+        written += part;
+        for_pieces(at + part, n - part, 4 << 10, |at, n| {
+            written += write(at, n);
+        });
     });
+    written
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -3044,14 +3052,14 @@ mod title_copies {
     fn copy_back_writes_mapped_pages_only() {
         let from = pattern();
         let to = holed(0xee);
-        write_mapped(to, from.as_ptr(), 3 * BLOCK);
+        assert_eq!(write_mapped(to, from.as_ptr(), 3 * BLOCK), 2 * BLOCK);
         assert_eq!(block(to, 0), &from[..BLOCK]);
         assert_eq!(block(to, 2), &from[2 * BLOCK..]);
         release(to);
         // Neither aligned nor whole: the bytes around the range stay.
         let to = holed(0xee);
         // SAFETY: inside the first block.
-        write_mapped(unsafe { to.add(100) }, from.as_ptr(), BLOCK - 300);
+        assert_eq!(write_mapped(unsafe { to.add(100) }, from.as_ptr(), BLOCK - 300), BLOCK - 300);
         let first = block(to, 0);
         assert_eq!(first[100..BLOCK - 200], from[..BLOCK - 300]);
         let around = first[..100].iter().chain(&first[BLOCK - 200..]);
@@ -3064,7 +3072,7 @@ mod title_copies {
             unsafe { VirtualProtect(to.add(2 * BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old) };
         assert_ne!(protected, 0);
         // SAFETY: the third block.
-        write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
+        assert_eq!(write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK), 0);
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
     }
