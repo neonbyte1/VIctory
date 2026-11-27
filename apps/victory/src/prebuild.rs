@@ -24,7 +24,7 @@ use victory_game::{sgd5, shaderpack};
 use victory_gpu::pipeline::{self, Prebuild};
 use victory_shader::{Container, FourCC, HwStage, native_programs};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{Source, shader_files, sources};
 
 /// Where a native program's container is: file, source, and its stage.
 type Found = (usize, usize, HwStage);
@@ -45,12 +45,7 @@ pub fn run(paths: &[PathBuf], threads: usize, keys_only: Option<PathBuf>) -> Res
     // The files that hold shaders (or the pack itself).
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
-        .flat_map(|root| {
-            walkdir::WalkDir::new(root)
-                .into_iter()
-                .filter_map(Result::ok)
-        })
-        .filter(|e| e.file_type().is_file() && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE))
+        .flat_map(|root| shader_files(root, false))
         .filter_map(|e| Some((e.path().to_owned(), std::fs::read(e.path()).ok()?)))
         .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || !sources(d).is_empty())
         .collect();

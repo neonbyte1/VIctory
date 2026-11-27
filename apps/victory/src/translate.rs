@@ -15,7 +15,7 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{Source, shader_files, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -208,13 +208,7 @@ pub fn run(
     let total = Mutex::new(Tally::default());
     let started = std::time::Instant::now();
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
+        for entry in shader_files(root, true) {
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
@@ -362,13 +356,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     // another target's would never be found.
     let target = victory_gpu::shader_cache::host_target();
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
+        for entry in shader_files(root, true) {
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
