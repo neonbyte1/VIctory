@@ -886,7 +886,17 @@ impl Host {
                 }),
                 views.GetCPUDescriptorHandleForHeapStart(),
             );
-            list.SetDescriptorHeaps(&[Some(views.clone())]);
+            // The root signature indexes the sampler heap directly, so one
+            // must be bound too, though the probe samples nothing.
+            let samplers: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(&root);
             list.SetComputeRoot32BitConstants(
                 0,
