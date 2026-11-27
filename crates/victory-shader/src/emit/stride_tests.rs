@@ -168,6 +168,31 @@ const HALF_STORE_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// User data: s2 a table with a raw UAV. Each lane stores the high half of
+/// a VGPR whose low half is junk: its index as the half at byte `2 × lane`
+/// (`buffer_store_short_d16_hi`), and `0x40 + lane` as the byte at
+/// `64 + lane` (`buffer_store_byte_d16_hi`).
+const HIGH_HALF_STORES_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3402_0081, // v_lshlrev_b32 v1, 1, v0
+    0x3404_0090, // v_lshlrev_b32 v2, 16, v0
+    0x3804_04FF,
+    0x0000_5A5A, // v_or_b32 v2, 0x5a5a, v2
+    0x4A06_00C0, // v_add_nc_u32 v3, 64, v0
+    0x3406_0690, // v_lshlrev_b32 v3, 16, v3
+    0x3806_06FF,
+    0x0000_A5A5, // v_or_b32 v3, 0xa5a5, v3
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE06C_1000,
+    0x8004_0201, // buffer_store_short_d16_hi v2, v1, s[16:19], 0 offen
+    0xE064_1040,
+    0x8004_0300, // buffer_store_byte_d16_hi v3, v0, s[16:19], 0 offen offset:64
+    0xBF81_0000, // s_endpgm
+];
+
 fn param(root: RootType, user_data: u8) -> RootParam {
     RootParam {
         root,
@@ -613,6 +638,52 @@ fn half_buffer_stores_leave_the_other_half_alone() {
     if ran == 0 {
         crate::emit::host::no_device("no SM 6.6 device", &[]);
     }
+}
+
+/// `buffer_store_short_d16_hi` and `buffer_store_byte_d16_hi` store the
+/// high half of their VGPR, each lane's field at its byte address, leaving
+/// the rest of the dword alone.
+#[test]
+fn high_half_buffer_stores_take_the_vgprs_high_half() {
+    let shader = build(
+        HIGH_HALF_STORES_WAVE32,
+        vec![param(RootType::Table, 2)],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let views = [View::RawUav(32)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut want: Vec<u32> = (0..16).map(|k| (2 * k) | ((2 * k + 1) << 16)).collect();
+    want.extend((0..8u8).map(|k| u32::from_le_bytes([0, 1, 2, 3].map(|b| 0x40 + 4 * k + b))));
+    want.resize(32, 0);
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
 #[test]

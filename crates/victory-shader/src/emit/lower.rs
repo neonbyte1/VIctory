@@ -9887,7 +9887,7 @@ impl<'a> Lower<'a> {
             Some("format_xyz") => (true, 3),
             Some("format_xyzw") => (true, 4),
             Some("ubyte" | "sbyte" | "ushort" | "sshort") if !store => (false, 1),
-            Some("byte" | "short") if store => (false, 1),
+            Some("byte" | "short" | "byte_d16_hi" | "short_d16_hi") if store => (false, 1),
             _ => return Err(name),
         };
         // Loads or stores of a byte or a half: its width and whether signed.
@@ -9895,9 +9895,9 @@ impl<'a> Lower<'a> {
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
         {
-            Some("ubyte" | "byte") => Some((8, false)),
+            Some("ubyte" | "byte" | "byte_d16_hi") => Some((8, false)),
             Some("sbyte") => Some((8, true)),
-            Some("ushort" | "short") => Some((16, false)),
+            Some("ushort" | "short" | "short_d16_hi") => Some((16, false)),
             Some("sshort") => Some((16, true)),
             _ => None,
         };
@@ -10097,6 +10097,13 @@ impl<'a> Lower<'a> {
             }
             let d = data.as_ref().ok_or("buffer store data")?;
             let x = self.vgprs(inst, d, 1)?[0];
+            // `_d16_hi`: the field is taken from the VGPR's high half.
+            let x = if name.ends_with("_d16_hi") {
+                let k16 = self.s.m.i32(16);
+                self.s.m.bin(c, Bin::LShr, x, k16)
+            } else {
+                x
+            };
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
             let byte = self.s.m.bin(c, Bin::And, off, three);
