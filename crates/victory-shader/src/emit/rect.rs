@@ -7,7 +7,8 @@
 //! opposite its longest side, and emits the triangle with its completion
 //! `(va, vb, v3)` (`va` before `vc`, `vb` after it), both turning the same
 //! way. Integer outputs (which can only be flat) keep `va`'s value at the
-//! fourth corner.
+//! fourth corner, and channels the vertex shader leaves unwritten stay
+//! unwritten.
 
 use super::bitcode::{Attr, Bin, Term, V, pred};
 use super::shader::Shader;
@@ -40,15 +41,36 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         .part(FourCC::OSG1)
         .ok_or(ShaderError::Malformed("a vertex shader without outputs"))?;
     let mut elements = super::signature(part.data)?;
-    elements.retain(|e| e.row.is_some());
-    for e in &mut elements {
-        e.usage = (1 << e.cols) - 1;
+    let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+    for (i, e) in elements.iter_mut().enumerate() {
+        let at = base + 32 * i;
+        let rw = part
+            .data
+            .get(at + 24..at + 26)
+            .ok_or(ShaderError::Malformed("truncated"))?;
+        let mask = ((1u32 << e.cols) - 1) as u8;
+        e.usage = ((rw[0] & !rw[1] & 0xf) >> e.col) & mask;
     }
+    elements.retain(|e| e.row.is_some());
+    if elements.iter().all(|e| e.usage == 0) {
+        return Err(ShaderError::Malformed("a vertex shader without outputs"));
+    }
+    let inputs = elements.clone();
+    for e in &mut elements {
+        e.interp = match (e.kind, e.comp) {
+            (3, _) => 4,
+            (0 | 6 | 7, 9) => 2,
+            (_, 4 | 5) | (0 | 13, _) => 1,
+            _ => 0,
+        };
+    }
+    super::container::same_mode_per_row(&mut elements, false);
+
     let mut s = Shader::new(false);
     s.gs = Some(6);
     let b = s.entry;
     // Corner k's values, element by element, component by component.
-    let mut corners: Vec<Vec<Vec<super::bitcode::V>>> = Vec::new();
+    let mut corners: Vec<Vec<Vec<Option<super::bitcode::V>>>> = Vec::new();
     for k in 0..3u32 {
         let mut values = Vec::new();
         for (id, e) in elements.iter().enumerate() {
@@ -57,10 +79,13 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
             } else {
                 (s.t.i32, ".i32")
             };
-            let mut comps = Vec::new();
+            let mut comps = Vec::with_capacity(usize::from(e.cols));
             for col in 0..e.cols {
-                let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.i32(k)];
-                comps.push(s.op(b, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args));
+                let v = (e.usage >> col & 1 != 0).then(|| {
+                    let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.i32(k)];
+                    s.op(b, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args)
+                });
+                comps.push(v);
             }
             values.push(comps);
         }
@@ -69,11 +94,12 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     // The right angle, as [`right_angle`] picks it from the position.
     let position = elements
         .iter()
-        .position(|e| e.kind == 3 && e.cols >= 2 && e.comp == 9)
+        .position(|e| e.kind == 3 && e.comp == 9 && e.usage & 0b11 == 0b11)
         .ok_or(ShaderError::Malformed("a rectangle list without a position"))?;
     let side = |s: &mut Shader, i: usize, j: usize| {
         let mut sum = None;
         for (&p, &q) in corners[i][position].iter().zip(&corners[j][position]).take(2) {
+            let (p, q) = (p.expect("written x and y"), q.expect("written x and y"));
             let d = s.m.bin(b, Bin::Sub, p, q);
             let sq = s.m.bin(b, Bin::Mul, d, d);
             sum = Some(match sum {
@@ -95,21 +121,27 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         s.m.select(b, at0, x0, x)
     };
     // The completing triangle (va, vb, v3), element by element.
-    let mut second: [Vec<Vec<V>>; 3] = Default::default();
+    let mut second: [Vec<Vec<Option<V>>>; 3] = Default::default();
     for (id, e) in elements.iter().enumerate() {
-        let mut cols: [Vec<V>; 3] = Default::default();
+        let mut cols: [Vec<Option<V>>; 3] = Default::default();
         let [c0, c1, c2] = [0, 1, 2].map(|k| &corners[k][id]);
         for ((&v0, &v1), &v2) in c0.iter().zip(c1).zip(c2) {
-            let va = pick(&mut s, [v2, v0, v1]);
-            let vb = pick(&mut s, [v1, v2, v0]);
-            let v3 = if e.comp == 9 {
-                let vc = pick(&mut s, [v0, v1, v2]);
-                let sum = s.m.bin(b, Bin::Add, va, vb);
-                s.m.bin(b, Bin::Sub, sum, vc)
-            } else {
-                va
+            let triple = match (v0, v1, v2) {
+                (Some(v0), Some(v1), Some(v2)) => {
+                    let va = pick(&mut s, [v2, v0, v1]);
+                    let vb = pick(&mut s, [v1, v2, v0]);
+                    let v3 = if e.comp == 9 {
+                        let vc = pick(&mut s, [v0, v1, v2]);
+                        let sum = s.m.bin(b, Bin::Add, va, vb);
+                        s.m.bin(b, Bin::Sub, sum, vc)
+                    } else {
+                        va
+                    };
+                    [Some(va), Some(vb), Some(v3)]
+                }
+                _ => [None; 3],
             };
-            for (k, v) in [va, vb, v3].into_iter().enumerate() {
+            for (k, v) in triple.into_iter().enumerate() {
                 cols[k].push(v);
             }
         }
@@ -123,7 +155,9 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
             for (id, e) in elements.iter().enumerate() {
                 let suffix = if e.comp == 9 { ".f32" } else { ".i32" };
                 for col in 0..e.cols {
-                    let v = corners[k][id][usize::from(col)];
+                    let Some(v) = corners[k][id][usize::from(col)] else {
+                        continue;
+                    };
                     let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), v];
                     s.op(b, &format!("storeOutput{suffix}"), Attr::NoUnwind, s.t.void, 5, &args);
                 }
@@ -134,7 +168,7 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         let stream = [s.m.i8(0)];
         s.op(b, "cutStream", Attr::NoUnwind, s.t.void, 98, &stream);
     }
-    s.inputs = elements.clone();
+    s.inputs = inputs;
     s.outputs = elements;
     s.m.terminate(b, Term::Ret);
     Ok(s.finish())
@@ -269,6 +303,251 @@ mod tests {
                     assert!(near, "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}");
                 }
             }
+        }
+    }
+
+    /// Unwritten elements and channels in the vertex shader's `OSG1` stay
+    /// unread and unwritten in the geometry shader, and outputs get their
+    /// DXIL interpolation modes (flat across a shared float-and-integer row),
+    /// so stage linkage and drawing succeed on both hardware and WARP.
+    #[test]
+    fn unwritten_channels_and_flat_outputs_link_and_draw() {
+        use super::super::bitcode::Cast;
+        use crate::dxbc::{Container, FourCC};
+
+        let vs = {
+            let mut s = Shader::new(false);
+            let b = s.entry;
+            s.inputs = vec![
+                element("POSITION", 0, 0, 0, 4),
+                element("TEXCOORD", 0, 0, 1, 4),
+            ];
+            s.outputs = vec![
+                element("SV_Position", 3, 4, 0, 4),
+                SigElement {
+                    usage: 0,
+                    ..element("COLOR", 0, 2, 1, 4)
+                },
+                SigElement {
+                    usage: 0b0101,
+                    ..element("TEXCOORD", 0, 2, 2, 4)
+                },
+                SigElement {
+                    index: 1,
+                    ..element("TEXCOORD", 0, 2, 3, 1)
+                },
+                SigElement {
+                    index: 2,
+                    comp: 5,
+                    col: 1,
+                    ..element("TEXCOORD", 0, 1, 3, 1)
+                },
+            ];
+            let load = |s: &mut Shader, id: u32, col: u8| {
+                let args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args)
+            };
+            for col in 0..4u8 {
+                let v = load(&mut s, 0, col);
+                let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+            for (in_col, out_col) in [(0u8, 0u8), (1u8, 2u8)] {
+                let v = load(&mut s, 1, in_col);
+                let args = [s.m.i32(2), s.m.i32(0), s.m.i8(out_col), v];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+            let flat_f = load(&mut s, 1, 2);
+            let args = [s.m.i32(3), s.m.i32(0), s.m.i8(0), flat_f];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            let flat_u_f = load(&mut s, 1, 3);
+            let flat_u = s.m.cast(b, Cast::FpToUi, flat_u_f, s.t.i32);
+            let args = [s.m.i32(4), s.m.i32(0), s.m.i8(0), flat_u];
+            s.op(b, "storeOutput.i32", Attr::NoUnwind, s.t.void, 5, &args);
+            s.m.terminate(b, Term::Ret);
+            s.finish()
+        };
+
+        let ps = {
+            let mut s = Shader::new(true);
+            let b = s.entry;
+            s.inputs = vec![
+                element("SV_Position", 3, 4, 0, 4),
+                SigElement {
+                    usage: 0,
+                    ..element("COLOR", 0, 2, 1, 4)
+                },
+                SigElement {
+                    usage: 0b0101,
+                    ..element("TEXCOORD", 0, 2, 2, 4)
+                },
+                SigElement {
+                    index: 1,
+                    ..element("TEXCOORD", 0, 1, 3, 1)
+                },
+                SigElement {
+                    index: 2,
+                    comp: 5,
+                    col: 1,
+                    ..element("TEXCOORD", 0, 1, 3, 1)
+                },
+            ];
+            s.outputs = vec![element("SV_Target", 16, 0, 0, 4)];
+            let load_f = |s: &mut Shader, id: u32, col: u8| {
+                let args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args)
+            };
+            let u = load_f(&mut s, 2, 0);
+            let v = load_f(&mut s, 2, 2);
+            let flat_f = load_f(&mut s, 3, 0);
+            let args = [s.m.i32(4), s.m.i32(0), s.m.i8(0), s.m.undef(s.t.i32)];
+            let flat_u = s.op(b, "loadInput.i32", Attr::ReadNone, s.t.i32, 4, &args);
+            let flat_u = s.m.cast(b, Cast::UiToFp, flat_u, s.t.f32);
+            for (col, val) in [u, v, flat_f, flat_u].into_iter().enumerate() {
+                let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col as u8), val];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+            s.m.terminate(b, Term::Ret);
+            s.finish()
+        };
+
+        let gs = super::rectangle_gs(&vs).unwrap();
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            for c in [&vs, &gs, &ps] {
+                v.validate(&mut c.clone()).unwrap();
+            }
+        }
+
+        let vs_c = Container::parse(&vs).unwrap();
+        let gs_c = Container::parse(&gs).unwrap();
+        assert_eq!(
+            gs_c.part(FourCC::OSG1).unwrap().data,
+            vs_c.part(FourCC::OSG1).unwrap().data
+        );
+        let psv = gs_c.part(FourCC::PSV0).unwrap().data;
+        // Runtime info (4 + 48), 0 bindings (4), string table, index table,
+        // then 16-byte PSVSignatureElement records (5 inputs, 5 outputs).
+        let str_len = u32::from_le_bytes(psv[56..60].try_into().unwrap()) as usize;
+        let idx_at = 60 + str_len;
+        let idx_cnt = u32::from_le_bytes(psv[idx_at..idx_at + 4].try_into().unwrap()) as usize;
+        let els_at = idx_at + 4 + 4 * idx_cnt + 4;
+        let interps: Vec<u8> = (0..10).map(|i| psv[els_at + 16 * i + 13]).collect();
+        assert_eq!(interps, [0, 0, 0, 0, 0, 4, 2, 2, 1, 1]);
+
+        let corner = |[x, y]: [f32; 2], flat_f: f32, flat_u: f32| [x, y, 0.5, 1.0, x, y, flat_f, flat_u];
+        let (tl, bl, br, tr) = ([-0.5, 0.5], [-0.5, -0.5], [0.5, -0.5], [0.5, 0.5]);
+        let orders = [
+            ([tl, bl, br], [0.25, 3.0]),
+            ([tl, bl, tr], [0.75, 9.0]),
+            ([bl, tr, tl], [0.50, 5.0]),
+        ];
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
+            for (n, &([p0, p1, p2], second_flat)) in orders.iter().enumerate() {
+                let vertices = [
+                    corner(p0, 0.25, 3.0),
+                    corner(p1, 0.50, 5.0),
+                    corner(p2, 0.75, 9.0),
+                ]
+                .concat();
+                let draw = Draw {
+                    roots: Vec::new(),
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 32,
+                    size: (32, 32),
+                    mesh_groups: 0,
+                };
+                let texels = host.draw(&root, &pso, &draw).unwrap();
+                for (i, t) in texels.iter().enumerate() {
+                    let (x, y) = ((i % 32) as f32, (i / 32) as f32);
+                    let (u, v) = ((x + 0.5) / 16.0 - 1.0, 1.0 - (y + 0.5) / 16.0);
+                    let inside = u.abs() < 0.5 && v.abs() < 0.5;
+                    if !inside {
+                        assert!(t.iter().all(|a| a.abs() < 1e-4), "outside ({x}, {y}): {t:?}");
+                        continue;
+                    }
+                    let flat = if n == 0 || u < v - 1e-4 {
+                        [0.25, 3.0]
+                    } else if u > v + 1e-4 {
+                        second_flat
+                    } else {
+                        assert!(
+                            ([0.25, 3.0], second_flat)
+                                .0
+                                .iter()
+                                .zip(&t[2..])
+                                .all(|(a, b)| (a - b).abs() < 1e-4)
+                                || second_flat.iter().zip(&t[2..]).all(|(a, b)| (a - b).abs() < 1e-4),
+                            "diagonal ({x}, {y}): {t:?}"
+                        );
+                        [t[2], t[3]]
+                    };
+                    let want = [u, v, flat[0], flat[1]];
+                    let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
+                    assert!(near, "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_system_values_make_their_row_constant() {
+        use crate::dxbc::{Container, FourCC};
+
+        let mut s = Shader::new(false);
+        s.outputs = vec![
+            element("SV_Position", 3, 4, 0, 4),
+            element("TEXCOORD", 0, 2, 1, 1),
+            SigElement {
+                comp: 5,
+                col: 1,
+                ..element("SV_RenderTargetArrayIndex", 4, 1, 1, 1)
+            },
+            SigElement {
+                comp: 5,
+                ..element("SV_ViewportArrayIndex", 5, 1, 2, 1)
+            },
+            SigElement {
+                comp: 4,
+                col: 1,
+                ..element("SV_PrimitiveID", 10, 1, 2, 1)
+            },
+        ];
+        s.m.terminate(s.entry, Term::Ret);
+        let gs = super::rectangle_gs(&s.finish()).unwrap();
+        let gs_c = Container::parse(&gs).unwrap();
+        let psv = gs_c.part(FourCC::PSV0).unwrap().data;
+        let str_len = u32::from_le_bytes(psv[56..60].try_into().unwrap()) as usize;
+        let idx_at = 60 + str_len;
+        let idx_cnt = u32::from_le_bytes(psv[idx_at..idx_at + 4].try_into().unwrap()) as usize;
+        let els_at = idx_at + 4 + 4 * idx_cnt + 4;
+        let interps: Vec<u8> = (0..10).map(|i| psv[els_at + 16 * i + 13]).collect();
+        assert_eq!(interps, [0, 0, 0, 0, 0, 4, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn vertex_shaders_without_written_outputs_are_refused() {
+        for outputs in [
+            Vec::new(),
+            vec![SigElement {
+                usage: 0,
+                ..element("SV_Position", 3, 4, 0, 4)
+            }],
+            vec![SigElement {
+                usage: 0b0001,
+                ..element("SV_Position", 3, 4, 0, 4)
+            }],
+        ] {
+            let mut s = Shader::new(false);
+            s.outputs = outputs;
+            s.m.terminate(s.entry, Term::Ret);
+            assert!(super::rectangle_gs(&s.finish()).is_err());
         }
     }
 }
