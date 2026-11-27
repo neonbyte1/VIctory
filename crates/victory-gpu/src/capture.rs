@@ -688,6 +688,11 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         11..=12 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
         13..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(i16_at(b, i))))),
         33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
+        // Signed 32-bit RGBA and RG color channels.
+        4 => (16, Box::new(move |b| [0, 1, 2].map(|i| u32_at(b, i) as i32 as f32))),
+        18 => (8, Box::new(move |b| {
+            [u32_at(b, 0) as i32 as f32, u32_at(b, 1) as i32 as f32, 0.0]
+        })),
         1..=2 => (16, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
         })),
@@ -798,6 +803,27 @@ fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8>
     let (p50, p99) = (at(0.5), at(0.99));
     tracing::info!(format, low, high, p50, p99, nonzero, not_finite = 0, "target values");
     out
+}
+
+#[test]
+fn signed_32_bit_color_captures_decode_negative_components() {
+    let rg = [-(1 << 30), 1 << 29, i32::MAX, 1 << 28, -(1 << 29), i32::MAX];
+    let rgba = [
+        -(1 << 30), 1 << 29, -(1 << 28), i32::MAX, i32::MAX,
+        1 << 28, -(1 << 29), 1 << 29, i32::MAX, i32::MAX,
+    ];
+    let rg: Vec<_> = rg.into_iter().flat_map(i32::to_le_bytes).collect();
+    let rgba: Vec<_> = rgba.into_iter().flat_map(i32::to_le_bytes).collect();
+    assert_eq!(
+        [
+            to_rgba(DXGI_FORMAT_R32G32_SINT.0 as u32, 1, 2, 12, &rg),
+            to_rgba(DXGI_FORMAT_R32G32B32A32_SINT.0 as u32, 1, 2, 20, &rgba),
+        ],
+        [
+            Some(vec![0, 127, 0, 255, 63, 0, 0, 255]),
+            Some(vec![0, 127, 0, 255, 63, 0, 127, 255]),
+        ]
+    );
 }
 
 /// Pixels per side of the grid [`probe`] reads.
