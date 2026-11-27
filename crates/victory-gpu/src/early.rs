@@ -49,6 +49,25 @@ pub(crate) fn on() -> bool {
     *ON
 }
 
+/// Whether barriers are relaxed (`VICTORY_EARLY_BARRIERS=1`); logged once.
+/// A barrier is then prepared with earlier submissions still in flight (its
+/// preparing settles them where it reads what they write back), and work
+/// after a submission that names the title memory it writes (a texture read
+/// back) no longer makes a barrier (`crate::host`'s `alone`, `barrier`).
+pub(crate) fn barriers() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = crate::switch::on("VICTORY_EARLY_BARRIERS");
+        if on {
+            tracing::info!(
+                "barriers are prepared with earlier submissions in flight; named work after is no barrier \
+                 (VICTORY_EARLY_BARRIERS)"
+            );
+        }
+        on
+    });
+    *ON
+}
+
 /// Why a wait reads title memory though a value write to its word is in
 /// flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -624,8 +624,8 @@ fn layout(key: usize) -> Arc<Layout> {
 /// At submission, for a list using title memory with view heap `key`
 /// bound: the heap's page table names every host copy there is, each
 /// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory).
-pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+/// until a step writes title memory, and whether the copy was clean).
+pub(crate) fn prepare(key: usize, add: impl FnMut(&Arc<Shadow>, usize, usize, bool)) {
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
@@ -638,15 +638,16 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     })
     .flatten();
     // Copies the title has not written since they took it are passed by
-    // without touching them (the table names every copy, ~4,700 in the world).
-    for l in layout.iter() {
-        for (c, bit) in l.copies.iter().zip(&l.bits) {
-            if !crate::watch::clean_bit(*bit) {
-                let (start, len) = c.range();
-                add(c, start as usize, len as usize);
-            }
-        }
-    }
+    // without touching them (the table names every copy, ~4,700 in the
+    // world), unless a submission in flight writes their memory other than
+    // through them (`crate::shadow::refresh_where_needed`).
+    let entries = layout.iter().flat_map(|l| {
+        l.copies.iter().zip(&l.bits).map(|(c, bit)| {
+            let (start, len) = c.range();
+            (c, Arc::as_ptr(c) as usize, start as usize, len as usize, *bit)
+        })
+    });
+    crate::shadow::refresh_where_needed(entries, add);
 }
 
 /// Whether any marked page in `marks` fell outside a valid copy in `l`.

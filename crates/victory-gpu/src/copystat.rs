@@ -232,8 +232,31 @@ pub(crate) enum C {
     EarlyRefusedBarrier,
     EarlyRefusedStamp,
     EarlyRefusedSize,
+    /// Barriers (`crate::host`), each once by its first kind: title memory
+    /// through page tables, missed-memory checks, writes through the heap's
+    /// views, unnamed work after, named work after (without
+    /// `VICTORY_EARLY_BARRIERS`), marks not captured apart. Barriers
+    /// prepared with earlier submissions left in flight, and submissions
+    /// with named work after left light (`VICTORY_EARLY_BARRIERS`); heavy
+    /// submissions with named work after.
+    BarrierMemory,
+    BarrierMissed,
+    BarrierHeapWrites,
+    BarrierAfter,
+    BarrierAfterNamed,
+    BarrierMarks,
+    AloneWaived,
+    AfterNamedLight,
+    HeavyAfterNamed,
+    /// Clean copies of heaps and page tables refreshed because a write in
+    /// flight crosses them (`crate::shadow::refresh_where_needed`), and the
+    /// settles only such clean copies (and unchanged textures) asked for.
+    CleanCrossed,
+    SettleAliasClean,
+    SettleLabelClean,
+    SettleTextureClean,
 }
-const COUNTERS: usize = 134;
+const COUNTERS: usize = 147;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -526,7 +549,7 @@ pub(crate) fn log(frames: f64) {
          {:.1} work after, {:.1} bottom-of-pipe writes ({:.1} for those alone), {:.1} missed-memory checks, \
          {:.1} declared GPU writes, {:.1} title memory through page tables; {:.1} light that marking heap reads alone made heavy before",
         c[C::HeavyHeapWrites as usize],
-        c[C::HeavyAfter as usize],
+        c[C::HeavyAfter as usize] + c[C::HeavyAfterNamed as usize],
         c[C::HeavyWrites as usize],
         c[C::HeavyWritesOnly as usize],
         c[C::HeavyMissed as usize],
@@ -566,6 +589,25 @@ pub(crate) fn log(frames: f64) {
         c[C::EarlyRefusedBarrier as usize],
         c[C::EarlyRefusedStamp as usize],
         c[C::EarlyRefusedSize as usize],
+    );
+    tracing::info!(
+        "  barriers per frame by kind: {:.1} title memory through page tables, {:.1} missed-memory checks, \
+         {:.1} writes through the heap's views, {:.1} unnamed work after, {:.1} named work after, {:.1} marks \
+         not captured; {:.1} prepared with earlier ones left in flight, {:.1} with named work after left light \
+         (VICTORY_EARLY_BARRIERS); clean copies refreshed for writes in flight across them {:.1}, settles they \
+         alone asked for: {:.1} other copies, {:.1} bottom-of-pipe writes, {:.1} textures",
+        c[C::BarrierMemory as usize],
+        c[C::BarrierMissed as usize],
+        c[C::BarrierHeapWrites as usize],
+        c[C::BarrierAfter as usize],
+        c[C::BarrierAfterNamed as usize],
+        c[C::BarrierMarks as usize],
+        c[C::AloneWaived as usize],
+        c[C::AfterNamedLight as usize],
+        c[C::CleanCrossed as usize],
+        c[C::SettleAliasClean as usize],
+        c[C::SettleLabelClean as usize],
+        c[C::SettleTextureClean as usize],
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

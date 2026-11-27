@@ -899,7 +899,10 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
         )
     };
     let (data, title) = (data as usize, title as usize);
-    list.defer_after(move || {
+    // The rows are all it writes in title memory: named, later submissions
+    // wait for it only where they read them (`HostList::defer_after_writing`).
+    let writes = rows.iter().map(|&(at, n)| (title + at as usize, title + (at + n) as usize)).collect();
+    list.defer_after_writing(writes, move || {
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);
             let _writing = crate::watch::writing(title + at, n);

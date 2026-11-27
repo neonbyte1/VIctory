@@ -48,14 +48,18 @@ type Range = (usize, u64, u64, bool);
 /// the change tracker (`crate::watch::clean_bit`).
 type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
+/// A viewed texture: slot count, cached watch::DIRTY bit, idle stamp epoch,
+/// title memory range once asked (none: no console layout).
+type Viewing = (u32, Option<u32>, u64, Option<Option<(usize, usize)>>);
+
 #[derive(Default)]
 struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
-    /// Distinct title-written textures viewed in this heap: `(slot count,
-    /// cached watch::DIRTY bit, idle stamp epoch)` so clean and idle textures
-    /// skip `Resource::host` and `HostTexture::staging` locks during [`uploads`].
-    textures: BTreeMap<usize, (u32, Option<u32>, u64)>,
+    /// Distinct title-written textures viewed in this heap ([`Viewing`]) so
+    /// clean and idle textures skip `Resource::host` and
+    /// `HostTexture::staging` locks during [`uploads`].
+    textures: BTreeMap<usize, Viewing>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
@@ -118,7 +122,7 @@ impl Inner {
                 }
             }
             Seen::Texture(r) => {
-                let entry = self.textures.entry(*r).or_insert((0, None, 0));
+                let entry = self.textures.entry(*r).or_insert((0, None, 0, None));
                 step(&mut entry.0);
                 if entry.0 == 0 {
                     self.textures.remove(r);
@@ -189,6 +193,15 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
     }
 }
 
+/// The title memory of texture `r`, `[start, end)`, if it has a console
+/// layout (as its staging takes it, all planes).
+fn texture_range(r: usize) -> Option<(usize, usize)> {
+    let (memory, desc) = crate::resource::texture_memory(r as This)?;
+    let layout = crate::resource::texture_layout(&desc)?;
+    let start = memory as usize;
+    Some((start, start.saturating_add(layout.size as usize)))
+}
+
 /// At submission, before anything else of it: the textures the heaps of its
 /// heap-indexing lists view, and `textures` (staging and host texture of
 /// those its lists read through tables, `crate::texture::upload`), are
@@ -242,10 +255,15 @@ pub(crate) fn uploads(
             staged_set = Some(set);
         }
     };
+    // Writes in flight to texture memory reach it only once their submission
+    // completes: a texture over them is brought up anyway, after a settle,
+    // whether its memory changed yet or not.
+    let flying = crate::shadow::flight_now();
+    let crosses = |(start, end): (usize, usize)| flying.as_ref().is_some_and(|f| f.crossing(start, end, 0).is_some());
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded), or its memory has not changed.
-        if copy.host_written.load(Relaxed) || !staging.maybe_changed() {
+        if copy.host_written.load(Relaxed) || !staging.maybe_changed() && !crosses(staging.title_range()) {
             continue;
         }
         push_unique(staging.clone(), copy.clone());
@@ -258,12 +276,11 @@ pub(crate) fn uploads(
         for viewed in heaps {
             let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
             for (&r, entry) in inner.textures.iter_mut() {
-                if let Some(bit) = entry.1
-                    && crate::watch::clean_bit(Some(bit))
-                {
-                    continue;
-                }
-                if entry.2 == epoch {
+                let clean = entry.1.is_some_and(|bit| crate::watch::clean_bit(Some(bit)));
+                let crossed = (clean || entry.2 == epoch)
+                    && flying.is_some()
+                    && entry.3.get_or_insert_with(|| texture_range(r)).is_some_and(crosses);
+                if (clean || entry.2 == epoch) && !crossed {
                     continue;
                 }
                 if let Some(done) = done.as_mut()
@@ -279,7 +296,7 @@ pub(crate) fn uploads(
                 // the submission that read it, which can see bytes one refresh
                 // old (a slot the title rewrites is made fresh anyway); upload on
                 // the mark itself if that shows.
-                let (bit, copy) = crate::resource::bindless_upload_check(r as This, presented);
+                let (bit, copy) = crate::resource::bindless_upload_check(r as This, presented, crossed);
                 if entry.1.is_none() && bit.is_some() {
                     entry.1 = bit;
                 }
@@ -296,7 +313,7 @@ pub(crate) fn uploads(
     }
     for (r, texture) in pending {
         if let Some(staging) = crate::texture::staging_for(r as This, &texture)
-            && staging.maybe_changed()
+            && (staging.maybe_changed() || crosses(staging.title_range()))
         {
             push_unique(staging, texture);
         }
@@ -305,14 +322,23 @@ pub(crate) fn uploads(
         return None;
     }
     guard.needs_recycle = true;
-    if let Some(owner) = work
-        .iter()
-        .filter_map(|(staging, _)| {
-            let (start, end) = staging.title_range();
-            crate::shadow::crossing(start, end, 0).map(|c| c.0)
-        })
-        .max()
-    {
+    // The latest writer in flight under them, and under those whose memory
+    // changed (a later one: a settle only unchanged textures ask for).
+    let mut crossed: (Option<u64>, Option<u64>) = (None, None);
+    for (staging, _) in &work {
+        let (start, end) = staging.title_range();
+        if let Some((o, _)) = crate::shadow::crossing(start, end, 0) {
+            crossed.0 = crossed.0.max(Some(o));
+            if staging.maybe_changed() {
+                crossed.1 = crossed.1.max(Some(o));
+            }
+        }
+    }
+    if let Some(owner) = crossed.0 {
+        #[cfg(feature = "diagnostics")]
+        if crossed.1 < crossed.0 {
+            crate::copystat::add(crate::copystat::C::SettleTextureClean, 1);
+        }
         settle(owner, crate::host::Settled::Texture);
     }
     let uploads = crate::texture::refresh_all(&work);
@@ -386,19 +412,21 @@ impl Drop for Uploads {
 /// is shaders marking the pages they write (as `crate::memory` does).
 ///
 /// Copies the title has not written since they took it are passed by: a
-/// world submission's heaps reach ~9,000 copies, a few of them written.
-pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+/// world submission's heaps reach ~9,000 copies, a few of them written. But
+/// not those whose memory a submission in flight writes other than through
+/// them (`crate::shadow::refresh_where_needed`): `add` gets whether the copy
+/// was clean.
+pub(crate) fn refresh(viewed: &Viewed, add: impl FnMut(&Arc<Shadow>, usize, usize, bool)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, uav, bit) in inner.hulls.values() {
-        if !crate::watch::clean_bit(*bit) {
-            let (address, len) = if *uav && shadow.marked() {
-                shadow.page_range(*address, *len)
-            } else {
-                (*address, *len)
-            };
-            add(shadow, address as usize, len as usize);
-        }
-    }
+    let entries = inner.hulls.values().map(|(shadow, address, len, uav, bit)| {
+        let (address, len) = if *uav && shadow.marked() {
+            shadow.page_range(*address, *len)
+        } else {
+            (*address, *len)
+        };
+        (shadow, Arc::as_ptr(shadow) as usize, address as usize, len as usize, *bit)
+    });
+    crate::shadow::refresh_where_needed(entries, add);
 }
 
 /// Draws and dispatches run with heap-indexing shaders, those of them

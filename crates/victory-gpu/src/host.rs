@@ -1159,20 +1159,39 @@ fn declared_overlap(next: &[Declared], flying: &[Declared]) -> bool {
 
 /// [`HostList::heavy_reasons`] bits that keep a submission's completion
 /// before the next one is prepared whatever it touches: writes through the
-/// heap's views (declared nowhere), work after it, missed-memory checks,
-/// title memory through page tables (anywhere). The others (bottom-of-pipe
-/// writes, declared GPU writes) are bounded and known at submission: later
-/// submissions wait for it only where they meet them (`Host::submit`,
-/// [`Settled`]).
+/// heap's views (declared nowhere), work after it that names nothing it
+/// writes, missed-memory checks, title memory through page tables
+/// (anywhere). The others (bottom-of-pipe writes, declared GPU writes) are
+/// bounded and known at submission: later submissions wait for it only
+/// where they meet them (`Host::submit`, [`Settled`]).
 const BARRIER_REASONS: u8 = 1 | 1 << 1 | 1 << 3 | 1 << 5;
+
+/// [`HostList::heavy_reasons`] bit of work after it that names the title
+/// memory it writes ([`HostList::defer_after_writing`]): registered in
+/// flight like declared writes, a barrier only without
+/// `VICTORY_EARLY_BARRIERS` (`crate::early::barriers`).
+const AFTER_NAMED: u8 = 1 << 7;
 
 /// Whether a submission with heavy reasons `reasons` that marks
 /// (`marks`) completes before the next is prepared: for a barrier reason,
 /// or marks its shaders set where each submission's are not captured apart
 /// (`crate::shadow::captures_write_marks`: they are taken from the one
-/// bitmap with nothing in flight after it).
-fn barrier(reasons: u8, marks: bool, captured: bool) -> bool {
-    reasons & BARRIER_REASONS != 0 || marks && !captured
+/// bitmap with nothing in flight after it). `relaxed`: with
+/// `VICTORY_EARLY_BARRIERS`.
+fn barrier(reasons: u8, marks: bool, captured: bool, relaxed: bool) -> bool {
+    let named = if relaxed { 0 } else { AFTER_NAMED };
+    reasons & (BARRIER_REASONS | named) != 0 || marks && !captured
+}
+
+/// Whether a submission completes every one in flight before it is
+/// prepared: a barrier, but with `VICTORY_EARLY_BARRIERS` (`relaxed`) only
+/// one whose marks are not its own (taken from the one bitmap, with nothing
+/// else in flight). Its preparing reads what those in flight write back
+/// only where it settles them, as any submission's ([`Settled`]); and they
+/// complete before it, in order (`Host::finish`). What it writes unnamed
+/// keeps the next submission waiting for it ([`barrier`]).
+fn alone(reasons: u8, marks: bool, captured: bool, relaxed: bool) -> bool {
+    if relaxed { marks && !captured } else { barrier(reasons, marks, captured, false) }
 }
 
 /// Why a submission being prepared completes one in flight first
@@ -1307,6 +1326,12 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
+    /// Some of `after` writes title memory it does not name
+    /// ([`HostList::defer_after`]).
+    after_unnamed: bool,
+    /// The title memory `[start, end)` the rest of `after` writes
+    /// ([`HostList::defer_after_writing`]).
+    after_writes: Vec<(usize, usize)>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1319,6 +1344,40 @@ struct Deferred {
     /// Probes run after bitmap readbacks to collect any VRAM-backed `memory`
     /// shadow pages that need CPU readback before `after` callbacks run.
     vram_probes: Vec<VramProbe>,
+}
+
+/// [`HostList::heavy_reasons`] of a list's deferred work, its shaders marking
+/// through views (`marks`) and possibly writing through the heap's
+/// (`heap_writes`).
+fn reasons_of(d: &Deferred, marks: bool, heap_writes: bool) -> u8 {
+    let heap = marks && d.copies.iter().any(|s| matches!(s, Step::Heap(_)));
+    u8::from(heap && heap_writes)
+        | u8::from(d.after_unnamed) << 1
+        | u8::from(!d.writes.is_empty()) << 2
+        | u8::from(!d.missed.is_empty()) << 3
+        | u8::from(d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..)))) << 4
+        | u8::from(d.copies.iter().any(|s| matches!(s, Step::Memory(_)))) << 5
+        | u8::from(heap && !heap_writes) << 6
+        | if d.after_writes.is_empty() { 0 } else { AFTER_NAMED }
+}
+
+/// [`HostList::flying`] of a list's deferred work.
+fn flying_of(d: &Deferred) -> Vec<(usize, usize, usize)> {
+    let declared = d.copies.iter().filter_map(|s| match s {
+        Step::GpuWrite(shadow, address, len, marked, _) => {
+            let (a, n) = if *marked {
+                let (a, n) = shadow.page_range(*address as u64, *len as u64);
+                (a as usize, n as usize)
+            } else {
+                (*address, *len)
+            };
+            Some((a, a + n, std::sync::Arc::as_ptr(shadow) as usize))
+        }
+        _ => None,
+    });
+    let labels = d.writes.iter().map(|&(at, _, bytes)| (at, at + bytes, crate::shadow::LABEL));
+    let after = d.after_writes.iter().map(|&(a, e)| (a, e, crate::shadow::AFTER));
+    declared.chain(labels).chain(after).collect()
 }
 
 /// The submission lock's state.
@@ -1696,7 +1755,11 @@ impl Host {
         let uploading = runs.iter().any(|l| l.uploads_at_submission());
         let reasons = runs.iter().fold(0u8, |r, l| r | l.heavy_reasons());
         let marking = runs.iter().any(|l| l.marks.load(Ordering::Relaxed));
-        let alone = barrier(reasons, marking, crate::shadow::captures_write_marks());
+        let captured = crate::shadow::captures_write_marks();
+        let relaxed = crate::early::barriers();
+        let alone = alone(reasons, marking, captured, relaxed);
+        // A barrier prepared with those in flight left there (counted).
+        let waived = barrier(reasons, marking, captured, relaxed) && !alone;
         let declared: Vec<Declared> = runs.iter().flat_map(|l| l.declared()).collect();
         let why = std::cell::Cell::new(0u8);
         let mut submitted = self.complete_while(self.lock_submitted(), |r| {
@@ -1706,7 +1769,7 @@ impl Host {
                 | u8::from(r.lists.iter().any(|held| lists.iter().any(|l| std::sync::Arc::ptr_eq(held, l)))) << 3
                 | u8::from(queue != 0 && r.marks && crate::resource::eviction_due()) << 4
                 | u8::from(declared_overlap(&declared, &r.declared)) << 5;
-            why.set(why.get() | bits);
+            why.set(why.get() | bits | u8::from(waived) << 6);
             bits != 0
         });
         #[cfg(feature = "diagnostics")]
@@ -1719,6 +1782,7 @@ impl Host {
                 C::WaitListAgain,
                 C::WaitEviction,
                 C::WaitDeclared,
+                C::AloneWaived,
             ]
             .into_iter()
             .enumerate()
@@ -2095,26 +2159,44 @@ impl Host {
         let mut vram = VramSync::default();
         let before = self.vram_before(vram_uploads, &vram_bitmaps, marks, mark_bytes, &mut vram);
         let reasons = runs.iter().fold(0u8, |r, l| r | l.heavy_reasons());
-        let barrier = barrier(reasons, marks, captured);
+        let relaxed = crate::early::barriers();
+        let barrier = barrier(reasons, marks, captured, relaxed);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
             for (bit, c) in [
-                C::HeavyHeapWrites,
-                C::HeavyAfter,
-                C::HeavyWrites,
-                C::HeavyMissed,
-                C::HeavyGpuWrites,
-                C::HeavyMemory,
-            ]
-            .into_iter()
-            .enumerate()
-            {
+                (0, C::HeavyHeapWrites),
+                (1, C::HeavyAfter),
+                (2, C::HeavyWrites),
+                (3, C::HeavyMissed),
+                (4, C::HeavyGpuWrites),
+                (5, C::HeavyMemory),
+                (7, C::HeavyAfterNamed),
+            ] {
                 add(c, u64::from(reasons >> bit & 1));
             }
             add(C::HeavyWritesOnly, u64::from(reasons & 0x3f == 1 << 2));
             // Heavy before the heap's read-only marks stopped counting.
             add(C::HeapReadsOnly, u64::from(reasons == 1 << 6));
+            // Each barrier once, by its first kind: page tables, missed
+            // checks, writes through the heap's views, unnamed work after,
+            // named work after (without the switch), marks not captured.
+            if barrier {
+                let kind = [5, 3, 0, 1, 7].into_iter().find(|&bit| reasons >> bit & 1 != 0);
+                add(
+                    match kind {
+                        Some(5) => C::BarrierMemory,
+                        Some(3) => C::BarrierMissed,
+                        Some(0) => C::BarrierHeapWrites,
+                        Some(1) => C::BarrierAfter,
+                        Some(_) => C::BarrierAfterNamed,
+                        None => C::BarrierMarks,
+                    },
+                    1,
+                );
+            }
+            // Named work after left light by the switch.
+            add(C::AfterNamedLight, u64::from(reasons & AFTER_NAMED != 0 && !barrier));
         }
         // Completing it takes the write marks (`Host::finish`) or reads the
         // lists' page bitmaps (`crate::memory::bind`'s probes).
@@ -2904,28 +2986,22 @@ impl HostList {
     }
 
     /// Why completing a submission of the list writes title memory or takes
-    /// what its shaders marked as written, as bits (any of 0–5: the list is
-    /// heavy): 0 writes marked through the heap's views, 1 work after it,
-    /// 2 bottom-of-pipe writes, 3 missed-memory checks, 4 copy-backs of
-    /// declared ranges its shaders write, 5 title memory through page tables.
-    /// The next submission's refreshes and copies read title memory: it is
-    /// prepared only once a submission with bits 0, 1, 3 or 5 has completed
-    /// ([`barrier`]); bits 2 and 4 name where it writes ([`HostList::declared`],
-    /// [`HostList::flying`]). Marks of views read alone (tables, root
-    /// views, and the heap's when no program of the list writes through
-    /// them) do not count: taken early, they make views early. Bit 6, not
-    /// heavy: the list marks through the heap's views and only reads them.
+    /// what its shaders marked as written, as bits (any of 0–5 or 7: the
+    /// list is heavy): 0 writes marked through the heap's views, 1 work after
+    /// it naming nothing it writes, 2 bottom-of-pipe writes, 3 missed-memory
+    /// checks, 4 copy-backs of declared ranges its shaders write, 5 title
+    /// memory through page tables, 7 work after it naming what it writes
+    /// ([`AFTER_NAMED`]). The next submission's refreshes and copies read
+    /// title memory: it is prepared only once a submission with bits 0, 1,
+    /// 3 or 5 (and 7 without `VICTORY_EARLY_BARRIERS`) has completed
+    /// ([`barrier`]); bits 2, 4 and 7 name where it writes
+    /// ([`HostList::declared`], [`HostList::flying`]). Marks of views read
+    /// alone (tables, root views, and the heap's when no program of the list
+    /// writes through them) do not count: taken early, they make views
+    /// early. Bit 6, not heavy: the list marks through the heap's views and
+    /// only reads them.
     fn heavy_reasons(&self) -> u8 {
-        let d = self.deferred();
-        let heap = self.marks.load(Ordering::Relaxed) && d.copies.iter().any(|s| matches!(s, Step::Heap(_)));
-        let heap_writes = self.heap_writes.load(Ordering::Relaxed);
-        u8::from(heap && heap_writes)
-            | u8::from(!d.after.is_empty()) << 1
-            | u8::from(!d.writes.is_empty()) << 2
-            | u8::from(!d.missed.is_empty()) << 3
-            | u8::from(d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..)))) << 4
-            | u8::from(d.copies.iter().any(|s| matches!(s, Step::Memory(_)))) << 5
-            | u8::from(heap && !heap_writes) << 6
+        reasons_of(&self.deferred(), self.marks.load(Ordering::Relaxed), self.heap_writes.load(Ordering::Relaxed))
     }
 
     /// The ranges its shaders declare as written ([`Declared`]).
@@ -2944,24 +3020,10 @@ impl HostList {
 
     /// What a submission of the list writes in title memory when it
     /// completes, for `crate::shadow::fly`: its declared ranges through
-    /// their copies (marked ones as the whole pages their copy-back writes)
-    /// and its bottom-of-pipe writes.
+    /// their copies (marked ones as the whole pages their copy-back writes),
+    /// its bottom-of-pipe writes and what its work after names.
     fn flying(&self) -> Vec<(usize, usize, usize)> {
-        let d = self.deferred();
-        let declared = d.copies.iter().filter_map(|s| match s {
-            Step::GpuWrite(shadow, address, len, marked, _) => {
-                let (a, n) = if *marked {
-                    let (a, n) = shadow.page_range(*address as u64, *len as u64);
-                    (a as usize, n as usize)
-                } else {
-                    (*address, *len)
-                };
-                Some((a, a + n, std::sync::Arc::as_ptr(shadow) as usize))
-            }
-            _ => None,
-        });
-        let labels = d.writes.iter().map(|&(at, _, bytes)| (at, at + bytes, crate::shadow::LABEL));
-        declared.chain(labels).collect()
+        flying_of(&self.deferred())
     }
 
     /// Whether a submission of the list brings textures up to date with
@@ -3212,9 +3274,22 @@ impl HostList {
     }
 
     /// Runs `work` once the list has run (each submission), before its
-    /// bottom-of-pipe writes.
+    /// bottom-of-pipe writes. What it writes in title memory is not named:
+    /// the submission completes before the next is prepared ([`barrier`]).
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().after.push(Box::new(work));
+        let mut d = self.deferred();
+        d.after.push(Box::new(work));
+        d.after_unnamed = true;
+    }
+
+    /// [`HostList::defer_after`] of `work` that writes title memory only in
+    /// `writes` (`[start, end)` each): registered in flight like declared
+    /// writes ([`HostList::flying`]), so with `VICTORY_EARLY_BARRIERS` later
+    /// submissions wait for it only where they read there ([`AFTER_NAMED`]).
+    pub(crate) fn defer_after_writing(&self, writes: Vec<(usize, usize)>, work: impl Fn() + Send + 'static) {
+        let mut d = self.deferred();
+        d.after.push(Box::new(work));
+        d.after_writes.extend(writes);
     }
 
     /// Registers a per-list VRAM/RAM dirty bitmap pair to zero before
@@ -3520,11 +3595,11 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    crate::bindless::refresh(viewed, |s, a, l, clean| batch.add_reached(s, a, l, clean));
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    crate::memory::prepare(heap, |s, a, l, clean| batch.add_reached(s, a, l, clean));
                     continue;
                 }
             };
@@ -3566,16 +3641,37 @@ struct Batch {
     /// in `refreshes` reads other than through its copy, and whether by
     /// bottom-of-pipe writes ([`crate::shadow::crossing`]).
     crossed: Option<(u64, bool)>,
+    /// The same over refreshes other than of clean copies of heaps and page
+    /// tables crossing writes in flight ([`Batch::add_reached`]): a later
+    /// `crossed` is a settle those alone make (counted).
+    crossed_dirty: Option<(u64, bool)>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        self.add_as(shadow, address, len, false);
+    }
+
+    /// [`Batch::add`] of a copy of a heap or page table (`clean`: the title
+    /// has not written it since it took it, and a submission in flight
+    /// writes its memory through another copy or after it ran,
+    /// `crate::shadow::refresh_where_needed`).
+    fn add_reached(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize, clean: bool) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::CleanCrossed, u64::from(clean));
+        self.add_as(shadow, address, len, clean);
+    }
+
+    fn add_as(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize, clean: bool) {
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         let crossed = crate::shadow::crossing(address, end, key);
-        if let Some(c) = crossed
-            && self.crossed.is_none_or(|k| k.0 < c.0)
-        {
-            self.crossed = Some(c);
+        if let Some(c) = crossed {
+            if self.crossed.is_none_or(|k| k.0 < c.0) {
+                self.crossed = Some(c);
+            }
+            if !clean && self.crossed_dirty.is_none_or(|k| k.0 < c.0) {
+                self.crossed_dirty = Some(c);
+            }
         }
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
@@ -3610,9 +3706,20 @@ impl Batch {
     fn flush(&mut self, owner: u64, settle: &mut dyn FnMut(u64, Settled)) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
+        let dirty = self.crossed_dirty.take();
         if let Some((o, label)) = self.crossed.take() {
+            // Only clean copies crossing writes in flight asked for it (or
+            // for a later submission): what correctness adds.
+            #[cfg(feature = "diagnostics")]
+            if dirty.is_none_or(|d| d.0 < o) {
+                crate::copystat::add(
+                    if label { crate::copystat::C::SettleLabelClean } else { crate::copystat::C::SettleAliasClean },
+                    1,
+                );
+            }
             settle(o, if label { Settled::Label } else { Settled::Alias });
         }
+        let _ = dirty;
         self.pending.clear();
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
@@ -5898,18 +6005,54 @@ mod light {
         assert!(!declared_overlap(&[], &a));
     }
 
-    /// Barriers: writes through the heap's views, work after, missed
-    /// checks, page tables, and marks shaders set where they are not
+    /// Barriers: writes through the heap's views, unnamed work after,
+    /// missed checks, page tables, and marks shaders set where they are not
     /// captured per submission; bottom-of-pipe writes and declared ranges
-    /// are not.
+    /// are not, nor named work after with `VICTORY_EARLY_BARRIERS`.
     #[test]
     fn only_undeclared_writes_and_shared_marks_are_barriers() {
-        for bit in 0..7 {
-            assert_eq!(barrier(1 << bit, false, true), [0, 1, 3, 5].contains(&bit), "bit {bit}");
+        for bit in 0..8 {
+            assert_eq!(barrier(1 << bit, false, true, false), [0, 1, 3, 5, 7].contains(&bit), "bit {bit}");
+            assert_eq!(barrier(1 << bit, false, true, true), [0, 1, 3, 5].contains(&bit), "bit {bit}, relaxed");
         }
-        assert!(!barrier(1 << 2 | 1 << 4 | 1 << 6, true, true), "declared, bottom-of-pipe, captured marks");
-        assert!(barrier(0, true, false), "marks not captured apart");
-        assert!(!barrier(0, false, false));
+        for relaxed in [false, true] {
+            assert!(!barrier(1 << 2 | 1 << 4 | 1 << 6, true, true, relaxed), "declared, bottom-of-pipe, captured marks");
+            assert!(barrier(0, true, false, relaxed), "marks not captured apart");
+            assert!(!barrier(0, false, false, relaxed));
+        }
+    }
+
+    /// With `VICTORY_EARLY_BARRIERS` a barrier no longer completes every
+    /// submission in flight before it is prepared, unless its marks are
+    /// taken from the one bitmap; without, every barrier does.
+    #[test]
+    fn relaxed_barriers_are_prepared_with_others_in_flight() {
+        for bit in [0, 1, 3, 5, 7] {
+            assert!(alone(1 << bit, true, true, false), "bit {bit}");
+            assert!(!alone(1 << bit, true, true, true), "bit {bit}, relaxed");
+            assert!(alone(1 << bit, true, false, true), "bit {bit}, marks not captured");
+        }
+        assert!(!alone(1 << 2 | 1 << 4, true, true, false), "not a barrier");
+    }
+
+    /// Work after a list that names what it writes (a texture read back)
+    /// is its own heavy reason, registered in flight as title writes;
+    /// unnamed work after stays a barrier reason.
+    #[test]
+    fn named_work_after_is_registered_in_flight() {
+        let d = Deferred {
+            after_writes: vec![(0x1000, 0x1100), (0x2000, 0x2040)],
+            ..Deferred::default()
+        };
+        assert_eq!(reasons_of(&d, false, false), AFTER_NAMED);
+        assert!(!barrier(reasons_of(&d, false, false), false, true, true));
+        assert_eq!(flying_of(&d), [(0x1000, 0x1100, crate::shadow::AFTER), (0x2000, 0x2040, crate::shadow::AFTER)]);
+        let d = Deferred {
+            after_unnamed: true,
+            ..d
+        };
+        assert_eq!(reasons_of(&d, false, false), AFTER_NAMED | 1 << 1);
+        assert!(barrier(reasons_of(&d, false, false), false, true, true));
     }
 
     /// A copy in video memory of a fresh pool of `pages` pages, and the

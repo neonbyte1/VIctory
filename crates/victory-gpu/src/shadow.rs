@@ -2014,6 +2014,12 @@ fn copy_back_run(
 /// every read of title memory crosses them.
 pub(crate) const LABEL: usize = usize::MAX;
 
+/// The copy of [`Flight`]'s title memory writes made after a submission
+/// ran with no copy in between (`crate::host::HostList::defer_after_writing`:
+/// a texture read back into a title buffer): none, as [`LABEL`], but not a
+/// bottom-of-pipe write.
+pub(crate) const AFTER: usize = usize::MAX - 1;
+
 /// Title memory that submissions in flight write and that reaches title
 /// memory only once each completes (`crate::host::Host::finish`), by
 /// submission: ranges `(start, end, copy)` their shaders declared as written
@@ -2022,13 +2028,14 @@ pub(crate) const LABEL: usize = usize::MAX;
 /// The copy itself holds what its shaders wrote for later submissions; any
 /// other reader of that memory (another copy of it, a title memory read at
 /// submission, a texture over it) would take title memory without it.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Flight {
     owners: Vec<Flying>,
 }
 
 /// One submission's part of [`Flight`]: its ranges sorted by start, and
 /// the largest end up to each.
+#[derive(Clone)]
 struct Flying {
     owner: u64,
     ranges: Vec<(usize, usize, usize)>,
@@ -2127,6 +2134,42 @@ pub(crate) fn crossing(start: usize, end: usize, copy: usize) -> Option<(u64, bo
         return None;
     }
     flight().crossing(start, end, copy)
+}
+
+/// What a preparing brings up to date of the copies its shaders may read
+/// (`crate::bindless::refresh`, `crate::memory::prepare`): each entry
+/// `(item, copy, start, len, bit)` (`copy` the copy's address, `bit` its
+/// change-tracker bit) goes to `add`, with whether it is clean, if the title
+/// changed its memory since it took it, or if a submission in flight writes
+/// that memory other than through the copy itself (another copy's range, a
+/// bottom-of-pipe or title write): those writes reach this copy only through
+/// title memory once that submission completes, which `add`'s refresh
+/// settles first (`crate::host`'s `Batch`). A clean copy is passed by only
+/// with neither: taken as up to date, it would be read without the writes of
+/// a submission it runs after on the GPU.
+pub(crate) fn refresh_where_needed<T>(
+    entries: impl IntoIterator<Item = (T, usize, usize, usize, Option<u32>)>,
+    mut add: impl FnMut(T, usize, usize, bool),
+) {
+    let flying = flight_now();
+    for (item, copy, start, len, bit) in entries {
+        let clean = crate::watch::clean_bit(bit);
+        let crossed = || {
+            flying
+                .as_ref()
+                .is_some_and(|f| f.crossing(start, start.saturating_add(len), copy).is_some())
+        };
+        if clean && !crossed() {
+            continue;
+        }
+        add(item, start, len, clean);
+    }
+}
+
+/// The registry as it is now, if anything is in flight: for callers asking
+/// [`Flight::crossing`] of many ranges at once (one lock for all).
+pub(crate) fn flight_now() -> Option<Flight> {
+    FLYING.load(AtomicOrdering::Acquire).then(|| flight().clone())
 }
 
 struct Entry {
@@ -3022,6 +3065,55 @@ pub(crate) mod tests {
         assert_eq!(copy.copy_back(0, p, PAGE), 0);
         assert_eq!(read(PAGE - 4), 0x77);
         unregister(p, p as u64);
+    }
+
+    /// The correctness hole of heaps and page tables (`crate::bindless::
+    /// refresh`, `crate::memory::prepare`, both through
+    /// [`refresh_where_needed`]): a copy E the title has not written since it
+    /// took it, of memory a submission R in flight writes through another
+    /// copy C, holds none of R's writes (they reach title memory, and E,
+    /// when R completes). Passed by as clean, a submission prepared now
+    /// would read E without them though it runs after R on the GPU; it must
+    /// be refreshed, which settles R first (`crate::host`'s `Batch`). C
+    /// itself holds R's writes and stays passed by, unless R's label or
+    /// work after writes its memory. Copies the title wrote go as before.
+    #[test]
+    fn a_clean_copy_of_memory_written_in_flight_through_another_is_refreshed() {
+        const R: u64 = u64::MAX / 2 + 100;
+        let p = crate::watch::tests::pool(2);
+        let (c, e) = (
+            crate::watch::track(p, 2 * PAGE, true).expect("tracked"),
+            crate::watch::track(p, 2 * PAGE, true).expect("tracked"),
+        );
+        c.take(p, p + 2 * PAGE);
+        e.take(p, p + 2 * PAGE);
+        assert!(c.clean() && e.clean());
+        let (c_copy, e_copy) = (0x1000_usize, 0x2000_usize);
+        let reached = || {
+            let mut added = Vec::new();
+            refresh_where_needed(
+                [("C", c_copy, p, 2 * PAGE, c.bit()), ("E", e_copy, p, PAGE, e.bit())],
+                |item, _, _, clean| added.push((item, clean)),
+            );
+            added
+        };
+        let none: [(&str, bool); 0] = [];
+        assert_eq!(reached(), none, "nothing in flight: both clean, passed by");
+        fly(R, vec![(p + 0x100, p + 0x200, c_copy)]);
+        assert_eq!(reached(), [("E", true)], "R writes through C: E is refreshed, C holds R's writes");
+        fly(R + 1, vec![(p + PAGE + 8, p + PAGE + 16, LABEL)]);
+        assert_eq!(reached(), [("C", true), ("E", true)], "R+1's label lies in C's memory");
+        land(R + 1);
+        fly(R + 1, vec![(p + PAGE, p + PAGE + 64, AFTER)]);
+        assert_eq!(reached(), [("C", true), ("E", true)], "so does R+1's named work after");
+        land(R + 1);
+        land(R);
+        assert_eq!(reached(), none, "landed: both clean again");
+        // SAFETY: a byte of our pool (the title writes it).
+        unsafe { (p as *mut u8).write_volatile(1) };
+        assert_eq!(reached(), [("C", false), ("E", false)], "written by the title: refreshed as before");
+        drop((c, e));
+        crate::watch::tests::free(p);
     }
 
     /// What submissions in flight write: a range read through another copy

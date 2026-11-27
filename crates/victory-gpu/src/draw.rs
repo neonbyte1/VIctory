@@ -2944,7 +2944,7 @@ void main() {
         viewed.set(0, Some(&uav_view), true);
         viewed.set(1, Some(&srv_view), true);
         let mut refreshed = Vec::new();
-        crate::bindless::refresh(&viewed, |_, a, l| refreshed.push((a, l)));
+        crate::bindless::refresh(&viewed, |_, a, l, _| refreshed.push((a, l)));
         refreshed.sort_unstable();
         assert_eq!(refreshed, vec![(p2, crate::watch::PAGE), (p2 + 8192, 256)]);
         crate::shadow::unregister(buf2 as usize, p2 as u64);

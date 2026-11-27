@@ -1125,11 +1125,13 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// Checks whether a bindless-viewed title texture may need an upload at
 /// `presented`, returning its cached `watch::DIRTY` bit (if its staging is
 /// tracked) and cloning the [`HostTexture`] only when it is recent, not
-/// host-written, and either uninitialized, untracked, or dirty.
+/// host-written, and either uninitialized, untracked, dirty, or `crossed`
+/// (a submission in flight writes its memory: `crate::bindless::uploads`).
 #[cfg(windows)]
 pub(crate) fn bindless_upload_check(
     this: This,
     presented: u64,
+    crossed: bool,
 ) -> (Option<u32>, Option<std::sync::Arc<HostTexture>>) {
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     if this.is_null() {
@@ -1142,6 +1144,7 @@ pub(crate) fn bindless_upload_check(
     let raw_bit = t.staging_dirty_bit.load(Acquire);
     let bit = (raw_bit < STAGING_ALWAYS_DIRTY).then_some(raw_bit);
     if let Some(b) = bit
+        && !crossed
         && crate::watch::clean_bit(Some(b))
     {
         return (Some(b), None);
