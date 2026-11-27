@@ -195,6 +195,8 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    // Keep pipelines compiled and early-start keys recorded in the last save interval.
+    victory_gpu::pipeline::save_pipeline_cache();
     println!("title exited with {code}");
     Ok(code)
 }
