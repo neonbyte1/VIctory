@@ -169,8 +169,17 @@ pub(crate) enum C {
     MarkDiffBytes,
     MarkMisses,
     MarkMerged,
+    /// Of the runs: pages opened only to bridge them; microseconds reading
+    /// and comparing before the lease, waiting for it, changing
+    /// protections, writing, checking after.
+    MarkBridged,
+    MarkPreUs,
+    MarkWaitUs,
+    MarkProtectUs,
+    MarkWriteUs,
+    MarkVerifyUs,
 }
-const COUNTERS: usize = 97;
+const COUNTERS: usize = 103;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -391,7 +400,9 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  marked copy-back per frame: {:.0} guard lock rounds, {:.0} protection changes; {:.0} runs of \
          {:.0} pages (the rest page by page); {:.0} byte runs, {:.1} MB written; {:.0} pages a title \
-         write reached while open, {:.0} pages the title wrote gone back by saved bytes",
+         write reached while open, {:.0} pages the title wrote gone back by saved bytes, {:.0} pages \
+         opened to bridge runs; in runs: {:.1} ms reading and comparing, {:.1} ms waiting for the \
+         lease, {:.1} ms changing protections, {:.1} ms writing, {:.1} ms checking",
         c[C::MarkLeases as usize],
         c[C::MarkProtects as usize],
         c[C::MarkRuns as usize],
@@ -400,6 +411,12 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::MarkDiffBytes as usize]),
         c[C::MarkMisses as usize],
         c[C::MarkMerged as usize],
+        c[C::MarkBridged as usize],
+        ms(c[C::MarkPreUs as usize]),
+        ms(c[C::MarkWaitUs as usize]),
+        ms(c[C::MarkProtectUs as usize]),
+        ms(c[C::MarkWriteUs as usize]),
+        ms(c[C::MarkVerifyUs as usize]),
     );
     tracing::info!(
         "  copies in video memory per frame: {:.1} completions, {:.1} heavy, {:.1} taking write marks; \

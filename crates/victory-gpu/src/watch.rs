@@ -690,6 +690,11 @@ impl Tracked {
 ///   changes, and takes the page only if, once guarded again, title memory
 ///   is what the copy holds. Otherwise the page stays changed (marked by
 ///   `open`), and the next refresh takes the title's bytes.
+/// - Pages opened only to bridge a run (not written) are ones this tracker
+///   alone holds and nothing else shows: checked the same way once guarded
+///   again, and marked changed ([`Lease::written`]) if the title wrote them.
+///   An armed other tracker would have needed its bytes saved first; there
+///   is none.
 ///
 /// Lock order as elsewhere: the guard lock, then a tracker's change set,
 /// then its saved bytes.
@@ -732,39 +737,60 @@ impl Lease<'_> {
         self.g.protected.contains(&page)
     }
 
-    /// Before the caller writes `pages` (ascending, no repeats): marks them
+    /// Whether this tracker alone holds page `page` and nothing else shows
+    /// it: a title write there that no fault sees concerns no other tracker.
+    pub(crate) fn alone(&self, page: usize) -> bool {
+        !self.g.alias_of.contains_key(&page)
+            && self
+                .g
+                .holders
+                .get(&page)
+                .is_some_and(|h| h.iter().all(|c| Arc::ptr_eq(c, &self.tracked.changed)))
+    }
+
+    /// Before the caller writes `write` (ascending, no repeats): marks them
     /// changed in every tracker holding them or another mapping of them
     /// (armed ones keep their bytes first, as for [`writing`]; the caller
-    /// unarms its own), then gives write access back to those guarded, one
-    /// protection change per run of consecutive pages. The other mappings
-    /// stay guarded: the write goes through this one, and the title's
-    /// through them waits for the lease. Returns the protection changes.
-    pub(crate) fn open(&mut self, pages: &[usize]) -> u64 {
+    /// unarms its own), then gives write access back to them and to
+    /// `bridge` (pages between them it will not write, unmarked: guarded
+    /// ones it alone holds, [`Lease::alone`], or ones open already), one
+    /// protection change per run of consecutive pages of both. The other
+    /// mappings stay guarded: the write goes through this one, and the
+    /// title's through them waits for the lease. Returns the protection
+    /// changes.
+    pub(crate) fn open(&mut self, write: &[usize], bridge: &[usize]) -> u64 {
         use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
         let g = &mut *self.g;
-        for (first, last) in page_runs(pages) {
+        for (first, last) in page_runs(write) {
             mark_changed(g, first, last, true);
         }
-        for (_, other) in aliases(g, pages) {
+        for (_, other) in aliases(g, write) {
             mark_changed(g, other, other + 1, true);
         }
-        let guarded: Vec<usize> = pages.iter().copied().filter(|p| g.protected.contains(p)).collect();
+        let mut all: Vec<usize> = write.iter().chain(bridge).copied().collect();
+        all.sort_unstable();
+        all.dedup();
         let mut calls = 0;
-        for (first, last) in page_runs(&guarded) {
+        for (first, last) in page_runs(&all) {
+            if g.protected.range(first..last).next().is_none() {
+                continue;
+            }
             let mut old = 0;
             calls += 1;
             #[cfg(feature = "diagnostics")]
             count_protect(1);
-            // SAFETY: blocks we made read-only; only their protection changes.
+            // SAFETY: title memory of the copy; only its protection changes
+            // (pages open already stay so).
             let opened = unsafe {
                 VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) != 0
             };
             if opened {
-                for page in first..last {
+                let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::OpenPages, guarded.len() as u64);
+                for page in guarded {
                     g.protected.remove(&page);
                 }
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::OpenPages, (last - first) as u64);
             } else {
                 // Across allocations: page by page.
                 for page in first..last {
@@ -773,6 +799,19 @@ impl Lease<'_> {
             }
         }
         calls
+    }
+
+    /// Pages `pages` (ascending, no repeats) that [`Lease::open`] bridged
+    /// changed while open (a title write no fault saw): changed in every
+    /// tracker holding them or another mapping of them.
+    pub(crate) fn written(&mut self, pages: &[usize]) {
+        let g = &mut *self.g;
+        for (first, last) in page_runs(pages) {
+            mark_changed(g, first, last, false);
+        }
+        for (_, other) in aliases(g, pages) {
+            mark_changed(g, other, other + 1, false);
+        }
     }
 
     /// After the caller's writes: guards `pages` (ascending, no repeats)

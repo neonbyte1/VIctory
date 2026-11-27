@@ -1332,6 +1332,13 @@ pub(crate) fn copy_back_marks(
             add(C::MarkDiffBytes, back.diff_bytes as u64);
             add(C::MarkMisses, back.misses as u64);
             add(C::MarkMerged, back.merged as u64);
+            add(C::MarkBridged, back.bridged as u64);
+            for (c, us) in [C::MarkPreUs, C::MarkWaitUs, C::MarkProtectUs, C::MarkWriteUs, C::MarkVerifyUs]
+                .into_iter()
+                .zip(back.us)
+            {
+                add(c, us);
+            }
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = back;
@@ -1398,11 +1405,20 @@ fn diff_runs(new: &[u8], old: &[u8], max: usize, out: &mut Vec<(u32, u32)>) {
         if new[at..end] != old[at..end] {
             for w in (at..end).step_by(8) {
                 let we = (w + 8).min(end);
-                let differs = |k: &usize| new[*k] != old[*k];
-                let Some(a) = (w..we).find(differs) else {
-                    continue;
+                let (a, b) = if we - w == 8 {
+                    let word = |s: &[u8]| u64::from_le_bytes(s[w..we].try_into().expect("8 bytes"));
+                    let x = word(new) ^ word(old);
+                    if x == 0 {
+                        continue;
+                    }
+                    (w + x.trailing_zeros() as usize / 8, w + 8 - x.leading_zeros() as usize / 8)
+                } else {
+                    let differs = |k: &usize| new[*k] != old[*k];
+                    let Some(a) = (w..we).find(differs) else {
+                        continue;
+                    };
+                    (a, (w..we).rfind(differs).unwrap_or(a) + 1)
                 };
-                let b = (w..we).rfind(differs).unwrap_or(a) + 1;
                 match out[first..].last_mut() {
                     // The word before differs too.
                     Some(r) if w >= 8 && r.1 as usize > w - 8 => r.1 = b as u32,
@@ -1445,12 +1461,18 @@ pub(crate) struct RunBack {
     pub(crate) diff_bytes: usize,
     /// Pages written that the title wrote too while open: left changed.
     pub(crate) misses: usize,
+    /// Pages opened only to bridge the run's written pages.
+    pub(crate) bridged: usize,
     /// Pages the title wrote since the copy took them: gone back by their
     /// saved bytes and left changed; kept the title's bytes (none saved).
     pub(crate) merged: usize,
     pub(crate) kept: usize,
     /// Protection changes asked.
     pub(crate) protects: u64,
+    /// Microseconds (diagnostics): reading and comparing before the lease,
+    /// waiting for it, changing protections, writing, checking after.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) us: [u64; 5],
 }
 
 #[cfg(test)]
@@ -1498,6 +1520,11 @@ fn run_hook(at: u8, page: usize) {
 ///   title's bytes, losing the shaders' (counted), as page by page.
 /// - A page in `unchanged` (the shaders changed nothing, `crate::host`):
 ///   nothing goes back, and if guarded it is taken unread.
+/// - Pages between those written are opened and guarded with them, so one
+///   protection change covers the run each way: open ones as they are, and
+///   guarded ones only where this copy alone holds them
+///   ([`crate::watch::Lease::alone`]); those are checked as the written
+///   ones, and marked changed if the title wrote them while open.
 ///
 /// A title write faulting while the lease is held lands after it, so after
 /// our writes. The one write of the title's that ours can overwrite lands
@@ -1534,6 +1561,17 @@ fn copy_back_run(
         diff_runs(host_page(i), before, DIFF_RUNS, diffs);
         Plan::Merge(s, diffs.len())
     };
+    #[cfg(feature = "diagnostics")]
+    let mut clock = std::time::Instant::now();
+    // Adds the time since the last lap to `us[k]` (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    let mut lap = |us: &mut [u64; 5], k: usize| {
+        let now = std::time::Instant::now();
+        us[k] += (now - clock).as_micros() as u64;
+        clock = now;
+    };
+    #[cfg(feature = "diagnostics")]
+    let mut us = [0u64; 5];
     // Before the lease: what the shaders changed of each page.
     let mut plans: Vec<Plan> = Vec::with_capacity(pages.len());
     for (i, &page) in pages.iter().enumerate() {
@@ -1554,7 +1592,11 @@ fn copy_back_run(
     }
     #[cfg(test)]
     run_hook(0, pages[0]);
+    #[cfg(feature = "diagnostics")]
+    lap(&mut us, 0);
     let mut lease = t.lease();
+    #[cfg(feature = "diagnostics")]
+    lap(&mut us, 1);
     // Our writes below must not save the pages for this copy (unarmed under
     // the lease: a first title write before it still saved them). A page
     // the title wrote since it was read goes back by what that write saved.
@@ -1582,7 +1624,23 @@ fn copy_back_run(
             _ => None,
         })
         .collect();
-    back.protects += lease.open(&written);
+    // Between the pages written, those not written are opened too, so that
+    // one protection change covers the run each way (the shaders leave
+    // many pages between those they change as they were): pages open
+    // already, and guarded ones this copy alone holds, checked after.
+    let bridge: Vec<usize> = match (written.first(), written.last()) {
+        (Some(&lo), Some(&hi)) => (lo + 1..hi)
+            .filter(|&pn| match plans[pn - first] {
+                Plan::Clean(a, b) | Plan::Merge(a, b) if a < b => false,
+                Plan::Skip => false,
+                _ => !lease.guarded(pn) || lease.alone(pn),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    back.protects += lease.open(&written, &bridge);
+    #[cfg(feature = "diagnostics")]
+    lap(&mut us, 2);
     #[cfg(test)]
     run_hook(1, pages[0]);
     for &pn in &written {
@@ -1598,8 +1656,10 @@ fn copy_back_run(
         back.diff_runs += b - a;
         back.written += 1;
     }
+    #[cfg(feature = "diagnostics")]
+    lap(&mut us, 3);
     // The pages the title had not written: guarded again, and taken where
-    // title memory holds what the copy does (those written, checked).
+    // title memory holds what the copy does (those opened, checked).
     let clean: Vec<usize> = pages
         .iter()
         .zip(&plans)
@@ -1608,20 +1668,34 @@ fn copy_back_run(
         .collect();
     let (guarded, calls) = lease.guard(&clean);
     back.protects += calls;
-    let mut taken = Vec::with_capacity(guarded.len());
+    #[cfg(feature = "diagnostics")]
+    lap(&mut us, 2);
+    let (mut taken, mut changed) = (Vec::with_capacity(guarded.len()), Vec::new());
     for pn in guarded {
         let i = pn - first;
         let Plan::Clean(a, b) = plans[i] else {
             continue;
         };
-        if a == b || crate::host::read_into((pn * PAGE) as *const u8, &mut title) && title[..] == *host_page(i) {
+        let bridged = bridge.binary_search(&pn).is_ok();
+        back.bridged += usize::from(bridged);
+        let opened = a < b || bridged;
+        if !opened || crate::host::read_into((pn * PAGE) as *const u8, &mut title) && title[..] == *host_page(i) {
             taken.push(pn);
         } else {
             back.misses += 1;
+            if bridged {
+                changed.push(pn);
+            }
         }
     }
+    lease.written(&changed);
     lease.taken(&taken);
     drop(lease);
+    #[cfg(feature = "diagnostics")]
+    {
+        lap(&mut us, 4);
+        back.us = us;
+    }
     TITLE.with(|b| *b.borrow_mut() = title);
     for plan in &plans {
         match plan {
@@ -2640,6 +2714,62 @@ mod run_tests {
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(9) };
         assert!(t.changed(p / PAGE + 1) && !t.changed(p / PAGE));
         drop(t);
+        free(p);
+    }
+
+    /// Pages between those a run writes are opened and guarded with them
+    /// (one protection change each way), checked after: one the title
+    /// wrote while open stays changed, one it did not is taken.
+    #[test]
+    fn a_run_bridges_the_pages_it_does_not_write_and_checks_them() {
+        let p = pool(4);
+        let t = crate::watch::track_copy(p, 4 * PAGE, true).expect("pool memory is tracked");
+        fill(p, 4 * PAGE);
+        let mut host = title_bytes(p, 4 * PAGE);
+        assert!(!t.take(p, p + 4 * PAGE).is_empty());
+        // The shaders change pages 0 and 3; 1 and 2 are bridged. The title
+        // writes page 2 while it is open.
+        host[100] ^= 1;
+        host[3 * PAGE + 100] ^= 1;
+        hook(move |at, _| {
+            if at == 1 {
+                // SAFETY: a byte of our pool, open for the run.
+                unsafe { ((p + 2 * PAGE + 64) as *mut u8).write_volatile(0x5c) };
+            }
+        });
+        let back = copy_back_run(&t, &pages_at(p, 4), &host, &Default::default());
+        unhook();
+        assert_eq!((back.written, back.bridged, back.misses, back.protects), (2, 2, 1, 2));
+        let title = title_bytes(p, 4 * PAGE);
+        assert_eq!((title[100], title[3 * PAGE + 100], title[2 * PAGE + 64]), (host[100], host[3 * PAGE + 100], 0x5c));
+        assert_eq!([0, 1, 2, 3].map(|k| t.changed(p / PAGE + k)), [false, false, true, false]);
+        // Guarded again, the bridged page counts a write.
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(9) };
+        assert!(t.changed(p / PAGE + 1));
+        drop(t);
+        free(p);
+    }
+
+    /// A page another tracker holds too is not bridged: a title write there
+    /// must fault, for that tracker.
+    #[test]
+    fn a_page_another_tracker_holds_is_not_bridged() {
+        let p = pool(3);
+        let t = crate::watch::track_copy(p, 3 * PAGE, true).expect("pool memory is tracked");
+        let other = crate::watch::track(p + PAGE, PAGE, true).expect("tracked");
+        fill(p, 3 * PAGE);
+        let mut host = title_bytes(p, 3 * PAGE);
+        assert!(!t.take(p, p + 3 * PAGE).is_empty() && !other.take(p, p + 3 * PAGE).is_empty());
+        host[100] ^= 1;
+        host[2 * PAGE + 100] ^= 1;
+        let back = copy_back_run(&t, &pages_at(p, 3), &host, &Default::default());
+        assert_eq!((back.written, back.bridged, back.protects), (2, 0, 4));
+        assert!(other.clean(), "the other tracker's page stayed guarded");
+        // SAFETY: a byte of our pool, guarded: the handler opens it.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(9) };
+        assert!(!other.clean() && t.changed(p / PAGE + 1));
+        drop((t, other));
         free(p);
     }
 
