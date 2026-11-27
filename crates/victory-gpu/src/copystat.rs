@@ -104,8 +104,31 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Copies in video memory (#3312), on completion: bytes the list after
+    /// a submission read back put into the mirrors, and the time; pages the
+    /// views' marks and the lists' page bitmaps named, of them those read
+    /// back in that list already (predicted from the last completion that
+    /// took them) and the bytes; bytes read back waited for, and the time.
+    VramStagedBytes,
+    VramStagedUs,
+    VramNamedPages,
+    VramPredictedPages,
+    VramPredictedBytes,
+    VramWaitedBytes,
+    VramWaitedUs,
+    /// Bytes read back speculatively (predicted) that no mark named.
+    VramWastedBytes,
+    /// Preparing: bytes of copies in video memory staged for upload, and
+    /// the time.
+    VramUpBytes,
+    VramUpUs,
+    /// Completions: all, heavy ones (the next submission waits for them),
+    /// those that took the views' write marks.
+    Completions,
+    HeavyCompletions,
+    MarksTaken,
 }
-const COUNTERS: usize = 61;
+const COUNTERS: usize = 74;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -310,6 +333,25 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    tracing::info!(
+        "  copies in video memory per frame: {:.1} completions, {:.1} heavy, {:.1} taking write marks; \
+         uploads staged {:.1} MB in {:.1} ms; read back in the submission and put in the mirrors \
+         {:.1} MB in {:.1} ms; pages named by marks and page bitmaps {:.0}, {:.0} of them read back in \
+         the submission ({:.1} MB, {:.1} MB read for none); read back waited for {:.1} MB in {:.1} ms",
+        c[C::Completions as usize],
+        c[C::HeavyCompletions as usize],
+        c[C::MarksTaken as usize],
+        mb(c[C::VramUpBytes as usize]),
+        ms(c[C::VramUpUs as usize]),
+        mb(c[C::VramStagedBytes as usize]),
+        ms(c[C::VramStagedUs as usize]),
+        c[C::VramNamedPages as usize],
+        c[C::VramPredictedPages as usize],
+        mb(c[C::VramPredictedBytes as usize]),
+        mb(c[C::VramWastedBytes as usize]),
+        mb(c[C::VramWaitedBytes as usize]),
+        ms(c[C::VramWaitedUs as usize]),
+    );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));

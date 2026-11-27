@@ -1109,7 +1109,19 @@ struct VramSync {
     reads: Vec<(usize, usize, usize)>,
     /// Ranges past [`STAGED_MAX`]: read back on completion, waited for.
     later: Vec<VramRead>,
+    /// Pages read back by the list after the submission because the last
+    /// completion that took marks needed them ([`PREDICTED`]): where they
+    /// are in read-back staging, by (buffer, offset, bytes).
+    predicted: std::collections::HashMap<(usize, u64, u64), usize>,
 }
+
+/// The pages of copies in video memory that the last completion taking
+/// the views' write marks or the lists' page bitmaps had to read back
+/// (`Host::vram_completed`): the next submission that takes them reads
+/// them back in its own list after it, before its fence value, so that
+/// completing it waits only for pages it did not name. Marks name mostly
+/// the same pages each frame.
+static PREDICTED: Mutex<Vec<VramRead>> = Mutex::new(Vec::new());
 
 /// How many of `lens` (in order) are staged at 16-byte offsets within
 /// `max` bytes, and those bytes.
@@ -1868,7 +1880,11 @@ impl Host {
         // back over what the CPU cleared meanwhile (`crate::shadow`).
         let mut vram = VramSync::default();
         let before = self.vram_before(vram_uploads, &vram_bitmaps, marks, &mut vram);
-        let after = self.vram_after(runs, &vram_bitmaps, marks, &mut vram);
+        let heavy = runs.iter().any(|l| l.heavy());
+        // Completing it takes the write marks (`Host::finish`) or reads the
+        // lists' page bitmaps (`crate::memory::bind`'s probes).
+        let takes = marks && (heavy || !overlap) || runs.iter().any(|l| !l.deferred().vram_probes.is_empty());
+        let after = self.vram_after(runs, &vram_bitmaps, marks, takes, &mut vram);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1959,7 +1975,7 @@ impl Host {
             value: submitted.value,
             queue: 0,
             lists: Vec::new(),
-            heavy: runs.iter().any(|l| l.heavy()),
+            heavy,
             uploads: uploads.is_some(),
             marks,
             sync: !overlap,
@@ -2020,6 +2036,13 @@ impl Host {
         // Copies in video memory first: their mirrors are what goes back. The
         // views' written pages are read back when their marks are taken below.
         let marks_taken = record.marks && (record.heavy || record.sync);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Completions, 1);
+            add(C::HeavyCompletions, u64::from(record.heavy));
+            add(C::MarksTaken, u64::from(marks_taken));
+        }
         self.vram_completed(std::mem::take(&mut record.vram), runs, marks_taken);
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
@@ -3732,6 +3755,10 @@ impl Host {
         self.upload_vram_copies(&uploads[n..]);
         let c = self.copy_list();
         if let Some(s) = &staging {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::VramUpUs);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::VramUpBytes, bytes);
             let mut at = 0u64;
             for u in &uploads[..n] {
                 // SAFETY: `u.src_ptr` is live for `u.len` bytes (held by
@@ -3765,12 +3792,16 @@ impl Host {
     /// memory (declared ranges) into read-back staging, the lists' page
     /// bitmaps and (`marks`) the views' bitmaps into system memory. On
     /// completion the staged bytes go into the mirrors ([`Host::vram_completed`]);
-    /// ranges past [`STAGED_MAX`] are read back then.
+    /// ranges past [`STAGED_MAX`] are read back then. `takes`: completing it
+    /// takes the views' write marks or reads the lists' page bitmaps, so the
+    /// pages those named last time ([`PREDICTED`]) are read back too, as far
+    /// as staging goes.
     fn vram_after(
         &self,
         runs: &[&HostList],
         bitmaps: &[(ID3D12Resource, ID3D12Resource)],
         marks: bool,
+        takes: bool,
         sync: &mut VramSync,
     ) -> Option<ID3D12CommandList> {
         let mut seen = std::collections::HashSet::new();
@@ -3791,13 +3822,23 @@ impl Host {
             }
         }
         let views = marks && crate::shadow::has_vram_bitmaps();
-        if reads.is_empty() && bitmaps.is_empty() && !views {
+        let mut predicted = if takes {
+            PREDICTED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        } else {
+            Vec::new()
+        };
+        if reads.is_empty() && predicted.is_empty() && bitmaps.is_empty() && !views {
             return None;
         }
-        let (n, bytes) = staged(reads.iter().map(|r| r.3), STAGED_MAX);
-        let staging = (bytes > 0).then(|| self.staging(true, bytes)).flatten();
-        let n = if staging.is_some() { n } else { 0 };
+        let (n, _) = staged(reads.iter().map(|r| r.3), STAGED_MAX);
         sync.later.extend(reads.drain(n..));
+        let (m, bytes) = staged(reads.iter().chain(&predicted).map(|r| r.3), STAGED_MAX);
+        predicted.truncate(m - reads.len());
+        let staging = (bytes > 0).then(|| self.staging(true, bytes)).flatten();
+        if staging.is_none() {
+            sync.later.append(&mut reads);
+            predicted.clear();
+        }
         let c = self.copy_list();
         if let Some(s) = &staging {
             let mut at = 0u64;
@@ -3805,6 +3846,13 @@ impl Host {
                 // SAFETY: our open list; live buffers, `at + len` inside the staging.
                 unsafe { c.list.CopyBufferRegion(&s.buffer, at, src, *src_off, *len) };
                 sync.reads.push((s.data + at as usize, *cpu_ptr, *len as usize));
+                at = (at + len).next_multiple_of(16);
+            }
+            for (src, src_off, _, len) in &predicted {
+                // SAFETY: as above (the prediction holds the buffers); its
+                // mirror pointers may be stale and are not used.
+                unsafe { c.list.CopyBufferRegion(&s.buffer, at, src, *src_off, *len) };
+                sync.predicted.insert((src.as_raw() as usize, *src_off, *len), s.data + at as usize);
                 at = (at + len).next_multiple_of(16);
             }
         }
@@ -3821,34 +3869,79 @@ impl Host {
     }
 
     /// First thing once a submission has run (`Host::finish`): what the list
-    /// after it read back goes into the copies' mirrors; then the pages that
-    /// only the bitmaps read back name, waited for: the views' written pages
-    /// (`marked`: their marks are taken now, `crate::shadow::copy_back_marks`)
-    /// and those the lists' page bitmaps name (`crate::memory::bind`). Those
-    /// submissions are heavy or waited for, so nothing runs after them and the
-    /// wait is for these copies alone. The lists and staging go back to their
-    /// pools.
+    /// after it read back goes into the copies' mirrors; then the pages only
+    /// the bitmaps name: the views' written pages (`marked`: their marks are
+    /// taken now, `crate::shadow::copy_back_marks`) and those the lists' page
+    /// bitmaps name (`crate::memory::bind`). Those the list after already
+    /// read back (predicted) are taken from staging; the rest are read back,
+    /// waited for. Those submissions are heavy or waited for, so nothing runs
+    /// after them: what the list after read back is what is there now, and
+    /// the wait is for these copies alone. The pages named become the next
+    /// prediction. The lists and staging go back to their pools.
     fn vram_completed(&self, sync: VramSync, runs: &[&HostList], marked: bool) {
         let VramSync {
             lists,
             staging,
             reads,
             mut later,
+            predicted,
         } = sync;
-        for (from, to, len) in reads {
-            // SAFETY: the submission has run: the staging holds the bytes;
-            // the mirror lives while the lists that declared the range do.
-            unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, len) };
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::VramStagedUs);
+            for &(from, to, len) in &reads {
+                // SAFETY: the submission has run: the staging holds the bytes;
+                // the mirror lives while the lists that declared the range do.
+                unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, len) };
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::VramStagedBytes, reads.iter().map(|r| r.2 as u64).sum());
         }
+        let mut named: Vec<VramRead> = Vec::new();
         if marked {
-            later.extend(crate::shadow::vram_marked_reads());
+            named.extend(crate::shadow::vram_marked_reads());
         }
+        let mut probed = false;
         for list in runs {
             for probe in &list.deferred().vram_probes {
-                probe(&mut later);
+                probe(&mut named);
+                probed = true;
             }
         }
-        self.readback_vram_copies(&later);
+        let mut used = std::collections::HashSet::new();
+        for read in &named {
+            let key = (read.0.as_raw() as usize, read.1, read.3);
+            if let Some(&from) = predicted.get(&key) {
+                // SAFETY: as above; `read`'s mirror is a live copy's, just
+                // named.
+                unsafe { std::ptr::copy_nonoverlapping(from as *const u8, read.2 as *mut u8, read.3 as usize) };
+                used.insert(key);
+            } else {
+                later.push(read.clone());
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::VramNamedPages, named.len() as u64);
+            add(C::VramPredictedPages, used.len() as u64);
+            add(C::VramPredictedBytes, used.iter().map(|k| k.2).sum());
+            add(
+                C::VramWastedBytes,
+                predicted.keys().filter(|k| !used.contains(*k)).map(|k| k.2).sum(),
+            );
+            add(C::VramWaitedBytes, later.iter().map(|r| r.3).sum());
+        }
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::VramWaitedUs);
+            self.readback_vram_copies(&later);
+        }
+        if marked || probed {
+            let mut seen = std::collections::HashSet::new();
+            named.retain(|r| seen.insert((r.0.as_raw() as usize, r.1, r.3)));
+            *PREDICTED.lock().unwrap_or_else(|e| e.into_inner()) = named;
+        }
         COPY_LISTS.lock().unwrap_or_else(|e| e.into_inner()).extend(lists);
         let mut pool = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         for (readback, s) in staging {
