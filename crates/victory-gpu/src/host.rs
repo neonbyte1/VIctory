@@ -4841,6 +4841,79 @@ mod present_plane_tests {
     use super::*;
 
     #[test]
+    fn packed_10_bit_frames_are_sampled_for_black_detection() {
+        let Some(host) = host() else {
+            eprintln!("skipping black-frame probe: no D3D12 device");
+            return;
+        };
+        let formats = [
+            (DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM),
+            (DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM),
+            (DXGI_FORMAT_R10G10B10A2_UINT, DXGI_FORMAT_R10G10B10A2_UINT),
+        ];
+        let mut observed = Vec::new();
+        for (format, view_format) in formats {
+            let mut texture = None;
+            // SAFETY: a live device and a valid render target description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 16,
+                            Height: 16,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            let texture = texture.unwrap();
+            let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: view_format,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            let (dark, lit, max, alpha) = if view_format == DXGI_FORMAT_R10G10B10A2_UINT {
+                (28.0, 32.0, 1023.0, 3.0)
+            } else {
+                (7.0 / 255.0, 8.0 / 255.0, 1.0, 1.0)
+            };
+            for color in [
+                [0.0, 0.0, 0.0, alpha],
+                [dark, 0.0, 0.0, 0.0],
+                [0.0, lit, 0.0, 0.0],
+                [0.0, 0.0, max, alpha],
+            ] {
+                let list = host.new_list().unwrap();
+                // SAFETY: an open list and a live render target.
+                unsafe {
+                    list.list
+                        .ClearRenderTargetView(host.rtv(&texture, Some(&desc)), &color, None);
+                }
+                list.close();
+                host.execute(&[&list]);
+                let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+                observed.push(host.present(&[(&texture, state)], 1));
+            }
+        }
+        assert_eq!(observed, [Some(true), Some(true), Some(false), Some(false)].repeat(4));
+    }
+
+    #[test]
     fn compositor_failure_presents_primary_in_the_same_frame() {
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");

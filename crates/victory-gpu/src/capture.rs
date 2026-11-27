@@ -884,18 +884,30 @@ const GRID: u32 = 4;
 /// alignment).
 const SLOT: u64 = 512;
 
-/// Records copies of a grid of pixels of `texture` (8-bit color, in the
-/// copy-source state) into a readback buffer, to tell black frames.
+pub(crate) struct BlackProbe {
+    buffer: ID3D12Resource,
+    packed_rgb10: bool,
+}
+
+/// Copies a grid of pixels from a color texture in copy-source state for
+/// black-frame diagnostics.
 pub(crate) fn probe(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
-) -> Option<ID3D12Resource> {
+) -> Option<BlackProbe> {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    if !matches!(d.Format.0, 27..=29 | 87 | 90 | 91) {
-        return None;
-    }
+    let packed_rgb10 = match d.Format {
+        DXGI_FORMAT_R10G10B10A2_TYPELESS | DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_UINT => true,
+        format if matches!(format.0, 27..=29 | 87 | 90 | 91) => false,
+        _ => return None,
+    };
+    let format = if d.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS {
+        DXGI_FORMAT_R10G10B10A2_UNORM
+    } else {
+        d.Format
+    };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: SLOT * u64::from(GRID * GRID),
@@ -948,7 +960,7 @@ pub(crate) fn probe(
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                         Offset: SLOT * u64::from(i),
                         Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: d.Format,
+                            Format: format,
                             Width: 1,
                             Height: 1,
                             Depth: 1,
@@ -974,12 +986,13 @@ pub(crate) fn probe(
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&pixel));
         }
-        Some(buffer)
+        Some(BlackProbe { buffer, packed_rgb10 })
     }
 }
 
-/// Whether every pixel [`probe`] read is (near) black.
-pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
+/// Whether every sampled pixel is (near) black.
+pub(crate) fn black(probe: &BlackProbe) -> bool {
+    let buffer = &probe.buffer;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copies finished (every submission is waited for).
     unsafe {
@@ -990,7 +1003,16 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
             std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
         let level = bytes
             .chunks(SLOT as usize)
-            .flat_map(|pixel| pixel[..3].iter().copied())
+            .map(|pixel| {
+                if probe.packed_rgb10 {
+                    let packed = u32::from_le_bytes(pixel[..4].try_into().unwrap());
+                    let max = (packed & 1023).max((packed >> 10) & 1023).max((packed >> 20) & 1023);
+                    // Keep the existing 8-bit diagnostic scale and ignore alpha.
+                    ((max * 255 + 511) / 1023) as u8
+                } else {
+                    pixel[0].max(pixel[1]).max(pixel[2])
+                }
+            })
             .max()
             .unwrap_or(0);
         buffer.Unmap(0, None);
