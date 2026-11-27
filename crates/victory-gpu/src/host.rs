@@ -2509,11 +2509,13 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+        let deferred = self.deferred();
+        let mut steps = deferred.copies.iter().peekable();
+        while let Some(step) = steps.next() {
+            let started;
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
-                started,
+                std::time::Instant::now(),
                 match step {
                     Step::Refresh(..) => C::StepRefreshUs,
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
@@ -2526,6 +2528,7 @@ impl HostList {
             );
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
+                    started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -2536,13 +2539,26 @@ impl HostList {
                     len
                 }
                 &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
+                    started = std::time::Instant::now();
+                    let fill = |dst: usize, src: usize, len: usize| {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            add(C::Copies, 1);
+                            add(C::CopyBytes, len as u64);
+                        }
+                        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                        len
+                    };
+                    let mut copied = fill(dst, src, len);
+                    // A run of fills (a list's constant buffers, mostly a
+                    // few hundred bytes each) is timed as one: reading the
+                    // clock around each would cost as much as the copies.
+                    while let Some(&Step::Fill(dst, src, len)) =
+                        steps.next_if(|s| matches!(s, Step::Fill(..)))
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        copied += fill(dst, src, len);
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    copied
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -2557,11 +2573,13 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let run = std::time::Instant::now();
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, run.elapsed().as_micros() as u64);
                     }
                     continue;
                 }
@@ -2680,13 +2698,14 @@ impl Batch {
 /// destination (`title_dst`) that is not all mapped takes nothing from its
 /// first unmapped page on.
 ///
-/// The copy runs in the kernel (`ReadProcessMemory`), which reports an
-/// unmapped page of the source, or of the destination it writes, instead of
-/// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
-/// title's big pools (it walks the page tables to the region's end), which
-/// made copies run at 100-200 MB/s; a title destination is asked only once
-/// its copy has failed (asked before each, the world's 80 copies per frame
-/// cost 60 ms).
+/// Both ways of reading the source report an unmapped page instead of
+/// faulting: in user mode into host memory ([`crate::title_copy`]), through
+/// the kernel (`ReadProcessMemory`), which also reports an unmapped page of
+/// the destination it writes, into title memory. Asking `VirtualQuery` first
+/// cost about 2 ms per copy in the title's big pools (it walks the page
+/// tables to the region's end), which made copies run at 100-200 MB/s; a
+/// title destination is asked only once its copy has failed (asked before
+/// each, the world's 80 copies per frame cost 60 ms).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -2705,7 +2724,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // A page that cannot be read fails either way and is found below.
+    let whole = if title_dst {
+        read(src, dst, len)
+    } else {
+        // SAFETY: the destination is host memory of `len` bytes.
+        unsafe { crate::title_copy::copy(dst, src, len) }
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -4372,5 +4397,95 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+}
+
+#[cfg(test)]
+mod fills {
+    use super::{HostList, host};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    const PAGE: usize = 4096;
+
+    fn list() -> Option<HostList> {
+        host()?.new_list().ok()
+    }
+
+    /// Fills and copies run in recorded order, and a fill's unmapped pages
+    /// read as zeros while its mapped ones are copied.
+    #[test]
+    fn steps_run_in_order_and_unmapped_pages_read_as_zeros() {
+        let Some(list) = list() else {
+            return; // no host GPU
+        };
+        // Three reserved pages, the middle one not committed.
+        // SAFETY: a fresh reservation; the committed pages are ours to fill.
+        let holed = unsafe {
+            let at =
+                VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!at.is_null());
+            for page in [0, 2] {
+                let page = at.add(page * PAGE);
+                assert!(!VirtualAlloc(page.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                page.write_bytes(7, PAGE);
+            }
+            at
+        };
+        let old = [1u8; 256];
+        let new = [2u8; 256];
+        let mut title = old;
+        let (mut first, mut second) = ([0u8; 256], [0u8; 100]);
+        let mut whole = vec![9u8; 3 * PAGE];
+        let memory = title.as_mut_ptr();
+        list.defer_fill(first.as_mut_ptr(), memory, 256);
+        list.defer_fill(whole.as_mut_ptr(), holed, 3 * PAGE);
+        // The title's own copy: fills after it see its bytes.
+        list.defer_copy(memory, new.as_ptr(), 256);
+        list.defer_fill(second.as_mut_ptr(), memory, 100);
+        list.run_deferred(&mut super::Batch::default());
+        assert_eq!((first, second), (old, [2u8; 100]));
+        assert_eq!(title, new);
+        assert!(whole[..PAGE].iter().all(|&b| b == 7));
+        assert!(whole[PAGE..2 * PAGE].iter().all(|&b| b == 0));
+        assert!(whole[2 * PAGE..].iter().all(|&b| b == 7));
+        // SAFETY: the reservation above.
+        assert_ne!(unsafe { VirtualFree(holed.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A list's constant buffer fills, as a submission runs them. Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture constant_fills`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn constant_fills_per_list() {
+        let Some(list) = list() else {
+            return; // no host GPU
+        };
+        const FILLS: usize = 4096;
+        let title: Vec<u8> = (0..FILLS * 512).map(|i| (i * 31 + i / 512) as u8).collect();
+        for len in [64usize, 256, 512] {
+            list.close();
+            list.reset();
+            let mut filled = Vec::new();
+            for i in 0..FILLS {
+                let (_, to) = list.scratch(len as u64).expect("scratch");
+                list.defer_fill(to, title[i * 512..].as_ptr(), len);
+                filled.push((to, i * 512));
+            }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..50 {
+                let started = std::time::Instant::now();
+                list.run_deferred(&mut super::Batch::default());
+                best = best.min(started.elapsed());
+            }
+            for (to, at) in filled {
+                // SAFETY: the list's scratch memory.
+                let got = unsafe { std::slice::from_raw_parts(to, len) };
+                assert_eq!(got, &title[at..at + len]);
+            }
+            let each = best.as_nanos() as f64 / FILLS as f64;
+            println!("{FILLS} fills of {len} B: {best:?} ({each:.1} ns each)");
+        }
     }
 }
