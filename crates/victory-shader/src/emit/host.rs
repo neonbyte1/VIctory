@@ -728,6 +728,34 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// Whether this device runs 64-bit atomics on typed resources in the
+    /// descriptor heap, which translated 64-bit image atomics need (the
+    /// same query as `victory-gpu`'s `heap_atomics64`).
+    pub fn heap_atomics64(&self) -> bool {
+        let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+        // SAFETY: each query writes its own structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS9,
+                    (&raw mut typed).cast(),
+                    size_of_val(&typed) as u32,
+                )
+                .is_ok()
+                && self
+                    .device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS11,
+                        (&raw mut heap).cast(),
+                        size_of_val(&heap) as u32,
+                    )
+                    .is_ok()
+        };
+        ok && typed.AtomicInt64OnTypedResourceSupported.as_bool()
+            && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+    }
+
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing

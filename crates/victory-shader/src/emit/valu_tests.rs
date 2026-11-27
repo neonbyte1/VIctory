@@ -2174,6 +2174,10 @@ fn image_atomics_of_64_bits() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        if !host.heap_atomics64() {
+            eprintln!("{label}: no 64-bit atomics on typed heap resources; skipped");
+            continue;
+        }
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: {e}"));
