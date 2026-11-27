@@ -115,28 +115,55 @@ fn relaunch_args(
     {
         *slot = exe.into();
     }
-    if !args.trim().is_empty() {
+    if !args.trim_matches([' ', '\t']).is_empty() {
         out.push("--".into());
         out.extend(split_args(args).into_iter().map(Into::into));
     }
     out
 }
 
-/// Splits the title's command-line tail into arguments, keeping double-quoted
-/// strings together (including empty ones). Windows command lines quote only
-/// with `"`: an apostrophe is ordinary text, as in `O'Brien`.
+/// Splits the title's command-line tail into arguments the way the C runtime
+/// the relaunched title starts with does ("Parsing C++ command-line
+/// arguments", Microsoft Learn): whitespace separates arguments outside
+/// double quotes; `2n` backslashes before a `"` are `n` backslashes and the
+/// `"` opens or closes quoting, `2n + 1` are `n` backslashes and a literal
+/// `"`; other backslashes are literal; inside quotes `""` is a literal `"`
+/// and quoting goes on. An empty quoted string is an argument. Windows
+/// command lines quote only with `"`: an apostrophe is ordinary text, as in
+/// `O'Brien`.
 fn split_args(args: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
     let mut started = false;
-    for c in args.chars() {
+    let mut chars = args.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
-            '"' => {
-                quoted = !quoted;
+            '\\' => {
+                let mut backslashes = 1;
+                while chars.next_if_eq(&'\\').is_some() {
+                    backslashes += 1;
+                }
                 started = true;
+                if chars.peek() != Some(&'"') {
+                    current.extend(std::iter::repeat_n('\\', backslashes));
+                    continue;
+                }
+                current.extend(std::iter::repeat_n('\\', backslashes / 2));
+                if backslashes % 2 == 1 {
+                    chars.next();
+                    current.push('"');
+                }
             }
-            c if !quoted && c.is_whitespace() => {
+            '"' => {
+                started = true;
+                if quoted && chars.next_if_eq(&'"').is_some() {
+                    current.push('"');
+                } else {
+                    quoted = !quoted;
+                }
+            }
+            ' ' | '\t' if !quoted => {
                 if started {
                     out.push(std::mem::take(&mut current));
                     started = false;
@@ -281,6 +308,52 @@ mod tests {
         .map(Into::into)
         .into();
         assert_eq!(again, expected, "the requested exe and quoted args survive");
+    }
+
+    #[test]
+    fn relaunch_args_split_as_the_c_runtime_does() {
+        // Expected values are what a Windows C runtime program receives in
+        // argv for each line (checked against a UCRT process), so the
+        // relaunched title reads what its arguments meant. Only a space or a
+        // tab separates arguments there.
+        let cases: [(&str, &[&str]); 19] = [
+            (r#"-json={\"a\":1} -y"#, &[r#"-json={"a":1}"#, "-y"]),
+            (r#"a\\\"b c"#, &[r#"a\"b"#, "c"]),
+            (r#"a\\b "c\\" d"#, &[r"a\\b", r"c\", "d"]),
+            (r"\\ x", &[r"\\", "x"]),
+            (r"a\\", &[r"a\\"]),
+            (r#""a\"#, &[r"a\"]),
+            (r#""a""b" c"#, &[r#"a"b"#, "c"]),
+            (r#""a"" b" c"#, &[r#"a" b"#, "c"]),
+            (r#"""" x"#, &["\" x"]),
+            (r#""""" x"#, &["\"", "x"]),
+            (r#""x y"z w"#, &["x yz", "w"]),
+            (r#"a"b c"d e"#, &["ab cd", "e"]),
+            (r#""unterminated x"#, &["unterminated x"]),
+            (r#""" a "" "#, &["", "a", ""]),
+            (r#""" """#, &["", ""]),
+            ("a\tb", &["a", "b"]),
+            ("\t \t", &[]),
+            ("a\nb\u{a0}c", &["a\nb\u{a0}c"]),
+            ("a\u{b}b\u{c}c\rd", &["a\u{b}b\u{c}c\rd"]),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(split_args(line), expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_relaunch_preserves_literal_whitespace_arguments() {
+        for args in ["\n", "\u{a0}"] {
+            let again = relaunch_args(
+                vec!["run".into(), "game.exe".into()],
+                std::ffi::OsStr::new("game.exe"),
+                "game.exe",
+                args,
+            );
+            let expected = ["run", "game.exe", "--", args].map(std::ffi::OsString::from);
+            assert_eq!(again, expected, "{args:?}");
+        }
     }
 
     #[test]
