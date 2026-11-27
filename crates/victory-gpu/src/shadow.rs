@@ -2033,6 +2033,15 @@ fn copy_back_run(
             .collect(),
         _ => Vec::new(),
     };
+    // A page lazy for another copy that this copy goes back to by saved bytes
+    // (`Merge`: its title bytes were never read, which would have given it
+    // them) gets that copy's bytes first: ours land on them, not under them
+    // (run lazyv1-u1: such writes were lost at the first touch).
+    for &pn in &through {
+        if crate::watch::maybe_lazy(pn) {
+            lease.resolve(pn);
+        }
+    }
     lease.will_write(&through);
     back.protects += lease.open(&opened, &bridge);
     #[cfg(feature = "diagnostics")]
@@ -3914,5 +3923,37 @@ mod run_tests {
         assert_eq!((&title[96..104], &title[104..108]), (&[0x77; 8][..], &[0xaa; 4][..]));
         assert_eq!(title[..96], host[..96]);
         assert!(t.changed(a / PAGE), "the copy takes the streamed bytes next");
+    }
+
+    /// Two copies of one view page, both written by shaders: the page is not
+    /// made lazy for the first (the second holds it: its next refresh would
+    /// read it at once), it goes back now, and the second (armed: that write
+    /// saved its bytes) goes back by them over it, so both copies' bytes
+    /// land. Made lazy, the page took the second copy's write behind its back
+    /// in run lazyv1-u1 (the verify caught it; the first touch put the first
+    /// copy's whole page over it).
+    #[test]
+    fn lazy_views_a_page_another_copy_holds_goes_back_at_once() {
+        use crate::watch::{lazy_checks, tests::LazyOn};
+        let _on = LazyOn::set();
+        let (a, _, _) = three_views(1);
+        let t = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
+        let u = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
+        fill(a, PAGE);
+        let mut first = title_bytes(a, PAGE);
+        let mut second = first.clone();
+        assert!(!t.take(a, a + PAGE).is_empty() && !u.take(a, a + PAGE).is_empty());
+        u.arm(a, a + PAGE);
+        let missed = lazy_checks().1;
+        first[10] = 0xaa;
+        let back = copy_back_run(&t, &[a], &first, &Default::default());
+        assert_eq!((back.lazy, back.written, back.through), (0, 1, 1));
+        assert!(u.changed(a / PAGE), "the other copy counts it changed");
+        second[20] = 0xbb;
+        let back = copy_back_run(&u, &[a], &second, &Default::default());
+        assert_eq!((back.written, back.merged), (1, 1));
+        assert_eq!(lazy_checks().1, missed, "nothing written behind a lazy page's back");
+        let title = title_bytes(a, PAGE);
+        assert_eq!((title[10], title[20], title[30]), (0xaa, 0xbb, pattern(30)), "both copies' bytes");
     }
 }

@@ -1170,6 +1170,16 @@ impl Lease<'_> {
                         })
                     }) {
                         Refused::Alias
+                    } else if std::iter::once(p)
+                        .chain(g.alias_of.get(&p).into_iter().flatten().copied())
+                        .any(|q| g.holders.get(&q).is_some_and(|h| h.iter().any(|c| !Arc::ptr_eq(c, &owner))))
+                    {
+                        // Another copy, texture or heap holds it: counted
+                        // changed, its next refresh reads it, which gives it
+                        // its bytes at once (run lazyv1-u1: 390 of 401 pages
+                        // a frame, each two protection changes per address
+                        // more than going back now).
+                        Refused::Held
                     } else {
                         return true;
                     };
@@ -1707,6 +1717,8 @@ enum Refused {
     Changed,
     Unguarded,
     Alias,
+    /// Another tracker holds it (here or where it shows elsewhere).
+    Held,
     /// Under a write the guards do not see, lazy already, past the limit,
     /// not the tracker's, or a protection change failed.
     Other,
@@ -1719,6 +1731,7 @@ fn refused(why: Refused) {
             Refused::Changed => crate::copystat::C::LazyRefusedChanged,
             Refused::Unguarded => crate::copystat::C::LazyRefusedUnguarded,
             Refused::Alias => crate::copystat::C::LazyRefusedAlias,
+            Refused::Held => crate::copystat::C::LazyRefusedHeld,
             Refused::Other => crate::copystat::C::LazyRefusedOther,
         },
         1,
@@ -2838,8 +2851,8 @@ pub(crate) mod tests {
     /// A lazy view page has no access and title memory keeps its bytes (the
     /// runtime's own view shows them); the title's first read faults, the
     /// copy's bytes go in and the page is guarded as taken, so a later write
-    /// faults once and marks it changed. Another tracker holding the page
-    /// counts it changed from the start; a page not made lazy stays guarded.
+    /// faults once and marks it changed. A page another tracker holds is not
+    /// made lazy (its next refresh would read it at once) and stays guarded.
     #[test]
     fn a_lazy_view_page_gets_the_copys_bytes_at_the_titles_first_read() {
         use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY};
@@ -2848,17 +2861,17 @@ pub(crate) mod tests {
         let (v, own) = section_views(2, 1);
         let a = v[0];
         let t = track_copy(a, 2 * PAGE, true).expect("views are tracked");
-        let u = track(a + PAGE, PAGE, true).expect("views are tracked");
+        let u = track(a, PAGE, true).expect("views are tracked");
         t.take(a, a + 2 * PAGE);
         u.take(a, a + 2 * PAGE);
         let copy = vec![0x5au8; 2 * PAGE];
         let page = a / PAGE + 1;
-        assert_eq!(t.lease().lazify(&[offer(a, 1, &copy, own)]), [page]);
-        assert!(u.changed(page) && !t.changed(page), "the other copy is older now");
+        assert_eq!(t.lease().lazify(&[offer(a, 0, &copy, own), offer(a, 1, &copy, own)]), [page]);
+        assert!(!u.changed(page - 1) && !t.changed(page));
         assert_eq!(protection(a + PAGE), Some(PAGE_NOACCESS));
         assert_eq!(raw(a + PAGE + 8), None, "no access");
         assert_eq!(byte(own + PAGE + 8), 0, "title memory keeps its bytes");
-        assert_eq!(protection(a), Some(PAGE_READONLY), "page 0 not lazy");
+        assert_eq!(protection(a), Some(PAGE_READONLY), "page 0 (another tracker holds it) not lazy");
         assert_eq!(byte(a + PAGE + 8), 0x5a, "the first read faults and finds the copy's bytes");
         assert!(!maybe_lazy(page));
         assert_eq!(protection(a + PAGE), Some(PAGE_READONLY), "guarded as taken");
@@ -2914,10 +2927,9 @@ pub(crate) mod tests {
         drop(t);
     }
 
-    /// Our host's touches give lazy pages the copy's bytes first: another
-    /// copy's refresh (it takes the page as it is, then reads it through the
-    /// kernel), a kernel read, a kernel write, a copy from it, the check
-    /// before a read, the runtime unmapping it, the copy going.
+    /// Our host's touches give lazy pages the copy's bytes first: a kernel
+    /// read, a kernel write, a copy from it, the check before a read, the
+    /// runtime unmapping it, the copy going.
     #[test]
     fn our_own_touches_give_lazy_view_pages_their_bytes_first() {
         use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY};
@@ -2925,14 +2937,12 @@ pub(crate) mod tests {
         let (v, own) = section_views(6, 1);
         let a = v[0];
         let t = track_copy(a, 6 * PAGE, true).expect("views are tracked");
-        let u = track(a, PAGE, true).expect("views are tracked");
         t.take(a, a + 6 * PAGE);
-        u.take(a, a + PAGE);
         let copy: Vec<u8> = (0..6 * PAGE).map(|i| (i / PAGE) as u8 + 1).collect();
         let offers: Vec<LazyView> = (0..6).map(|k| offer(a, k, &copy, own)).collect();
         assert_eq!(t.lease().lazify(&offers).len(), 6);
-        assert_eq!(u.take(a, a + PAGE), [(a, a + PAGE)]);
-        assert_eq!(protection(a), Some(PAGE_NOACCESS), "taking a lazy page leaves it without access");
+        assert!(t.take(a, a + PAGE).is_empty(), "a lazy page of its own copy is not taken again");
+        assert_eq!(protection(a), Some(PAGE_NOACCESS));
         let mut bytes = [0u8; 4];
         assert!(crate::host::read_into((a + 16) as *const u8, &mut bytes));
         assert_eq!(bytes, [1; 4], "a kernel read finds the copy's bytes");
@@ -2951,12 +2961,11 @@ pub(crate) mod tests {
         t.resolve_all();
         assert_eq!(raw(a + 5 * PAGE + 5), Some(6), "the copy going");
         assert!((0..6).all(|k| !maybe_lazy(a / PAGE + k)));
-        drop((t, u));
+        drop(t);
     }
 
-    /// A page shown at two addresses goes lazy at both: the other mapping's
-    /// tracker counts it changed, a read there gives the copy's bytes to
-    /// both, guarded again together.
+    /// A page shown at two addresses goes lazy at both, and a read at either
+    /// gives the copy's bytes to both, guarded again together.
     #[test]
     fn a_lazy_view_page_shown_elsewhere_is_lazy_at_every_address() {
         use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY};
@@ -2964,18 +2973,16 @@ pub(crate) mod tests {
         let (v, own) = section_views(1, 2);
         let (a, b) = (v[0], v[1]);
         let t = track_copy(a, PAGE, true).expect("views are tracked");
-        let u = track(b, PAGE, true).expect("views are tracked");
         t.take(a, a + PAGE);
-        u.take(b, b + PAGE);
         let copy = vec![6u8; PAGE];
         assert_eq!(t.lease().lazify(&[offer(a, 0, &copy, own)]), [a / PAGE]);
-        assert!(u.changed(b / PAGE) && !t.changed(a / PAGE));
+        assert!(!t.changed(a / PAGE));
         assert_eq!((protection(a), protection(b)), (Some(PAGE_NOACCESS), Some(PAGE_NOACCESS)));
         assert_eq!(byte(b + 3), 6, "a read at the other address");
         assert_eq!((protection(a), protection(b)), (Some(PAGE_READONLY), Some(PAGE_READONLY)));
         assert!(!maybe_lazy(a / PAGE) && !maybe_lazy(b / PAGE));
         assert_eq!(raw(a + 3), Some(6), "the same physical page");
-        drop((t, u));
+        drop(t);
     }
 
     /// Pages a tracker cannot make lazy go back at once: one the title wrote
