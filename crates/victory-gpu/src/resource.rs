@@ -2306,7 +2306,7 @@ pub(crate) fn test_buffer(width: u64) -> This {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[cfg(windows)]
@@ -2369,6 +2369,24 @@ mod tests {
             layout: 1,
             flags: 0,
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn placed_buffer_for_test(address: u64, width: u64) -> This {
+        let mut out = std::ptr::null();
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(),
+                address,
+                &buffer(width),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            ),
+            S_OK
+        );
+        out
     }
 
     fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {

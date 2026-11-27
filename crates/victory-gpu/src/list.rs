@@ -1713,27 +1713,37 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    if max == 0 {
+        return;
+    }
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let range = match args {
+        [[kind, ..]] => indirect_arguments(arguments, offset, (*kind, stride, max), !count.is_null()),
+        _ => None,
+    };
+    #[cfg(windows)]
+    let counter = indirect_buffer_address(count, count_offset, 4);
+    #[cfg(not(windows))]
+    // Only the Windows backend resolves the count buffer.
+    let _ = count_offset;
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let ([[kind, ..]], Some((address, len, limit))) = (args, range)
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, limit), (address, len), counter);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
-            address.is_some(),
+            range.is_some(),
             count.is_null() || counter.is_some()
         ));
     }
@@ -1753,11 +1763,77 @@ extern "system" fn execute_indirect(
             stride,
             ?args,
             max,
-            address = ?address.map(|a| format!("{a:#x}")),
+            address = ?range.map(|(a, _, _)| format!("{a:#x}")),
             counted = !count.is_null(),
             "indirect execution dropped (first time for this signature)"
         );
     }
+}
+
+fn indirect_arguments(
+    resource: This,
+    offset: u64,
+    (kind, stride, max): (u32, u32, u32),
+    counted: bool,
+) -> Option<(u64, u64, u32)> {
+    let (base, size) = crate::resource::buffer_bytes(resource)?;
+    let available = size.checked_sub(offset)?;
+    let (len, limit) = indirect_argument_limit(kind, stride, max, available, counted)?;
+    Some((indirect_offset(base as u64, size, offset, len)?, len, limit))
+}
+
+fn indirect_argument_limit(
+    kind: u32,
+    stride: u32,
+    max: u32,
+    available: u64,
+    counted: bool,
+) -> Option<(u64, u32)> {
+    // The clamp shader addresses records with a 32-bit byte offset.
+    let available = available.min(1 << 32);
+    let payload = indirect_argument_span(kind, stride, 1)?;
+    // The GPU count can still select fewer records at execution. Limit
+    // the native clamp's reads to records that fit the logical resource.
+    let limit = if counted {
+        let capacity = 1 + available.checked_sub(payload)? / u64::from(stride);
+        u64::from(max).min(capacity) as u32
+    } else {
+        max
+    };
+    let len = indirect_argument_span(kind, stride, limit)?;
+    (len <= available).then_some((len, limit))
+}
+
+/// The final record needs its argument payload, with no trailing padding.
+fn indirect_argument_span(kind: u32, stride: u32, count: u32) -> Option<u64> {
+    let payload = match kind {
+        0 => 16, // Draw.
+        1 => 20, // Draw indexed.
+        2 | 10 | 105 => 12, // Dispatch, mesh dispatch, single-pass dispatch.
+        _ => return None,
+    };
+    if stride < payload || !stride.is_multiple_of(4) {
+        return None;
+    }
+    Some(count.checked_sub(1).map_or(0, |last| {
+        u64::from(last) * u64::from(stride) + u64::from(payload)
+    }))
+}
+
+#[cfg(windows)]
+fn indirect_buffer_address(resource: This, offset: u64, span: u64) -> Option<u64> {
+    let (base, size) = crate::resource::buffer_bytes(resource)?;
+    indirect_offset(base as u64, size, offset, span)
+}
+
+/// Check the logical resource before a native shadow can widen the extent.
+fn indirect_offset(base: u64, size: u64, offset: u64, span: u64) -> Option<u64> {
+    let end = offset.checked_add(span)?;
+    if !offset.is_multiple_of(4) || end > size {
+        return None;
+    }
+    base.checked_add(end)?;
+    base.checked_add(offset)
 }
 
 /// Indirect executions dropped since the last call.
@@ -2582,6 +2658,54 @@ mod tests {
             list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
             (buffer, footprint)
         }
+    }
+
+    #[test]
+    fn indirect_spans_respect_the_logical_resource() {
+        for (kind, bytes) in [(0, 16), (1, 20), (2, 12), (10, 12), (105, 12)] {
+            assert_eq!(indirect_argument_span(kind, 24, 0), Some(0));
+            assert_eq!(indirect_argument_span(kind, 24, 1), Some(bytes));
+            assert_eq!(indirect_argument_span(kind, 24, 2), Some(24 + bytes));
+        }
+        assert_eq!(indirect_argument_span(1, 16, 1), None);
+        assert_eq!(indirect_argument_span(2, 13, 1), None);
+        assert_eq!(indirect_argument_span(3, 24, 1), None);
+        assert_eq!(indirect_argument_limit(2, 16, 64, 28, true), Some((28, 2)));
+        assert_eq!(indirect_argument_limit(2, 16, 64, 28, false), None);
+        assert_eq!(indirect_argument_limit(2, 16, 64, 11, true), None);
+        assert_eq!(indirect_argument_limit(2, 16, 1, 28, true), Some((12, 1)));
+        assert_eq!(indirect_offset(0x1000, 32, 4, 28), Some(0x1004));
+        assert_eq!(indirect_offset(0x1000, 31, 4, 28), None);
+        assert_eq!(indirect_offset(0x1000, 8, 4, 4), Some(0x1004));
+        assert_eq!(indirect_offset(0x1000, 7, 4, 4), None);
+        assert_eq!(indirect_offset(0x1000, 8, 2, 4), None);
+        assert_eq!(indirect_offset(0x1000, 8, 8, 0), Some(0x1008));
+        assert_eq!(indirect_offset(0x1000, 8, 12, 0), None);
+        assert_eq!(indirect_offset(0x1000, u64::MAX, u64::MAX - 3, 4), None);
+        assert_eq!(indirect_offset(u64::MAX - 7, 8, 4, 4), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a native D3D12 device for the backing shadow"]
+    fn indirect_span_does_not_inherit_a_larger_native_shadow() {
+        let data = [0u32; 16];
+        let base = data.as_ptr() as u64;
+        let outer = crate::resource::tests::placed_buffer_for_test(base, 64);
+        let inner = crate::resource::tests::placed_buffer_for_test(base, 28);
+        let span = indirect_argument_span(2, 16, 2).unwrap();
+        let shadow = crate::shadow::find(base + 4, span).expect("enclosing D3D12 shadow");
+        assert_eq!(shadow.left(base + 4), 60);
+        assert_eq!(indirect_buffer_address(outer, 4, span), Some(base + 4));
+        assert_eq!(indirect_buffer_address(inner, 0, span), Some(base));
+        assert_eq!(indirect_buffer_address(inner, 4, span), None);
+        assert_eq!(indirect_arguments(inner, 4, (2, 16, 64), true), Some((base + 4, 12, 1)));
+        assert_eq!(indirect_arguments(inner, 4, (2, 16, 64), false), None);
+        assert_eq!(indirect_buffer_address(inner, 24, 4), Some(base + 24));
+        assert_eq!(indirect_buffer_address(inner, 28, 4), None);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(inner), 0);
+        assert_eq!(release(outer), 0);
     }
 
     #[test]

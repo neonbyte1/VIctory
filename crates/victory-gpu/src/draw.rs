@@ -1757,7 +1757,7 @@ impl State {
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
-        arguments: u64,
+        (arguments, len): (u64, u64),
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
@@ -1793,7 +1793,6 @@ impl State {
             why("no host pipeline");
             return false;
         }
-        let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
