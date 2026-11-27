@@ -1110,18 +1110,38 @@ struct VramSync {
     /// Ranges past [`STAGED_MAX`]: read back on completion, waited for.
     later: Vec<VramRead>,
     /// Pages read back by the list after the submission because the last
-    /// completion that took marks needed them ([`PREDICTED`]): where they
-    /// are in read-back staging, by (buffer, offset, bytes).
+    /// completion of a submission like it needed them ([`PREDICTED`]): where
+    /// they are in read-back staging, by (buffer, offset, bytes).
     predicted: std::collections::HashMap<(usize, u64, u64), usize>,
+    /// The submission's kind ([`signature`]), if completing it takes marks
+    /// or page bitmaps: its named pages become the next prediction for it.
+    signature: Option<u64>,
 }
 
-/// The pages of copies in video memory that the last completion taking
-/// the views' write marks or the lists' page bitmaps had to read back
-/// (`Host::vram_completed`): the next submission that takes them reads
-/// them back in its own list after it, before its fence value, so that
-/// completing it waits only for pages it did not name. Marks name mostly
-/// the same pages each frame.
-static PREDICTED: Mutex<Vec<VramRead>> = Mutex::new(Vec::new());
+/// The pages of copies in video memory that the last completion of each
+/// kind of submission taking the views' write marks or the lists' page
+/// bitmaps had to read back (`Host::vram_completed`), by [`signature`]: the
+/// next one of that kind reads them back in its own list after it, before
+/// its fence value, so that completing it waits only for pages it did not
+/// name. A pass marks mostly the same pages each frame; the passes of a
+/// frame mark different ones (async2-u1: the last completion's pages were
+/// 39 of the ~2,800 a frame's 19 completions named).
+static PREDICTED: Mutex<std::collections::BTreeMap<u64, Vec<VramRead>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Kinds of submission kept in [`PREDICTED`] at most.
+const PREDICTED_KINDS: usize = 256;
+
+/// A submission's kind, the same from frame to frame: the pipelines each
+/// of its lists bound, in order.
+fn signature(runs: &[&HostList]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for list in runs {
+        list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).hash(&mut h);
+    }
+    h.finish()
+}
 
 /// How many of `lens` (in order) are staged at 16-byte offsets within
 /// `max` bytes, and those bytes.
@@ -1883,7 +1903,8 @@ impl Host {
         let heavy = runs.iter().any(|l| l.heavy());
         // Completing it takes the write marks (`Host::finish`) or reads the
         // lists' page bitmaps (`crate::memory::bind`'s probes).
-        let takes = marks && (heavy || !overlap) || runs.iter().any(|l| !l.deferred().vram_probes.is_empty());
+        let takes = (marks && (heavy || !overlap) || runs.iter().any(|l| !l.deferred().vram_probes.is_empty()))
+            .then(|| signature(runs));
         let after = self.vram_after(runs, &vram_bitmaps, marks, takes, &mut vram);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -3789,26 +3810,30 @@ impl Host {
 
     /// Records, closed, the list that runs after a submission's own and
     /// before its fence value: what its shaders wrote of copies in video
-    /// memory (declared ranges) into read-back staging, the lists' page
-    /// bitmaps and (`marks`) the views' bitmaps into system memory. On
-    /// completion the staged bytes go into the mirrors ([`Host::vram_completed`]);
-    /// ranges past [`STAGED_MAX`] are read back then. `takes`: completing it
-    /// takes the views' write marks or reads the lists' page bitmaps, so the
-    /// pages those named last time ([`PREDICTED`]) are read back too, as far
-    /// as staging goes.
+    /// memory (declared ranges not marked) into read-back staging, the
+    /// lists' page bitmaps and (`marks`) the views' bitmaps into system
+    /// memory. On completion the staged bytes go into the mirrors
+    /// ([`Host::vram_completed`]); ranges past [`STAGED_MAX`] are read back
+    /// then. `takes`: completing it takes the views' write marks or reads the
+    /// lists' page bitmaps, and the submission's kind: the pages its kind
+    /// named last time ([`PREDICTED`]) are read back too, as far as staging
+    /// goes.
     fn vram_after(
         &self,
         runs: &[&HostList],
         bitmaps: &[(ID3D12Resource, ID3D12Resource)],
         marks: bool,
-        takes: bool,
+        takes: Option<u64>,
         sync: &mut VramSync,
     ) -> Option<ID3D12CommandList> {
         let mut seen = std::collections::HashSet::new();
         let mut reads: Vec<VramRead> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len, _, _) = step
+                // Marked ranges of tracked copies keep no snapshot
+                // (`Shadow::writing`): they go back by their marks, whose
+                // pages are read back on completion.
+                if let Step::GpuWrite(shadow, address, len, false, _) = step
                     && seen.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
                     && let Some((cpu_ptr, base, start, buf_len)) = shadow.vram_readback()
                 {
@@ -3822,11 +3847,10 @@ impl Host {
             }
         }
         let views = marks && crate::shadow::has_vram_bitmaps();
-        let mut predicted = if takes {
-            PREDICTED.lock().unwrap_or_else(|e| e.into_inner()).clone()
-        } else {
-            Vec::new()
-        };
+        let mut predicted = takes
+            .and_then(|kind| PREDICTED.lock().unwrap_or_else(|e| e.into_inner()).get(&kind).cloned())
+            .unwrap_or_default();
+        sync.signature = takes;
         if reads.is_empty() && predicted.is_empty() && bitmaps.is_empty() && !views {
             return None;
         }
@@ -3885,6 +3909,7 @@ impl Host {
             reads,
             mut later,
             predicted,
+            signature,
         } = sync;
         {
             #[cfg(feature = "diagnostics")]
@@ -3937,10 +3962,16 @@ impl Host {
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::VramWaitedUs);
             self.readback_vram_copies(&later);
         }
-        if marked || probed {
+        if let Some(kind) = signature
+            && (marked || probed)
+        {
             let mut seen = std::collections::HashSet::new();
             named.retain(|r| seen.insert((r.0.as_raw() as usize, r.1, r.3)));
-            *PREDICTED.lock().unwrap_or_else(|e| e.into_inner()) = named;
+            let mut kinds = PREDICTED.lock().unwrap_or_else(|e| e.into_inner());
+            if kinds.len() >= PREDICTED_KINDS && !kinds.contains_key(&kind) {
+                kinds.clear();
+            }
+            kinds.insert(kind, named);
         }
         COPY_LISTS.lock().unwrap_or_else(|e| e.into_inner()).extend(lists);
         let mut pool = STAGING.lock().unwrap_or_else(|e| e.into_inner());
