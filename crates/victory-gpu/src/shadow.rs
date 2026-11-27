@@ -432,6 +432,13 @@ impl Shadow {
     /// `b.gpu` are the run's).
     fn new_at(b: Backing, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
+        // A copy in video memory keeps its bytes in its mirror, which no GPU
+        // work writes in place (`crate::watch::Tracked::own_bytes`).
+        if b.vram
+            && let Some(t) = &tracked
+        {
+            t.own_bytes(b.data);
+        }
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
             buffer: b.buffer,
@@ -4080,57 +4087,68 @@ mod run_tests {
     /// `VICTORY_OWNER`, A's and B's submissions in flight together, both
     /// arming the page (`Shadow::writing`): disjoint writes of both land
     /// whichever completes first, as page by page with title memory's bytes.
+    /// Each copy's bytes change only at its own completion (its read-back),
+    /// right before its copy-back.
     /// - Nothing lazy when both start: A's copy-back makes it lazy and B,
     ///   armed, keeps title memory's bytes; B goes back by them over A's.
-    /// - Lazy for A when both start (B given A's bytes, A's and B's own bytes
-    ///   kept as they were): A first marks it again, then B goes back by its
-    ///   kept bytes over A's; or B first takes it over, then A goes back by
-    ///   its kept bytes over B's.
+    /// - Lazy for A when both start (B given A's bytes): A first marks it
+    ///   again, then B goes back by its kept bytes over A's; or B first takes
+    ///   it over, then A goes back by its kept bytes over B's.
+    ///
+    /// Bytes kept at arming (copies the GPU writes in place) and when marked
+    /// (copies in video memory, `crate::watch::Tracked::own_bytes`) alike.
     #[test]
     fn owner_two_copies_in_flight_together_keep_both_writes() {
         use crate::watch::tests::OwnerOn;
         let _on = OwnerOn::set();
-        for case in 0..3 {
+        for (case, own) in (0..3).flat_map(|case| [(case, false), (case, true)]) {
             let (a, b, _) = owner_views(1);
             let ta = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
             let tb = crate::watch::track_copy(b, PAGE, true).expect("views are tracked");
             fill(a, PAGE);
             let mut ha = title_bytes(a, PAGE);
-            assert!(!ta.take(a, a + PAGE).is_empty() && !tb.take(b, b + PAGE).is_empty());
             let mut hb = ha.clone();
+            if own {
+                ta.own_bytes(ha.as_ptr());
+                tb.own_bytes(hb.as_ptr());
+            }
+            assert!(!ta.take(a, a + PAGE).is_empty() && !tb.take(b, b + PAGE).is_empty());
             if case > 0 {
                 // An earlier submission of A wrote bytes 0-127; B was given them.
                 ha[..128].fill(0xaa);
                 assert_eq!(copy_back_run(&ta, &[a], &ha, &Default::default()).lazy, 1);
                 assert!(!tb.take(b, b + PAGE).is_empty());
-                hb = served(b);
+                hb.copy_from_slice(&served(b));
             }
-            // Both submissions start: their pages armed, A's and B's bytes
-            // as they are.
+            // Both submissions start: their pages armed.
             arm(&ta, a, &ha);
             arm(&tb, b, &hb);
-            ha[200..300].fill(0xcc);
-            hb[2048..2176].fill(0xbb);
+            let what = format!("case {case}, own bytes {own}");
             if case < 2 {
+                ha[200..300].fill(0xcc);
                 copy_back_run(&ta, &[a], &ha, &Default::default());
+                hb[2048..2176].fill(0xbb);
                 let back = copy_back_run(&tb, &[b], &hb, &Default::default());
-                assert_eq!((back.merged, back.taken_over), (1, 0), "case {case}: {back:?}");
+                assert_eq!((back.merged, back.taken_over), (1, 0), "{what}: {back:?}");
             } else {
+                hb[2048..2176].fill(0xbb);
                 let back = copy_back_run(&tb, &[b], &hb, &Default::default());
-                assert_eq!(back.taken_over, 1, "{back:?}");
+                assert_eq!(back.taken_over, 1, "{what}: {back:?}");
+                ha[200..300].fill(0xcc);
                 let back = copy_back_run(&ta, &[a], &ha, &Default::default());
-                assert_eq!(back.merged, 1, "{back:?}");
+                assert_eq!(back.merged, 1, "{what}: {back:?}");
             }
             let title = title_bytes(a, PAGE);
             let old = if case > 0 { 0xaa } else { pattern(5) };
             assert_eq!(
                 (title[5], title[250], title[2050], title[3000]),
                 (old, 0xcc, 0xbb, pattern(3000)),
-                "case {case}: every write"
+                "{what}: every write"
             );
-            assert_eq!(title_read(a + 2050), 0xbb, "case {case}");
+            assert_eq!(title_read(a + 2050), 0xbb, "{what}");
             ta.disarm();
             tb.disarm();
+            drop((ta, tb));
         }
     }
 }

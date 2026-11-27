@@ -57,9 +57,22 @@ fn opened(page: usize) -> &'static AtomicU32 {
 }
 
 /// The pages a tracker has not taken since they changed, what it saves of
-/// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
-/// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool);
+/// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty),
+/// whether it is a host buffer copy's (the only trackers [`retake`] marks),
+/// and where its copy keeps its bytes when that is CPU memory our GPU work
+/// does not write (a copy in video memory's mirror): `(bytes of title
+/// address 0, start, end)` ([`Tracked::own_bytes`]).
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool, std::sync::OnceLock<(usize, usize, usize)>);
+
+impl Changed {
+    /// The copy's 64 KiB of whole page `page` (a page number), if known.
+    fn own_page(&self, page: usize) -> Option<&[u8]> {
+        let &(base, start, end) = self.4.get()?;
+        let at = page * PAGE;
+        // SAFETY: inside the copy's bytes (checked), alive while it tracks.
+        (at >= start && at + PAGE <= end).then(|| unsafe { std::slice::from_raw_parts(base.wrapping_add(at) as *const u8, PAGE) })
+    }
+}
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -538,7 +551,13 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
     set_dirty(bit, true);
-    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy));
+    let changed = Arc::new(Changed(
+        Mutex::new(pages.iter().copied().collect()),
+        Mutex::default(),
+        bit,
+        copy,
+        std::sync::OnceLock::new(),
+    ));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -834,18 +853,35 @@ impl Tracked {
         }
     }
 
+    /// The copy keeps its bytes of `[start, end)` at `data` in CPU memory
+    /// our GPU work does not write while it runs (a copy in video memory's
+    /// mirror, written only by its refreshes and read-backs): with [`owner`],
+    /// a lazy page it holds as current that another copy's copy-back marks
+    /// changed while it is armed keeps those bytes then ([`mark_others`]),
+    /// with no copy at arming.
+    pub(crate) fn own_bytes(&self, data: *const u8) {
+        let _ = self.changed.4.set(((data as usize).wrapping_sub(self.start), self.start, self.end));
+    }
+
     /// [`Tracked::arm`], and with [`owner`] the copy's bytes of armed whole
     /// pages that are lazy and that it holds as current (not changed: given
     /// the lazy copy's bytes, or its own) are kept now as their bytes before
     /// the submission (`bytes` gives the copy's 64 KiB of a page number, or
-    /// none for a page it holds in part). A save at a first write later
-    /// would find title memory without them: another copy's copy-back over
-    /// such a page while this one's shaders run marks it changed, and its own
-    /// copy-back goes back by these bytes (`crate::shadow::copy_back_run`,
-    /// `Merge`), as with title memory's bytes when nothing is lazy.
+    /// none for a page it holds in part): for copies whose bytes the GPU
+    /// writes in place (no [`Tracked::own_bytes`]). A save at a first write
+    /// later would find title memory without them: another copy's copy-back
+    /// over such a page while this one's shaders run marks it changed, and
+    /// its own copy-back goes back by these bytes
+    /// (`crate::shadow::copy_back_run`, `Merge`), as with title memory's
+    /// bytes when nothing is lazy.
     pub(crate) fn arm_keeping<'b>(&self, from: usize, to: usize, bytes: impl Fn(usize) -> Option<&'b [u8]>) {
         self.arm(from, to);
+        if self.changed.4.get().is_some() {
+            return;
+        }
         let (from, to) = (from.max(self.start), to.min(self.end));
+        #[cfg(feature = "diagnostics")]
+        let _timed = Timed(std::time::Instant::now(), crate::copystat::C::OwnerKeepUs);
         if from >= to || !owner() || !any_lazy(from / PAGE, to.div_ceil(PAGE)) {
             return;
         }
@@ -857,6 +893,8 @@ impl Tracked {
             }
             if let Some(b) = bytes(page) {
                 saved.bytes.insert(page, b.into());
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::OwnerKeptArming, 1);
             }
         }
     }
@@ -1505,14 +1543,28 @@ fn mark_changed_but(g: &mut Guards, page: usize, except: &Arc<Changed>) {
 }
 
 /// Lazy page `page` and the pages showing it elsewhere count changed in every
-/// tracker holding them but `except` (nothing saved: title memory does not
-/// hold the bytes before; armed trackers kept them, [`Tracked::arm_keeping`]).
+/// tracker holding them but `except`. Title memory does not hold the bytes
+/// before: a tracker armed for such a page (first changed now) keeps its
+/// copy's own bytes ([`Tracked::own_bytes`]), or kept them at arming
+/// ([`Tracked::arm_keeping`]).
 fn mark_others(g: &mut Guards, page: usize, except: &Arc<Changed>) {
     let pages: Vec<usize> = std::iter::once(page).chain(g.alias_of.get(&page).cloned().unwrap_or_default()).collect();
     for q in pages {
         for c in g.holders.get(&q).into_iter().flatten().filter(|c| !Arc::ptr_eq(c, except)) {
-            c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(q);
+            let first = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(q);
             set_dirty(c.2, true);
+            if !first {
+                continue;
+            }
+            let mut saved = c.1.lock().unwrap_or_else(|e| e.into_inner());
+            if saved.armed(q)
+                && !saved.bytes.contains_key(&q)
+                && let Some(bytes) = c.own_page(q)
+            {
+                saved.bytes.insert(q, bytes.into());
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::OwnerKeptMarking, 1);
+            }
         }
     }
 }
@@ -2056,6 +2108,8 @@ pub(crate) fn serve(at: usize, dst: *mut u8, len: usize, read: &mut impl FnMut(u
         return read(at, dst, len);
     }
     // Under the guard lock the lazy pages' bytes, then the rest without it.
+    #[cfg(feature = "diagnostics")]
+    let _timed = Timed(std::time::Instant::now(), crate::copystat::C::OwnerServeUs);
     let mut gaps: Vec<(usize, usize)> = Vec::new();
     {
         let g = guards();
