@@ -591,7 +591,7 @@ mod tests {
     fn maps_and_unloads_a_prepared_copy() {
         let prepared = prepared_own();
         let dir = tempfile::tempdir().unwrap();
-        let image = load(&prepared, dir.path()).unwrap();
+        let image = load(&prepared, dir.path(), &prepared.file_name()).unwrap();
         assert_ne!(image.base(), 0);
         assert_eq!(image.base() % PAGE, 0, "the loader page-aligns the mapping");
         assert_eq!(image.info().import_count(), prepared.info.import_count());
@@ -766,7 +766,7 @@ mod tests {
         let name = prepared.file_name();
         assert_eq!(module_by_name(&name), 0, "no module with this name yet");
         let dir = tempfile::tempdir().unwrap();
-        let error = load(&prepared, dir.path()).unwrap_err();
+        let error = load(&prepared, dir.path(), &name).unwrap_err();
         let text = format!("{error:#}").to_ascii_lowercase();
         assert!(
             text.contains("tls"),
