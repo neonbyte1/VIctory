@@ -868,6 +868,15 @@ impl Shadow {
         self.vram.then_some((self.data as usize, self.base, self.start, self.len))
     }
 
+    /// Whether a refresh of this copy is owed to the GPU after
+    /// [`crate::copy_pool::run`]: a copy in device memory is what the GPU
+    /// reads, so every refresh of it has to be uploaded, and one with armed
+    /// pages needs a queued copy's saved bytes filled in. A copy with
+    /// neither owes nothing and need not remember the range.
+    fn deferred_upload(vram: bool, tracked: bool) -> bool {
+        vram || tracked
+    }
+
     fn queue_vram_upload(&self, off: u64, len: u64) {
         if self.vram && len > 0 {
             VRAM_UPLOADS
@@ -887,19 +896,24 @@ impl Shadow {
     /// As [`Shadow::copy`], queued where the caller collects a
     /// submission's refreshes ([`crate::copy_pool::queued`]): for copies
     /// nothing reads back before they are made. What a queued copy took
-    /// goes into the saved bytes of armed pages once it is made
-    /// ([`Shadow::queued_made`]).
+    /// goes into the saved bytes of armed pages once it is made, and into
+    /// VRAM ([`Shadow::queued_made`]).
     fn copy_queued(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if !crate::copy_pool::copy(at, from as *const u8, to - from) {
+            // Made here: the GPU's copy of it is refreshed with it, as
+            // [`Shadow::copy`]'s is.
+            self.queue_vram_upload((from - start) as u64, (to - from) as u64);
             if let Some(t) = &self.tracked {
                 // SAFETY: `to - from` bytes inside the mapping, just copied.
                 t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
             }
-        } else if self.tracked.is_some() {
+        } else if Self::deferred_upload(self.vram, self.tracked.is_some()) {
+            // Queued: its VRAM upload and its armed pages' saved bytes go
+            // in `queued_made`, once the bytes are in place.
             self.queued.lock().unwrap_or_else(|e| e.into_inner()).push((from, to));
         }
         to - from
@@ -907,14 +921,17 @@ impl Shadow {
 
     /// After [`crate::copy_pool::run`] made the copies
     /// [`Shadow::copy_queued`] queued: what they took goes into the saved
-    /// bytes of the armed pages they cover, as [`Shadow::copy`]'s does.
+    /// bytes of the armed pages they cover, as [`Shadow::copy`]'s does, and
+    /// into VRAM (a copy there is only what the GPU reads: a refresh that
+    /// reaches the staging bytes alone leaves it stale).
     pub(crate) fn queued_made(&self) {
-        let Some(t) = &self.tracked else {
-            return;
-        };
         let made = std::mem::take(&mut *self.queued.lock().unwrap_or_else(|e| e.into_inner()));
         let start = self.start as usize;
         for (from, to) in made {
+            self.queue_vram_upload((from - start) as u64, (to - from) as u64);
+            let Some(t) = &self.tracked else {
+                continue;
+            };
             // SAFETY: `to - from` bytes inside the mapping, copied.
             let bytes =
                 unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
@@ -1806,6 +1823,82 @@ pub(crate) mod tests {
             assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
         }
         unregister(p, p as u64);
+    }
+
+    /// A refresh a flush defers is uploaded to VRAM once it is made: the VRAM
+    /// copy is what the GPU reads, so a deferred refresh that reached the
+    /// staging bytes alone would leave the GPU's copy of title memory stale
+    /// (the world's data never reaching VRAM, #3312 with #2051).
+    #[test]
+    fn a_deferred_refresh_of_a_vram_copy_is_uploaded_to_vram() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        if !copy.vram {
+            unregister(p, p as u64);
+            return; // a host copy: there is nothing in VRAM to refresh
+        }
+        // This copy's uploads of its first page, by the name an upload gives it.
+        let ours = |uploads: &[VramCopy]| {
+            uploads
+                .iter()
+                .filter(|u| u.dst_off == copy.base && u.len == PAGE as u64)
+                .count()
+        };
+        let title = |at: usize| (p + at) as *mut u8;
+        let before = ours(&take_vram_uploads());
+        // Made at once (no flush collecting copies): the upload goes with it.
+        // SAFETY: a byte of our pool.
+        unsafe { title(20).write_volatile(0x11) };
+        assert!(copy.update(p, PAGE) > 0, "the title's write is copied");
+        assert_eq!(
+            ours(&take_vram_uploads()),
+            before + 1,
+            "a refresh made at once is uploaded at once"
+        );
+        // Deferred to a flush: nothing is uploaded until the copy is made, and
+        // `queued_made` uploads it then.
+        // SAFETY: a byte of our pool.
+        unsafe { title(24).write_volatile(0x22) };
+        let (copied, pieces) = crate::copy_pool::queued(|| copy.update(p, PAGE));
+        assert!(copied > 0, "the title's write is copied");
+        assert!(!pieces.is_empty(), "the copy is queued, not made");
+        assert_eq!(
+            ours(&take_vram_uploads()),
+            before,
+            "nothing is uploaded before the copy is made"
+        );
+        crate::copy_pool::run(pieces);
+        assert_eq!(
+            ours(&take_vram_uploads()),
+            before,
+            "still nothing before `queued_made`"
+        );
+        copy.queued_made();
+        assert_eq!(
+            ours(&take_vram_uploads()),
+            before + 1,
+            "a queued refresh is uploaded once it is made"
+        );
+        unregister(p, p as u64);
+    }
+
+    /// Which refreshes a copy defers, without a device: a copy in device
+    /// memory owes the GPU every range (nothing else would ever upload it),
+    /// a host copy owes only what its armed pages need; a copy with neither
+    /// owes nothing.
+    #[test]
+    fn a_vram_copy_defers_every_refresh() {
+        assert!(!Shadow::deferred_upload(false, false), "nothing to do after the copy");
+        assert!(Shadow::deferred_upload(false, true), "an armed page's saved bytes");
+        assert!(Shadow::deferred_upload(true, true));
+        assert!(
+            Shadow::deferred_upload(true, false),
+            "the GPU reads a copy in device memory: every refresh is uploaded, tracked or not"
+        );
     }
 
     /// A title buffer over a pool and, after it, a plain allocation (memory
