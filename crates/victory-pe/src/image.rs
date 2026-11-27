@@ -189,10 +189,10 @@ impl ImageInfo {
         };
 
         let imports = match file.import_table()? {
-            Some(table) => parse_imports(&table, opt.size_of_image())?,
+            Some(table) => parse_imports(&table, &sections, opt.size_of_image())?,
             None => Vec::new(),
         };
-        let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
+        let delay_imports = parse_delay_imports(&file, &sections, opt.size_of_image())?;
         let exports = parse_exports(&file, opt.image_base())?;
         let tls = parse_tls(&file, data, opt.image_base(), opt.size_of_image())?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
@@ -283,6 +283,7 @@ fn convert_import(import: Import<'_>) -> ImportSymbol {
 
 fn parse_imports(
     table: &ImportTable<'_>,
+    sections: &[SectionInfo],
     size_of_image: u32,
 ) -> Result<Vec<ImportModule>, PeError> {
     let mut modules = Vec::new();
@@ -296,9 +297,13 @@ fn parse_imports(
         };
         modules.push(ImportModule {
             dll: utf8(table.name(desc.name.get(LE))?),
-            entries: entries(table.thunks(int_rva)?, iat_rva, size_of_image, |t| {
-                table.import::<ImageNtHeaders64>(t)
-            })?,
+            entries: entries(
+                table.thunks(int_rva)?,
+                iat_rva,
+                sections,
+                size_of_image,
+                |t| table.import::<ImageNtHeaders64>(t),
+            )?,
         });
     }
     Ok(modules)
@@ -306,6 +311,7 @@ fn parse_imports(
 
 fn parse_delay_imports(
     file: &PeFile64<'_>,
+    sections: &[SectionInfo],
     size_of_image: u32,
 ) -> Result<Vec<ImportModule>, PeError> {
     let Some(table) = file.delay_load_import_table()? else {
@@ -319,6 +325,7 @@ fn parse_delay_imports(
             entries: entries(
                 table.thunks(desc.import_name_table_rva.get(LE))?,
                 desc.import_address_table_rva.get(LE),
+                sections,
                 size_of_image,
                 |t| table.import::<ImageNtHeaders64>(t),
             )?,
@@ -327,11 +334,32 @@ fn parse_delay_imports(
     Ok(modules)
 }
 
+/// Returns whether the 8-byte IAT slot at `rva` lies inside one file-backed
+/// section.
+fn iat_slot_in_section(sections: &[SectionInfo], rva: u32) -> bool {
+    sections.iter().any(|s| {
+        let Some(delta) = rva.checked_sub(s.rva) else {
+            return false;
+        };
+        let backed = match s.virtual_size {
+            0 => s.file_size,
+            vs => vs.min(s.file_size),
+        };
+        delta.checked_add(8).is_some_and(|end| end <= backed)
+            && s.file_offset
+                .checked_add(delta)
+                .and_then(|offset| offset.checked_add(7))
+                .is_some()
+    })
+}
+
 /// Pairs each name-table entry with its IAT slot. The IAT RVA is not checked
-/// by `object`, so every slot is checked to lie inside the image here.
+/// by `object`, so every slot is checked to lie inside a file-backed section
+/// within the image here.
 fn entries<'data>(
     mut thunks: ImportThunkList<'data>,
     iat_rva: u32,
+    sections: &[SectionInfo],
     size_of_image: u32,
     import: impl Fn(pe::ImageThunkData64) -> object::read::Result<Import<'data>>,
 ) -> Result<Vec<ImportEntry>, PeError> {
@@ -340,9 +368,14 @@ fn entries<'data>(
         let iat_slot_rva = u32::try_from(entries.len() * 8)
             .ok()
             .and_then(|offset| iat_rva.checked_add(offset))
-            .filter(|&rva| rva.checked_add(8).is_some_and(|end| end <= size_of_image))
+            .filter(|&rva| {
+                rva.checked_add(8).is_some_and(|end| end <= size_of_image)
+                    && iat_slot_in_section(sections, rva)
+            })
             .ok_or_else(|| {
-                PeError::Malformed(format!("IAT at {iat_rva:#x} runs outside the image"))
+                PeError::Malformed(format!(
+                    "IAT at {iat_rva:#x} runs outside a file-backed section"
+                ))
             })?;
         entries.push(ImportEntry {
             symbol: convert_import(import(thunk)?),
@@ -526,6 +559,41 @@ mod tests {
             Err(PeError::Malformed(_))
         ));
     }
+
+    #[test]
+    fn rejects_null_iat_for_regular_imports() {
+        let mut data = own_image();
+        let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
+        let import_rva = layout::read_u32(&data, dd).unwrap();
+        let info = ImageInfo::parse(&data).unwrap();
+        let desc = info.rva_to_file_offset(import_rva).unwrap() as usize;
+        assert_ne!(layout::read_u32(&data, desc).unwrap(), 0); // OriginalFirstThunk
+        assert!(!info.imports[0].entries.is_empty());
+
+        data[desc + 16..desc + 20].fill(0); // FirstThunk
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_header_iat_for_regular_imports() {
+        let mut data = own_image();
+        let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
+        let import_rva = layout::read_u32(&data, dd).unwrap();
+        let info = ImageInfo::parse(&data).unwrap();
+        let desc = info.rva_to_file_offset(import_rva).unwrap() as usize;
+        assert_ne!(layout::read_u32(&data, desc).unwrap(), 0); // OriginalFirstThunk
+        assert!(!info.imports[0].entries.is_empty());
+
+        data[desc + 16..desc + 20].copy_from_slice(&0x40u32.to_le_bytes()); // FirstThunk in headers
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
     /// A minimal PE32+ image: one section at RVA 0x1000 holding `body`, with
     /// the export directory (RVA 0x1000, 0x80 bytes) pointing at it.
     fn synthetic_image(body: &[u8]) -> Vec<u8> {
@@ -638,6 +706,45 @@ mod tests {
         assert_eq!(info.rva_to_file_offset(u32::MAX), Some(0x21F));
         assert_eq!(info.rva_to_file_offset(u32::MAX - 0x20), None);
         assert_eq!(info.rva_to_file_offset(0), None);
+    }
+
+    #[test]
+    fn rejects_null_iat_for_delay_imports() {
+        let mut body = [0u8; 0x80];
+        let delay_rva = 0x1000u32;
+        let iat_rva = 0x1060u32;
+        let name_rva = 0x1070u64;
+        body[0..4].copy_from_slice(&1u32.to_le_bytes()); // RVA-based descriptor
+        body[4..8].copy_from_slice(&0x1040u32.to_le_bytes()); // DllNameRVA
+        body[12..16].copy_from_slice(&iat_rva.to_le_bytes()); // ImportAddressTableRVA
+        body[16..20].copy_from_slice(&0x1050u32.to_le_bytes()); // ImportNameTableRVA
+        body[0x40..0x49].copy_from_slice(b"test.dll\0");
+        body[0x50..0x58].copy_from_slice(&name_rva.to_le_bytes());
+        body[0x60..0x68].copy_from_slice(&name_rva.to_le_bytes());
+        body[0x72..0x77].copy_from_slice(b"test\0"); // name after the zero hint
+
+        let mut data = synthetic_image(&body);
+        let export_dd =
+            layout::data_directory_offset(&data, pe::IMAGE_DIRECTORY_ENTRY_EXPORT).unwrap();
+        data[export_dd..export_dd + 8].fill(0);
+        let delay_dd =
+            layout::data_directory_offset(&data, pe::IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT).unwrap();
+        data[delay_dd..delay_dd + 4].copy_from_slice(&delay_rva.to_le_bytes());
+        data[delay_dd + 4..delay_dd + 8].copy_from_slice(&0x40u32.to_le_bytes());
+
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.delay_imports.len(), 1);
+        let module = &info.delay_imports[0];
+        assert_eq!(module.dll, "test.dll");
+        assert_eq!(module.entries.len(), 1);
+        assert_eq!(module.entries[0].iat_slot_rva, iat_rva);
+
+        let desc = info.rva_to_file_offset(delay_rva).unwrap() as usize;
+        data[desc + 12..desc + 16].fill(0); // ImportAddressTableRVA
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
     }
 
     #[test]
