@@ -1637,6 +1637,9 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        if vertices == 0 || instances == 0 {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -1742,6 +1745,9 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        if indices == 0 || instances == 0 {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();

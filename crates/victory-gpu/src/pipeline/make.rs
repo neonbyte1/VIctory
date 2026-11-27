@@ -476,6 +476,69 @@ fn drained() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn empty_draws_do_not_request_graphics_pipelines() {
+        use crate::object::{S_OK, This, guid, slot};
+
+        if crate::host::host().is_none() {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        }
+        let null = std::ptr::null();
+        let allocator_iid = guid(
+            0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+        let select = slot::<extern "system" fn(This, This)>(list, 0xc8);
+        let draw = slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60);
+        let indexed = slot::<extern "system" fn(This, u32, u32, u32, i32, u32)>(list, 0x68);
+        let release = |object| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        let demand = |is_indexed, items, instances| {
+            let mut pipeline = null;
+            // Only its demand flag matters. Missing shaders keep this fixture
+            // independent of timing and the driver's graphics pipeline cache.
+            assert_eq!(
+                crate::pipeline::hand_out(
+                    vec![], None, &crate::pipeline::PIPELINE_IIDS[0], &mut pipeline,
+                ),
+                S_OK
+            );
+            select(list, pipeline);
+            if is_indexed {
+                indexed(list, items, instances, 0, 0, 0);
+            } else {
+                draw(list, items, instances, 0, 0);
+            }
+            let used = crate::pipeline::pipeline(pipeline).host.used.load(Ordering::Relaxed);
+            select(list, null);
+            release(pipeline);
+            used
+        };
+        let empty = [
+            (false, 0, 1),
+            (false, 3, 0),
+            (true, 0, 1),
+            (true, 3, 0),
+        ].map(|(indexed, items, instances)| demand(indexed, items, instances));
+        let nonempty = [demand(false, 3, 1), demand(true, 3, 1)];
+        assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), S_OK);
+        release(list);
+        release(allocator);
+        assert_eq!(empty, [false; 4]);
+        assert_eq!(nonempty, [true; 2]);
+    }
+
     /// An early start is queued once; a draw waiting for it puts it ahead,
     /// once, unless a worker has taken it.
     #[test]
