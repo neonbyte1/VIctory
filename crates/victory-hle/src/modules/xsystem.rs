@@ -277,7 +277,11 @@ mod device_type {
     pub(crate) fn module() -> HleModule {
         HleModule {
             name: "device type",
-            dlls: &["advapi32.dll", "api-ms-win-core-registry-*"],
+            dlls: &[
+                "advapi32.dll",
+                "kernelbase.dll",
+                "api-ms-win-core-registry-*",
+            ],
             exports: vec![
                 hle_export!(RegOpenKeyW),
                 hle_export!(RegOpenKeyExW),
@@ -366,6 +370,89 @@ mod device_type {
             );
             assert!(size > 0);
             assert_eq!(RegCloseKey(key), SUCCESS);
+        }
+
+        #[test]
+        fn kernelbase_registry_lookups_get_our_overrides() {
+            use crate::HleResolver;
+            use crate::modules::kernel::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+            use victory_loader::Provenance;
+            use victory_pe::ImportSymbol;
+
+            let resolver = HleResolver::default();
+            for name in ["RegOpenKeyExW", "RegQueryValueExW", "RegCloseKey"] {
+                let symbol = ImportSymbol::Name {
+                    hint: 0,
+                    name: name.into(),
+                };
+                assert_eq!(
+                    resolver.classify("kernelbase.dll", &symbol),
+                    Some(Provenance::Hle),
+                    "kernelbase.dll!{name}"
+                );
+            }
+
+            let kernelbase = GetModuleHandleW(w("kernelbase.dll").as_ptr());
+            assert!(!kernelbase.is_null());
+            let api_set = LoadLibraryW(w("api-ms-win-core-registry-l1-1-0.dll").as_ptr());
+            assert!(!api_set.is_null());
+
+            type OpenEx = extern "system" fn(Key, *const u16, u32, u32, *mut Key) -> u32;
+            type Query =
+                extern "system" fn(Key, *const u16, *mut u32, *mut u32, *mut u8, *mut u32) -> u32;
+            type Close = extern "system" fn(Key) -> u32;
+
+            for (label, module) in [
+                ("kernelbase.dll", kernelbase),
+                ("api-ms-win-core-registry-l1-1-0.dll", api_set),
+            ] {
+                let open_ptr = GetProcAddress(module, c"RegOpenKeyExW".as_ptr().cast());
+                let query_ptr = GetProcAddress(module, c"RegQueryValueExW".as_ptr().cast());
+                let close_ptr = GetProcAddress(module, c"RegCloseKey".as_ptr().cast());
+                assert_eq!(
+                    open_ptr as usize, RegOpenKeyExW as *const () as usize,
+                    "{label}!RegOpenKeyExW"
+                );
+                assert_eq!(
+                    query_ptr as usize, RegQueryValueExW as *const () as usize,
+                    "{label}!RegQueryValueExW"
+                );
+                assert_eq!(
+                    close_ptr as usize, RegCloseKey as *const () as usize,
+                    "{label}!RegCloseKey"
+                );
+
+                // SAFETY: the addresses verified above are our functions with these signatures.
+                let (open_ex, query, close) = unsafe {
+                    (
+                        std::mem::transmute::<*mut c_void, OpenEx>(open_ptr),
+                        std::mem::transmute::<*mut c_void, Query>(query_ptr),
+                        std::mem::transmute::<*mut c_void, Close>(close_ptr),
+                    )
+                };
+                let mut key = std::ptr::null_mut();
+                assert_eq!(
+                    open_ex(LOCAL_MACHINE, w(KEY).as_ptr(), 0, 1, &mut key),
+                    SUCCESS
+                );
+                let (mut kind, mut value, mut size) = (0, 0u32, 4);
+                assert_eq!(
+                    query(
+                        key,
+                        w(VALUE).as_ptr(),
+                        std::ptr::null_mut(),
+                        &mut kind,
+                        (&raw mut value).cast(),
+                        &mut size,
+                    ),
+                    SUCCESS
+                );
+                assert_eq!(
+                    (kind, size, value),
+                    (DWORD, 4, console_mode(console::current()))
+                );
+                assert_eq!(close(key), SUCCESS);
+            }
         }
     }
 }
