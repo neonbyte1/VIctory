@@ -623,6 +623,8 @@ impl Staging {
             for &i in &touched {
                 let (a, b) = span(i);
                 if !done.contains(&(a, b)) {
+                    #[cfg(feature = "diagnostics")]
+                    let _census = crate::census::as_kind(crate::census::Kind::Texture, 0);
                     // SAFETY: inside the buffer of the texture's size.
                     crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
                     (bytes, _) = (bytes + b - a, done.push((a, b)));
@@ -785,6 +787,9 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
+    // A page shaders wrote that has not gone back has no access until it
+    // does: the caller reads it next.
+    crate::watch::reading(at as usize, len);
     let mut p = at as usize;
     let Some(end) = p.checked_add(len) else {
         return false;

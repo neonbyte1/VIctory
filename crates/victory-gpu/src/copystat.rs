@@ -257,8 +257,48 @@ pub(crate) enum C {
     SettleAliasClean,
     SettleLabelClean,
     SettleTextureClean,
+    /// Lazy view pages (`VICTORY_LAZY_VIEWS`, `crate::watch::Lease::lazify`):
+    /// offered and made lazy instead of written; lazy pages shaders wrote
+    /// again before any touch (nothing read or copied); first touches,
+    /// each copying the page in (title reads, title writes, our host);
+    /// dropped unwritten (withheld); time of those copies; protection
+    /// changes for lazy pages; offered but not made so: changed, not
+    /// guarded, shown elsewhere where it cannot be, held by another
+    /// tracker, other.
+    LazyOffered,
+    LazyMade,
+    LazyAgain,
+    LazyTitleReads,
+    LazyTitleWrites,
+    LazyHostTouches,
+    LazyDropped,
+    LazyResolveUs,
+    LazyProtects,
+    LazyRefusedChanged,
+    LazyRefusedUnguarded,
+    LazyRefusedAlias,
+    LazyRefusedHeld,
+    LazyRefusedOther,
+    /// `VICTORY_OWNER`: lazy pages our host read with the copy's bytes
+    /// (`crate::watch::serve`), and the bytes; lazy pages another copy's
+    /// copy-back took over (`crate::watch::Lease::take_over`).
+    OwnerServed,
+    OwnerServedBytes,
+    OwnerTakenOver,
+    /// `VICTORY_OWNER`: page addresses barred from going lazy for a while,
+    /// given back twice within a few frames (`crate::watch::churn`).
+    OwnerBarred,
+    /// `VICTORY_OWNER`: lazy pages' bytes armed copies kept: at arming
+    /// (copies the GPU writes in place), when another copy's copy-back
+    /// marked them (copies in video memory).
+    OwnerKeptArming,
+    OwnerKeptMarking,
+    /// `VICTORY_OWNER`: microseconds in `crate::watch::serve` (lazy pages'
+    /// part) and in `crate::watch::Tracked::arm_keeping`.
+    OwnerServeUs,
+    OwnerKeepUs,
 }
-const COUNTERS: usize = 147;
+const COUNTERS: usize = 169;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -512,6 +552,46 @@ pub(crate) fn log(frames: f64) {
         c[C::MarkViewProtects as usize],
         c[C::MarkThrough as usize],
     );
+    let (checks, missed, last) = crate::watch::take_lazy_checks();
+    tracing::info!(
+        "  lazy view pages per frame (on: {}, owner: {}): {:.0} offered, {:.0} made lazy (not copied back), {:.0} marked \
+         again before any touch (never copied); copied on demand: {:.0} at title reads, {:.0} at title writes, \
+         {:.0} for our host, {:.1} ms; {:.0} dropped unwritten; {} lazy now; {:.0} protection changes; not made \
+         lazy: {:.0} changed, {:.0} not guarded, {:.0} shown elsewhere, {:.0} held by another tracker, {:.0} other; checked {:.0}, {:.0} \
+         written behind our back; our host given the copy's bytes {:.0} pages ({:.1} MB), taken over by another copy {:.0}, \
+         barred for churning {:.1}; armed copies kept their bytes of lazy pages {:.0} at arming, {:.1} when marked; \
+         serving {:.1} ms, keeping at arming {:.1} ms",
+        crate::watch::lazy_views(),
+        crate::watch::owner(),
+        c[C::LazyOffered as usize],
+        c[C::LazyMade as usize],
+        c[C::LazyAgain as usize],
+        c[C::LazyTitleReads as usize],
+        c[C::LazyTitleWrites as usize],
+        c[C::LazyHostTouches as usize],
+        ms(c[C::LazyResolveUs as usize]),
+        c[C::LazyDropped as usize],
+        crate::watch::lazy_live(),
+        c[C::LazyProtects as usize],
+        c[C::LazyRefusedChanged as usize],
+        c[C::LazyRefusedUnguarded as usize],
+        c[C::LazyRefusedAlias as usize],
+        c[C::LazyRefusedHeld as usize],
+        c[C::LazyRefusedOther as usize],
+        checks as f64 / frames,
+        missed as f64 / frames,
+        c[C::OwnerServed as usize],
+        c[C::OwnerServedBytes as usize] / 1e6,
+        c[C::OwnerTakenOver as usize],
+        c[C::OwnerBarred as usize],
+        c[C::OwnerKeptArming as usize],
+        c[C::OwnerKeptMarking as usize],
+        ms(c[C::OwnerServeUs as usize]),
+        ms(c[C::OwnerKeepUs as usize]),
+    );
+    if missed > 0 {
+        tracing::warn!(pages = missed, last = ?last, "lazy view pages written behind our back (their bytes lost at the first touch)");
+    }
     let sites: Vec<String> = crate::watch::site_counts()
         .iter()
         .zip(crate::watch::SITE_NAMES)
@@ -612,6 +692,9 @@ pub(crate) fn log(frames: f64) {
         c[C::SettleLabelClean as usize],
         c[C::SettleTextureClean as usize],
     );
+    for line in crate::census::lines(frames) {
+        tracing::info!("{line}");
+    }
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));

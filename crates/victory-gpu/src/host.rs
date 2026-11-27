@@ -2443,6 +2443,10 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        // Lazy view pages still hold the title bytes we left (diagnostics:
+        // a writer that went past us loses its bytes at the first touch).
+        #[cfg(feature = "diagnostics")]
+        crate::watch::verify_lazy(32);
         if marks_taken {
             // Pages shaders marked first: the copy-backs below end what the
             // copies keep for them.
@@ -3551,6 +3555,13 @@ impl HostList {
                     if let Some(o) = crossed {
                         settle(o, Settled::Copy);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let _census = {
+                        let kind = crate::census::as_kind(crate::census::Kind::TitleCopy, 0);
+                        crate::census::touch(src, len);
+                        crate::census::written(dst, len, crate::census::Writer::Kernel);
+                        kind
+                    };
                     if matches!(step, Step::Copy(..)) {
                         copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     } else if crate::texture::committed(src as *const u8, len)
@@ -3570,6 +3581,8 @@ impl HostList {
                     if let Some((o, _)) = crate::shadow::crossing(src, src + len, 0) {
                         settle(o, Settled::Fill);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let _census = crate::census::as_kind(crate::census::Kind::TitleCopy, 0);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -3820,11 +3833,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::census::touch(src as usize, len);
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
+    // Nor may the source be a page shaders wrote that has not gone back: its
+    // copy's bytes are read instead (`VICTORY_OWNER`), or go back first.
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = crate::watch::serve(src as usize, dst, len, &mut |s, d, n| read(s as *const u8, d, n));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -3841,13 +3858,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FallbackUs);
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // that fails), zeros for what cannot be read; lazy pages served as above.
+    let piece = |at: usize, to: *mut u8, n: usize| crate::watch::serve(at, to, n, &mut |s, d, n| read(s as *const u8, d, n));
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !piece(at, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !piece(at, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -3859,8 +3877,18 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
-/// readable.
+/// readable. Pages shaders wrote that have not gone back are read from the
+/// copy that wrote them, or go back first (`crate::watch::serve`).
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    crate::census::touch(src as usize, dst.len());
+    crate::watch::serve(src as usize, dst.as_mut_ptr(), dst.len(), &mut |s, d, n| read(s as *const u8, d, n))
+}
+
+/// [`read_into`] with no look at pages that have not gone back (a page with
+/// no access fails the read): for holders of the guard lock, which that look
+/// takes.
+pub(crate) fn read_raw(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -4974,6 +5002,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
         crate::memory::log_frame();
+        crate::watch::frame_end();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         self.report_frames += 1;

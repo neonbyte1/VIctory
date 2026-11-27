@@ -389,11 +389,23 @@ static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// garbage BVH nodes over meshlet buffers, run shards20), else from the
 /// frame's end ([`retake_dropped`]).
 pub(crate) fn drop_withheld(address: usize, len: usize) {
+    // Pages shaders wrote earlier that have not gone back hold these writes
+    // now too: they stay out with them, from now on.
+    crate::watch::forget_lazy(address, len);
     if SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed) {
         crate::watch::retake(address, len);
     } else {
         DROPPED.lock().unwrap_or_else(|e| e.into_inner()).push((address, len));
     }
+}
+
+/// Tests: no list missed memory so far (an earlier test's misses withhold
+/// writes for the rest of the process: no frame is presented).
+#[cfg(test)]
+pub(crate) fn forget_misses() {
+    use std::sync::atomic::Ordering::Relaxed;
+    SUBMISSION_MISSED.store(false, Relaxed);
+    MISSED_IN.store(MISS_NEVER, Relaxed);
 }
 
 /// At a frame's end: what the frame withheld leaves the host copies, so
