@@ -5695,12 +5695,13 @@ impl<'a> Lower<'a> {
     /// A handle for the descriptor `src` read at `site`; the heap index of
     /// a texture shader view the program takes from the heap itself is noted
     /// for the instruction's read mark (handles are made once per block,
-    /// often before the instruction). A view read through a table needs
-    /// none: the host makes the slot for the draw.
+    /// often before the instruction). A view read at a fixed table entry
+    /// needs none: the host makes the used-resource list's slots for the
+    /// draw ([`Self::fixed_table_entry`]).
     fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
         let h = self.handle_made(site, src, sampler, props)?;
         if let Some(&index) = self.s.texture_index.get(&h)
-            && self.is_heap_direct(src)
+            && !self.fixed_table_entry(src)
         {
             self.s.texture_reads.push(index);
         }
@@ -5941,6 +5942,19 @@ impl<'a> Lower<'a> {
                 .get(load)
                 .and_then(|a| self.x.native.layout.get(a.param))
                 .is_some_and(|p| p.root == RootType::ResourceHeap),
+            _ => false,
+        })
+    }
+
+    /// Whether a descriptor is a table entry at a fixed offset on every
+    /// path: one the used-resource list names, whose slot the host makes
+    /// for the draw. An entry at a computed offset (a descriptor array) may
+    /// be any slot past those.
+    fn fixed_table_entry(&self, src: &Source) -> bool {
+        src.leaves().iter().all(|l| match l {
+            Source::Loaded { load, .. } => self
+                .entry_address(*load)
+                .is_some_and(|(param, _)| self.x.native.layout[param].root == RootType::Table),
             _ => false,
         })
     }

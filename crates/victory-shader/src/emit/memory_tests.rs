@@ -639,12 +639,20 @@ fn writes_through_views_mark_their_pages() {
 /// mark their heap index (`emit`, "Read marks"): an `image_load` of the view
 /// at heap byte offset 32 (index 1) sets exactly the bit one past
 /// [`super::VIEW_READS`]. The same read through a table marks nothing (a
-/// table read makes its slot on the host).
+/// table read makes its slot on the host), unless the table entry is
+/// computed (a descriptor array: the host makes only the entries the
+/// used-resource list names).
 #[test]
 fn heap_direct_texture_reads_mark_their_heap_index() {
-    let lower_with = |root: RootType, used: Vec<UsedResource>, offset: u32| {
+    let lower_with = |root: RootType, used: Vec<UsedResource>, offset: u32, dynamic: bool| {
         let mut w = vec![s_mov_b32(5, ZERO as u8)];
-        w.extend(s_load(3, 12, 4, offset));
+        let mut load = s_load(3, 12, 4, offset);
+        if dynamic {
+            // v_readfirstlane_b32 s6, v0; s_lshl_b32 s6, s6, 5; s6 the soffset.
+            w.extend([0x7E0C_0500, 0x8F06_8506]);
+            load[1] = 6 << 25 | offset;
+        }
+        w.extend(load);
         w.push(S_WAITCNT_ALL);
         w.extend((0..2).map(|v| v_mov_b32(v, ZERO)));
         // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
@@ -689,22 +697,24 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         })
         .expect("lower")
     };
-    let table = lower_with(
-        RootType::Table,
-        vec![UsedResource {
-            kind: ResourceType::Srv,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 8,
-            user_data: 4,
-            slot: 0,
-        }],
-        0,
-    );
+    let used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 4,
+        slot: 0,
+    }];
+    let table = lower_with(RootType::Table, used.clone(), 0, false);
     assert!(!table.view_marks, "a table read marks nothing");
-    let l = lower_with(RootType::ResourceHeap, Vec::new(), 32);
+    let computed = lower_with(RootType::Table, used, 0, true);
+    assert!(
+        computed.view_marks && !computed.heap,
+        "a read at a computed table entry is marked"
+    );
+    let l = lower_with(RootType::ResourceHeap, Vec::new(), 32, false);
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
     let shader = HostShader {
         stage: HwStage::Cs,

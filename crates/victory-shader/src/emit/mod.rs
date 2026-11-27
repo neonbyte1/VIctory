@@ -177,8 +177,9 @@
 //!   entry while the list runs.
 //! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
 //!   every image instruction that reads a texture shader view the program
-//!   takes from the resource heap itself (not through a table, whose slots
-//!   the host makes for the draw) also sets bit
+//!   takes from the resource heap itself, or from a table at a computed
+//!   entry (not at a fixed one, whose slot the host makes for the draw),
+//!   also sets bit
 //!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
 //!   written pages, where still clear: the host makes views it left null
 //!   until a shader reads them (textures the title placed itself).
