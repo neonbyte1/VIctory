@@ -1123,7 +1123,7 @@ fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool) 
             let ty = [0, 0, 8, 12, 9, 13, 14, 15, 10, 11, 11].get(d[1] as usize).copied().unwrap_or(0);
             match (unordered, d[1]) {
                 (_, 6 | 7) => (ty, 0, 1),
-                (true, _) => (ty, d[4], 1),
+                (true, _) => (ty, d[2], 1),
                 (false, _) => (ty, d[4], if d[5] == u32::MAX { mips.saturating_sub(d[4]) } else { d[5] }),
             }
         }
@@ -2565,17 +2565,37 @@ mod tests {
         (texture[0], texture[4], texture[6], texture[7], texture[9]) = (3, 1000, 600, 1 | 10 << 16, 1);
         let mut array = texture;
         (array[4], array[7]) = (1024, 6);
+        use std::mem::offset_of;
+        const {
+            assert!(offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, ViewDimension) == 4);
+            assert!(offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, Anonymous) == 16);
+            assert!(offset_of!(D3D12_TEX2D_SRV, MostDetailedMip) == 0);
+            assert!(offset_of!(D3D12_TEX2D_SRV, MipLevels) == 4);
+            assert!(offset_of!(D3D12_UNORDERED_ACCESS_VIEW_DESC, ViewDimension) == 4);
+            assert!(offset_of!(D3D12_UNORDERED_ACCESS_VIEW_DESC, Anonymous) == 8);
+            assert!(offset_of!(D3D12_TEX1D_UAV, MipSlice) == 0);
+            assert!(offset_of!(D3D12_TEX1D_ARRAY_UAV, MipSlice) == 0);
+            assert!(offset_of!(D3D12_TEX2D_UAV, MipSlice) == 0);
+            assert!(offset_of!(D3D12_TEX2D_ARRAY_UAV, MipSlice) == 0);
+            assert!(offset_of!(D3D12_TEX2D_ARRAY_UAV, ArraySize) == 8);
+            assert!(offset_of!(D3D12_TEX3D_UAV, MipSlice) == 0);
+            assert!(offset_of!(D3D12_TEX3D_UAV, WSize) == 8);
+        };
         let mut view = [0u32; 10];
         // Levels 2-4 of the texture: width - 1 = 999 (0b11_1110_0111).
-        (view[1], view[4], view[5]) = (4, 2, 3);
+        (view[1], view[4], view[5]) = (D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32, 2, 3);
         let words = image_words(&texture, Some(&view), false);
         assert_eq!(words, [0, 3 << 30, 249 | 599 << 14, 0xFAC | 2 << 12 | 4 << 16 | 9 << 28]);
         // Its whole chain from level 1.
         (view[4], view[5]) = (1, u32::MAX);
         assert_eq!(image_words(&texture, Some(&view), false)[3], 0xFAC | 1 << 12 | 9 << 16 | 9 << 28);
-        // An unordered view of level 3: that level alone.
-        let uav = [0, 4, 0, 0, 3, 0, 0, 0, 0, 0];
-        assert_eq!(image_words(&texture, Some(&uav), true)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
+        // Unordered views read MipSlice at d[2] (union starts at offset 8, not SRV's 16).
+        let uav2d = [0, D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32, 3, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(image_words(&texture, Some(&uav2d), true)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
+        let uav_arr = [0, D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0 as u32, 1, 0, 6, 0, 0, 0, 0, 0];
+        assert_eq!(image_words(&array, Some(&uav_arr), true)[3], 0xFAC | 1 << 12 | 1 << 16 | 13 << 28);
+        let uav3d = [0, D3D12_UAV_DIMENSION_TEXTURE3D.0 as u32, 2, 0, 8, 0, 0, 0, 0, 0];
+        assert_eq!(image_words(&texture, Some(&uav3d), true)[3], 0xFAC | 2 << 12 | 2 << 16 | 10 << 28);
         // The array's own view: a 2D array, levels 0-10.
         let words = image_words(&array, None, false);
         assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
