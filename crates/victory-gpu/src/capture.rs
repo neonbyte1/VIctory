@@ -217,7 +217,7 @@ pub(crate) fn save_read_back(
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
+        let len = buffer.GetDesc().Width as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
@@ -549,7 +549,7 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), buffer.GetDesc().Width as usize);
         // Tiny targets (exposure, averages): their values as they are.
         if f.Width * f.Height <= 16 {
             let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
