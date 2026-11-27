@@ -922,6 +922,22 @@ impl Lease<'_> {
         }
     }
 
+    /// Before the caller writes `pages` (ascending, no repeats) through its
+    /// own writable mapping of their memory ([`writable_alias`]): marks
+    /// them changed in every tracker holding them or another mapping of
+    /// them (armed ones keep their bytes first), as [`Lease::open`], but
+    /// changes no protection. The title's mappings stay guarded: its writes
+    /// there fault and wait for the lease, so they land after the caller's.
+    pub(crate) fn will_write(&mut self, pages: &[usize]) {
+        let g = &mut *self.g;
+        for (first, last) in page_runs(pages) {
+            mark_changed(g, first, last, true);
+        }
+        for (_, other) in aliases(g, pages) {
+            mark_changed(g, other, other + 1, true);
+        }
+    }
+
     /// After the caller's writes: guards `pages` (ascending, no repeats)
     /// again, one protection change per run of consecutive pages, with every
     /// other mapping of them. Returns the pages guarded now, leaving out
@@ -1159,6 +1175,35 @@ pub fn title_memory_remapped(at: usize, len: usize) {
                     g.alias_of.remove(&other);
                 }
             }
+        }
+    }
+}
+
+/// The runtime's answer to where title page `page` (its address) can be
+/// written without its guards: the address of the same page in a writable
+/// mapping of the runtime's own that no tracker holds and the title does
+/// not use, or `None` (memory that is not a section's: the runtime's
+/// pools). A function pointer, 0 for none ([`set_writable_alias`]).
+static WRITABLE_ALIAS: AtomicU64 = AtomicU64::new(0);
+
+/// The runtime tells how to find its own writable mapping of title pages
+/// that sections back (its physical-page views): copy-back of marked pages
+/// writes there instead of opening the title's guarded mapping
+/// (`crate::shadow`'s runs). The function must not call into this module
+/// (it is asked with no guard lock held, but its own lock is taken while
+/// the runtime maps pages, which calls in here).
+pub fn set_writable_alias(f: fn(usize) -> Option<usize>) {
+    WRITABLE_ALIAS.store(f as usize as u64, Ordering::Release);
+}
+
+/// See [`set_writable_alias`].
+pub(crate) fn writable_alias(page: usize) -> Option<usize> {
+    match WRITABLE_ALIAS.load(Ordering::Acquire) {
+        0 => None,
+        f => {
+            // SAFETY: stored from a `fn(usize) -> Option<usize>`.
+            let f = unsafe { std::mem::transmute::<usize, fn(usize) -> Option<usize>>(f as usize) };
+            f(page)
         }
     }
 }

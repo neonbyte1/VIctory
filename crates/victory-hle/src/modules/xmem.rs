@@ -363,18 +363,57 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section, and our own writable view of all of it once asked for
+/// ([`writable_alias`]).
+struct Section(HANDLE, std::sync::OnceLock<usize>);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+impl Section {
+    /// Our writable view of the whole section (0 if it cannot be mapped),
+    /// mapped on first use.
+    fn whole(&self) -> usize {
+        *self.1.get_or_init(|| {
+            use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+            // SAFETY: our section, mapped whole (length 0) at an address of
+            // the system's choice; unmapped when the section goes.
+            unsafe { MapViewOfFile(self.0, FILE_MAP_WRITE, 0, 0, 0) }.Value as usize
+        })
+    }
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if let Some(&at) = self.1.get()
+            && at != 0
+        {
+            // SAFETY: our own view of the section.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
+}
+
+/// Where the GPU side may write title page `at` (an address in a view of
+/// physical pages) without its guards: the same page in our own writable
+/// view of its section, which no tracker holds and the title does not see
+/// (`victory_gpu::set_writable_alias`; copy-back of what shaders wrote).
+/// `None` for memory that is no section's. Takes the page table's lock:
+/// never called with the GPU side's guard lock held.
+fn writable_alias(at: usize) -> Option<usize> {
+    let physical = physical();
+    let (base, (_, slice)) = physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + size)?;
+    let whole = slice.section.whole();
+    (whole != 0).then(|| whole + (slice.index + (at - base) / PAGE) * PAGE + at % PAGE)
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -515,7 +554,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, std::sync::OnceLock::new()));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -845,6 +884,10 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         shown.push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
+    // Copy-back of what shaders wrote goes through our own views of these
+    // pages from now on.
+    static ALIAS: std::sync::Once = std::sync::Once::new();
+    ALIAS.call_once(|| victory_gpu::set_writable_alias(writable_alias));
     true
 }
 

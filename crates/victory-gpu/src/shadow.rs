@@ -1342,6 +1342,7 @@ pub(crate) fn copy_back_marks(
             add(C::MarkMisses, back.misses as u64);
             add(C::MarkMerged, back.merged as u64);
             add(C::MarkBridged, back.bridged as u64);
+            add(C::MarkThrough, back.through as u64);
             for (c, us) in [C::MarkPreUs, C::MarkWaitUs, C::MarkProtectUs, C::MarkWriteUs, C::MarkVerifyUs]
                 .into_iter()
                 .zip(back.us)
@@ -1505,8 +1506,10 @@ pub(crate) struct RunBack {
     pub(crate) diff_bytes: usize,
     /// Pages written that the title wrote too while open: left changed.
     pub(crate) misses: usize,
-    /// Pages opened only to bridge the run's written pages.
+    /// Pages opened only to bridge the run's written pages; pages written
+    /// through the runtime's own mapping of them (no protection change).
     pub(crate) bridged: usize,
+    pub(crate) through: usize,
     /// Pages the title wrote since the copy took them: gone back by their
     /// saved bytes and left changed; kept the title's bytes (none saved).
     pub(crate) merged: usize,
@@ -1569,6 +1572,12 @@ fn run_hook(at: u8, page: usize) {
 ///   guarded ones only where this copy alone holds them
 ///   ([`crate::watch::Lease::alone`]); those are checked as the written
 ///   ones, and marked changed if the title wrote them while open.
+/// - Pages a section backs (the runtime's physical-page views) are written
+///   through the runtime's own writable mapping of the section
+///   ([`crate::watch::writable_alias`]) and never opened: the title's
+///   mappings stay guarded throughout, so a title write meanwhile faults,
+///   waits for the lease and lands after ours, and the page is taken with
+///   no check.
 ///
 /// A title write faulting while the lease is held lands after it, so after
 /// our writes. The one write of the title's that ours can overwrite lands
@@ -1634,6 +1643,12 @@ fn copy_back_run(
         };
         plans.push(plan);
     }
+    // Pages a section backs (the runtime's physical-page views) are
+    // written through the runtime's own writable mapping of them: the
+    // title's stays guarded, so no protection changes and no check after
+    // (asked before the lease: the runtime's lock is taken around calls in
+    // here).
+    let alias: Vec<Option<usize>> = pages.iter().map(|&page| crate::watch::writable_alias(page)).collect();
     #[cfg(test)]
     run_hook(0, pages[0]);
     #[cfg(feature = "diagnostics")]
@@ -1668,11 +1683,13 @@ fn copy_back_run(
             _ => None,
         })
         .collect();
-    // Between the pages written, those not written are opened too, so that
+    let (through, opened): (Vec<usize>, Vec<usize>) = written.iter().partition(|&&pn| alias[pn - first].is_some());
+    back.through = through.len();
+    // Between the pages opened, those not written are opened too, so that
     // one protection change covers the run each way (the shaders leave
     // many pages between those they change as they were): pages open
     // already, and guarded ones this copy alone holds, checked after.
-    let bridge: Vec<usize> = match (written.first(), written.last()) {
+    let bridge: Vec<usize> = match (opened.first(), opened.last()) {
         (Some(&lo), Some(&hi)) => (lo + 1..hi)
             .filter(|&pn| match plans[pn - first] {
                 Plan::Clean(a, b) | Plan::Merge(a, b) if a < b => false,
@@ -1682,7 +1699,8 @@ fn copy_back_run(
             .collect(),
         _ => Vec::new(),
     };
-    back.protects += lease.open(&written, &bridge);
+    lease.will_write(&through);
+    back.protects += lease.open(&opened, &bridge);
     #[cfg(feature = "diagnostics")]
     lap(&mut us, 2);
     #[cfg(test)]
@@ -1694,7 +1712,8 @@ fn copy_back_run(
         };
         for &(x, y) in &diffs[a..b] {
             let (x, y) = (x as usize, y as usize);
-            crate::host::write_mapped((pn * PAGE + x) as *mut u8, host_page(i)[x..].as_ptr(), y - x);
+            let to = alias[i].unwrap_or(pn * PAGE) + x;
+            crate::host::write_mapped(to as *mut u8, host_page(i)[x..].as_ptr(), y - x);
             back.diff_bytes += y - x;
         }
         back.diff_runs += b - a;
@@ -1722,7 +1741,7 @@ fn copy_back_run(
         };
         let bridged = bridge.binary_search(&pn).is_ok();
         back.bridged += usize::from(bridged);
-        let opened = a < b || bridged;
+        let opened = (a < b && alias[i].is_none()) || bridged;
         if !opened || crate::host::read_into((pn * PAGE) as *const u8, &mut title) && title[..] == *host_page(i) {
             taken.push(pn);
         } else {
@@ -2936,5 +2955,94 @@ mod run_tests {
         assert_eq!(title[100], 0x5c, "the title's write lands last");
         assert_eq!(&title[101..108], &host[101..108], "the shaders' other bytes went back");
         assert!(t.changed(a / PAGE), "the page changed after the run took it");
+    }
+
+    /// Three views of one fresh section of `pages` pages: the title's
+    /// (`a`), another title view reported as showing the same pages (`b`),
+    /// and the runtime's own (`c`), which copy-back is told to write
+    /// through for `a`'s pages.
+    fn three_views(pages: usize) -> (usize, usize, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
+        static AT: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+        let len = pages * PAGE;
+        // SAFETY: a pagefile section mapped three times; the test keeps them.
+        let [a, b, c] = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            [(); 3].map(|()| MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize)
+        };
+        assert!(a != 0 && b != 0 && c != 0);
+        for k in (0..len).step_by(PAGE) {
+            crate::watch::title_memory_aliased(b + k, &[a + k]);
+        }
+        AT[0].store(a, Relaxed);
+        AT[1].store(len, Relaxed);
+        AT[2].store(c, Relaxed);
+        crate::watch::set_writable_alias(|at| {
+            let (a, len, c) = (AT[0].load(Relaxed), AT[1].load(Relaxed), AT[2].load(Relaxed));
+            (a..a + len).contains(&at).then(|| at - a + c)
+        });
+        (a, b, c)
+    }
+
+    /// Pages the runtime can map for us go back through its own mapping:
+    /// no protection change, the title's mappings stay guarded (a later
+    /// write there counts), and nothing is checked after.
+    #[test]
+    fn a_run_writes_view_pages_through_our_own_mapping() {
+        let (a, b, _) = three_views(3);
+        let t = crate::watch::track_copy(a, 3 * PAGE, true).expect("views are tracked");
+        fill(a, 3 * PAGE);
+        let mut host = title_bytes(a, 3 * PAGE);
+        assert!(!t.take(a, a + 3 * PAGE).is_empty());
+        host[100..200].fill(0xaa);
+        host[2 * PAGE + 7] ^= 1;
+        let back = copy_back_run(&t, &pages_at(a, 3), &host, &Default::default());
+        assert_eq!((back.written, back.through, back.protects, back.misses), (2, 2, 0, 0));
+        assert_eq!(title_bytes(a, 3 * PAGE), host, "title memory holds the copy");
+        assert!((0..3).all(|k| !t.changed(a / PAGE + k)), "taken");
+        // SAFETY: a byte of the title's other view, still guarded.
+        unsafe { ((b + 2 * PAGE + 8) as *mut u8).write_volatile(9) };
+        assert!(t.changed(a / PAGE + 2) && !t.changed(a / PAGE));
+        // SAFETY: a byte of the title's view, still guarded.
+        unsafe { ((a + 8) as *mut u8).write_volatile(9) };
+        assert!(t.changed(a / PAGE));
+    }
+
+    /// A title write while a run writes through our own mapping faults (the
+    /// title's mappings stay guarded) and waits for the lease: it lands
+    /// after ours, on the very bytes the shaders changed, and the page
+    /// counts as changed after the run took it. Through the other title
+    /// mapping too.
+    #[test]
+    fn a_title_write_during_a_write_through_our_mapping_lands_after_it() {
+        let (a, b, _) = three_views(2);
+        let t = crate::watch::track_copy(a, 2 * PAGE, true).expect("views are tracked");
+        fill(a, 2 * PAGE);
+        let mut host = title_bytes(a, 2 * PAGE);
+        assert!(!t.take(a, a + 2 * PAGE).is_empty());
+        host[100..108].fill(0xaa);
+        host[PAGE + 100..PAGE + 108].fill(0xbb);
+        let writers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::default();
+        let slot = writers.clone();
+        hook(move |at, _| {
+            if at == 1 {
+                let mut w = slot.lock().unwrap();
+                // SAFETY: (both) a byte of a title view, guarded: the
+                // handler waits for the lease, then opens it.
+                w.push(std::thread::spawn(move || unsafe { ((a + 100) as *mut u8).write_volatile(0x5c) }));
+                w.push(std::thread::spawn(move || unsafe { ((b + PAGE + 100) as *mut u8).write_volatile(0x5d) }));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
+        let back = copy_back_run(&t, &pages_at(a, 2), &host, &Default::default());
+        unhook();
+        writers.lock().unwrap().drain(..).for_each(|w| w.join().unwrap());
+        assert_eq!((back.written, back.through, back.protects, back.misses), (2, 2, 0, 0));
+        let title = title_bytes(a, 2 * PAGE);
+        assert_eq!((title[100], title[PAGE + 100]), (0x5c, 0x5d), "the title's writes land last");
+        assert_eq!((&title[101..108], &title[PAGE + 101..PAGE + 108]), (&host[101..108], &host[PAGE + 101..PAGE + 108]));
+        assert!(t.changed(a / PAGE) && t.changed(a / PAGE + 1), "both pages changed after the run took them");
     }
 }

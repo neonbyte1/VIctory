@@ -184,8 +184,10 @@ pub(crate) enum C {
     MarkViewPages,
     MarkPoolProtects,
     MarkViewProtects,
+    /// Marked pages written through the runtime's own mapping of them.
+    MarkThrough,
 }
-const COUNTERS: usize = 107;
+const COUNTERS: usize = 108;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -426,11 +428,12 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "  marked pages per frame by memory: pools {:.0} pages, {:.0} protection changes; views {:.0} \
-         pages, {:.0} protection changes",
+         pages, {:.0} protection changes; {:.0} pages written through our own mapping",
         c[C::MarkPoolPages as usize],
         c[C::MarkPoolProtects as usize],
         c[C::MarkViewPages as usize],
         c[C::MarkViewProtects as usize],
+        c[C::MarkThrough as usize],
     );
     let sites: Vec<String> = crate::watch::site_counts()
         .iter()
