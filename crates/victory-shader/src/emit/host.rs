@@ -4,10 +4,14 @@
 use std::ffi::CString;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+#[cfg(test)]
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+#[cfg(test)]
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, PCSTR};
 
 use super::HostShader;
@@ -17,6 +21,71 @@ use crate::dxbc::{Container, FourCC};
 pub struct Host {
     pub device: ID3D12Device,
     warp: bool,
+    /// The objects a dispatch makes once and reuses; see [`Reused`].
+    #[cfg(test)]
+    reused: std::sync::Mutex<Option<Reused>>,
+}
+
+/// What a dispatch needs that does not depend on its inputs: the queue,
+/// allocator, list, fence and event. Making them cost 4.2 ms of an 8.3 ms
+/// dispatch, and the `valu_tests` cases run hundreds of dispatches for one
+/// shader, so they are made once per host instead. The GPU tests run one at a
+/// time (`ONE_AT_A_TIME`) and every dispatch waits for its fence, so the
+/// objects are free to reuse.
+#[cfg(test)]
+struct Reused {
+    queue: ID3D12CommandQueue,
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    event: HANDLE,
+    /// The fence value of the last dispatch.
+    value: u64,
+    /// A recording has begun and its fence has not been waited for: the
+    /// allocator is in use and the list is open, so neither may be reset.
+    recording: std::cell::Cell<bool>,
+}
+
+#[cfg(test)]
+impl Reused {
+    fn new(dev: &ID3D12Device) -> Result<Self, String> {
+        // SAFETY: plain D3D12 calls with descriptions that outlive them; the
+        // event is closed by `Drop`.
+        unsafe {
+            let alloc: ID3D12CommandAllocator = dev
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .map_err(err)?;
+            let list: ID3D12GraphicsCommandList =
+                dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                    .map_err(err)?;
+            list.Close().map_err(err)?;
+            Ok(Reused {
+                queue: dev
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .map_err(err)?,
+                alloc,
+                list,
+                fence: dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?,
+                event: CreateEventW(None, false, false, None).map_err(err)?,
+                value: 0,
+                recording: std::cell::Cell::new(false),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for Reused {
+    fn drop(&mut self) {
+        // SAFETY: the event is ours, and the last dispatch waited for the
+        // fence, so nothing is left to signal it.
+        unsafe {
+            let _ = CloseHandle(self.event);
+        }
+    }
 }
 
 /// What the stage declares that a pipeline must match.
@@ -158,6 +227,37 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
+/// Waits until `fence` reaches `value`, without spinning: the queue sets an
+/// event when it does. The timeout keeps the device-removal check - a removed
+/// device never signals - so the wait reports it instead of hanging the run.
+#[cfg(test)]
+fn wait(event: HANDLE, fence: &ID3D12Fence, dev: &ID3D12Device, value: u64) -> Result<(), String> {
+    // SAFETY: the event is the caller's, and the fence is done with it once it
+    // signals (it must not be closed before that).
+    unsafe {
+        if let Err(e) = fence.SetEventOnCompletion(value, event) {
+            return Err(err(e));
+        }
+        // 100 ms: nothing while the GPU runs, and a wedged device is reported
+        // rather than waited for.
+        loop {
+            match WaitForSingleObject(event, 100) {
+                WAIT_OBJECT_0 => break,
+                WAIT_TIMEOUT => {
+                    if let Err(e) = dev.GetDeviceRemovedReason() {
+                        return Err(format!("device removed: {}", err(e)));
+                    }
+                }
+                other => return Err(format!("wait failed: {}", other.0)),
+            }
+        }
+        if let Err(e) = dev.GetDeviceRemovedReason() {
+            return Err(format!("device removed: {}", err(e)));
+        }
+        Ok(())
+    }
+}
+
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
@@ -180,12 +280,16 @@ impl Host {
                 .map(|d| Host {
                     device: d.0.clone(),
                     warp: true,
+                    #[cfg(test)]
+                    reused: std::sync::Mutex::new(None),
                 })
                 .map_err(Clone::clone);
         }
         Ok(Host {
             device: create_device(false)?,
             warp: false,
+            #[cfg(test)]
+            reused: std::sync::Mutex::new(None),
         })
     }
 
@@ -193,7 +297,12 @@ impl Host {
     /// serialised as WARP's is when the device runs on a software adapter.
     pub fn from_device(device: ID3D12Device) -> Self {
         let warp = on_software_adapter(&device);
-        Host { device, warp }
+        Host {
+            device,
+            warp,
+            #[cfg(test)]
+            reused: std::sync::Mutex::new(None),
+        }
     }
 
     /// The wave sizes the device runs ([`super::Target::ANY`] if it does
@@ -1268,19 +1377,11 @@ impl Host {
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+            let event = CreateEventW(None, false, false, None).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(format!(
-                        "device removed: {}",
-                        err(dev.GetDeviceRemovedReason().unwrap_err())
-                    ));
-                }
-                std::thread::yield_now();
-            }
-            if let Err(e) = dev.GetDeviceRemovedReason() {
-                return Err(format!("device removed: {}", err(e)));
-            }
+            let waited = wait(event, &fence, dev, 1);
+            let _ = CloseHandle(event);
+            waited?;
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let mut out = Vec::with_capacity((w * h) as usize);
@@ -1432,21 +1533,28 @@ impl Host {
     ) -> Result<Vec<Vec<u32>>, String> {
         let _guard = self.lock_warp();
         let dev = &self.device;
+        let mut reused = self.reused.lock().unwrap_or_else(|e| e.into_inner());
+        // A dispatch that failed between `Reset` and its fence left the list
+        // recording and the allocator in use: make new ones rather than fail
+        // every later dispatch with a second, misleading error.
+        if reused.as_ref().is_some_and(|r| r.recording.get()) {
+            *reused = None;
+        }
+        if reused.is_none() {
+            *reused = Some(Reused::new(dev)?);
+        }
+        let r = reused.as_mut().expect("just made");
+        r.value += 1;
+        let value = r.value;
+        let (queue, list, fence) = (&r.queue, &r.list, &r.fence);
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
-            let alloc: ID3D12CommandAllocator = dev
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                .map_err(err)?;
-            let list: ID3D12GraphicsCommandList = dev
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso)
-                .map_err(err)?;
+            // Free the memory of the previous recording; its fence was waited
+            // for, and a dispatch that did not wait is dropped above.
+            r.alloc.Reset().map_err(err)?;
+            r.recording.set(true);
+            list.Reset(&r.alloc, pso).map_err(err)?;
             let make = |heap: D3D12_HEAP_TYPE, desc: &D3D12_RESOURCE_DESC, state| {
                 let mut r: Option<ID3D12Resource> = None;
                 dev.CreateCommittedResource(
@@ -2063,14 +2171,9 @@ impl Host {
             }
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            queue.Signal(fence, value).map_err(err)?;
+            wait(r.event, fence, dev, value)?;
+            r.recording.set(false);
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();

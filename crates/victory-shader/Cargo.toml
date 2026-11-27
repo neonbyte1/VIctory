@@ -29,6 +29,8 @@ windows = { workspace = true, optional = true, features = [
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+    "Win32_System_Threading",
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
@@ -38,6 +40,8 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+    "Win32_System_Threading",
 ] }
 
 [lints]
