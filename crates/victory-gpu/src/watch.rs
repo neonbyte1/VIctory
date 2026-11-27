@@ -828,9 +828,28 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// Advanced whenever the runtime maps or unmaps title memory: what callers
+/// cached about views of physical pages (that they are committed) holds
+/// only while it stands.
+static REMAP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn remap_epoch() -> u64 {
+    REMAP_EPOCH.load(Ordering::Acquire)
+}
+
+/// The runtime has finished unmapping title memory `[at, at + len)`.
+/// [`title_memory_remapped`] runs before the view goes away, so a refresh
+/// between the two can still find the range mapped and cache that under the
+/// epoch it started; advancing the epoch again once the view is gone makes
+/// such a cache entry stale.
+pub fn title_memory_unmapped(_at: usize, _len: usize) {
+    REMAP_EPOCH.fetch_add(1, Ordering::Release);
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    REMAP_EPOCH.fetch_add(1, Ordering::Release);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.

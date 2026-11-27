@@ -1146,6 +1146,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        // The view is gone: commit state cached since the call above is stale.
+        victory_gpu::title_memory_unmapped(at, size);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
