@@ -590,6 +590,133 @@ impl Module {
         }
     }
 
+    /// Whether every live instruction's operands are defined where it uses
+    /// them: earlier in its block or in a block that dominates it (a phi's
+    /// incoming value: at the end of its incoming block), over the blocks
+    /// reached from the entry through [`Module::term`]. Lowering that splits
+    /// the block it is in (a meeting of host waves) and goes on adding code
+    /// to the old one breaks this.
+    pub fn defs_dominate_uses(&self) -> bool {
+        let n = self.blocks.len();
+        let succs = |b: usize| successors(self.term(b));
+        // Reverse postorder of the blocks reached from the entry.
+        let mut seen = vec![false; n];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        let order: Vec<usize> = post.into_iter().rev().collect();
+        let mut pos = vec![usize::MAX; n];
+        for (k, &b) in order.iter().enumerate() {
+            pos[b] = k;
+        }
+        let mut preds = vec![Vec::new(); n];
+        for &b in &order {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+            }
+        }
+        // Immediate dominators (Cooper, Harvey and Kennedy).
+        let mut idom = vec![usize::MAX; n];
+        idom[0] = 0;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in order.iter().skip(1) {
+                let mut new = usize::MAX;
+                for &q in preds[b].iter().filter(|&&q| idom[q] != usize::MAX) {
+                    new = if new == usize::MAX {
+                        q
+                    } else {
+                        let (mut x, mut y) = (new, q);
+                        while x != y {
+                            while pos[x] > pos[y] {
+                                x = idom[x];
+                            }
+                            while pos[y] > pos[x] {
+                                y = idom[y];
+                            }
+                        }
+                        x
+                    };
+                }
+                if idom[b] != new {
+                    idom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        let dominates = |a: usize, mut b: usize| loop {
+            if a == b {
+                break true;
+            }
+            if b == 0 {
+                break false;
+            }
+            b = idom[b];
+        };
+        // Where each instruction is: its block and place (phis before the
+        // body).
+        let mut at = vec![(usize::MAX, 0usize); self.insts.len()];
+        for &b in &order {
+            let block = &self.blocks[b];
+            for (k, &i) in block.phis.iter().chain(&block.body).enumerate() {
+                at[i as usize] = (b, k);
+            }
+        }
+        // A value defined before place `k` of block `b` (usize::MAX: its end).
+        let before = |v: V, b: usize, k: usize| match v {
+            V::Inst(j) => {
+                let (db, dk) = at[j as usize];
+                db != usize::MAX && if db == b { dk < k } else { dominates(db, b) }
+            }
+            _ => true,
+        };
+        let live = self.live();
+        order.iter().all(|&b| {
+            let block = &self.blocks[b];
+            let phis = block.phis.iter().filter(|&&i| live[i as usize]).all(|&i| {
+                let Op::Phi(incoming) = &self.insts[i as usize].op else {
+                    return false;
+                };
+                incoming
+                    .iter()
+                    .all(|&(v, from)| pos[from] == usize::MAX || before(v, from, usize::MAX))
+            });
+            let body = block
+                .body
+                .iter()
+                .enumerate()
+                .filter(|&(_, &i)| live[i as usize])
+                .all(|(k, &i)| {
+                    let mut ok = true;
+                    for_each_operand(&self.insts[i as usize].op, |v| {
+                        ok &= before(v, b, block.phis.len() + k);
+                    });
+                    ok
+                });
+            let term = match self.term(b) {
+                Some(Term::CondBr(c, ..)) => before(c, b, usize::MAX),
+                _ => true,
+            };
+            phis && body && term
+        })
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {

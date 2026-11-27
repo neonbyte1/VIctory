@@ -285,10 +285,20 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 
 /// Whether a dispatch with the title pipeline is held back: it is the
 /// acceleration-structure builder's, which does not run this frame
-/// ([`builder::runs`]).
+/// ([`builder::runs`]). The builder's dispatches are counted for the frame
+/// line, run or held.
 #[cfg(windows)]
 pub(crate) fn held_back(this: This) -> bool {
-    !this.is_null() && pipeline(this).builder && !builder::runs()
+    if this.is_null() || !pipeline(this).builder {
+        return false;
+    }
+    let held = !builder::runs();
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(if held { C::BvhHeld } else { C::BvhRun }, 1);
+    }
+    held
 }
 
 /// A title DLL was mapped at `base`, `size` bytes (the acceleration-

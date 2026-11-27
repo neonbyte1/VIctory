@@ -88,6 +88,22 @@ pub fn host_target() -> Target {
     crate::host::host().map_or(Target::ANY, |h| h.target())
 }
 
+/// Whether programs translate with pair meetings
+/// ([`victory_shader::emit::Options::pair_meetings`]): yes, unless
+/// `VICTORY_BVH_HALVES=0` (for A/B runs; logged once). Off, console wave64
+/// programs with several console waves to a group are refused on hosts of
+/// 32-lane waves, and the BVH builder (whole or not at all) never runs there.
+pub fn pair_meetings() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = crate::switch::on_unless_zero("VICTORY_BVH_HALVES");
+        if !on {
+            tracing::info!("programs translate without pair meetings (VICTORY_BVH_HALVES=0)");
+        }
+        on
+    });
+    *ON
+}
+
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one, and whether it
 /// came from there.
@@ -97,23 +113,29 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
     crate::descriptor::host::probe_view_limit();
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
+    let pair_meetings = pair_meetings();
     let options = victory_shader::emit::Options {
         view_marks: true,
         target,
+        pair_meetings,
     };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &host_key(build(), target), container, translate),
+        Some(cache) => cached(cache, &host_key(build(), target, pair_meetings), container, translate),
         None => (translate(container), false),
     }
 }
 
 /// The part of an entry's key before the container: the build, and the
-/// host's wave sizes (a translation for one host's waves is not another's).
-fn host_key(build: &[u8; 32], target: Target) -> [u8; 32] {
+/// host's wave sizes (a translation for one host's waves is not another's),
+/// and pair meetings when asked for (keys without them stay as they were).
+fn host_key(build: &[u8; 32], target: Target, pair_meetings: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
+    if pair_meetings {
+        h.update(b"pair meetings");
+    }
     *h.finalize().as_bytes()
 }
 
@@ -539,9 +561,11 @@ mod tests {
             lanes_min: 32,
             lanes_max: 64,
         };
-        assert_eq!(host_key(&build, nvidia), host_key(&build, nvidia));
-        assert_ne!(host_key(&build, nvidia), host_key(&build, rdna));
-        assert_ne!(host_key(&build, nvidia), host_key(&[8; 32], nvidia));
+        assert_eq!(host_key(&build, nvidia, false), host_key(&build, nvidia, false));
+        assert_ne!(host_key(&build, nvidia, false), host_key(&build, rdna, false));
+        assert_ne!(host_key(&build, nvidia, false), host_key(&[8; 32], nvidia, false));
+        // Pair meetings change the translation of the builder's programs.
+        assert_ne!(host_key(&build, nvidia, false), host_key(&build, nvidia, true));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

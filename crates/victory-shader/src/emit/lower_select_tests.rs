@@ -1,12 +1,14 @@
 //! `lower`'s numeric-select test (#439), a child module of it kept in its own
 //! file so that `lower.rs` stays under the asset policy's file-size limit.
 
-use super::super::emit;
 use crate::native::{ComputeIo, RootParam};
 use crate::{Container, FourCC, HwStage, NativeProgram, ResourceType, RootType, UsedResource};
 
 #[test]
 fn selects_from_independently_written_mask_words() {
+    // Without pair meetings: a group of more than 64 threads needs them to
+    // translate on a host without 64-lane waves (the off-switch's rule).
+    let pair_meetings = false;
     let words = [
         0xbe81_0380u32, // s1 = 0 (table address high)
         0xf408_0200,
@@ -73,7 +75,8 @@ fn selects_from_independently_written_mask_words() {
             lanes_max: 32,
         };
         for target in [wave32_only, super::super::Target::ANY] {
-            let result = emit(&c, &native, &p, &st, &io, &res, target);
+            let options = super::super::Options { target, pair_meetings, ..super::super::Options::default() };
+            let result = super::super::emit_with(&c, &native, &p, &st, &io, &res, options);
             if uses_select && threads > 64 && !target.runs(64) {
                 assert!(matches!(
                     result,

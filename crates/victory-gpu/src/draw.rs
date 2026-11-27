@@ -2175,7 +2175,6 @@ fn create_spread_signature(
     signature
 }
 
-
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need. `marked`: a shader's
 /// writes through the view mark their pages (every translated shader's do);
@@ -3908,6 +3907,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             Options {
                 view_marks: true,
                 target: victory_shader::emit::Target::ANY,
+                pair_meetings: false,
             },
         )
         .unwrap();

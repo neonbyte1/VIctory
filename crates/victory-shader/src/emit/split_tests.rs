@@ -5,7 +5,7 @@
 //! half run as two host waves of 32 (see `lower::Lower::new`).
 
 use super::host::{Dispatch, Host, Root, View, adapters};
-use super::tests::{compute, emit_for};
+use super::tests::{compute, emit_for, emit_for_no_pairs};
 use crate::native::{RootParam, RootType, StageIo};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -293,7 +293,8 @@ fn exchanges_inside_a_branch_one_half_skips() {
 }
 
 /// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// group barrier: not without pair meetings (on by default;
+/// `VICTORY_BVH_HALVES=0`), which is the rule this checks.
 #[test]
 fn console_flow_is_for_one_console_wave_per_group() {
     let body = [
@@ -305,8 +306,8 @@ fn console_flow_is_for_one_console_wave_per_group() {
         lanes_min: 32,
         lanes_max: 32,
     };
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    assert!(emit_for_no_pairs(&program(&body, 64), nvidia).is_ok());
+    assert!(emit_for_no_pairs(&program(&body, 128), nvidia).is_err());
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in
