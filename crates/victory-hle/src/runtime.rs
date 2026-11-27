@@ -174,10 +174,22 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = field_text(rest);
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
+        // Text up to the first child belongs to this element. A self-closing
+        // element has none, so whatever follows it belongs to its parent.
+        let body = if closed {
+            String::new()
+        } else {
+            let body = field_text(rest);
+            [
+                ("&lt;", "<"),
+                ("&gt;", ">"),
+                ("&quot;", "\""),
+                ("&apos;", "'"),
+                ("&amp;", "&"),
+            ]
             .iter()
-            .fold(body, |b, (entity, c)| b.replace(entity, c));
+            .fold(body, |b, (entity, c)| b.replace(entity, c))
+        };
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -251,6 +263,14 @@ pub fn use_console_timers() {
 mod tests {
     use super::*;
 
+    /// The body recorded for `path`, if any element has it.
+    fn body<'a>(elements: &'a [(String, String)], path: &str) -> Option<&'a str> {
+        elements
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, text)| text.as_str())
+    }
+
     #[test]
     fn a_quoted_angle_bracket_does_not_end_its_tag() {
         let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
@@ -285,5 +305,140 @@ mod tests {
         assert_eq!(t.id, 0x639A_A8DD);
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
+    }
+
+    #[test]
+    fn elements_record_the_path_of_each_nested_element() {
+        let found = elements("<A><B><C>x</C></B></A>");
+        for (path, text) in [("A", ""), ("A/B", ""), ("A/B/C", "x")] {
+            assert_eq!(body(&found, path), Some(text), "{path}");
+        }
+        assert_eq!(found.len(), 3, "one entry per element");
+    }
+
+    #[test]
+    fn a_self_closing_element_owns_no_text() {
+        // The words after `/>` belong to the parent, not to `Flag`.
+        let found = elements("<Game><Flag/>owned by the parent<Name>ok</Name></Game>");
+        assert_eq!(body(&found, "Game/Flag"), Some(""));
+        assert_eq!(body(&found, "Game/Name"), Some("ok"));
+        // Neighbours with nothing between them are still empty.
+        let neighbours = elements("<R><A/><B/></R>");
+        assert_eq!(body(&neighbours, "R/A"), Some(""));
+        assert_eq!(body(&neighbours, "R/B"), Some(""));
+    }
+
+    #[test]
+    fn comments_cdata_and_declarations_are_skipped() {
+        let found =
+            elements("<?xml version=\"1.0\"?><G><!-- <X>c</X> --><![CDATA[<Y>d</Y>]]><Z>1</Z></G>");
+        assert_eq!(body(&found, "G/X"), None, "inside a comment");
+        assert_eq!(body(&found, "G/Y"), None, "inside CDATA");
+        assert_eq!(body(&found, "G/Z"), Some("1"));
+    }
+
+    #[test]
+    fn predefined_entities_are_decoded_once() {
+        assert_eq!(
+            body(&elements("<A>&lt;&gt;&amp;&quot;&apos;</A>"), "A"),
+            Some("<>&\"'")
+        );
+        // One pass: `&amp;lt;` is the text `&lt;`, not a second `<`.
+        assert_eq!(body(&elements("<A>&amp;lt;</A>"), "A"), Some("&lt;"));
+    }
+
+    #[test]
+    fn unterminated_markup_is_ignored_without_panicking() {
+        let found = elements("<A>x<B");
+        assert_eq!(body(&found, "A"), Some("x"));
+        assert_eq!(body(&found, "A/B"), None, "the <?B has no >");
+        assert!(elements("<").is_empty());
+    }
+
+    #[test]
+    fn missing_manifest_yields_defaults() {
+        for text in [
+            "",
+            "<Game></Game>",
+            "<NotGame><TitleId>1</TitleId></NotGame>",
+        ] {
+            let title = Title::from_manifest(text);
+            assert_eq!(
+                (title.id, title.store_id.as_str(), title.storage_bytes),
+                (0, "", 0),
+                "{text:?}"
+            );
+            assert_eq!(title.storage, PathBuf::new(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn lowercase_hex_id_and_quota_in_bytes() {
+        let title = Title::from_manifest(
+            "<Game><TitleId>deadbeef</TitleId>\
+             <PersistentLocalStorage><SizeMB>2</SizeMB></PersistentLocalStorage></Game>",
+        );
+        assert_eq!(title.id, 0xDEAD_BEEF);
+        assert_eq!(title.storage_bytes, 2 << 20);
+    }
+
+    #[test]
+    fn invalid_id_and_missing_quota_are_zero() {
+        let title = Title::from_manifest("<Game><TitleId>0x12</TitleId></Game>");
+        assert_eq!((title.id, title.storage_bytes), (0, 0));
+    }
+
+    #[test]
+    fn store_id_is_trimmed_and_entity_decoded() {
+        let title = Title::from_manifest("<Game><StoreId>  a&amp;b  </StoreId></Game>");
+        assert_eq!(title.store_id, "a&b");
+    }
+
+    #[test]
+    fn commented_and_cdata_ids_are_ignored() {
+        let title = Title::from_manifest(
+            "<Game><!--<TitleId>1</TitleId>--><![CDATA[<StoreId>x</StoreId>]]>\
+             <TitleId>2</TitleId></Game>",
+        );
+        assert_eq!(title.id, 2);
+        assert_eq!(title.store_id, "");
+    }
+
+    #[test]
+    fn the_first_element_at_a_path_wins() {
+        let title = Title::from_manifest("<Game><TitleId>1</TitleId><TitleId>2</TitleId></Game>");
+        assert_eq!(title.id, 1);
+    }
+
+    #[test]
+    fn saves_live_beside_storage() {
+        assert_eq!(Title::default().saves(), PathBuf::from("saves"));
+        let title = Title {
+            storage: PathBuf::from("data/0000/storage"),
+            ..Title::default()
+        };
+        assert_eq!(title.saves(), PathBuf::from("data/0000/saves"));
+    }
+
+    #[test]
+    fn image_registry_remembers_replaces_and_forgets() {
+        let base = 0x7DFF_5A5A_0001;
+        let first = Path::new(r"C:\victory-test\victory-runtime-image.dll");
+        let second = Path::new(r"D:\victory-test\victory-renamed-image.dll");
+        let name = |path: &Path| path.file_name().unwrap().to_owned();
+
+        set_image_path(base, first);
+        assert_eq!(image_path(base).map(|p| name(&p)), Some(name(first)));
+        assert_eq!(image_named("VICTORY-RUNTIME-IMAGE.DLL"), Some(base));
+
+        // A second file at the same base replaces the first.
+        set_image_path(base, second);
+        assert_eq!(image_path(base).map(|p| name(&p)), Some(name(second)));
+        assert_eq!(image_named("victory-runtime-image.dll"), None);
+        assert_eq!(image_named("victory-renamed-image.dll"), Some(base));
+
+        forget_image(base);
+        assert_eq!(image_path(base), None);
+        assert_eq!(image_named("victory-renamed-image.dll"), None);
     }
 }
