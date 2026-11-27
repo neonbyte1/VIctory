@@ -498,7 +498,14 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    // The list names the resource until it is reset: the title may release it
+    // before the list runs.
+    let host = |r: This| {
+        crate::resource::host_resource(r).map(|h| {
+            list.keep(&h);
+            h.as_raw().cast_const().cast()
+        })
+    };
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -2300,6 +2307,36 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// A UAV or aliasing barrier names host resources the list must keep
+    /// alive: the title may release them before the list runs.
+    #[test]
+    fn uav_and_aliasing_barriers_keep_their_resources() {
+        let Some(host) = crate::host::host() else { return };
+        let desc: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let properties = [1u32, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut texture = std::ptr::null();
+        let made = crate::resource::create_committed(
+            std::ptr::null(),
+            properties.as_ptr().cast(),
+            0,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut texture,
+        );
+        assert_eq!(made, S_OK);
+        let list = host.new_list().unwrap();
+        for kind in [1, 2] {
+            let before = list.kept_count();
+            let barrier = Barrier { kind, flags: 0, first: texture, second: 0, last: 0 };
+            assert!(host_barrier(&list, &barrier).is_some());
+            assert_eq!(list.kept_count(), before + 1, "kind {kind}");
+        }
+        list.close();
     }
 
     #[test]

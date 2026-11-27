@@ -2679,6 +2679,11 @@ impl HostList {
         Some(made)
     }
 
+    #[cfg(test)]
+    pub(crate) fn kept_count(&self) -> usize {
+        self.deferred().kept.len()
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
