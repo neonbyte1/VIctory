@@ -175,8 +175,34 @@ impl Drop for Held<'_> {
 static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// The library of a WARP host: the hardware's refuses its pipelines and the
+/// other way round, so one file for both was emptied by every switch (#2637).
+const SOFTWARE_LIBRARY_FILE: &str = "host-pipelines-warp.bin";
+
+/// The library file of a host on the software adapter or on hardware.
+fn library_file(software: bool) -> &'static str {
+    if software { SOFTWARE_LIBRARY_FILE } else { LIBRARY_FILE }
+}
+
+/// The library file of this run's host.
+fn host_library_file() -> &'static str {
+    library_file(host_software())
+}
+
+/// The pre-build's list of a host on the software adapter or on hardware: it
+/// is tagged with its library's bytes, so one list for both was replaced by
+/// whichever pre-built last and refused by the other.
+fn prebuilt_file(software: bool) -> &'static str {
+    if software { SOFTWARE_PREBUILT_FILE } else { PREBUILT_FILE }
+}
+
+/// Whether this run's host is on the software adapter (WARP).
+fn host_software() -> bool {
+    crate::host::host().is_some_and(|h| h.software)
+}
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
+const SOFTWARE_PREBUILT_FILE: &str = "prebuilt-pipelines-warp.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -186,11 +212,11 @@ fn library() -> Option<&'static Shared> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
+            let blob = read(host_library_file()).unwrap_or_default();
             let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
+            if let (Some(l), Some(list)) = (library.as_mut(), read(prebuilt_file(host_software())))
                 && !l._blob.is_empty()
             {
                 l.prebuilt = listed(&list, &tag);
@@ -427,10 +453,10 @@ pub(crate) fn save(now: bool) {
     };
     let used = used().as_ref().map(Used::list).unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| write_atomically(&dir.join(host_library_file()), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
+            Some(list) => write_atomically(&dir.join(prebuilt_file(host_software())), list.as_bytes()),
             None => Ok(()),
         });
     let (created, distinct) = created();
@@ -607,6 +633,118 @@ mod tests {
     fn a_save_buffer_the_host_cannot_give_is_refused() {
         assert!(zeroed(usize::MAX / 2).is_none());
         assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    }
+
+    /// A hardware pre-build and a WARP one in one cache folder each read back
+    /// their own list: neither replaces the other's (#2646 review).
+    #[test]
+    fn each_host_reads_back_its_own_prebuilt_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        let (hw, warp) = (keys(&["a", "b"]), keys(&["c"]));
+        std::fs::write(dir.path().join(prebuilt_file(false)), list("hw-tag", &hw)).unwrap();
+        std::fs::write(dir.path().join(prebuilt_file(true)), list("warp-tag", &warp)).unwrap();
+        let read = |software| std::fs::read(dir.path().join(prebuilt_file(software))).unwrap();
+        assert_eq!(listed(&read(false), "hw-tag"), hw);
+        assert_eq!(listed(&read(true), "warp-tag"), warp);
+        // a list read for another library's bytes is refused, as before
+        assert!(listed(&read(true), "hw-tag").is_empty());
+    }
+
+    /// A WARP host and a hardware one keep their libraries apart, so a run on
+    /// one does not empty the other's; the hardware file keeps its name (#2637).
+    #[test]
+    fn warp_and_hardware_hosts_keep_their_own_library() {
+        assert_eq!(library_file(false), "host-pipelines.bin");
+        assert_ne!(library_file(true), library_file(false));
+        assert!(library_file(true).ends_with(".bin"));
+        // the pre-build's list too: it names its library's bytes
+        assert_eq!(prebuilt_file(false), "prebuilt-pipelines.txt");
+        assert_ne!(prebuilt_file(true), prebuilt_file(false));
+        assert!(prebuilt_file(true).ends_with(".txt"));
+    }
+
+    /// Cache state is process-global, so use fresh WARP processes to save
+    /// and reload while the hardware library and its index hold marker bytes.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn warp_cache_save_and_reload_preserve_hardware_files() {
+        const STEP: &str = "VICTORY_TEST_WARP_CACHE_STEP";
+        const CACHE: &str = "VICTORY_TEST_WARP_CACHE_DIR";
+        const NAME: &str = "pipeline::library::tests::warp_cache_save_and_reload_preserve_hardware_files";
+        const KEY: &str = "synthetic-warp-cache-key";
+        const NO_LIBRARY: &str = "WARP pipeline libraries unavailable";
+        const HARDWARE_BLOB: &[u8] = b"synthetic bytes from a different adapter";
+        const HARDWARE_INDEX: &[u8] = b"hardware-tag\nsynthetic-hardware-key";
+
+        if let Ok(step) = std::env::var(STEP) {
+            use_pipeline_cache(PathBuf::from(std::env::var_os(CACHE).unwrap()));
+            if step == "save" {
+                if library().is_none() {
+                    println!("{NO_LIBRARY}");
+                    return;
+                }
+                note_prebuilt(KEY.to_owned());
+                save(true);
+            } else {
+                assert_eq!(step, "reload");
+                assert!(prebuilt(KEY), "WARP did not reload its tagged entry");
+            }
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let hardware = dir.path().join("host-pipelines.bin");
+        let hardware_index = dir.path().join("prebuilt-pipelines.txt");
+        let software = dir.path().join("host-pipelines-warp.bin");
+        let software_index = dir.path().join("prebuilt-pipelines-warp.txt");
+        std::fs::write(&hardware, HARDWARE_BLOB).unwrap();
+        std::fs::write(&hardware_index, HARDWARE_INDEX).unwrap();
+
+        let run = |step| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(STEP, step)
+                .env(CACHE, dir.path())
+                .env("VICTORY_D3D12_WARP", "1")
+                .env("VICTORY_D3D12_DEBUG", "0")
+                .env("VICTORY_D3D12_GBV", "0")
+                .output()
+                .unwrap()
+        };
+        let saved = run("save");
+        let message = String::from_utf8_lossy(&saved.stdout);
+        if saved.status.success() && message.contains(NO_LIBRARY) {
+            eprintln!("{NO_LIBRARY}; skipped");
+            return;
+        }
+        assert!(
+            saved.status.success(),
+            "{message}\n{}",
+            String::from_utf8_lossy(&saved.stderr),
+        );
+        let hardware_after = std::fs::read(&hardware).unwrap();
+        let hardware_index_after = std::fs::read(&hardware_index).unwrap();
+        println!(
+            "WARP save: hardware blob {} -> {} bytes, hardware index {} -> {} bytes",
+            HARDWARE_BLOB.len(),
+            hardware_after.len(),
+            HARDWARE_INDEX.len(),
+            hardware_index_after.len(),
+        );
+        assert!(hardware_after == HARDWARE_BLOB, "WARP save replaced the hardware file");
+        assert!(
+            hardware_index_after == HARDWARE_INDEX,
+            "WARP save replaced the hardware prebuilt list",
+        );
+        assert!(software.is_file() && software_index.is_file());
+        let reloaded = run("reload");
+        assert!(
+            reloaded.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&reloaded.stdout),
+            String::from_utf8_lossy(&reloaded.stderr),
+        );
     }
 
     #[test]
