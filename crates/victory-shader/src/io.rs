@@ -581,7 +581,14 @@ impl Halves<'_> {
                 }
                 // A plain copy of a barycentric: that one where it runs.
                 let copied = match (&inst.fields, inst.name()) {
-                    (Fields::Valu(c), "v_mov_b32") if c.dpp.is_none() && c.sdwa.is_none() => {
+                    (Fields::Valu(c), "v_mov_b32")
+                        if c.abs == 0
+                            && c.neg == 0
+                            && !c.clamp
+                            && c.omod == 0
+                            && c.dpp.is_none()
+                            && c.sdwa.is_none() =>
+                    {
                         match c.src.first() {
                             Some(&Operand::Vector { reg: from, .. }) => inst.read(Reg::V(from)),
                             _ => None,
@@ -728,6 +735,27 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn modified_barycentric_copy_is_not_treated_as_plain_barycentric() {
+        let check = |w0: u32, w1: u32| {
+            let p = program(&[
+                w0,
+                w1,          // v_mov_b32_e64 v4, <v0 with optional modifiers>
+                0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                S_ENDPGM,
+            ]);
+            raise(&p, &pixel(vec![TEXCOORD], 2))
+        };
+        // Plain VOP3 copy of v0 keeps the hardware barycentric.
+        assert!(check(0xD581_0004, 0x0000_0100).is_ok());
+        // Any float modifier changes the barycentric and must be rejected.
+        assert!(check(0xD581_0004, 0x2000_0100).is_err()); // neg
+        assert!(check(0xD581_0104, 0x0000_0100).is_err()); // abs
+        assert!(check(0xD581_8004, 0x0000_0100).is_err()); // clamp
+        assert!(check(0xD581_0004, 0x0800_0100).is_err()); // mul:2
     }
 
     #[test]

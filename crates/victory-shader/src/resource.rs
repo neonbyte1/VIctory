@@ -742,6 +742,8 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
+            || f.omod != 0
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -768,6 +770,8 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
+            && !f.clamp
+            && f.omod == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.vterm(inst, s))
@@ -1573,6 +1577,8 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
+            && !f.clamp
+            && f.omod == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.raw(inst, s))
@@ -4269,5 +4275,46 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn clamped_vector_add_and_modified_vector_copy_are_not_plain_address_ops() {
+        // Plain v_add_nc_u32_e64 v0, v1, 16 decomposes into offset 16 + v1;
+        // with clamp (saturating add) it must stay a single opaque offset.
+        let run_add = |w0: u32| {
+            track_words(
+                &[
+                    w0,
+                    (144 << 9) | 257, // v_add_nc_u32_e64 v0, v1, 16 [clamp]
+                    0xDC30_8000,
+                    0x0200_0000, // global_load_dword v2, v0, s[0:1]
+                    S_ENDPGM,
+                ],
+                &[param(Descriptor, 0, 2)],
+                HwStage::Cs,
+            )
+        };
+        assert_eq!(run_add(0xD525_0000).scalar[0].1.offset, 16);
+        assert_eq!(run_add(0xD525_8000).scalar[0].1.offset, 0);
+
+        // Plain v_mov_b32_e64 v0, s8 copies the table base; with clamp or
+        // omod it is no longer a bitwise copy of s8.
+        let run_mov = |w0: u32, w1: u32| {
+            track_words(
+                &[
+                    w0,
+                    w1,          // v_mov_b32_e64 v0, s8 [clamp / mul:2]
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    0xDC30_8000,
+                    0x027D_0000, // global_load_dword v2, v[0:1], off
+                    S_ENDPGM,
+                ],
+                &[param(Table, 8, 1)],
+                HwStage::Ps,
+            )
+        };
+        assert_eq!(run_mov(0xD581_0000, 8).scalar[0].1.param, 0);
+        assert_eq!(run_mov(0xD581_8000, 8).scalar[0].1.param, MEMORY);
+        assert_eq!(run_mov(0xD581_0000, 0x0800_0008).scalar[0].1.param, MEMORY);
     }
 }
