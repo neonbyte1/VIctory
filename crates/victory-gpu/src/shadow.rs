@@ -515,7 +515,15 @@ impl Shadow {
         let sub = sub_of(&mut subs, owner);
         sub.pending.insert((address, address + len, marked));
         if marked && let Some(t) = &self.tracked {
-            t.arm(address, address + len);
+            // The copy's bytes of pages another copy's shaders' bytes stay
+            // with are kept as they are now (`crate::watch::Tracked::arm_keeping`).
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            t.arm_keeping(address, address + len, |pn| {
+                let page = pn * PAGE;
+                // SAFETY: a whole page inside the mapping, read only here.
+                (page >= start && page + PAGE <= end)
+                    .then(|| unsafe { std::slice::from_raw_parts(self.data.add(page - start), PAGE) })
+            });
             return;
         }
         let (from, to) = self.inside(address, len);
@@ -1789,6 +1797,9 @@ pub(crate) struct RunBack {
     /// touch (nothing read, written or copied).
     pub(crate) lazy: usize,
     pub(crate) again: usize,
+    /// Lazy pages of another copy this copy's shaders wrote, left lazy with
+    /// this copy's bytes (`VICTORY_OWNER`, `crate::watch::Lease::take_over`).
+    pub(crate) taken_over: usize,
     /// Protection changes asked.
     pub(crate) protects: u64,
     /// Microseconds (diagnostics): reading and comparing before the lease,
@@ -1914,7 +1925,13 @@ fn copy_back_run(
     // Before the lease: what the shaders changed of each page.
     let mut plans: Vec<Plan> = Vec::with_capacity(pages.len());
     for (i, &page) in pages.iter().enumerate() {
-        let plan = if let Some(before) = t.saved(page / PAGE) {
+        let plan = if crate::watch::owner() && !t.changed(page / PAGE) && crate::watch::maybe_lazy(page / PAGE) {
+            // Lazy and held as current (`VICTORY_OWNER`): this copy's again,
+            // or another's this one takes over; bytes kept at arming
+            // (`crate::watch::Tracked::arm_keeping`) stay for the case it is
+            // neither under the lease.
+            Plan::Lazy
+        } else if let Some(before) = t.saved(page / PAGE) {
             merge(i, &before, &mut diffs)
         } else if t.changed(page / PAGE) {
             Plan::Kept
@@ -1955,9 +1972,30 @@ fn copy_back_run(
         let pn = page / PAGE;
         t.unarm(pn);
         if matches!(plans[i], Plan::Lazy) {
-            if lease.lazy_own(pn, host_page(i).as_ptr() as usize) {
+            let src = host_page(i).as_ptr() as usize;
+            let unchanged = unchanged.contains(&src);
+            if lease.lazy_own(pn, src) {
+                if unchanged {
+                    lease.taken(&[pn]);
+                } else {
+                    lease.again(pn);
+                }
                 back.again += 1;
                 continue;
+            }
+            // Another copy's, and this one held it as current when its
+            // shaders ran (given those bytes, `crate::watch::serve`): it
+            // stays lazy with this copy's bytes if the shaders changed it,
+            // as it is if they did not (`VICTORY_OWNER`).
+            if crate::watch::owner() && !t.changed(pn) && crate::watch::maybe_lazy(pn) {
+                if unchanged {
+                    lease.taken(&[pn]);
+                    continue;
+                }
+                if lease.take_over(pn, src) {
+                    back.taken_over += 1;
+                    continue;
+                }
             }
             // Not this copy's (any more): given its bytes, it goes back as
             // any other page, its title bytes read now (guarded: no title
@@ -3955,5 +3993,144 @@ mod run_tests {
         assert_eq!(lazy_checks().1, missed, "nothing written behind a lazy page's back");
         let title = title_bytes(a, PAGE);
         assert_eq!((title[10], title[20], title[30]), (0xaa, 0xbb, pattern(30)), "both copies' bytes");
+    }
+
+    /// Two title views `a` and `b` of one fresh section (reported as showing
+    /// the same pages) and the runtime's own view `c`, through which pages
+    /// at both go back (`VICTORY_OWNER` tests: two copies of one page).
+    fn owner_views(pages: usize) -> (usize, usize, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        static AT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+        let (a, b, c) = three_views(pages);
+        for (slot, v) in AT.iter().zip([a, b, pages * PAGE, c]) {
+            slot.store(v, Relaxed);
+        }
+        crate::watch::set_writable_alias(|at| {
+            let [a, b, len, c] = [0, 1, 2, 3].map(|k| AT[k].load(Relaxed));
+            [a, b].into_iter().find(|v| (*v..v + len).contains(&at)).map(|v| at - v + c)
+        });
+        (a, b, c)
+    }
+
+    /// A copy's 64 KiB of title page `p` as our host reads it (lazy pages
+    /// given their copy's bytes: a refresh).
+    fn served(p: usize) -> Vec<u8> {
+        let mut v = vec![0u8; PAGE];
+        crate::host::copy_mapped(v.as_mut_ptr(), p as *const u8, PAGE, false);
+        v
+    }
+
+    /// Bytes of title memory as the title reads them (a page with no access
+    /// faults, and the handler gives it its bytes).
+    fn title_read(at: usize) -> u8 {
+        // SAFETY: a byte of a test view.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    /// Arms `t`'s copy of `[p, p + len)`, whose bytes are `host`, as the
+    /// copy does for a submission whose shaders mark it
+    /// (`Shadow::writing`).
+    fn arm(t: &crate::watch::Tracked, p: usize, host: &[u8]) {
+        t.arm_keeping(p, p + host.len(), |pn| {
+            let at = pn * PAGE - p;
+            (at + PAGE <= host.len()).then(|| &host[at..at + PAGE])
+        });
+    }
+
+    /// `VICTORY_OWNER`: copies A and B of one page at two mappings. A's
+    /// shaders write bytes 0-127 and the page stays with A; B's refresh is
+    /// given A's bytes (no protection change); B's shaders write 2048-2175 in
+    /// the next submission and B takes the page over: nothing written,
+    /// nothing protected, A counts it changed and is given B's bytes, and the
+    /// title's first read finds both writes.
+    #[test]
+    fn owner_two_copies_writing_disjoint_bytes_in_turn_both_land() {
+        use crate::watch::tests::{OwnerOn, raw};
+        let _on = OwnerOn::set();
+        let (a, b, c) = owner_views(1);
+        let ta = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
+        let tb = crate::watch::track_copy(b, PAGE, true).expect("views are tracked");
+        fill(a, PAGE);
+        let mut ha = title_bytes(a, PAGE);
+        assert!(!ta.take(a, a + PAGE).is_empty() && !tb.take(b, b + PAGE).is_empty());
+        ha[..128].fill(0xaa);
+        let back = copy_back_run(&ta, &[a], &ha, &Default::default());
+        assert_eq!((back.lazy, back.written), (1, 0), "{back:?}");
+        assert_eq!((raw(a), raw(b)), (None, None), "no access at both mappings");
+        assert!(tb.changed(b / PAGE), "B counts it changed");
+        #[cfg(feature = "diagnostics")]
+        let protects = crate::watch::thread_counts().1;
+        assert!(!tb.take(b, b + PAGE).is_empty());
+        let mut hb = served(b);
+        assert_eq!(hb, ha, "B is given A's bytes");
+        hb[2048..2176].fill(0xbb);
+        let back = copy_back_run(&tb, &[b], &hb, &Default::default());
+        assert_eq!((back.taken_over, back.written, back.through, back.protects), (1, 0, 0, 0), "{back:?}");
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(crate::watch::thread_counts().1, protects, "no protection change since A's copy-back");
+        assert!(ta.changed(a / PAGE) && !tb.changed(b / PAGE));
+        // SAFETY: the runtime's own view: title memory still holds the old bytes.
+        assert_eq!(unsafe { (c as *const u8).read_volatile() }, pattern(0), "nothing written");
+        assert!(!ta.take(a, a + PAGE).is_empty());
+        assert_eq!(served(a), hb, "A is given B's bytes");
+        assert_eq!((title_read(a + 5), title_read(b + 2050), title_read(a + 3000)), (0xaa, 0xbb, pattern(3000)));
+        assert_eq!(title_bytes(a, PAGE), hb, "both writes in title memory");
+    }
+
+    /// `VICTORY_OWNER`, A's and B's submissions in flight together, both
+    /// arming the page (`Shadow::writing`): disjoint writes of both land
+    /// whichever completes first, as page by page with title memory's bytes.
+    /// - Nothing lazy when both start: A's copy-back makes it lazy and B,
+    ///   armed, keeps title memory's bytes; B goes back by them over A's.
+    /// - Lazy for A when both start (B given A's bytes, A's and B's own bytes
+    ///   kept as they were): A first marks it again, then B goes back by its
+    ///   kept bytes over A's; or B first takes it over, then A goes back by
+    ///   its kept bytes over B's.
+    #[test]
+    fn owner_two_copies_in_flight_together_keep_both_writes() {
+        use crate::watch::tests::OwnerOn;
+        let _on = OwnerOn::set();
+        for case in 0..3 {
+            let (a, b, _) = owner_views(1);
+            let ta = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
+            let tb = crate::watch::track_copy(b, PAGE, true).expect("views are tracked");
+            fill(a, PAGE);
+            let mut ha = title_bytes(a, PAGE);
+            assert!(!ta.take(a, a + PAGE).is_empty() && !tb.take(b, b + PAGE).is_empty());
+            let mut hb = ha.clone();
+            if case > 0 {
+                // An earlier submission of A wrote bytes 0-127; B was given them.
+                ha[..128].fill(0xaa);
+                assert_eq!(copy_back_run(&ta, &[a], &ha, &Default::default()).lazy, 1);
+                assert!(!tb.take(b, b + PAGE).is_empty());
+                hb = served(b);
+            }
+            // Both submissions start: their pages armed, A's and B's bytes
+            // as they are.
+            arm(&ta, a, &ha);
+            arm(&tb, b, &hb);
+            ha[200..300].fill(0xcc);
+            hb[2048..2176].fill(0xbb);
+            if case < 2 {
+                copy_back_run(&ta, &[a], &ha, &Default::default());
+                let back = copy_back_run(&tb, &[b], &hb, &Default::default());
+                assert_eq!((back.merged, back.taken_over), (1, 0), "case {case}: {back:?}");
+            } else {
+                let back = copy_back_run(&tb, &[b], &hb, &Default::default());
+                assert_eq!(back.taken_over, 1, "{back:?}");
+                let back = copy_back_run(&ta, &[a], &ha, &Default::default());
+                assert_eq!(back.merged, 1, "{back:?}");
+            }
+            let title = title_bytes(a, PAGE);
+            let old = if case > 0 { 0xaa } else { pattern(5) };
+            assert_eq!(
+                (title[5], title[250], title[2050], title[3000]),
+                (old, 0xcc, 0xbb, pattern(3000)),
+                "case {case}: every write"
+            );
+            assert_eq!(title_read(a + 2050), 0xbb, "case {case}");
+            ta.disarm();
+            tb.disarm();
+        }
     }
 }

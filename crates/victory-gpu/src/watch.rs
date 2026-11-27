@@ -248,6 +248,10 @@ struct Guards {
     /// Pages being written through views the guards do not see
     /// ([`unseen_writing`]), with how many such writes each: never made lazy.
     held: BTreeMap<usize, u32>,
+    /// `VICTORY_OWNER`: lazy pages given back to title memory by a touch:
+    /// the frame of the last, how many within [`CHURN_FRAMES`] of each other,
+    /// and the frame until which the page is not made lazy again ([`churn`]).
+    churn: BTreeMap<usize, (u64, u32, u64)>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -262,6 +266,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     alias_of: BTreeMap::new(),
     lazy: BTreeMap::new(),
     held: BTreeMap::new(),
+    churn: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -829,6 +834,33 @@ impl Tracked {
         }
     }
 
+    /// [`Tracked::arm`], and with [`owner`] the copy's bytes of armed whole
+    /// pages that are lazy and that it holds as current (not changed: given
+    /// the lazy copy's bytes, or its own) are kept now as their bytes before
+    /// the submission (`bytes` gives the copy's 64 KiB of a page number, or
+    /// none for a page it holds in part). A save at a first write later
+    /// would find title memory without them: another copy's copy-back over
+    /// such a page while this one's shaders run marks it changed, and its own
+    /// copy-back goes back by these bytes (`crate::shadow::copy_back_run`,
+    /// `Merge`), as with title memory's bytes when nothing is lazy.
+    pub(crate) fn arm_keeping<'b>(&self, from: usize, to: usize, bytes: impl Fn(usize) -> Option<&'b [u8]>) {
+        self.arm(from, to);
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to || !owner() || !any_lazy(from / PAGE, to.div_ceil(PAGE)) {
+            return;
+        }
+        let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        for page in from / PAGE..to.div_ceil(PAGE) {
+            if !lazy_bit(page) || changed.contains(&page) || saved.bytes.contains_key(&page) || !saved.armed(page) {
+                continue;
+            }
+            if let Some(b) = bytes(page) {
+                saved.bytes.insert(page, b.into());
+            }
+        }
+    }
+
     /// Page `page` (a page number) is armed again after [`Tracked::unarm`]:
     /// shaders of a later submission may write it, and the copy-back just
     /// made it equal to title memory, so its next first write keeps its
@@ -1158,7 +1190,7 @@ impl Lease<'_> {
                 .iter()
                 .filter(|v| {
                     let p = v.page;
-                    let why = if blocked(g, p) || !own.contains(&p) {
+                    let why = if blocked(g, p) || !own.contains(&p) || barred(g, p) {
                         Refused::Other
                     } else if changed.contains(&p) {
                         Refused::Changed
@@ -1170,15 +1202,17 @@ impl Lease<'_> {
                         })
                     }) {
                         Refused::Alias
-                    } else if std::iter::once(p)
-                        .chain(g.alias_of.get(&p).into_iter().flatten().copied())
-                        .any(|q| g.holders.get(&q).is_some_and(|h| h.iter().any(|c| !Arc::ptr_eq(c, &owner))))
+                    } else if !self::owner()
+                        && std::iter::once(p)
+                            .chain(g.alias_of.get(&p).into_iter().flatten().copied())
+                            .any(|q| g.holders.get(&q).is_some_and(|h| h.iter().any(|c| !Arc::ptr_eq(c, &owner))))
                     {
                         // Another copy, texture or heap holds it: counted
                         // changed, its next refresh reads it, which gives it
                         // its bytes at once (run lazyv1-u1: 390 of 401 pages
                         // a frame, each two protection changes per address
-                        // more than going back now).
+                        // more than going back now). With `owner` it is given
+                        // the copy's bytes instead ([`serve`]).
                         Refused::Held
                     } else {
                         return true;
@@ -1204,6 +1238,9 @@ impl Lease<'_> {
         };
         let make = |g: &mut Guards, q: usize, e: LazyPage| {
             g.protected.remove(&q);
+            // Its bytes change while it is not guarded: a write fault's read
+            // of it from before does not count ([`OPENED`]).
+            opened(q).fetch_add(1, Ordering::Relaxed);
             g.lazy.insert(q, e);
             set_lazy_bit(q, true);
         };
@@ -1267,6 +1304,46 @@ impl Lease<'_> {
     /// host's touch).
     pub(crate) fn resolve(&mut self, page: usize) -> bool {
         resolve(&mut self.g, page, Touch::Host)
+    }
+
+    /// `VICTORY_OWNER`: lazy page `page` this tracker's copy holds the bytes
+    /// of was written again by its shaders (nothing goes back): what it kept
+    /// for the page is stale, and every other tracker holding the page or
+    /// another mapping of it counts it changed, as a copy-back would have
+    /// made them (their next read is given the new bytes, [`serve`]).
+    pub(crate) fn again(&mut self, page: usize) {
+        self.tracked.changed.taken(page);
+        if owner() {
+            let me = self.tracked.changed.clone();
+            mark_others(&mut self.g, page, &me);
+        }
+    }
+
+    /// `VICTORY_OWNER`: lazy page `page`, another copy's, was written by this
+    /// tracker's copy's shaders, whose bytes of it at `src` were the lazy
+    /// copy's (it held the page as current, not changed, when its submission
+    /// ran: given them, or theirs since): those bytes with what its shaders
+    /// changed are what title memory would hold after both copy-backs, so the
+    /// page stays lazy, with this copy's bytes, and nothing is written or
+    /// protected. The other copy and every other holder count it changed.
+    /// False if the page is not lazy (any more).
+    pub(crate) fn take_over(&mut self, page: usize, src: usize) -> bool {
+        let me = self.tracked.changed.clone();
+        let g = &mut *self.g;
+        let Some(alias) = g.lazy.get(&page).map(|l| l.alias) else {
+            return false;
+        };
+        for q in std::iter::once(page).chain(g.alias_of.get(&page).cloned().unwrap_or_default()) {
+            if let Some(l) = g.lazy.get_mut(&q).filter(|l| l.alias == alias) {
+                l.src = src;
+                l.owner = me.clone();
+            }
+        }
+        me.taken(page);
+        mark_others(g, page, &me);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::OwnerTakenOver, 1);
+        true
     }
 }
 
@@ -1425,6 +1502,19 @@ fn mark_changed_but(g: &mut Guards, page: usize, except: &Arc<Changed>) {
     }
     #[cfg(feature = "diagnostics")]
     g.written.insert(page);
+}
+
+/// Lazy page `page` and the pages showing it elsewhere count changed in every
+/// tracker holding them but `except` (nothing saved: title memory does not
+/// hold the bytes before; armed trackers kept them, [`Tracked::arm_keeping`]).
+fn mark_others(g: &mut Guards, page: usize, except: &Arc<Changed>) {
+    let pages: Vec<usize> = std::iter::once(page).chain(g.alias_of.get(&page).cloned().unwrap_or_default()).collect();
+    for q in pages {
+        for c in g.holders.get(&q).into_iter().flatten().filter(|c| !Arc::ptr_eq(c, except)) {
+            c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(q);
+            set_dirty(c.2, true);
+        }
+    }
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
@@ -1610,26 +1700,50 @@ pub(crate) struct LazyView {
     pub(crate) alias: usize,
 }
 
-/// Whether marked view pages go back lazily (`VICTORY_LAZY_VIEWS=1`): 1 on,
-/// 0 off, `u8::MAX` not asked yet. Read by the fault handler.
+/// Whether marked view pages go back lazily: 1 lazily (`VICTORY_LAZY_VIEWS=1`),
+/// 2 lazily and left with the copy that wrote them while others read them
+/// (`VICTORY_OWNER=1`, [`owner`]), 0 off, `u8::MAX` not asked yet. Read by
+/// the fault handler.
 static LAZY_VIEWS: AtomicU8 = AtomicU8::new(u8::MAX);
+
+fn lazy_mode() -> u8 {
+    match LAZY_VIEWS.load(Ordering::Relaxed) {
+        u8::MAX => {
+            let on = |name: &str| std::env::var(name).as_deref() == Ok("1");
+            let mode = if on("VICTORY_OWNER") {
+                2
+            } else {
+                u8::from(on("VICTORY_LAZY_VIEWS"))
+            };
+            LAZY_VIEWS.store(mode, Ordering::Relaxed);
+            mode
+        }
+        mode => mode,
+    }
+}
 
 /// Whether marked view pages go back lazily ([`Lease::lazify`]).
 pub(crate) fn lazy_views() -> bool {
-    match LAZY_VIEWS.load(Ordering::Relaxed) {
-        u8::MAX => {
-            let on = std::env::var("VICTORY_LAZY_VIEWS").as_deref() == Ok("1");
-            LAZY_VIEWS.store(u8::from(on), Ordering::Relaxed);
-            on
-        }
-        mode => mode == 1,
-    }
+    lazy_mode() != 0
+}
+
+/// Whether a lazy page stays with the copy that wrote it when our host reads
+/// it (`VICTORY_OWNER=1`): readers through the kernel are given the copy's
+/// bytes ([`serve`]), and pages other trackers hold are made lazy too.
+pub(crate) fn owner() -> bool {
+    lazy_mode() == 2
 }
 
 /// Tests: lazy view pages on or off.
 #[cfg(test)]
 pub(crate) fn set_lazy_views(on: bool) {
     LAZY_VIEWS.store(u8::from(on), Ordering::Relaxed);
+}
+
+/// Tests: [`owner`] on (lazy view pages too) or off.
+#[cfg(test)]
+pub(crate) fn set_owner(on: bool) {
+    LAZY_VIEWS.store(if on { 2 } else { 0 }, Ordering::Relaxed);
 }
 
 /// Pages that may be lazy: those below 2^44 (title memory is below 2^40).
@@ -1764,6 +1878,9 @@ fn resolve(g: &mut Guards, page: usize, touch: Touch) -> bool {
     let Some((lazy, pages)) = take_lazy(g, page) else {
         return false;
     };
+    if owner() {
+        churn(g, &pages);
+    }
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(std::time::Instant::now(), crate::copystat::C::LazyResolveUs);
     // The title bytes are still those we left: no writer went past us.
@@ -1788,6 +1905,45 @@ fn resolve(g: &mut Guards, page: usize, touch: Touch) -> bool {
     #[cfg(not(feature = "diagnostics"))]
     let _ = touch;
     true
+}
+
+/// Frames over which a page given back twice is churning ([`churn`]).
+const CHURN_FRAMES: u64 = 8;
+/// Frames a churning page is not made lazy again.
+const CHURN_BAR: u64 = 64;
+
+/// Frames presented so far ([`frame_end`]).
+static FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// A frame was presented (the churn bar's clock).
+pub(crate) fn frame_end() {
+    FRAME.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `VICTORY_OWNER`: lazy pages `pages` (the addresses of one page) were
+/// given back to title memory by a touch. A page given back twice within
+/// [`CHURN_FRAMES`] costs two protection changes per address each time it
+/// goes lazy and back: it is not made lazy for [`CHURN_BAR`] frames.
+fn churn(g: &mut Guards, pages: &[usize]) {
+    let now = FRAME.load(Ordering::Relaxed);
+    for &p in pages {
+        let e = g.churn.entry(p).or_insert((now, 0, 0));
+        e.1 = if now.saturating_sub(e.0) <= CHURN_FRAMES { e.1 + 1 } else { 1 };
+        e.0 = now;
+        if e.1 >= 2 {
+            e.2 = now + CHURN_BAR;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::OwnerBarred, 1);
+        }
+    }
+    if g.churn.len() > 1 << 14 {
+        g.churn.retain(|_, e| now.saturating_sub(e.0) <= CHURN_FRAMES || e.2 > now);
+    }
+}
+
+/// Whether page `p` is barred from going lazy ([`churn`]).
+fn barred(g: &Guards, p: usize) -> bool {
+    g.churn.get(&p).is_some_and(|e| e.2 > FRAME.load(Ordering::Relaxed))
 }
 
 /// [`resolve`] of the lazy pages of `[first, last)`.
@@ -1879,6 +2035,60 @@ pub(crate) fn reading(at: usize, len: usize) {
     }
     let mut g = guards();
     resolve_range(&mut g, first, last, Touch::Host);
+}
+
+/// Our host's read of title memory `[at, at + len)` into `dst` through the
+/// kernel: with [`owner`], lazy pages there are given their copy's bytes
+/// (title memory keeps no access, the copy keeps them); the rest is read by
+/// `read(src, dst, len)`, which returns false where a page is not readable.
+/// Without, lazy pages get their bytes in title memory first ([`reading`]).
+/// The copy's bytes are what title memory would hold once they went back:
+/// those the copy-back would write (`crate::shadow::copy_back_run` makes a
+/// page lazy only where title memory held the copy's bytes before).
+pub(crate) fn serve(at: usize, dst: *mut u8, len: usize, read: &mut impl FnMut(usize, *mut u8, usize) -> bool) -> bool {
+    let end = at.saturating_add(len);
+    let (first, last) = (at / PAGE, end.div_ceil(PAGE));
+    if !any_lazy(first, last) {
+        return read(at, dst, len);
+    }
+    if !owner() {
+        reading(at, len);
+        return read(at, dst, len);
+    }
+    // Under the guard lock the lazy pages' bytes, then the rest without it.
+    let mut gaps: Vec<(usize, usize)> = Vec::new();
+    {
+        let g = guards();
+        let mut cur = at;
+        for page in first..last {
+            let Some(lazy) = g.lazy.get(&page) else {
+                continue;
+            };
+            let (a, b) = ((page * PAGE).max(at), ((page + 1) * PAGE).min(end));
+            if cur < a {
+                gaps.push((cur, a));
+            }
+            // SAFETY: the copy's 64 KiB of the page (alive while it is lazy:
+            // its copy gives them back under this lock before it goes) and
+            // the caller's `len` bytes at `dst`.
+            unsafe { std::ptr::copy_nonoverlapping((lazy.src + (a - page * PAGE)) as *const u8, dst.add(a - at), b - a) };
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::OwnerServed, 1);
+                crate::copystat::add(crate::copystat::C::OwnerServedBytes, (b - a) as u64);
+            }
+            cur = b;
+        }
+        if cur < end {
+            gaps.push((cur, end));
+        }
+    }
+    // A page of a gap made lazy meanwhile fails its read: served then.
+    gaps.into_iter().fold(true, |ok, (a, b)| {
+        // SAFETY: inside the caller's `len` bytes at `dst`.
+        let to = unsafe { dst.add(a - at) };
+        (read(a, to, b - a) || serve(a, to, b - a, read)) && ok
+    })
 }
 
 /// Writes into title pages through views the guards do not see (the
@@ -2140,7 +2350,7 @@ fn install() {
         if kind == READ {
             // Only lazy pages fault on reads (no allocation here, and no
             // lock unless the page's bit is set).
-            if LAZY_LIVE.load(Ordering::Acquire) == 0 && LAZY_VIEWS.load(Ordering::Relaxed) != 1 {
+            if LAZY_LIVE.load(Ordering::Acquire) == 0 && !matches!(LAZY_VIEWS.load(Ordering::Relaxed), 1 | 2) {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             let given = lazy_bit(at / PAGE) && {
@@ -2786,6 +2996,24 @@ pub(crate) mod tests {
     impl Drop for LazyOn {
         fn drop(&mut self) {
             set_lazy_views(self.0);
+        }
+    }
+
+    /// `VICTORY_OWNER=1` for a test (lazy view pages too), as it was after.
+    pub(crate) struct OwnerOn(u8);
+
+    impl OwnerOn {
+        pub(crate) fn set() -> OwnerOn {
+            let before = LAZY_VIEWS.load(Ordering::Relaxed);
+            set_owner(true);
+            crate::memory::forget_misses();
+            OwnerOn(before)
+        }
+    }
+
+    impl Drop for OwnerOn {
+        fn drop(&mut self) {
+            LAZY_VIEWS.store(self.0, Ordering::Relaxed);
         }
     }
 
