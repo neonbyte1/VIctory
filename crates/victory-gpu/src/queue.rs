@@ -514,6 +514,9 @@ extern "system" fn present(
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
+    // The draw trace ends with the frame even when there is no image to show.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let draw_trace = crate::draw::take_frame();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -598,7 +601,7 @@ extern "system" fn present(
                 }
             }
             #[cfg(feature = "diagnostics")]
-            blinks(frame, resources[0].0, resources[0].2, shown);
+            blinks(frame, resources[0].0, resources[0].2, shown, draw_trace);
             #[cfg(not(feature = "diagnostics"))]
             let _ = shown;
         }
@@ -610,12 +613,11 @@ extern "system" fn present(
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
+fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>, draws: Vec<String>) {
     static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let drawn = crate::draw::drawn();
     let black = shown.unwrap_or(false);
-    let draws = crate::draw::take_frame();
     if black && !last.0 {
         last.2 += 1;
         tracing::warn!(
@@ -785,6 +787,56 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn present_without_a_plane_drains_the_draw_trace() {
+        use tracing::{Event, Metadata, Subscriber, span};
+
+        struct DrawTrace;
+        impl Subscriber for DrawTrace {
+            fn enabled(&self, meta: &Metadata<'_>) -> bool {
+                meta.target() == "victory_gpu::draw" && *meta.level() == tracing::Level::DEBUG
+            }
+
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        let trace = tracing::Dispatch::new(DrawTrace);
+        let marker = "draw 3 from 7001 ";
+        let record = |state: &mut crate::draw::State| {
+            tracing::dispatcher::with_default(&trace, || state.draw(&list, 3, 1, 7001, 0));
+        };
+        record(&mut state);
+        assert!(
+            crate::draw::take_frame().iter().any(|draw| draw.starts_with(marker)),
+            "the draw entered the trace"
+        );
+        record(&mut state);
+        list.close();
+
+        let null = std::ptr::null();
+        assert_eq!(present(null, 0, null.cast(), null.cast()), S_OK);
+        let pending = crate::draw::take_frame();
+        assert!(
+            !pending.iter().any(|draw| draw.starts_with(marker)),
+            "previous frame's draw leaked: {pending:?}"
+        );
+    }
     use crate::object::slot;
 
     /// Distinct title resources can name the same host texture. Presenting
