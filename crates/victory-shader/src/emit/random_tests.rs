@@ -503,7 +503,7 @@ fn listing(native: &NativeProgram) -> String {
         native.io
     );
     for inst in gfx10::decode(&native.patched_code()).unwrap_or_default() {
-        let words: Vec<String> = inst.words.iter().map(|w| format!("{w:08x}")).collect();
+        let words: Vec<String> = inst.words().iter().map(|w| format!("{w:08x}")).collect();
         text += &format!(
             "  {:4x}: {:28} {}\n",
             inst.offset,

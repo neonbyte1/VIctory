@@ -901,12 +901,15 @@ mod tests {
     }
 
     fn inst_raw(encoding: Encoding, opcode: u16, words: &[u32]) -> Instruction {
+        let mut dwords = [0u32; Instruction::MAX_WORDS];
+        dwords[..words.len()].copy_from_slice(words);
         Instruction {
             offset: 0,
             encoding,
             opcode,
             name: crate::gfx10::name(encoding, opcode),
-            words: words.to_vec(),
+            words: dwords,
+            len: words.len() as u8,
         }
     }
 
