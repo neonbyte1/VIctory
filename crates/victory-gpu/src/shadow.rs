@@ -3128,6 +3128,9 @@ pub(crate) mod tests {
     #[test]
     fn lazy_view_marked_pages_go_back_at_the_first_touch() {
         use crate::watch::tests::{LazyOn, own_alias, raw, section_views};
+        if !runs_on() {
+            return; // page by page (`VICTORY_MARK_RUNS=0`): nothing goes lazy
+        }
         let _on = LazyOn::set();
         let (v, own) = section_views(2, 1);
         let p = v[0];
@@ -3175,6 +3178,9 @@ pub(crate) mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
+        if !runs_on() {
+            return; // page by page (`VICTORY_MARK_RUNS=0`): nothing goes lazy
+        }
         let _on = LazyOn::set();
         let (v, own) = section_views(1, 1);
         let p = v[0];
