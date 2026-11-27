@@ -42,6 +42,70 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
     let _ = SAVE.set(ranges);
 }
 
+/// Writes `byte` at `address`, which may be a read-only or execute-only
+/// page of the title image (`VICTORY_POKE` on code, e.g. nopping a site's
+/// `int3`): the page is made writable for the write and its protection
+/// restored, and executable pages have the instruction cache flushed.
+/// False if the address is not committed memory the host can write.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn write_title_byte(address: usize, byte: u8) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtect, VirtualQuery,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: our own process's address space, into a sized struct.
+    let queried = unsafe {
+        VirtualQuery(
+            address as *const _,
+            &mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 || info.State != MEM_COMMIT {
+        return false;
+    }
+    // Page protection without the modifier bits (`PAGE_GUARD` and the
+    // caching flags) so the comparison below names a base protection.
+    let base_protect = info.Protect & 0xFF;
+    let writable = matches!(
+        base_protect,
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    );
+    if !writable {
+        // Executability keeps execute; data gets plain read-write.
+        let new_protect = if info.Protect & 0xF0 != 0 {
+            PAGE_EXECUTE_READWRITE
+        } else {
+            PAGE_READWRITE
+        };
+        let page = address & !0xFFF;
+        let mut old = 0u32;
+        // SAFETY: one page of our own address space.
+        if unsafe { VirtualProtect(page as *mut _, 0x1000, new_protect, &mut old) } == 0 {
+            return false;
+        }
+        // SAFETY: `address` is committed memory we just made writable.
+        unsafe { (address as *mut u8).write_volatile(byte) };
+        let mut restored = 0u32;
+        // SAFETY: restoring what the page had.
+        unsafe { VirtualProtect(page as *mut _, 0x1000, old, &mut restored) };
+        if info.Protect & 0xF0 != 0 {
+            // SAFETY: a page of our own process that may hold code.
+            unsafe {
+                FlushInstructionCache(GetCurrentProcess(), page as *const _, 0x1000);
+            }
+        }
+        return true;
+    }
+    // SAFETY: `address` is committed writable memory.
+    unsafe { (address as *mut u8).write_volatile(byte) };
+    true
+}
+
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 

@@ -281,8 +281,8 @@ fn watch(base: usize, size: usize) {
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
 /// each title+rva twice a second. A title that ends itself when its main
 /// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
-/// through slower frames with its tick flag poked. The address must be
-/// writable title data.
+/// through slower frames with its tick flag poked. Code pages work too:
+/// a site's `int3` can be nopped (`:0x90`).
 #[cfg(all(windows, feature = "diagnostics"))]
 fn poke(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_POKE") else {
@@ -298,8 +298,7 @@ fn poke(base: usize, size: usize) {
     std::thread::spawn(move || {
         loop {
             for &(rva, byte) in &pokes {
-                // SAFETY: a byte inside the mapped image, checked above.
-                unsafe { ((base + rva) as *mut u8).write_volatile(byte) };
+                victory_loader::write_title_byte(base + rva, byte);
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
