@@ -30,10 +30,10 @@ use crate::shader::{MAX_FILE, Source, sources};
 type Found = (usize, usize, HwStage);
 
 /// One pipeline to make: a graphics or compute record of the pack.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Job {
-    Graphics(usize),
     Compute(usize),
+    Graphics(usize),
 }
 
 pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
@@ -198,25 +198,28 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     // First every record's key, which needs no translation: what a
     // pre-build put in the library is skipped, what an earlier run drew
     // with is made first.
-    let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    // Write the jobs in submission order regardless of which worker finishes first.
+    let lines: Mutex<BTreeMap<Job, String>> = Mutex::new(BTreeMap::new());
     let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
     let listed = AtomicUsize::new(0);
     each(&jobs, threads, |job| match prepare(job) {
         Ok(p) if keys_only.is_some() => {
-            lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
+            lock(&lines).insert(job, format!("{}\t{job:?}\t{}", p.key(), p.describe()));
         }
         Ok(p) if pipeline::prebuilt(&p.key()) => drop(listed.fetch_add(1, Ordering::Relaxed)),
         Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
         Err(why) => {
             if keys_only.is_some() {
-                lock(&lines).push(format!("-\t{job:?}\t{}\t{why}", shaders_of(job)));
+                lock(&lines).insert(job, format!("-\t{job:?}\t{}\t{why}", shaders_of(job)));
             }
             skip(why);
         }
     });
     let listed = listed.into_inner();
     if let Some(file) = keys_only {
-        std::fs::write(file, lock(&lines).join("\n"))?;
+        let lines = lines.into_inner().unwrap_or_else(|e| e.into_inner());
+        let ordered: Vec<_> = lines.into_values().collect();
+        std::fs::write(file, ordered.join("\n"))?;
     }
     let mut todo = todo.into_inner().unwrap_or_else(|e| e.into_inner());
     todo.sort_by_key(|&(later, _)| later);
