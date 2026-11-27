@@ -32,6 +32,8 @@ use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::resource::lane_of;
 
+mod bdd;
+
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Bool(u32);
@@ -234,37 +236,6 @@ impl Bools {
         }
     }
 
-    fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
-        if self.overflow {
-            return Bool::FALSE;
-        }
-        if f == Bool::TRUE || g == h {
-            return g;
-        }
-        if f == Bool::FALSE {
-            return h;
-        }
-        if (g, h) == (Bool::TRUE, Bool::FALSE) {
-            return f;
-        }
-        if let Some(&r) = self.memo.get(&(f, g, h)) {
-            return r;
-        }
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = top(f).min(top(g)).min(top(h));
-        let ((f0, f1), (g0, g1), (h0, h1)) = (self.split(f, v), self.split(g, v), self.split(h, v));
-        let lo = self.ite(f0, g0, h0);
-        let hi = self.ite(f1, g1, h1);
-        let r = self.mk(v, lo, hi);
-        if !self.overflow {
-            if self.memo.len() >= MAX_MEMO {
-                self.memo.clear();
-            }
-            self.memo.insert((f, g, h), r);
-        }
-        r
-    }
-
     fn and(&mut self, a: Bool, b: Bool) -> Bool {
         self.ite(a, b, Bool::FALSE)
     }
@@ -280,54 +251,6 @@ impl Bools {
     fn xor(&mut self, a: Bool, b: Bool) -> Bool {
         let nb = self.not(b);
         self.ite(a, nb, b)
-    }
-
-    /// Whether some lane can satisfy every `(b, holds)` of `all` at once:
-    /// `b` where `holds`, its negation where not. Yes when the search grows
-    /// too large to finish.
-    pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
-        let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::new())
-    }
-
-    /// `refuted`: conditions no lane meets, so a split reaching them again
-    /// stops at once (diagrams sharing most atoms reach the same ones often).
-    fn meet_in(
-        &self,
-        mut all: Vec<(Bool, bool)>,
-        budget: &mut usize,
-        refuted: &mut HashSet<Vec<(Bool, bool)>>,
-    ) -> bool {
-        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
-        if all.iter().any(fails) {
-            return false;
-        }
-        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-        all.sort_unstable();
-        all.dedup();
-        if refuted.contains(&all) {
-            return false;
-        }
-        if all.is_empty() || *budget == 0 {
-            return true;
-        }
-        *budget -= 1;
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        let met = [false, true].into_iter().any(|value| {
-            let next = all
-                .iter()
-                .map(|&(b, holds)| {
-                    let (lo, hi) = self.split(b, v);
-                    (if value { hi } else { lo }, holds)
-                })
-                .collect();
-            self.meet_in(next, budget, refuted)
-        });
-        if !met {
-            refuted.insert(all);
-        }
-        met
     }
 
     /// The value `atom` has in every lane meeting `facts` (as [`Bools::meet`]
@@ -347,58 +270,6 @@ impl Bools {
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
-    }
-
-    /// `b` with every atom born at reverse-postorder index `from` or later
-    /// existentially quantified: what still holds once those are redefined.
-    fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
-        if self.overflow {
-            return Bool::FALSE;
-        }
-        let (v, lo, hi) = self.nodes[b.0 as usize];
-        if v == TERMINAL {
-            return b;
-        }
-        if let Some(&r) = memo.get(&b) {
-            return r;
-        }
-        let lo = self.forget(lo, from, memo);
-        let hi = self.forget(hi, from, memo);
-        let r = if self.born[v as usize] >= from {
-            self.or(lo, hi)
-        } else {
-            self.mk(v, lo, hi)
-        };
-        memo.insert(b, r);
-        r
-    }
-
-    /// `b` with every variable in `values` (sorted by variable) replaced by
-    /// its value. Nothing below a node testing a later variable than the
-    /// last of them changes.
-    fn restrict(&mut self, b: Bool, values: &[(u32, bool)], memo: &mut Map<Bool, Bool>) -> Bool {
-        let (v, lo, hi) = self.nodes[b.0 as usize];
-        if v == TERMINAL || values.last().is_none_or(|&(last, _)| v > last) {
-            return b;
-        }
-        if let Some(&r) = memo.get(&b) {
-            return r;
-        }
-        let decided = values.binary_search_by_key(&v, |&(v, _)| v).ok();
-        let r = match decided {
-            Some(i) => self.restrict(if values[i].1 { hi } else { lo }, values, memo),
-            None => {
-                let l = self.restrict(lo, values, memo);
-                let h = self.restrict(hi, values, memo);
-                self.mk(v, l, h)
-            }
-        };
-        // While only decided nodes were walked the walk is one path, which
-        // meets no node twice: the table (and its allocation) can wait.
-        if decided.is_none() || !memo.is_empty() {
-            memo.insert(b, r);
-        }
-        r
     }
 
     /// `b` with each atom that `known` decides replaced by its value. The
