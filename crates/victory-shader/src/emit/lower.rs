@@ -3649,7 +3649,9 @@ impl<'a> Lower<'a> {
             MaskData::None => name == "s_bcnt1_i32_b64",
         };
         let effect = matches!(inst.fields, Fields::Exp { .. })
-            || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+            || matches!(inst.fields, Fields::Flat { .. })
+                && (!name.starts_with("global_load_")
+                    || matches!(inst.fields, Fields::Flat { lds: true, .. }))
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
@@ -11642,6 +11644,24 @@ mod tests {
                 "VOP3 {modifier} was dropped for op {op:#x}"
             );
         }
+    }
+
+    #[test]
+    fn a_global_load_into_lds_is_refused() {
+        // Encoding from gfx10::sp3::tests::loads_into_lds_have_no_result_register:
+        // global_load_dword v2, s[4:5] inst_offset:1024 lds.
+        let words = [
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xDC30_A400,
+            0x0004_0002, // global_load_dword v2, s[4:5] inst_offset:1024 lds
+            S_ENDPGM,
+        ];
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&words, 6 << 1) else {
+            panic!("a global load into LDS translated");
+        };
+        assert_eq!(what, "a global load result");
     }
 
     #[test]

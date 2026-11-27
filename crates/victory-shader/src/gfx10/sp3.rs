@@ -850,6 +850,28 @@ mod tests {
     }
 
     #[test]
+    fn loads_into_lds_have_no_result_register() {
+        // Encodings from LLVM's llvm/test/MC/AMDGPU/gfx10_asm_flat.s (LLVM
+        // spells the offset `offset:1024`): with `lds` the load goes to LDS
+        // and the instruction has no VGPR destination.
+        let got = [
+            one(&[0xDC30_A400, 0x0004_0002], true),
+            one(&[0xDC30_A400, 0x007D_0002], true),
+            one(&[0xDC30_6400, 0x0004_0000], true),
+            one(&[0xDC30_6400, 0x007D_0002], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "global_load_dword v2, s[4:5] inst_offset:1024 lds",
+                "global_load_dword v[2:3], off inst_offset:1024 lds",
+                "scratch_load_dword off, s4 inst_offset:1024 lds",
+                "scratch_load_dword v2, off inst_offset:1024 lds",
+            ]
+        );
+    }
+
+    #[test]
     fn memory_and_export() {
         assert_eq!(
             one(&[0xE034_7010, 0x0102_0402], true),

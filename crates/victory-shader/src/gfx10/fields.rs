@@ -417,8 +417,10 @@ impl Instruction {
                 } else {
                     n
                 };
+                // A global or scratch load into LDS (`lds`) has no VGPR result.
+                let to_lds = self.encoding != Encoding::Flat && bit(w0, 13);
                 Fields::Flat {
-                    dst: (load || atomic && glc).then(|| vector(w1 >> 24, ret)),
+                    dst: (load && !to_lds || atomic && glc).then(|| vector(w1 >> 24, ret)),
                     addr,
                     data: (!load).then(|| vector(w1 >> 8 & 0xFF, n)),
                     saddr: (self.encoding != Encoding::Flat).then(|| {
