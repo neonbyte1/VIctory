@@ -231,6 +231,11 @@ struct Lower<'a> {
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
     join_handles: HashMap<(String, bool, u32), V>,
+    /// [`Lower::handles`] of buffer size queries, which share no handle
+    /// with an access ([`Lower::swap_size_caches`]).
+    size_handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// [`Lower::entry_handles`] of buffer size queries.
+    size_entry_handles: HashMap<(EntryAddress, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -671,6 +676,8 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             entry_handles: HashMap::new(),
             join_handles: HashMap::new(),
+            size_handles: HashMap::new(),
+            size_entry_handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -4461,6 +4468,14 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Trades the handle caches of accesses for those of buffer size queries,
+    /// and back when called again. A cache [`Lower::handle`] gains for a
+    /// loaded descriptor needs its twin here.
+    fn swap_size_caches(&mut self) {
+        std::mem::swap(&mut self.handles, &mut self.size_handles);
+        std::mem::swap(&mut self.entry_handles, &mut self.size_entry_handles);
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -4469,6 +4484,17 @@ impl<'a> Lower<'a> {
     /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
     /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
     /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
+    ///
+    /// A buffer's record count is queried through a handle of its own,
+    /// cached as an access's is (once for a descriptor at a fixed address,
+    /// else per block and load) and never the handle of an access. AMD's
+    /// RDNA 4 driver (32.0.32029.2010 on an RX 9070 XT) faults inside its
+    /// shader compiler, ending the process at pipeline creation, when one
+    /// handle of a raw buffer in a descriptor table feeds both a size query
+    /// whose result is used and a load; with a handle each it compiles. Every
+    /// buffer view is treated the same; an image's handle stays shared with
+    /// its accesses. A query nothing reads is not written, and neither is
+    /// its handle.
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
@@ -4590,7 +4616,18 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        // The accesses' handle, made while the load is lowered and not at
+        // the first access: where it is written does not depend on whether
+        // a size is read.
         let h = self.handle(site, &src, false, props)?;
+        let h = if image.is_some() {
+            h
+        } else {
+            self.swap_size_caches();
+            let own = self.handle(site, &src, false, props);
+            self.swap_size_caches();
+            own?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -11273,6 +11310,8 @@ mod tests {
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
+
+    mod size_handles;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
