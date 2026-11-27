@@ -399,6 +399,10 @@ impl Instruction {
             }
             Encoding::Flat | Encoding::Global | Encoding::Scratch => {
                 let saddr = (w1 >> 16 & 0x7F) as u8;
+                // GFX10.3 scratch with neither a VGPR nor an SGPR address
+                // (ST mode) holds EXEC_HI's code in the SGPR field: no
+                // register is read (LLVM: `off, off`).
+                let st = self.encoding == Encoding::Scratch && saddr == 0x7F;
                 let glc = bit(w0, 16);
                 let n = data_dwords(name);
                 let (load, atomic) = (name.contains("_load_"), name.contains("_atomic_"));
@@ -417,8 +421,10 @@ impl Instruction {
                     dst: (load || atomic && glc).then(|| vector(w1 >> 24, ret)),
                     addr,
                     data: (!load).then(|| vector(w1 >> 8 & 0xFF, n)),
-                    saddr: (self.encoding != Encoding::Flat)
-                        .then(|| scalar(saddr, 1 + u8::from(self.encoding == Encoding::Global))),
+                    saddr: (self.encoding != Encoding::Flat).then(|| {
+                        let code = if st { NULL } else { saddr };
+                        scalar(code, 1 + u8::from(self.encoding == Encoding::Global))
+                    }),
                     offset: match self.encoding {
                         // GFX10 FLAT offsets are 11-bit and unsigned: the
                         // hardware ignores bit 11.

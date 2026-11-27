@@ -866,6 +866,27 @@ mod tests {
     }
 
     #[test]
+    fn scratch_without_an_address_names_no_register() {
+        // Encodings from LLVM's llvm/test/MC/AMDGPU/flat-scratch-st-mode.s
+        // (gfx1030 only): the SGPR field holds 0x7F, which is no operand.
+        let got = [
+            one(&[0xDC30_4000, 0x017F_0000], true),
+            one(&[0xDC34_4000, 0x017F_0000], true),
+            one(&[0xDC70_4000, 0x007F_0200], true),
+            one(&[0xDC60_4000, 0x007F_0200], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "scratch_load_dword v1, off, off",
+                "scratch_load_dwordx2 v[1:2], off, off",
+                "scratch_store_dword off, v2, off",
+                "scratch_store_byte off, v2, off",
+            ]
+        );
+    }
+
+    #[test]
     fn one_sided_packed_negation_is_printed() {
         // Encodings from llvm-mc -mcpu=gfx1030. A source negated in both
         // halves keeps the `-` prefix; one-sided bits get LLVM's suffixes.
