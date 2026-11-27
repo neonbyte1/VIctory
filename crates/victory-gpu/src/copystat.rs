@@ -609,6 +609,9 @@ pub(crate) fn log(frames: f64) {
         c[C::SettleLabelClean as usize],
         c[C::SettleTextureClean as usize],
     );
+    if let Some(line) = crate::census::line(frames) {
+        tracing::info!("{line}");
+    }
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));

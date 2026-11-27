@@ -3543,6 +3543,13 @@ impl HostList {
                     if let Some(o) = crossed {
                         settle(o, Settled::Copy);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let _census = {
+                        let kind = crate::census::as_kind(crate::census::Kind::TitleCopy, 0);
+                        crate::census::touch(src, len);
+                        crate::census::written(dst, len, crate::census::Writer::Kernel);
+                        kind
+                    };
                     if matches!(step, Step::Copy(..)) {
                         copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     } else if crate::texture::committed(src as *const u8, len)
@@ -3562,6 +3569,8 @@ impl HostList {
                     if let Some((o, _)) = crate::shadow::crossing(src, src + len, 0) {
                         settle(o, Settled::Fill);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let _census = crate::census::as_kind(crate::census::Kind::TitleCopy, 0);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -3777,6 +3786,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::census::touch(src as usize, len);
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
@@ -3818,6 +3829,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    crate::census::touch(src as usize, dst.len());
     read(src, dst.as_mut_ptr(), dst.len())
 }
 

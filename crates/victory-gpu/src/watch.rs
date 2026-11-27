@@ -203,6 +203,9 @@ type Read = Option<(usize, Box<[u8]>)>;
 /// Page `page`'s bytes now (None if it cannot be read).
 fn page_bytes(page: usize) -> Option<Box<[u8]>> {
     let mut bytes = vec![0u8; PAGE].into_boxed_slice();
+    // A save of the title's bytes, not a reader of what shaders wrote.
+    #[cfg(feature = "diagnostics")]
+    let _own = crate::census::as_kind(crate::census::Kind::Own, 0);
     crate::host::read_into((page * PAGE) as *const u8, &mut bytes).then_some(bytes)
 }
 
@@ -1236,6 +1239,8 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let _site = at_site(Site::Writing);
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    #[cfg(feature = "diagnostics")]
+    crate::census::written(at, len, crate::census::Writer::Kernel);
     let mut g = guards();
     g.busy.push((first, last));
     changed(&mut g, first, last, true, &mut None);
@@ -1249,6 +1254,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     #[cfg(feature = "diagnostics")]
     let _site = at_site(Site::Remapped);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    #[cfg(feature = "diagnostics")]
+    crate::census::gone(at, len);
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false, &mut None);
@@ -1382,6 +1389,8 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let page = at / PAGE;
+        #[cfg(feature = "diagnostics")]
+        crate::census::written(at, 1, crate::census::Writer::Title);
         let mut g = guards();
         // A tracker armed for the page keeps its bytes before the write: they
         // are read without the lock, the page guarded meanwhile, and kept

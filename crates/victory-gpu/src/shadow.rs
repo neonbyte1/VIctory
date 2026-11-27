@@ -380,6 +380,8 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _own = crate::census::as_kind(crate::census::Kind::Own, 0);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -593,6 +595,8 @@ impl Shadow {
     fn copy_back_or_not(&self, owner: u64, address: usize, len: usize, back: bool) -> usize {
         #[cfg(feature = "diagnostics")]
         let _site = crate::watch::at_site(crate::watch::Site::Declared);
+        #[cfg(feature = "diagnostics")]
+        let _own = crate::census::as_kind(crate::census::Kind::Own, 0);
         let mut subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
         let Some(i) = subs.iter().position(|s| s.owner == owner) else {
             return 0;
@@ -710,6 +714,8 @@ impl Shadow {
         let Some(t) = &self.tracked else {
             return 0;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::census::marked(page / PAGE, self as *const Shadow as usize);
         let written = self.copy_back_marked_page(t, page, unchanged);
         self.rearm_for_later(t, owner, &[page]);
         written
@@ -802,8 +808,21 @@ impl Shadow {
         // SAFETY: whole pages inside the mapping; only the submitting
         // thread writes it, and not meanwhile.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(pages[0] - self.start as usize), pages.len() * PAGE) };
+        #[cfg(feature = "diagnostics")]
+        for &page in pages {
+            crate::census::marked(page / PAGE, self as *const Shadow as usize);
+        }
         let back = copy_back_run(t, pages, host, unchanged);
         self.rearm_for_later(t, owner, pages);
+        // Census: clean view pages of a copy in video memory the shaders
+        // changed, gone back through the runtime's own mapping.
+        #[cfg(feature = "diagnostics")]
+        if self.vram && crate::census::on() {
+            for &pn in &back.offered {
+                let mirror = self.data as usize + (pn * PAGE - self.start as usize);
+                crate::census::offer(pn, self as *const Shadow as usize, mirror);
+            }
+        }
         back
     }
 
@@ -1014,6 +1033,8 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        #[cfg(feature = "diagnostics")]
+        let _refresh = crate::census::as_kind(crate::census::Kind::Refresh, self as *const Shadow as usize);
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         self.queue_vram_upload((from - start) as u64, (to - from) as u64);
         if let Some(t) = &self.tracked {
@@ -1026,6 +1047,9 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // Census: its bytes are freed below.
+        #[cfg(feature = "diagnostics")]
+        crate::census::drop_copy(self as *const Shadow as usize);
         if let Some(slice) = self.slice {
             arena().give_back(slice);
         } else if self.vram && self.alloc_size > 0 {
@@ -1497,6 +1521,8 @@ pub(crate) fn copy_back_marks(
     memory_withheld: bool,
     unchanged: &std::collections::HashSet<usize>,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let _own = crate::census::as_kind(crate::census::Kind::Own, 0);
     let (mut marked, held) = if memory_withheld {
         (taken.bits(Some(false)), taken.bits(Some(true)))
     } else {
@@ -1757,6 +1783,10 @@ pub(crate) struct RunBack {
     /// waiting for it, changing protections, writing, checking after.
     #[cfg(feature = "diagnostics")]
     pub(crate) us: [u64; 5],
+    /// Pages taken that the shaders changed and that went back through the
+    /// runtime's own mapping, as page numbers (diagnostics: the census).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) offered: Vec<usize>,
 }
 
 #[cfg(test)]
@@ -1984,6 +2014,10 @@ fn copy_back_run(
         let opened = (a < b && alias[i].is_none()) || bridged;
         if !opened || crate::host::read_into((pn * PAGE) as *const u8, &mut title) && title[..] == *host_page(i) {
             taken.push(pn);
+            #[cfg(feature = "diagnostics")]
+            if a < b && alias[i].is_some() {
+                back.offered.push(pn);
+            }
         } else {
             back.misses += 1;
             if bridged {
