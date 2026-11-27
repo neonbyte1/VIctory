@@ -216,9 +216,13 @@ pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
     host::free_library(module)
 }
 
+/// Pseudo modules never receive thread notifications.
 /// Title images hear of thread starts and ends from us, not from the
 /// Windows loader (`victory_loader::disable_thread_calls`).
 pub extern "system" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
+    if registry().iter().any(|m| handle(m) == module) {
+        return 1;
+    }
     host::disable_thread_library_calls(module)
 }
 
@@ -609,6 +613,14 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disable_thread_library_calls_accepts_pseudo_modules() {
+        let module = GetModuleHandleA(c"xgameruntime.dll".as_ptr().cast());
+        assert!(!module.is_null());
+        assert_eq!(DisableThreadLibraryCalls(module), 1);
+        assert_eq!(DisableThreadLibraryCalls(std::ptr::null_mut()), 0);
+    }
 
     #[test]
     fn title_images_report_their_original_path() {
