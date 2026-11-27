@@ -591,6 +591,34 @@ fn tbuffer_load_of_v1(op: u8, format: u8) -> HostShader {
 }
 
 #[test]
+fn shift_add_and_align_take_sign_bit_modifiers() {
+    // VOP3 abs / neg on v_lshl_add_u32, v_add_lshl_u32, v_alignbit_b32 and
+    // v_alignbyte_b32 clear / flip a source's bit 31, as on a float
+    // (RDNA2: boykopovar/AnyPS5#25964 on gfx1036 and gfx1201, #25799).
+    // (op, NEG bits, ABS bits, inputs v1..v3, result)
+    let cases: &[(u16, u32, u32, [u32; 3], u32)] = &[
+        (0x346, 4, 0, [5, 2, 1], 0x8000_0015),          // lshl_add: neg(src2)
+        (0x347, 0, 1, [0x8000_0003, 1, 0], 4),          // add_lshl: abs(src0)
+        (0x14E, 2, 0, [0, 1, 31], 1),                   // alignbit: neg(src1)
+        (0x14F, 2, 0, [0, 0x00FF_FFFF, 3], 0x80),       // alignbyte: neg(src1)
+        (0x14E, 0, 2, [0, 0x8000_0000, 31], 0),         // alignbit: abs(src1)
+        // abs and neg on one source: abs clears bit 31, then neg sets it
+        // (-|x|, as on a float); the other order would give 4 and 0x15
+        (0x347, 1, 1, [3, 1, 0], 0x8000_0004),          // add_lshl: -|src0|
+        (0x346, 4, 4, [5, 2, 0x8000_0001], 0x8000_0015), // lshl_add: -|src2|
+    ];
+    for &(op, neg, abs, [a, b, c], want) in cases {
+        let mut w = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3));
+        w[0] |= abs << 8;
+        w[1] |= neg << 29;
+        let shader = build_valu_cs(&w);
+        run_cases(&shader, &[[a, b, c, 0]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: op {op:#x} neg {neg} abs {abs} of {a:#x}, {b:#x}, {c:#x} = {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
+#[test]
 fn tbuffer_d16_loads_pack_two_channels_per_dword() {
     // tbuffer_load_format_d16_x and tbuffer_load_format_d16_xy.
     let (x, xy) = (8, 9);

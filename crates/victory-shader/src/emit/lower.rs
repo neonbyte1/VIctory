@@ -2122,11 +2122,19 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
+        let (abs, neg) = (v.abs >> k & 1 != 0, v.neg >> k & 1 != 0);
+        // VOP3 abs / neg on the shift-add and align ops act on the source's
+        // sign bit, as on a float (measured on RDNA2: boykopovar/AnyPS5#25964,
+        // #25799); other integer operations keep refusing them.
+        let sign_bit_mods = matches!(
+            inst.name(),
+            "v_lshl_add_u32" | "v_add_lshl_u32" | "v_alignbit_b32" | "v_alignbyte_b32"
+        );
+        if (abs || neg) && !sign_bit_mods {
             return Err("integer operand modifiers");
         }
-        match self.src0 {
-            Some(x) if k == 0 => Ok(x),
+        let x = match self.src0 {
+            Some(x) if k == 0 => x,
             _ => {
                 let sel = Self::sdwa_src(inst, k);
                 // A byte or word select within the low half.
@@ -2135,12 +2143,23 @@ impl<'a> Lower<'a> {
                     Some(x) => x,
                     None => self.operand(inst, &op)?,
                 };
-                Ok(match sel {
+                match sel {
                     Some((sel, sext)) => self.select_bits(x, sel, sext),
                     None => x,
-                })
+                }
             }
+        };
+        let c = self.cur;
+        let mut x = x;
+        if abs {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
         }
+        if neg {
+            let m = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        Ok(x)
     }
 
     fn unary(&mut self, op: u32, f: V) -> V {
