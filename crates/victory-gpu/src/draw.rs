@@ -2915,7 +2915,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// object in one format and read through a placed view in another: a
     /// castable pair shares one host texture (no copy), a pair of other
     /// shapes over the same bytes (block-compressed against plain) is two,
-    /// bridged by a copy at the read.
+    /// bridged by a copy at the read. On a host without relaxed format
+    /// casting (Intel Iris Xe) the castable pair is two as well, and the
+    /// copy bridges it the same way.
     #[test]
     fn a_texture_written_in_one_format_reads_in_another_through_a_placed_view() {
         let Some(host) = crate::host::host() else {
@@ -2958,6 +2960,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
+            // One host texture only where the host took the castable formats.
+            let shared = shared && !a.castable.is_empty();
             assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
