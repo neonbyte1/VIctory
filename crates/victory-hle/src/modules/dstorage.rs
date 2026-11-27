@@ -149,7 +149,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: name });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File {
+            files: Files::new(file),
+            path: name,
+        },
+    );
     put(out, file)
 }
 
@@ -262,9 +268,83 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    file: std::fs::File,
+    files: Files,
     /// As the title named it (diagnostics).
     path: String,
+}
+
+/// A file as the workers read it: the handle the title opened, and a handle
+/// for each worker, made from it when that worker first reads. The host does
+/// the reads of one handle (opened for synchronous reads, as the title's is)
+/// one after the other, so every worker read a file through one queue: 48 KiB
+/// at random from a large archive went at 185 MB/s through one handle and
+/// 990 MB/s through a handle per worker (24 workers).
+/// `VICTORY_DSTORAGE_HANDLES=0`: every worker reads through the title's
+/// handle, as before.
+struct Files {
+    first: std::fs::File,
+    /// Indexed by [`this_thread`], modulo their count; `None` inside if the
+    /// host made no other handle (then `first` is read).
+    others: Box<[OnceLock<Option<std::fs::File>>]>,
+}
+
+impl Files {
+    fn new(first: std::fs::File) -> Files {
+        static HANDLES: OnceLock<bool> = OnceLock::new();
+        let handles = *HANDLES
+            .get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HANDLES").is_none_or(|v| v != "0"));
+        Files::with(first, if handles { workers() } else { 0 })
+    }
+
+    /// With `others` handles besides `first` (0: `first` alone).
+    fn with(first: std::fs::File, others: usize) -> Files {
+        Files {
+            first,
+            others: (0..others).map(|_| OnceLock::new()).collect(),
+        }
+    }
+
+    /// Reads at `offset`, as [`FileExt::seek_read`].
+    fn read_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let other = match self.others.len() {
+            0 => None,
+            n => self.others[this_thread() % n]
+                .get_or_init(|| reopen(&self.first))
+                .as_ref(),
+        };
+        other.unwrap_or(&self.first).seek_read(out, offset)
+    }
+}
+
+/// The scheduler's workers: one for each of the host's processors.
+fn workers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+/// A number for this thread: 0 for the first that asks, and so on.
+fn this_thread() -> usize {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    thread_local! {
+        static NUMBER: usize = NEXT.fetch_add(1, Ordering::Relaxed) as usize;
+    }
+    NUMBER.with(|n| *n)
+}
+
+/// Another handle to `file`, for synchronous reads; `None` if the host gives
+/// none.
+fn reopen(file: &std::fs::File) -> Option<std::fs::File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, ReOpenFile};
+    // SAFETY: a file we hold open.
+    let handle = unsafe { ReOpenFile(file.as_raw_handle(), GENERIC_READ, FILE_SHARE_READ, 0) };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(%error, "dstorage: a file could not be opened again");
+        return None;
+    }
+    // SAFETY: a handle just opened, ours alone.
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -433,8 +513,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
+        let started = (0..workers())
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
@@ -1001,16 +1080,16 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
+    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
-        .file;
+        .files;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match files.read_at(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1291,6 +1370,102 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    /// Reads all of `out` at `at` through `files`.
+    fn read_all(files: &Files, out: &mut [u8], at: u64) {
+        let mut done = 0;
+        while done < out.len() {
+            let n = files.read_at(&mut out[done..], at + done as u64).unwrap();
+            assert_ne!(n, 0, "{at} {}", out.len());
+            done += n;
+        }
+    }
+
+    /// Threads reading through handles of their own, or all through the
+    /// title's, get the file's bytes, and nothing past its end.
+    #[test]
+    fn workers_read_a_file_through_handles_of_their_own() {
+        let plain = pattern(300_001);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, &plain).unwrap();
+        for others in [0, 3] {
+            let files = Files::with(std::fs::File::open(&path).unwrap(), others);
+            std::thread::scope(|s| {
+                for _ in 0..6 {
+                    s.spawn(|| {
+                        let reads = [
+                            (0, 4096),
+                            (1, 100),
+                            (4095, 2),
+                            (12_345, 250_000),
+                            (299_990, 11),
+                        ];
+                        for (at, len) in reads {
+                            let mut out = vec![0; len];
+                            read_all(&files, &mut out, at as u64);
+                            assert!(out == plain[at..at + len], "{others} {at} {len}");
+                        }
+                        let mut out = [0; 16];
+                        assert_eq!(files.read_at(&mut out, 299_999).unwrap(), 2);
+                        assert_eq!(files.read_at(&mut out, 300_001).unwrap(), 0);
+                        assert_eq!(files.read_at(&mut out, 400_000).unwrap(), 0);
+                    });
+                }
+            });
+            let made = files
+                .others
+                .iter()
+                .filter(|o| o.get().is_some_and(Option::is_some))
+                .count();
+            assert_eq!(made, others, "a handle for each slot a thread read through");
+        }
+    }
+
+    /// How fast threads read a file through one handle and through a handle
+    /// each, at `VICTORY_BENCH_FILE` (a large file, only read): requests of
+    /// 48 KiB at random, first from places nobody read lately, then the same
+    /// again. `VICTORY_BENCH_FILE=... cargo test --release -p victory-hle
+    /// --lib read_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a benchmark"]
+    fn read_bench() {
+        const SIZE: usize = 48 << 10;
+        const READS: usize = 12_000;
+        let threads = workers();
+        let path = std::env::var("VICTORY_BENCH_FILE").expect("VICTORY_BENCH_FILE");
+        let len = std::fs::metadata(&path).unwrap().len();
+        let mut seed = Instant::now().elapsed().as_nanos() as u64 | 0x9e37_79b9;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (name, others) in [("one handle", 0), ("a handle each", threads)] {
+            let files = Files::with(std::fs::File::open(&path).unwrap(), others);
+            let at: Vec<u64> = (0..READS)
+                .map(|_| (random() % (len - SIZE as u64)) & !15)
+                .collect();
+            for pass in ["cold", "again"] {
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let start = Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(|| {
+                            let mut out = vec![0; SIZE];
+                            while let Some(&at) = at.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                read_all(&files, &mut out, at);
+                            }
+                        });
+                    }
+                });
+                let took = start.elapsed().as_secs_f64();
+                let rate = (READS * SIZE) as f64 / took / 1e6;
+                println!("{threads} threads, {name}, {pass}: {rate:.0} MB/s");
+            }
+        }
     }
 
     #[test]
