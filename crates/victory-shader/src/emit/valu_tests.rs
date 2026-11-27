@@ -2134,6 +2134,214 @@ fn v_cmp_class_f16_matches_rdna2() {
     });
 }
 
+#[test]
+fn cvt_f32_f64_matches_rdna2() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f)
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+
+    let cases: &[(f64, f32)] = &[
+        (0.0, 0.0),
+        (-0.0, -0.0),
+        (1.0, 1.0),
+        (-1.0, -1.0),
+        (std::f64::consts::PI, std::f32::consts::PI),
+        (65536.5, 65536.5),
+        (1.0e-30, (1.0e-30f64) as f32),
+        (1.0e38, 1.0e38),
+    ];
+
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&(d, _)| {
+            let bits = d.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].1.to_bits();
+        assert_eq!(
+            got,
+            want,
+            "{}: v_cvt_f32_f64({}) = {:#010x} ({}), want {:#010x} ({})",
+            backend,
+            cases[i].0,
+            got,
+            f32::from_bits(got),
+            want,
+            cases[i].1,
+        );
+    });
+}
+
+#[test]
+fn cvt_f32_f64_decodes_double_inline_constants() {
+    let values = [
+        0.5,
+        -0.5,
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        4.0,
+        -4.0,
+        f64::from_bits(0x3fc4_5f30_6dc9_c882) as f32,
+    ];
+    for (code, value) in (240..=248).zip(values) {
+        let shader = build_valu_cs(&[vop1(0x00f, 0, code)]);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(
+                got,
+                value.to_bits(),
+                "{backend}: FP64 inline constant {code} should convert to {value}"
+            );
+        });
+    }
+    // Integer inline 1 is a bit pattern, a tiny positive double.
+    let integer_one = build_valu_cs(&[vop1(0x00f, 0, 129)]);
+    run_cases(&integer_one, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: integer inline bits");
+    });
+}
+
+#[test]
+fn cvt_f32_f64_uses_literal_as_the_high_word() {
+    for (high, value) in [
+        (0x4008_0000, 3.0f32),
+        (0xc00c_0000, -3.5),
+        (0x8000_0000, -0.0),
+    ] {
+        let shader = build_valu_cs(&[vop1(0x00f, 0, 255), high]);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(
+                got,
+                value.to_bits(),
+                "{backend}: FP64 literal {high:#010x} in the high dword"
+            );
+        });
+    }
+}
+
+#[test]
+fn cvt_f32_f64_applies_e64_source_and_output_modifiers() {
+    const ABS: u32 = 1 << 8;
+    const NEG: u32 = 1 << 29;
+    const CLAMP: u32 = 1 << 15;
+    const MUL_2: u32 = 1 << 27;
+    for (input, abs_clamp, neg_omod, expected) in [
+        (-1.25f64, ABS, 0, 1.25f32),
+        (-1.25, 0, NEG, 1.25),
+        (-1.25, ABS, NEG, -1.25),
+        (-0.75, ABS | CLAMP, MUL_2, 1.0),
+    ] {
+        let mut words = vop3(0x18f, 0, vgpr(1), 0, 0);
+        words[0] |= abs_clamp;
+        words[1] |= neg_omod;
+        let shader = build_valu_cs(&words);
+        let bits = input.to_bits();
+        run_cases(
+            &shader,
+            &[[bits as u32, (bits >> 32) as u32, 0, 0]],
+            |backend, _, _, got| {
+                assert_eq!(
+                    got,
+                    expected.to_bits(),
+                    "{backend}: {words:08x?} input {input}"
+                );
+            },
+        );
+    }
+}
+
+/// The low and high dwords of a double.
+fn dwords(x: f64) -> [u32; 2] {
+    let bits = x.to_bits();
+    [bits as u32, (bits >> 32) as u32]
+}
+
+/// `body` runs on each 4-dword input and leaves a double in `v[6:7]`; `check`
+/// gets the double's bits for each backend and input.
+fn run_f64_raw(body: &[u32], inputs: &[[u32; 4]], mut check: impl FnMut(&str, usize, u64)) {
+    use std::collections::HashMap;
+    let with = |word: u32| build_valu_cs(&[body, &[word]].concat());
+    let (low, high) = (with(vop1(0x001, 0, vgpr(6))), with(vop1(0x001, 0, vgpr(7))));
+    let mut lows = HashMap::new();
+    run_cases(&low, inputs, |backend, i, _, got| {
+        lows.insert((backend.to_string(), i), got);
+    });
+    run_cases(&high, inputs, |backend, i, _, got| {
+        let lo = lows[&(backend.to_string(), i)];
+        check(backend, i, u64::from(got) << 32 | u64::from(lo));
+    });
+}
+
+/// [`run_f64_raw`] with each input two doubles, in `v[1:2]` and `v[3:4]`.
+fn run_f64(body: &[u32], cases: &[[f64; 2]], check: impl FnMut(&str, usize, u64)) {
+    run_f64_raw(body, &double_inputs(cases), check);
+}
+
+fn double_inputs(cases: &[[f64; 2]]) -> Vec<[u32; 4]> {
+    cases
+        .iter()
+        .map(|&[a, b]| {
+            let (a, b) = (dwords(a), dwords(b));
+            [a[0], a[1], b[0], b[1]]
+        })
+        .collect()
+}
+
+/// Equal doubles, any NaN equal to any other.
+fn same_f64(got: u64, want: f64) -> bool {
+    let got = f64::from_bits(got);
+    got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan())
+}
+
+const F64_CASES: &[[f64; 2]] = &[
+    [1.5, 2.25],
+    [-3.0, 0.1],
+    [0.1, 0.2],
+    [1e300, 1e300],
+    [1e-200, 1e-200],
+    [-0.0, 0.0],
+    [0.0, 0.0],
+    [-0.0, -0.0],
+    [f64::NAN, 1.0],
+    [1.0, f64::NAN],
+    [f64::INFINITY, f64::NEG_INFINITY],
+    [f64::MAX, -f64::MAX],
+];
+
+#[test]
+fn f64_add_mul_and_fma_are_ieee() {
+    // v_add_f64 v[6:7], v[1:2], v[3:4] (VOP3 0x164), v_mul_f64 (0x165) and
+    // v_fma_f64 v[6:7], v[1:2], v[3:4], 1.0 (0x14c; inline constant 242).
+    type Op = (&'static str, [u32; 2], fn(f64, f64) -> f64);
+    let ops: [Op; 3] = [
+        ("v_add_f64", vop3(0x164, 6, vgpr(1), vgpr(3), 0), |a, b| {
+            a + b
+        }),
+        ("v_mul_f64", vop3(0x165, 6, vgpr(1), vgpr(3), 0), |a, b| {
+            a * b
+        }),
+        (
+            "v_fma_f64",
+            vop3(0x14c, 6, vgpr(1), vgpr(3), 242),
+            |a, b| a.mul_add(b, 1.0),
+        ),
+    ];
+    for (name, words, reference) in ops {
+        run_f64(&words, F64_CASES, |backend, i, got| {
+            let [a, b] = F64_CASES[i];
+            let want = reference(a, b);
+            assert!(
+                same_f64(got, want),
+                "{backend}: {name}({a}, {b}) = {} ({got:#018x}), want {want}",
+                f64::from_bits(got),
+            );
+        });
+    }
+}
+
 /// A compute program in an `ACCC` part, as the AMD upscaler's are: `body`
 /// leaves its result in v0, stored to the raw UAV of the table at user data
 /// 4 (root parameter 1). Translated from the container's bytes.
@@ -2223,6 +2431,378 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
             assert_eq!(got, want, "{backend}: {body:08x?}");
         });
     }
+}
+
+#[test]
+fn f64_max_and_min_order_zeros_and_skip_nan() {
+    // v_min_f64 (VOP3 0x166) and v_max_f64 (0x167) v[6:7], v[1:2], v[3:4].
+    let ordered = |a: f64, b: f64, max: bool| {
+        if a.is_nan() {
+            return b;
+        }
+        if b.is_nan() {
+            return a;
+        }
+        if a == 0.0 && b == 0.0 {
+            // -0 below +0.
+            let negative = if max {
+                a.is_sign_negative() && b.is_sign_negative()
+            } else {
+                a.is_sign_negative() || b.is_sign_negative()
+            };
+            return if negative { -0.0 } else { 0.0 };
+        }
+        if max { a.max(b) } else { a.min(b) }
+    };
+    for (name, op, max) in [("v_min_f64", 0x166, false), ("v_max_f64", 0x167, true)] {
+        let words = vop3(op, 6, vgpr(1), vgpr(3), 0);
+        run_f64(&words, F64_CASES, |backend, i, got| {
+            let [a, b] = F64_CASES[i];
+            let want = ordered(a, b, max);
+            assert!(
+                same_f64(got, want),
+                "{backend}: {name}({a}, {b}) = {} ({got:#018x}), want {want}",
+                f64::from_bits(got),
+            );
+        });
+    }
+}
+
+#[test]
+fn f64_sources_apply_abs_and_neg() {
+    // v_add_f64 v[6:7], v[1:2], v[3:4] with abs (bits 8, 9) and neg (bits
+    // 61, 62) per source, abs first.
+    const ABS: [u32; 2] = [1 << 8, 1 << 9];
+    const NEG: [u32; 2] = [1 << 29, 1 << 30];
+    let cases = [[-2.5, 4.0], [3.0, -1.0], [-0.0, 0.0]];
+    for (abs, neg) in [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2), (3, 3), (1, 2)] {
+        let mut words = vop3(0x164, 6, vgpr(1), vgpr(3), 0);
+        let modify = |x: f64, k: usize| {
+            let x = if abs >> k & 1 != 0 { x.abs() } else { x };
+            if neg >> k & 1 != 0 { -x } else { x }
+        };
+        for k in 0..2 {
+            if abs >> k & 1 != 0 {
+                words[0] |= ABS[k];
+            }
+            if neg >> k & 1 != 0 {
+                words[1] |= NEG[k];
+            }
+        }
+        run_f64(&words, &cases, |backend, i, got| {
+            let [a, b] = cases[i];
+            let want = modify(a, 0) + modify(b, 1);
+            assert!(
+                same_f64(got, want),
+                "{backend}: abs {abs:#b} neg {neg:#b} ({a}, {b}) = {} want {want}",
+                f64::from_bits(got),
+            );
+        });
+    }
+}
+
+#[test]
+fn f64_arithmetic_reads_sgpr_pairs() {
+    // v_add_f64 v[6:7], s[0:1], s[2:3]: the root constants.
+    let words = vop3(0x164, 6, sgpr(0), sgpr(2), 0);
+    run_f64(&words, F64_CASES, |backend, i, got| {
+        let [a, b] = F64_CASES[i];
+        assert!(
+            same_f64(got, a + b),
+            "{backend}: ({a}, {b}) = {}",
+            f64::from_bits(got),
+        );
+    });
+}
+
+/// Inputs for [`f64_reads_uniform_pairs_at_odd_dwords`]: v[2:3] and the
+/// pair it would be with its high dword lost, (v2, v2), differ in each.
+const ODD_PAIR_INPUTS: [[u32; 4]; 4] = [
+    [0, 0x3ff8_0000, 0x4000_0000, 0],
+    [0x1111_1111, 0x3ff8_0000, 0x4000_0000, 0x4010_0000],
+    [0x89ab_cdef, 0x4049_0fdb, 0xc008_0000, 0x3fd0_0000],
+    // v[1:2] = 1.5 lies between v[2:3] and (v2, v2).
+    [0, 0x3ff8_0000, 0x3ff0_0000, 0x4000_0000],
+];
+
+/// The 64 bits in `v[n:n+1]` of a [`build_valu_cs`] program's inputs.
+fn bits_at(x: &[u32; 4], n: usize) -> u64 {
+    u64::from(x[n]) << 32 | u64::from(x[n - 1])
+}
+
+fn f64_at(x: &[u32; 4], n: usize) -> f64 {
+    f64::from_bits(bits_at(x, n))
+}
+
+#[test]
+fn f64_reads_uniform_pairs_at_odd_dwords() {
+    // FIND-21: v1..v4 are the four root constants, one load. Before the
+    // lowering XORed register-pair dwords with an opaque zero, doubles at
+    // dwords 1 and 2 (v[2:3]), alone or sharing a dword with another source,
+    // came out of AMD's compiler with the low dword as both halves; WARP and
+    // NVIDIA were right. The 64-bit integer cases were right on AMD too.
+    type Wide = (&'static str, Vec<u32>, fn(&[u32; 4]) -> u64);
+    let op3 = |op, a, b, c| vop3(op, 6, a, b, c).to_vec();
+    let wide: [Wide; 13] = [
+        (
+            "v_add_f64 v[6:7], v[1:2], v[3:4]",
+            op3(0x164, vgpr(1), vgpr(3), 0),
+            |x| (f64_at(x, 1) + f64_at(x, 3)).to_bits(),
+        ),
+        (
+            "v_add_f64 v[6:7], v[2:3], 1.0",
+            op3(0x164, vgpr(2), 242, 0),
+            |x| (f64_at(x, 2) + 1.0).to_bits(),
+        ),
+        (
+            "v_add_f64 v[6:7], v[2:3], v[2:3]",
+            op3(0x164, vgpr(2), vgpr(2), 0),
+            |x| (f64_at(x, 2) + f64_at(x, 2)).to_bits(),
+        ),
+        (
+            "v_add_f64 v[6:7], v[2:3], v[3:4]",
+            op3(0x164, vgpr(2), vgpr(3), 0),
+            |x| (f64_at(x, 2) + f64_at(x, 3)).to_bits(),
+        ),
+        (
+            "v_add_f64 v[6:7], v[1:2], v[2:3]",
+            op3(0x164, vgpr(1), vgpr(2), 0),
+            |x| (f64_at(x, 1) + f64_at(x, 2)).to_bits(),
+        ),
+        (
+            "v_mul_f64 v[6:7], v[1:2], v[2:3]",
+            op3(0x165, vgpr(1), vgpr(2), 0),
+            |x| (f64_at(x, 1) * f64_at(x, 2)).to_bits(),
+        ),
+        (
+            "v_fma_f64 v[6:7], v[2:3], v[3:4], v[1:2]",
+            op3(0x14c, vgpr(2), vgpr(3), vgpr(1)),
+            |x| f64_at(x, 2).mul_add(f64_at(x, 3), f64_at(x, 1)).to_bits(),
+        ),
+        (
+            "v_max_f64 v[6:7], v[2:3], 1.0",
+            op3(0x167, vgpr(2), 242, 0),
+            |x| f64_at(x, 2).max(1.0).to_bits(),
+        ),
+        (
+            "v_min_f64 v[6:7], v[2:3], 4.0",
+            op3(0x166, vgpr(2), 246, 0),
+            |x| f64_at(x, 2).min(4.0).to_bits(),
+        ),
+        (
+            "v_cvt_f64_f32 v[6:7], v2",
+            vec![vop1(0x010, 6, vgpr(2))],
+            |x| f64::from(f32::from_bits(x[1])).to_bits(),
+        ),
+        // 64-bit integer pairs.
+        (
+            "v_lshlrev_b64 v[6:7], v1, v[2:3]",
+            op3(0x2ff, vgpr(1), vgpr(2), 0),
+            |x| bits_at(x, 2) << (x[0] & 63),
+        ),
+        (
+            "v_lshrrev_b64 v[6:7], v4, v[2:3]",
+            op3(0x300, vgpr(4), vgpr(2), 0),
+            |x| bits_at(x, 2) >> (x[3] & 63),
+        ),
+        (
+            "v_mad_u64_u32 v[6:7], null, v1, v4, v[2:3]",
+            {
+                // VOP3B: the carry goes to null.
+                let mut w = op3(0x176, vgpr(1), vgpr(4), vgpr(2));
+                w[0] |= 125 << 8;
+                w
+            },
+            |x| (u64::from(x[0]) * u64::from(x[3])).wrapping_add(bits_at(x, 2)),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, words, reference) in wide {
+        run_f64_raw(&words, &ODD_PAIR_INPUTS, |backend, i, got| {
+            let want = reference(&ODD_PAIR_INPUTS[i]);
+            let float = name.contains("f64");
+            let same = if float {
+                same_f64(got, f64::from_bits(want))
+            } else {
+                got == want
+            };
+            if !same {
+                wrong.push(format!(
+                    "{backend}: {name} on input {i}: {got:#018x}, want {want:#018x}"
+                ));
+            }
+        });
+    }
+
+    // Results in v0: conversions and compares (through v_cndmask_b32_e64
+    // v0, 0, 1, s20).
+    type Narrow = (&'static str, Vec<u32>, fn(&[u32; 4]) -> u32);
+    let compare = |op: u16, a: u16, b: u16| {
+        let mut body = vop3(op, 20, a, b, 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        body
+    };
+    let narrow: [Narrow; 5] = [
+        (
+            "v_cvt_f32_f64 v0, v[2:3]",
+            vec![vop1(0x00f, 0, vgpr(2))],
+            |x| (f64_at(x, 2) as f32).to_bits(),
+        ),
+        (
+            "v_cvt_i32_f64 v0, v[2:3]",
+            vec![vop1(0x003, 0, vgpr(2))],
+            |x| f64_at(x, 2) as i32 as u32,
+        ),
+        (
+            "v_cvt_u32_f64 v0, v[2:3]",
+            vec![vop1(0x015, 0, vgpr(2))],
+            |x| f64_at(x, 2) as u32,
+        ),
+        (
+            "v_cmp_gt_f64 s20, v[2:3], 2.0",
+            compare(0x024, vgpr(2), 244),
+            |x| u32::from(f64_at(x, 2) > 2.0),
+        ),
+        (
+            "v_cmp_lt_f64 s20, v[1:2], v[2:3]",
+            compare(0x021, vgpr(1), vgpr(2)),
+            |x| u32::from(f64_at(x, 1) < f64_at(x, 2)),
+        ),
+    ];
+    for (name, body, reference) in narrow {
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &ODD_PAIR_INPUTS, |backend, i, _, got| {
+            let want = reference(&ODD_PAIR_INPUTS[i]);
+            if got != want {
+                wrong.push(format!(
+                    "{backend}: {name} on input {i}: {got:#010x}, want {want:#010x}"
+                ));
+            }
+        });
+    }
+    for w in &wrong {
+        eprintln!("{w}");
+    }
+    assert!(wrong.is_empty(), "{} wrong results", wrong.len());
+}
+
+#[test]
+fn v_cmp_f64_matches_ieee() {
+    // v_cmp_<op>_f64 s20, v[1:2], v[3:4] (VOPC 0x020-0x02f in VOP3);
+    // v_cndmask_b32_e64 v0, 0, 1, s20 (VOP3 0x101)
+    type Op = (&'static str, u16, fn(f64, f64) -> bool);
+    fn unordered(a: f64, b: f64) -> bool {
+        a.is_nan() || b.is_nan()
+    }
+    let ops: [Op; 16] = [
+        ("f", 0x020, |_, _| false),
+        ("lt", 0x021, |a, b| a < b),
+        ("eq", 0x022, |a, b| a == b),
+        ("le", 0x023, |a, b| a <= b),
+        ("gt", 0x024, |a, b| a > b),
+        ("lg", 0x025, |a, b| !unordered(a, b) && a != b),
+        ("ge", 0x026, |a, b| a >= b),
+        ("o", 0x027, |a, b| !unordered(a, b)),
+        ("u", 0x028, unordered),
+        // "Not" forms are true for a NaN.
+        ("nge", 0x029, |a, b| unordered(a, b) || a < b),
+        ("nlg", 0x02a, |a, b| unordered(a, b) || a == b),
+        ("ngt", 0x02b, |a, b| unordered(a, b) || a <= b),
+        ("nle", 0x02c, |a, b| unordered(a, b) || a > b),
+        ("neq", 0x02d, |a, b| unordered(a, b) || a != b),
+        ("nlt", 0x02e, |a, b| unordered(a, b) || a >= b),
+        ("tru", 0x02f, |_, _| true),
+    ];
+    let inputs = double_inputs(F64_CASES);
+    for (name, op, reference) in ops {
+        let mut body = vop3(op, 20, vgpr(1), vgpr(3), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let [a, b] = F64_CASES[i];
+            let want = u32::from(reference(a, b));
+            assert_eq!(got, want, "{backend}: v_cmp_{name}_f64({a}, {b})");
+        });
+    }
+}
+
+#[test]
+fn f64_conversions_match_rdna2() {
+    // v_cvt_f64_i32 v[6:7], v1 (VOP1 0x004) and v_cvt_f64_u32 (0x016).
+    let ints = [0u32, 1, 5, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFB, u32::MAX];
+    let inputs: Vec<[u32; 4]> = ints.iter().map(|&x| [x, 0, 0, 0]).collect();
+    run_f64_raw(&[vop1(0x004, 6, vgpr(1))], &inputs, |backend, i, got| {
+        let want = f64::from(ints[i] as i32);
+        assert_eq!(
+            got,
+            want.to_bits(),
+            "{backend}: v_cvt_f64_i32({:#x})",
+            ints[i]
+        );
+    });
+    run_f64_raw(&[vop1(0x016, 6, vgpr(1))], &inputs, |backend, i, got| {
+        let want = f64::from(ints[i]);
+        assert_eq!(
+            got,
+            want.to_bits(),
+            "{backend}: v_cvt_f64_u32({:#x})",
+            ints[i]
+        );
+    });
+
+    // v_cvt_f64_f32 v[6:7], v1 (VOP1 0x010).
+    let floats = [
+        1.5f32,
+        -0.0,
+        0.1,
+        f32::MAX,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        f32::MIN_POSITIVE,
+    ];
+    let inputs: Vec<[u32; 4]> = floats.iter().map(|x| [x.to_bits(), 0, 0, 0]).collect();
+    run_f64_raw(&[vop1(0x010, 6, vgpr(1))], &inputs, |backend, i, got| {
+        let want = f64::from(floats[i]);
+        assert!(
+            same_f64(got, want),
+            "{backend}: v_cvt_f64_f32({})",
+            floats[i]
+        );
+    });
+
+    // v_cvt_i32_f64 v0, v[1:2] (VOP1 0x003) and v_cvt_u32_f64 (0x015)
+    // saturate and turn NaN into 0.
+    let doubles = [
+        0.0,
+        1.9,
+        -1.9,
+        2.5,
+        3e9,
+        -3e9,
+        5e9,
+        4e9,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let inputs: Vec<[u32; 4]> = doubles
+        .iter()
+        .map(|&x| {
+            let d = dwords(x);
+            [d[0], d[1], 0, 0]
+        })
+        .collect();
+    let to_i32 = build_valu_cs(&[vop1(0x003, 0, vgpr(1))]);
+    run_cases(&to_i32, &inputs, |backend, i, _, got| {
+        let want = doubles[i] as i32 as u32;
+        assert_eq!(got, want, "{backend}: v_cvt_i32_f64({})", doubles[i]);
+    });
+    let to_u32 = build_valu_cs(&[vop1(0x015, 0, vgpr(1))]);
+    run_cases(&to_u32, &inputs, |backend, i, _, got| {
+        let want = doubles[i] as u32;
+        assert_eq!(got, want, "{backend}: v_cvt_u32_f64({})", doubles[i]);
+    });
 }
 
 /// `v_pk_fmac_f16` (VOP2): each half of the destination plus the product

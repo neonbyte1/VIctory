@@ -25,6 +25,8 @@ mod phi;
 
 type Why = &'static str;
 
+mod double;
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -6070,6 +6072,9 @@ impl<'a> Lower<'a> {
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
         }
+        if let Some(r) = self.valu_f64(inst, name, guard) {
+            return r;
+        }
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
         }
@@ -6464,6 +6469,11 @@ impl<'a> Lower<'a> {
                 }
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                let a = self.fsrc64(inst, 0)?;
+                let r = self.s.m.cast(c, Cast::FPTrunc, a, self.s.t.f32);
+                float(self, r)
+            }
             "v_cvt_f32_u32" => {
                 // WARP can misround a full-width uitofp. Each 16-bit
                 // half and the scaled high half are exact in f32, so the
@@ -6793,6 +6803,12 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn read_pair(&mut self, inst: &Inst, lo: Reg, hi: Reg) -> Result<(V, V), Why> {
+        let lo = self.i32_of(inst.read(lo).ok_or("an unread operand")?)?;
+        let hi = self.i32_of(inst.read(hi).ok_or("an unread operand")?)?;
+        Ok((lo, hi))
+    }
+
     /// A 64-bit source (a register pair; inline constants sign-extend).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -6806,8 +6822,7 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::INT64;
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
-            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
-            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            let (lo, hi) = l.read_pair(inst, r, r1)?;
             let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
             let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
             let k32 = l.s.m.int_const(i64t, 32);
@@ -8056,11 +8071,17 @@ impl<'a> Lower<'a> {
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 self.s.m.cmp(c, pred::NE, bit, zero)
             }
-            "f32" | "f16" => {
-                let (a, b) = if ty == "f16" {
-                    (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
-                } else {
-                    (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
+            "f32" | "f16" | "f64" => {
+                if ty == "f64" && matches!(op, "f" | "tru") {
+                    // Constant, so no doubles are built (WARP loses the device on a
+                    // double `fcmp false`).
+                    self.lane(inst, Some(op == "tru"));
+                    return Ok(());
+                }
+                let (a, b) = match ty {
+                    "f16" => (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?),
+                    "f64" => (self.fsrc64(inst, 0)?, self.fsrc64(inst, 1)?),
+                    _ => (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?),
                 };
                 if op == "lg" {
                     // Ordered and not equal, false for a NaN, as `olt | ogt`.
