@@ -607,11 +607,23 @@ impl Tracked {
     /// read as zeros, with no copy to try (each such page cost a dozen
     /// failing kernel reads, 7-30 ms a frame in run perf4).
     pub(crate) fn take_split(&self, from: usize, to: usize) -> (Runs, Runs) {
+        match self.take_split_unless(from, to, &[]) {
+            Ok(taken) => taken,
+            Err(_) => unreachable!("nothing is forbidden"),
+        }
+    }
+
+    /// [`Tracked::take_split`], unless a changed page of `[from, to)` lies
+    /// in one of `forbidden`'s page runs `[first, last)`: then nothing is
+    /// taken, and the result is the largest key among the runs holding such
+    /// pages. Decided on the pages changed when asked: one written after
+    /// is left changed for a later take.
+    pub(crate) fn take_split_unless(&self, from: usize, to: usize, forbidden: &[(usize, usize, u64)]) -> Result<(Runs, Runs), u64> {
         #[cfg(feature = "diagnostics")]
         let _site = at_site(if self.changed.3 { Site::TakeCopy } else { Site::TakeOther });
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
-            return (Vec::new(), Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let pages: Vec<usize> = {
             #[cfg(feature = "diagnostics")]
@@ -622,7 +634,15 @@ impl Tracked {
             changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
         };
         if pages.is_empty() {
-            return (Vec::new(), Vec::new());
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if let Some(key) = forbidden
+            .iter()
+            .filter(|&&(first, last, _)| pages.iter().any(|p| (first..last).contains(p)))
+            .map(|r| r.2)
+            .max()
+        {
+            return Err(key);
         }
         let mut whole: Vec<usize> = pages
             .iter()
@@ -661,7 +681,7 @@ impl Tracked {
                 _ => runs.push((a, b)),
             }
         }
-        (copy, zero)
+        Ok((copy, zero))
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -725,6 +745,14 @@ impl Tracked {
         if from < to {
             self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).arm(from / PAGE, to.div_ceil(PAGE));
         }
+    }
+
+    /// Page `page` (a page number) is armed again after [`Tracked::unarm`]:
+    /// shaders of a later submission may write it, and the copy-back just
+    /// made it equal to title memory, so its next first write keeps its
+    /// bytes.
+    pub(crate) fn rearm(&self, page: usize) {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).unarmed.remove(&page);
     }
 
     /// Page `page` (a page number) needs no saving any more: its copy-back
@@ -1495,6 +1523,36 @@ pub(crate) mod tests {
         assert_eq!(t.take(p, p + 3 * PAGE), [(p + PAGE, p + 2 * PAGE + 100)]);
         assert!(t.take(p, p + 3 * PAGE).is_empty());
         assert!(t.clean());
+        drop(t);
+        free(p);
+    }
+
+    /// A take refused for a changed page under a forbidden run takes
+    /// nothing and names the run's largest key; changed pages outside them
+    /// are taken as usual, and a forbidden page that is not changed does
+    /// not refuse it. A page rearmed after unarming keeps its bytes again.
+    #[test]
+    fn takes_refuse_changed_pages_under_forbidden_runs() {
+        let p = pool(3);
+        let t = track(p, 3 * PAGE, true).expect("tracked");
+        let first = p / PAGE;
+        let forbidden = [(first + 1, first + 2, 7), (first + 1, first + 3, 9), (first + 5, first + 6, 11)];
+        assert_eq!(t.take_split_unless(p, p + 3 * PAGE, &forbidden), Err(9), "all three changed at first");
+        assert!(t.changed(first) && t.changed(first + 1), "nothing taken");
+        assert_eq!(t.take_split_unless(p, p + PAGE, &forbidden), Ok((vec![(p, p + PAGE)], Vec::new())), "page 0 is not forbidden");
+        assert_eq!(t.take(p + PAGE, p + 3 * PAGE).len(), 1);
+        // SAFETY: a byte of our pool's first page.
+        unsafe { (p as *mut u8).write_volatile(1) };
+        assert_eq!(t.take_split_unless(p, p + 3 * PAGE, &forbidden), Ok((vec![(p, p + PAGE)], Vec::new())), "pages 1 and 2 unchanged");
+        // Armed, unarmed (a copy-back under way), rearmed: the next first
+        // write keeps the page's bytes.
+        t.arm(p, p + PAGE);
+        t.unarm(first);
+        t.rearm(first);
+        // SAFETY: as above.
+        unsafe { (p as *mut u8).write_volatile(2) };
+        assert_eq!(t.saved(first).map(|b| b[0]), Some(1), "rearmed: its bytes before the write kept");
+        t.disarm();
         drop(t);
         free(p);
     }

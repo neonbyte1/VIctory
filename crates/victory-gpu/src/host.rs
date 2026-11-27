@@ -8,11 +8,17 @@
 //! memory, and the fences signalled behind them move, when the completion
 //! thread sees them done ([`Host::submit`], [`Host::finish`]).
 //!
-//! shortcut: overlapping, a submission whose completion writes title memory
-//! (copy-backs, write marks, bottom-of-pipe writes) completes before the
-//! next one is prepared, whose refreshes read title memory: only
-//! submissions without such writes overlap. Snapshots and bitmaps per
-//! submission would lift it.
+//! Overlapping, a submission completes before the next one is prepared
+//! only if its completion writes title memory nobody declared (work after
+//! it, writes through the heap's views, page tables) or takes marks shared
+//! with later ones: a barrier. The others stay in flight with what they
+//! write in title memory on completion named (declared ranges, bottom-of-
+//! pipe writes, `crate::shadow::fly`), and each has its own snapshots
+//! (`crate::shadow::Shadow::writing`) and write marks
+//! (`crate::shadow::capture_write_marks`). A later submission completes
+//! them first only where its preparing reads what they write
+//! ([`Settled`]), or where it declares ranges they declare
+//! ([`declared_overlap`]).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -633,10 +639,10 @@ pub(crate) mod tests {
         // SAFETY: the texture's memory, 256-byte rows of 64 texels.
         unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
         copy.unstamp();
-        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
+        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[], &mut crate::host::nothing_in_flight);
         assert_eq!(crate::texture::uploads(object), 0, "not read lately: not brought up");
         copy.stamp();
-        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
+        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[], &mut crate::host::nothing_in_flight);
         assert_eq!(crate::texture::uploads(object), 1, "read in the last pass: brought up");
     }
 
@@ -666,11 +672,11 @@ pub(crate) mod tests {
             .collect();
         // No submission uploads meanwhile.
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
+        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[], &mut crate::host::nothing_in_flight);
         for &object in &objects {
             assert_eq!(crate::texture::uploads(object), 1, "each brought up once");
         }
-        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
+        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[], &mut crate::host::nothing_in_flight);
         for &object in &objects {
             assert_eq!(crate::texture::uploads(object), 1, "unchanged: not again");
         }
@@ -1126,6 +1132,70 @@ struct VramSync {
     /// The submission's kind ([`signature`]), if completing it takes marks
     /// or page bitmaps: its named pages become the next prediction for it.
     signature: Option<u64>,
+    /// Where the list after it put its shaders' write marks in read-back
+    /// staging (`crate::shadow::capture_write_marks`), and the bytes of
+    /// each: its own marks, whatever ran before or after it.
+    marks: Option<([Option<u64>; 2], u64, usize)>,
+}
+
+/// A range `(copy, start, end, marked)` (title addresses) a submission's
+/// shaders declare as written through a buffer copy (`Step::GpuWrite`).
+type Declared = (usize, usize, usize, bool);
+
+/// Whether a submission declaring `next` must wait for one in flight that
+/// declared `flying` before it is prepared: they write overlapping ranges
+/// of one copy, and not both by marks. An unmarked range's snapshot is taken
+/// from the copy when the submission is prepared, so it would miss what the
+/// one in flight writes there (and copy it back again over later title
+/// writes); marked ranges keep no snapshot (`crate::shadow::Shadow::writing`).
+fn declared_overlap(next: &[Declared], flying: &[Declared]) -> bool {
+    next.iter().any(|&(copy, a, e, marked)| {
+        flying
+            .iter()
+            .any(|&(c, x, y, m)| c == copy && a < y && x < e && !(marked && m))
+    })
+}
+
+/// [`HostList::heavy_reasons`] bits that keep a submission's completion
+/// before the next one is prepared whatever it touches: writes through the
+/// heap's views (declared nowhere), work after it, missed-memory checks,
+/// title memory through page tables (anywhere). The others (bottom-of-pipe
+/// writes, declared GPU writes) are bounded and known at submission: later
+/// submissions wait for it only where they meet them (`Host::submit`,
+/// [`Settled`]).
+const BARRIER_REASONS: u8 = 1 | 1 << 1 | 1 << 3 | 1 << 5;
+
+/// Whether a submission with heavy reasons `reasons` that marks
+/// (`marks`) completes before the next is prepared: for a barrier reason,
+/// or marks its shaders set where each submission's are not captured apart
+/// (`crate::shadow::captures_write_marks`: they are taken from the one
+/// bitmap with nothing in flight after it).
+fn barrier(reasons: u8, marks: bool, captured: bool) -> bool {
+    reasons & BARRIER_REASONS != 0 || marks && !captured
+}
+
+/// Why a submission being prepared completes one in flight first
+/// (`Host::run`): what it is about to read is title memory that one writes
+/// when it completes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Settled {
+    /// A refresh would copy pages the title changed under that one's
+    /// declared ranges of the same copy (or memory copied whole there).
+    Same,
+    /// A refresh of another copy of memory it writes.
+    Alias,
+    /// A refresh of memory its bottom-of-pipe writes go to.
+    Label,
+    /// A title memory read at submission (`Step::Fill`).
+    Fill,
+    /// A texture over memory it writes (`crate::bindless::uploads`).
+    Texture,
+}
+
+/// Tests: the `settle` of a preparing with nothing in flight, never asked.
+#[cfg(test)]
+pub(crate) fn nothing_in_flight(owner: u64, why: Settled) {
+    panic!("nothing is in flight to complete (submission {owner}, {why:?})");
 }
 
 /// The pages of copies in video memory that the last completion of each
@@ -1254,6 +1324,8 @@ struct Submitted {
     /// Submissions the host GPU may still be running, oldest first: each
     /// completes ([`Host::finish`]) once it has run, in order.
     flight: std::collections::VecDeque<InFlight>,
+    /// Submissions prepared so far (the last one's [`InFlight::owner`]).
+    owners: u64,
 }
 
 /// A submission on the host GPU, not completed yet: what completing it
@@ -1261,21 +1333,25 @@ struct Submitted {
 struct InFlight {
     /// The host fence value signalled after it.
     value: u64,
+    /// Its number among submissions, from 1 in the order they are prepared
+    /// (`crate::shadow`'s per-submission state names it).
+    owner: u64,
     /// The title's queue that submitted it (0: ours).
     queue: usize,
     /// The title's host lists it runs, held until it has completed (a title
     /// list reset meanwhile records into others, `crate::list::restart`),
     /// then recycled.
     lists: Vec<std::sync::Arc<HostList>>,
-    /// Its completion writes title memory or reads the marks bitmaps
-    /// ([`HostList::heavy_reasons`]): it completes before the next submission is
-    /// prepared.
-    heavy: bool,
+    /// It completes before the next submission is prepared ([`barrier`]).
+    barrier: bool,
+    /// The ranges its shaders declare as written ([`declared_overlap`]).
+    declared: Vec<Declared>,
     /// It runs the upload list (`crate::bindless::uploads`), which the next
     /// submission with uploads records again.
     uploads: bool,
     /// Its shaders mark in the views' bitmaps: its completion takes the
-    /// read marks, and if it is heavy (or waited for) the write marks.
+    /// read marks, and the write marks if they are its own (captured, or it
+    /// is a barrier or waited for).
     marks: bool,
     /// It is waited for at once (`Host::execute`): nothing runs after it.
     sync: bool,
@@ -1597,28 +1673,58 @@ impl Host {
         }
         let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
         // What must complete before this submission is prepared:
-        // submissions whose completion writes title memory or reads the
-        // marks bitmaps (its refreshes and copies read title memory, its
-        // shaders mark in the same bitmaps, copies of title buffers keep one
-        // snapshot each); all of them before title copies and work that
-        // write title memory on the CPU for the GPU's timeline (those before
-        // may still read what they overwrite); the last upload list before
-        // another; a host list's last run before it runs again (its
-        // prelude and steps run again); and, once a frame, before the
-        // title's first submission, those whose shaders mark reads, for the
-        // eviction pass to clear the marks (not before a present's: it would
-        // wait for the frame it shows).
+        // - barriers ([`barrier`]): their completion writes title memory
+        //   nobody declared, or takes marks shared with later submissions;
+        // - all of them before a barrier (its checks and page tables see
+        //   every earlier result), and before title copies and work that
+        //   write title memory on the CPU for the GPU's timeline (those
+        //   before may still read what they overwrite);
+        // - those declaring a range of a copy this one declares too, unless
+        //   both mark ([`declared_overlap`]);
+        // - the last upload list before another; a host list's last run
+        //   before it runs again (its prelude and steps run again); and, once
+        //   a frame, before the title's first submission, those whose shaders
+        //   mark reads, for the eviction pass to clear the marks (not before a
+        //   present's: it would wait for the frame it shows).
+        // The rest stay in flight: what this one's preparing reads of what
+        // they write is waited for where it is read ([`Settled`]).
         let writes = runs.iter().any(|l| l.writes_at_submission());
         let uploading = runs.iter().any(|l| l.uploads_at_submission());
+        let reasons = runs.iter().fold(0u8, |r, l| r | l.heavy_reasons());
+        let marking = runs.iter().any(|l| l.marks.load(Ordering::Relaxed));
+        let alone = barrier(reasons, marking, crate::shadow::captures_write_marks());
+        let declared: Vec<Declared> = runs.iter().flat_map(|l| l.declared()).collect();
+        let why = std::cell::Cell::new(0u8);
         let mut submitted = self.complete_while(self.lock_submitted(), |r| {
-            r.heavy
-                || queue != 0 && r.marks && crate::resource::eviction_due()
-                || writes
-                || uploading && r.uploads
-                || r.lists
-                    .iter()
-                    .any(|held| lists.iter().any(|l| std::sync::Arc::ptr_eq(held, l)))
+            let bits = u8::from(r.barrier)
+                | u8::from(alone) << 1
+                | u8::from(writes) << 2
+                | u8::from(uploading && r.uploads) << 3
+                | u8::from(r.lists.iter().any(|held| lists.iter().any(|l| std::sync::Arc::ptr_eq(held, l)))) << 4
+                | u8::from(queue != 0 && r.marks && crate::resource::eviction_due()) << 5
+                | u8::from(declared_overlap(&declared, &r.declared)) << 6;
+            why.set(why.get() | bits);
+            bits != 0
         });
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            for (bit, c) in [
+                C::WaitBarrier,
+                C::WaitAlone,
+                C::WaitTitleWrites,
+                C::WaitUploads,
+                C::WaitListAgain,
+                C::WaitEviction,
+                C::WaitDeclared,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                add(c, u64::from(why.get() >> bit & 1));
+            }
+        }
+        let _ = why;
         let mut record = self.run(&mut submitted, &runs, true);
         drop(runs);
         (record.queue, record.lists) = (queue, lists);
@@ -1807,12 +1913,43 @@ impl Host {
         }
     }
 
+    /// While a submission is prepared ([`Host::run`]): completes those in
+    /// flight up to submission `owner`, whose completion writes title
+    /// memory the preparing is about to read (`why`, counted).
+    fn settle(&self, submitted: &mut Submitted, owner: u64, why: Settled) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(
+                match why {
+                    Settled::Same => C::SettleSame,
+                    Settled::Alias => C::SettleAlias,
+                    Settled::Label => C::SettleLabel,
+                    Settled::Fill => C::SettleFill,
+                    Settled::Texture => C::SettleTexture,
+                },
+                1,
+            );
+        }
+        let _ = why;
+        let waiting = std::time::Instant::now();
+        while submitted.flight.front().is_some_and(|r| r.owner <= owner) {
+            let record = submitted.flight.pop_front().expect("a first");
+            let quiet = !submitted.flight.iter().any(|r| r.marks);
+            self.complete(record, quiet);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SettleUs, waiting.elapsed().as_micros() as u64);
+        let _ = waiting;
+    }
+
     /// Prepares closed lists (title memory brought into host copies,
     /// uploads, preludes) and runs them on the host GPU, without waiting
     /// (but with `VICTORY_GPU_TIMING`, which waits for each list): what
     /// completing them needs. `overlap`: submissions may stay in flight
     /// after this one. Those in flight that it needs done have completed
-    /// (`Host::submit`).
+    /// (`Host::submit`); others may still be when it reads title memory
+    /// they write, and complete then ([`Host::settle`]).
     fn run(&self, submitted: &mut Submitted, runs: &[&HostList], overlap: bool) -> InFlight {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1865,13 +2002,26 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // Its number, and what reading title memory that submissions in
+        // flight write waits for (`Host::settle`), kept out of the time
+        // preparing.
+        submitted.owners += 1;
+        let owner = submitted.owners;
+        #[cfg(feature = "diagnostics")]
+        let numbered = submitted.value + 1;
+        let mut settled = std::time::Duration::ZERO;
+        let mut settle = |o: u64, why: Settled| {
+            let waiting = std::time::Instant::now();
+            self.settle(submitted, o, why);
+            settled += waiting.elapsed();
+        };
         // The upload list and its staging memory are used again: the
         // submission that last ran them has completed (`Host::submit`).
         let uploading = !heaps.is_empty() || !textures.is_empty();
         #[cfg(feature = "diagnostics")]
         let timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = uploading
-            .then(|| crate::bindless::uploads(&heaps, &textures))
+            .then(|| crate::bindless::uploads(&heaps, &textures, &mut settle))
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(timed);
@@ -1894,8 +2044,7 @@ impl Host {
                 for (k, (note, _)) in notes.iter().enumerate() {
                     tracing::info!(
                         target: "victory_gpu::trace",
-                        "s{} l{i}/{} #{k}: {note}",
-                        submitted.value + 1,
+                        "s{numbered} l{i}/{} #{k}: {note}",
                         all.len()
                     );
                 }
@@ -1906,7 +2055,7 @@ impl Host {
         let mut firsts = Vec::with_capacity(all.len());
         let mut batch = Batch::default();
         for list in all {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, owner, &mut settle);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1915,7 +2064,7 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
+        batch.flush(owner, &mut settle);
         let vram_uploads = crate::shadow::take_vram_uploads();
         let mut vram_bitmaps: Vec<(ID3D12Resource, ID3D12Resource)> = Vec::new();
         let mut seen_bitmaps = std::collections::HashSet::new();
@@ -1930,16 +2079,20 @@ impl Host {
         // Out of overlap nothing else is in flight: the bitmaps are this
         // submission's whatever marked them (tests bind them directly).
         let marks = !overlap || all.iter().any(|l| l.marks.load(Ordering::Relaxed));
+        // Its shaders' write marks are captured apart by the list after it
+        // (`crate::shadow::capture_write_marks`), from the bytes in use now.
+        let captured = marks && crate::shadow::captures_write_marks();
+        let mark_bytes = crate::shadow::write_marks_bytes();
         // Copies in video memory: brought up to date by a list run before the
         // submission's own, read back by one run after them, before its fence
         // value; the read-back is taken on completion (`Host::finish`), so the
         // submission stays in flight like any other. The views' bitmaps go
-        // with a submission that marks only: one that does not would copy them
-        // back over what the CPU cleared meanwhile (`crate::shadow`).
+        // with a submission that marks only: one that does not would copy the
+        // read marks back over what the CPU cleared meanwhile (`crate::shadow`).
         let mut vram = VramSync::default();
-        let before = self.vram_before(vram_uploads, &vram_bitmaps, marks, &mut vram);
+        let before = self.vram_before(vram_uploads, &vram_bitmaps, marks, mark_bytes, &mut vram);
         let reasons = runs.iter().fold(0u8, |r, l| r | l.heavy_reasons());
-        let heavy = reasons & 0x3f != 0;
+        let barrier = barrier(reasons, marks, captured);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -1962,9 +2115,18 @@ impl Host {
         }
         // Completing it takes the write marks (`Host::finish`) or reads the
         // lists' page bitmaps (`crate::memory::bind`'s probes).
-        let takes = (marks && (heavy || !overlap) || runs.iter().any(|l| !l.deferred().vram_probes.is_empty()))
-            .then(|| signature(runs));
-        let after = self.vram_after(runs, &vram_bitmaps, marks, takes, &mut vram);
+        let takes = (marks && (captured || barrier || !overlap)
+            || runs.iter().any(|l| !l.deferred().vram_probes.is_empty()))
+        .then(|| signature(runs));
+        let after = self.vram_after(runs, &vram_bitmaps, marks, captured.then_some(mark_bytes), takes, &mut vram);
+        // Later submissions are prepared while it runs: what it writes in
+        // title memory on completion, for them to wait for where they read it.
+        let declared: Vec<Declared> = runs.iter().flat_map(|l| l.declared()).collect();
+        if overlap {
+            crate::shadow::fly(owner, runs.iter().flat_map(|l| l.flying()).collect());
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PreparedOverlapping, u64::from(!submitted.flight.is_empty()));
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -2049,13 +2211,15 @@ impl Host {
                 removed_during(all, removed_in)
             ));
         }
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(prepared.elapsed().as_micros() as u64, Ordering::Relaxed);
         InFlight {
             value: submitted.value,
+            owner,
             queue: 0,
             lists: Vec::new(),
-            heavy,
+            barrier,
+            declared,
             uploads: uploads.is_some(),
             marks,
             sync: !overlap,
@@ -2114,16 +2278,18 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         // Copies in video memory first: their mirrors are what goes back. The
-        // views' written pages are read back when their marks are taken below.
-        let marks_taken = record.marks && (record.heavy || record.sync);
+        // views' written pages are read back when their marks are taken below:
+        // its own (captured after it), or taken from the bitmaps with nothing
+        // after it in flight (a barrier, or waited for).
+        let marks_taken = record.marks && (record.vram.marks.is_some() || record.barrier || record.sync);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
             add(C::Completions, 1);
-            add(C::HeavyCompletions, u64::from(record.heavy));
+            add(C::HeavyCompletions, u64::from(record.barrier));
             add(C::MarksTaken, u64::from(marks_taken));
         }
-        let unchanged = self.vram_completed(std::mem::take(&mut record.vram), runs, marks_taken);
+        let (unchanged, marks) = self.vram_completed(std::mem::take(&mut record.vram), runs, marks_taken);
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
@@ -2177,13 +2343,10 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
-        // Write marks are this submission's alone if it is heavy (the next
-        // waits for it) or waited for: those of a later one still running
-        // would go back early and be lost to it.
         if marks_taken {
             // Pages shaders marked first: the copy-backs below end what the
             // copies keep for them.
-            crate::shadow::copy_back_marks(&withheld, withholding, &unchanged);
+            crate::shadow::copy_back_marks(record.owner, &marks, &withheld, withholding, &unchanged);
         }
         // Texture views left null that shaders read: made for what follows
         // (a later submission's marks taken with them only make its views
@@ -2197,10 +2360,10 @@ impl Host {
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
-                let written = shadow.copy_back(address, len);
+                let written = shadow.copy_back(record.owner, address, len);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             } else {
-                shadow.keep_writes(address, len);
+                shadow.keep_writes(record.owner, address, len);
                 crate::memory::note_withheld(len as u64);
                 crate::memory::drop_withheld(address, len);
             }
@@ -2218,6 +2381,9 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        // What it wrote is in title memory now: later preparings read it
+        // there.
+        crate::shadow::land(record.owner);
         // Host objects given up before the submission had their last
         // holder in it.
         let InFlight {
@@ -2724,9 +2890,10 @@ impl HostList {
     /// heavy): 0 writes marked through the heap's views, 1 work after it,
     /// 2 bottom-of-pipe writes, 3 missed-memory checks, 4 copy-backs of
     /// declared ranges its shaders write, 5 title memory through page tables.
-    /// The next submission's refreshes and copies read title memory, and its
-    /// shaders mark in the same bitmaps, so it is prepared only once a heavy
-    /// submission has completed. Marks of views read alone (tables, root
+    /// The next submission's refreshes and copies read title memory: it is
+    /// prepared only once a submission with bits 0, 1, 3 or 5 has completed
+    /// ([`barrier`]); bits 2 and 4 name where it writes ([`HostList::declared`],
+    /// [`HostList::flying`]). Marks of views read alone (tables, root
     /// views, and the heap's when no program of the list writes through
     /// them) do not count: taken early, they make views early. Bit 6, not
     /// heavy: the list marks through the heap's views and only reads them.
@@ -2741,6 +2908,42 @@ impl HostList {
             | u8::from(d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..)))) << 4
             | u8::from(d.copies.iter().any(|s| matches!(s, Step::Memory(_)))) << 5
             | u8::from(heap && !heap_writes) << 6
+    }
+
+    /// The ranges its shaders declare as written ([`Declared`]).
+    fn declared(&self) -> Vec<Declared> {
+        self.deferred()
+            .copies
+            .iter()
+            .filter_map(|s| match s {
+                Step::GpuWrite(shadow, address, len, marked, _) => {
+                    Some((std::sync::Arc::as_ptr(shadow) as usize, *address, *address + *len, *marked))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What a submission of the list writes in title memory when it
+    /// completes, for `crate::shadow::fly`: its declared ranges through
+    /// their copies (marked ones as the whole pages their copy-back writes)
+    /// and its bottom-of-pipe writes.
+    fn flying(&self) -> Vec<(usize, usize, usize)> {
+        let d = self.deferred();
+        let declared = d.copies.iter().filter_map(|s| match s {
+            Step::GpuWrite(shadow, address, len, marked, _) => {
+                let (a, n) = if *marked {
+                    let (a, n) = shadow.page_range(*address as u64, *len as u64);
+                    (a as usize, n as usize)
+                } else {
+                    (*address, *len)
+                };
+                Some((a, a + n, std::sync::Arc::as_ptr(shadow) as usize))
+            }
+            _ => None,
+        });
+        let labels = d.writes.iter().map(|&(at, _, bytes)| (at, at + bytes, crate::shadow::LABEL));
+        declared.chain(labels).collect()
     }
 
     /// Whether the list's steps write title memory when it is submitted
@@ -3217,10 +3420,12 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging, copy));
     }
 
-    /// Runs the list's submission-time steps; refreshes go into `batch`
-    /// (the title's big buffers, a 174 MB one among them, are read by most
-    /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    /// Runs the list's submission-time steps for submission `owner`;
+    /// refreshes go into `batch` (the title's big buffers, a 174 MB one
+    /// among them, are read by most lists of a submission, through many
+    /// ranges). Title memory read that a submission in flight writes on
+    /// completion is read once `settle` has completed it ([`Settled`]).
+    fn run_deferred(&self, batch: &mut Batch, owner: u64, settle: &mut dyn FnMut(u64, Settled)) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -3245,7 +3450,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written(owner, settle);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -3254,6 +3459,9 @@ impl HostList {
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
+                    }
+                    if let Some((o, _)) = crate::shadow::crossing(src, src + len, 0) {
+                        settle(o, Settled::Fill);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
@@ -3269,7 +3477,7 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                        batch.title_written(owner, settle);
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -3283,9 +3491,9 @@ impl HostList {
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
                     if !marked {
-                        batch.flush();
+                        batch.flush(owner, settle);
                     }
-                    shadow.writing(*address, *len, *marked);
+                    shadow.writing(owner, *address, *len, *marked);
                     continue;
                 }
                 // Brought up to date before the submission's lists were made.
@@ -3319,6 +3527,12 @@ impl HostList {
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+///
+/// Submissions in flight that write title memory a refresh reads complete
+/// before the refreshes are done ([`Settled`]): through another copy of it
+/// or by bottom-of-pipe writes (asked when the refresh is added, clean or
+/// not: their writes make it change), or where the title changed pages
+/// under their ranges of the same copy (`crate::shadow::Shadow::update`).
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -3327,17 +3541,27 @@ struct Batch {
     /// The range of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// The latest submission in flight writing title memory that a refresh
+    /// in `refreshes` reads other than through its copy, and whether by
+    /// bottom-of-pipe writes ([`crate::shadow::crossing`]).
+    crossed: Option<(u64, bool)>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
+        let crossed = crate::shadow::crossing(address, end, key);
+        if let Some(c) = crossed
+            && self.crossed.is_none_or(|k| k.0 < c.0)
+        {
+            self.crossed = Some(c);
+        }
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
-        if shadow.clean() {
+        if crossed.is_none() && shadow.clean() {
             return;
         }
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        if crossed.is_none() && self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
             return;
         }
         match self.pending.get(&key) {
@@ -3354,20 +3578,30 @@ impl Batch {
 
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
-        self.flush();
+    fn title_written(&mut self, owner: u64, settle: &mut dyn FnMut(u64, Settled)) {
+        self.flush(owner, settle);
         self.current.clear();
     }
 
-    /// Does the refreshes; returns the bytes copied.
-    fn flush(&mut self) -> usize {
+    /// Does the refreshes for submission `owner`, once those in flight
+    /// whose writes they read have completed (`settle`); returns the bytes
+    /// copied.
+    fn flush(&mut self, owner: u64, settle: &mut dyn FnMut(u64, Settled)) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
+        if let Some((o, label)) = self.crossed.take() {
+            settle(o, if label { Settled::Label } else { Settled::Alias });
+        }
         self.pending.clear();
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            let copied = loop {
+                match shadow.update(owner, from, to - from) {
+                    Ok(copied) => break copied,
+                    Err(o) => settle(o, Settled::Same),
+                }
+            };
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
@@ -3861,13 +4095,15 @@ impl Host {
     /// Records, closed, the list that runs before a submission's own: the
     /// copies in video memory brought up to date from their mirrors (through
     /// staging held in `sync`), page tables, the lists' page bitmaps zeroed,
-    /// and (`marks`: its shaders mark) the views' bitmaps as the CPU left
-    /// them. Uploads past [`STAGED_MAX`] go first, waited for.
+    /// and (`marks`: its shaders mark) the views' write marks in video
+    /// memory cleared (`mark_bytes` of them) and their read marks as the CPU
+    /// left them. Uploads past [`STAGED_MAX`] go first, waited for.
     fn vram_before(
         &self,
         uploads: Vec<crate::shadow::VramCopy>,
         bitmaps: &[(ID3D12Resource, ID3D12Resource)],
         marks: bool,
+        mark_bytes: u64,
         sync: &mut VramSync,
     ) -> Option<ID3D12CommandList> {
         let views = marks && crate::shadow::has_vram_bitmaps();
@@ -3902,7 +4138,7 @@ impl Host {
         }
         crate::memory::sync_vram_pre(&c.list, bitmaps);
         if views {
-            crate::shadow::sync_bitmaps_pre(&c.list);
+            crate::shadow::sync_bitmaps_pre(&c.list, mark_bytes);
         }
         // SAFETY: our open list.
         unsafe { c.list.Close() }.expect("close copy list");
@@ -3915,8 +4151,10 @@ impl Host {
     /// Records, closed, the list that runs after a submission's own and
     /// before its fence value: what its shaders wrote of copies in video
     /// memory (declared ranges not marked) into read-back staging, the
-    /// lists' page bitmaps and (`marks`) the views' bitmaps into system
-    /// memory. On completion the staged bytes go into the mirrors
+    /// lists' page bitmaps and (`marks`) the views' read marks into system
+    /// memory, and (`capture`: bytes of each bitmap) the views' write marks
+    /// its shaders set into staging (`crate::shadow::capture_write_marks`).
+    /// On completion the staged bytes go into the mirrors
     /// ([`Host::vram_completed`]); ranges past [`STAGED_MAX`] are read back
     /// then. `takes`: completing it takes the views' write marks or reads the
     /// lists' page bitmaps, and the submission's kind: the pages its kind
@@ -3927,6 +4165,7 @@ impl Host {
         runs: &[&HostList],
         bitmaps: &[(ID3D12Resource, ID3D12Resource)],
         marks: bool,
+        capture: Option<u64>,
         takes: Option<u64>,
         sync: &mut VramSync,
     ) -> Option<ID3D12CommandList> {
@@ -3955,15 +4194,21 @@ impl Host {
             .and_then(|kind| PREDICTED.lock().unwrap_or_else(|e| e.into_inner()).get(&kind).cloned())
             .unwrap_or_default();
         sync.signature = takes;
-        if reads.is_empty() && predicted.is_empty() && bitmaps.is_empty() && !views {
+        if reads.is_empty() && predicted.is_empty() && bitmaps.is_empty() && !views && capture.is_none() {
             return None;
         }
         let (n, _) = staged(reads.iter().map(|r| r.3), STAGED_MAX);
         sync.later.extend(reads.drain(n..));
         let (m, bytes) = staged(reads.iter().chain(&predicted).map(|r| r.3), STAGED_MAX);
         predicted.truncate(m - reads.len());
-        let staging = (bytes > 0).then(|| self.staging(true, bytes)).flatten();
+        // The write marks after the rest, whatever the cap.
+        let marks_at = bytes.next_multiple_of(16);
+        let room = marks_at + capture.map_or(0, crate::shadow::capture_bytes);
+        let staging = (room > 0).then(|| self.staging(true, room)).flatten();
         if staging.is_none() {
+            if room > marks_at {
+                fail(format_args!("no read-back staging for a submission's write marks ({room} bytes)"));
+            }
             sync.later.append(&mut reads);
             predicted.clear();
         }
@@ -3984,6 +4229,12 @@ impl Host {
                 at = (at + len).next_multiple_of(16);
             }
         }
+        if let Some(bytes) = capture {
+            let placed = staging
+                .as_ref()
+                .map_or([None; 2], |s| crate::shadow::capture_write_marks(&c.list, &s.buffer, marks_at, bytes));
+            sync.marks = Some((placed, bytes, staging.as_ref().map_or(0, |s| s.data)));
+        }
         crate::memory::sync_vram_post(&c.list, bitmaps);
         if views {
             crate::shadow::sync_bitmaps_post(&c.list);
@@ -3999,21 +4250,23 @@ impl Host {
     /// First thing once a submission has run (`Host::finish`): what the list
     /// after it read back goes into the copies' mirrors; then the pages only
     /// the bitmaps name: the views' written pages (`marked`: their marks are
-    /// taken now, `crate::shadow::copy_back_marks`) and those the lists' page
-    /// bitmaps name (`crate::memory::bind`). Those the list after already
-    /// read back (predicted) are taken from staging; the rest are read back,
-    /// waited for. Those submissions are heavy or waited for, so nothing runs
-    /// after them: what the list after read back is what is there now, and
-    /// the wait is for these copies alone. The pages named become the next
-    /// prediction. The lists and staging go back to their pools. Returns the
-    /// named pages whose bytes the GPU left as the mirror had them, by mirror
-    /// address ([`into_mirror`]).
+    /// taken now, its own as the list after it captured them, else from the
+    /// bitmaps in system memory; `crate::shadow::copy_back_marks`) and those
+    /// the lists' page bitmaps name (`crate::memory::bind`). Those the list
+    /// after already read back (predicted) are taken from staging, as the
+    /// submission left them; the rest are read back, waited for (behind
+    /// what was submitted since: only submissions writing other ranges of
+    /// those copies, or marking them too, run meanwhile, `Host::submit`).
+    /// The pages named become the next prediction. The lists and staging go
+    /// back to their pools. Returns the named pages whose bytes the GPU left
+    /// as the mirror had them, by mirror address ([`into_mirror`]), and the
+    /// write marks taken.
     fn vram_completed(
         &self,
         sync: VramSync,
         runs: &[&HostList],
         marked: bool,
-    ) -> std::collections::HashSet<usize> {
+    ) -> (std::collections::HashSet<usize>, crate::shadow::WriteMarks) {
         let VramSync {
             lists,
             staging,
@@ -4021,10 +4274,18 @@ impl Host {
             later,
             predicted,
             signature,
+            marks,
         } = sync;
+        let marks = match (marked, marks) {
+            (false, _) => crate::shadow::WriteMarks::default(),
+            // SAFETY: the submission has run; its read-back staging is held
+            // until the end of this call.
+            (true, Some((placed, bytes, data))) => unsafe { crate::shadow::WriteMarks::staged(data, placed, bytes) },
+            (true, None) => crate::shadow::WriteMarks::take_ram(),
+        };
         let mut named: Vec<VramRead> = Vec::new();
         if marked {
-            named.extend(crate::shadow::vram_marked_reads());
+            named.extend(crate::shadow::vram_marked_reads(&marks));
         }
         let mut probed = false;
         for list in runs {
@@ -4102,7 +4363,7 @@ impl Host {
                 pool.push(s);
             }
         }
-        unchanged
+        (unchanged, marks)
     }
 
     #[cfg(test)]
@@ -5456,7 +5717,7 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, nothing_in_flight};
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again
@@ -5473,22 +5734,22 @@ mod batch {   // `mod tests` is already taken at the top of this file
         };
         let mut batch = Batch::default();
         batch.add(&copy, p, len);
-        assert_eq!(batch.flush(), len, "all of it at first");
+        assert_eq!(batch.flush(0, &mut nothing_in_flight), len, "all of it at first");
         // SAFETY: our pool, guarded since the copy took it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(7) };
         // The next submission: two lists ask for the copy.
         let mut batch = Batch::default();
         batch.add(&copy, p, len);
         batch.add(&copy, p + 100, 200);
-        assert_eq!(batch.flush(), PAGE, "the page written");
+        assert_eq!(batch.flush(0, &mut nothing_in_flight), PAGE, "the page written");
         assert_eq!(copy.read_host((p + PAGE + 8) as u64, 1)[0], 7);
         // SAFETY: as above.
         unsafe { (p as *mut u8).write_volatile(1) };
         batch.add(&copy, p, len);
-        assert_eq!(batch.flush(), 0, "nothing again in the submission");
-        batch.title_written();
+        assert_eq!(batch.flush(0, &mut nothing_in_flight), 0, "nothing again in the submission");
+        batch.title_written(0, &mut nothing_in_flight);
         batch.add(&copy, p, len);
-        assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        assert_eq!(batch.flush(0, &mut nothing_in_flight), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
@@ -5595,6 +5856,282 @@ mod vram_async {
     }
 }
 
+#[cfg(test)]
+mod light {
+    use super::*;
+    use crate::shadow::Shadow;
+    use crate::watch::PAGE;
+    use std::sync::Arc;
+
+    /// A submission declaring a range of a copy waits for one in flight
+    /// declaring an overlapping range of the same copy, unless both mark.
+    #[test]
+    fn declared_ranges_wait_unless_both_marked() {
+        let a = [(1, 0x1000, 0x2000, false)];
+        assert!(declared_overlap(&a, &[(1, 0x1800, 0x1900, false)]), "unmarked over unmarked");
+        assert!(declared_overlap(&a, &[(1, 0x1800, 0x1900, true)]), "unmarked over marked");
+        assert!(declared_overlap(&[(1, 0x1000, 0x2000, true)], &[(1, 0x1fff, 0x3000, false)]), "marked over unmarked");
+        assert!(!declared_overlap(&[(1, 0x1000, 0x2000, true)], &[(1, 0x1800, 0x1900, true)]), "both marked");
+        assert!(!declared_overlap(&a, &[(2, 0x1800, 0x1900, false)]), "another copy");
+        assert!(!declared_overlap(&a, &[(1, 0x2000, 0x3000, false)]), "touching");
+        assert!(!declared_overlap(&[], &a));
+    }
+
+    /// Barriers: writes through the heap's views, work after, missed
+    /// checks, page tables, and marks shaders set where they are not
+    /// captured per submission; bottom-of-pipe writes and declared ranges
+    /// are not.
+    #[test]
+    fn only_undeclared_writes_and_shared_marks_are_barriers() {
+        for bit in 0..7 {
+            assert_eq!(barrier(1 << bit, false, true), [0, 1, 3, 5].contains(&bit), "bit {bit}");
+        }
+        assert!(!barrier(1 << 2 | 1 << 4 | 1 << 6, true, true), "declared, bottom-of-pipe, captured marks");
+        assert!(barrier(0, true, false), "marks not captured apart");
+        assert!(!barrier(0, false, false));
+    }
+
+    /// A copy in video memory of a fresh pool of `pages` pages, and the
+    /// pool; none without one.
+    fn vram_copy(pages: usize) -> Option<(usize, Arc<Shadow>)> {
+        let p = crate::watch::tests::pool(pages);
+        let len = (pages * PAGE) as u64;
+        crate::shadow::register(p, p as u64, len);
+        match crate::shadow::find(p as u64, len).filter(|c| c.vram_readback().is_some()) {
+            Some(copy) => Some((p, copy)),
+            None => {
+                release(p, None);
+                None
+            }
+        }
+    }
+
+    fn release(p: usize, copy: Option<Arc<Shadow>>) {
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// A list that reads `copy` whole and whose "shader" writes `value` at
+    /// title address `at` of it: a declared range (`marked`: its page's
+    /// mark set too), written by a copy on the GPU.
+    fn writer(host: &Host, copy: &Arc<Shadow>, at: usize, value: u32, marked: bool) -> HostList {
+        let list = host.new_list().unwrap();
+        let (start, len) = copy.range();
+        copy.refresh(&list, start, len);
+        if marked {
+            list.marking();
+            copy.gpu_writes(&list, start, len, true);
+            crate::shadow::tests::mark_on_gpu(&list, copy, ((at as u64 - start) / PAGE as u64) as u32).expect("marked");
+        } else {
+            copy.gpu_writes(&list, at as u64, 4, false);
+        }
+        let (up, data) = host.upload_buffer(4).expect("an upload buffer");
+        // SAFETY: a mapped upload buffer of 4 bytes; an open list, live buffers.
+        unsafe {
+            data.cast::<u32>().write_volatile(value);
+            list.list.CopyBufferRegion(&copy.buffer, copy.offset(at as u64), &up, 0, 4);
+        }
+        list.keep(&up);
+        list.close();
+        list
+    }
+
+    /// A list that only reads `copy` whole.
+    fn reader(host: &Host, copy: &Arc<Shadow>) -> HostList {
+        let list = host.new_list().unwrap();
+        let (start, len) = copy.range();
+        copy.refresh(&list, start, len);
+        list.close();
+        list
+    }
+
+    /// A title word.
+    fn word(at: usize) -> u32 {
+        // SAFETY: a word of a test's pool.
+        unsafe { (at as *const u32).read_volatile() }
+    }
+
+    /// Lets the host GPU go `ms` after now, from another thread (the test's
+    /// own may be waiting for it).
+    fn release_gpu_after<G: 'static>(gate: G, ms: u64) -> std::thread::JoinHandle<()> {
+        struct Sent<T>(T);
+        // SAFETY: the gate holds a fence, free-threaded.
+        unsafe impl<T> Send for Sent<T> {}
+        let gate = Sent(gate);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            drop(gate);
+        })
+    }
+
+    fn in_flight(host: &Host) -> usize {
+        host.lock_submitted().flight.len()
+    }
+
+    /// Overlapping, two submissions writing different copies stay in
+    /// flight together with the host GPU held (each would have been
+    /// completed before the next was prepared), and both go back.
+    #[test]
+    fn submissions_writing_apart_stay_in_flight_together() {
+        let Some(host) = host() else { return };
+        if !overlap() {
+            return; // VICTORY_GPU_OVERLAP=0
+        }
+        let _queues = crate::queue::tests::TITLE_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((p, a)) = vram_copy(1) else { return };
+        let Some((q, b)) = vram_copy(1) else { return release(p, Some(a)) };
+        let gate = host.hold_gpu();
+        let started = Instant::now();
+        host.submit(0, vec![Arc::new(writer(host, &a, p + 16, 0xaaaa_0001, false))]);
+        host.submit(0, vec![Arc::new(writer(host, &b, q + 16, 0xbbbb_0002, false))]);
+        let returned = started.elapsed();
+        assert!(returned < Duration::from_secs(5), "back with the host GPU held ({returned:?})");
+        assert_eq!(in_flight(host), 2, "both in flight");
+        assert_eq!((word(p + 16), word(q + 16)), (0, 0), "nothing went back yet");
+        drop(gate);
+        host.complete_all();
+        assert_eq!((word(p + 16), word(q + 16)), (0xaaaa_0001, 0xbbbb_0002));
+        release(p, Some(a));
+        release(q, Some(b));
+    }
+
+    /// The title changes a page a submission in flight writes: a later
+    /// submission reading it completes that one first while it is prepared
+    /// (its refresh would have put the title's page over the GPU's write in
+    /// the copy), so the copy ends with both writes.
+    #[test]
+    fn a_refresh_of_a_page_changed_under_a_range_in_flight_waits_for_it() {
+        let Some(host) = host() else { return };
+        if !overlap() {
+            return; // VICTORY_GPU_OVERLAP=0
+        }
+        let _queues = crate::queue::tests::TITLE_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((p, a)) = vram_copy(1) else { return };
+        let gate = host.hold_gpu();
+        host.submit(0, vec![Arc::new(writer(host, &a, p + 16, 0xcafe_0001, false))]);
+        // SAFETY: a word of our pool (guarded: the write marks the page).
+        unsafe { ((p + 64) as *mut u32).write_volatile(0x3333) };
+        let released = release_gpu_after(gate, 500);
+        let started = Instant::now();
+        host.submit(0, vec![Arc::new(reader(host, &a))]);
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(400), "waited for the first ({took:?})");
+        assert_eq!(word(p + 16), 0xcafe_0001, "the first completed while the second was prepared");
+        released.join().unwrap();
+        host.complete_all();
+        assert_eq!(a.read_host((p + 16) as u64, 1)[0], 0xcafe_0001, "the GPU's write stays in the copy");
+        assert_eq!(a.read_host((p + 64) as u64, 1)[0], 0x3333, "the title's write reaches it");
+        release(p, Some(a));
+    }
+
+    /// A submission declaring an unmarked range a submission in flight
+    /// declares too waits for it before it is prepared; the later write
+    /// wins.
+    #[test]
+    fn a_range_declared_again_waits_for_the_one_in_flight() {
+        let Some(host) = host() else { return };
+        if !overlap() {
+            return; // VICTORY_GPU_OVERLAP=0
+        }
+        let _queues = crate::queue::tests::TITLE_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((p, a)) = vram_copy(1) else { return };
+        let gate = host.hold_gpu();
+        host.submit(0, vec![Arc::new(writer(host, &a, p + 16, 0x0001_0001, false))]);
+        let second = writer(host, &a, p + 16, 0x0002_0002, false);
+        let released = release_gpu_after(gate, 500);
+        let started = Instant::now();
+        host.submit(0, vec![Arc::new(second)]);
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(400), "waited for the first ({took:?})");
+        assert_eq!(word(p + 16), 0x0001_0001, "the first completed before the second was prepared");
+        released.join().unwrap();
+        host.complete_all();
+        assert_eq!(word(p + 16), 0x0002_0002);
+        release(p, Some(a));
+    }
+
+    /// Two submissions marking pages of one copy stay in flight together;
+    /// each completion takes its own marks (the second's shaders set the
+    /// same dword of the bitmap anew), and both pages go back.
+    #[test]
+    fn marking_submissions_take_their_own_marks() {
+        let Some(host) = host() else { return };
+        if !overlap() {
+            return; // VICTORY_GPU_OVERLAP=0
+        }
+        let _queues = crate::queue::tests::TITLE_QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((p, a)) = vram_copy(2) else { return };
+        if !a.marked() {
+            return release(p, Some(a)); // no mark bits left
+        }
+        let first = writer(host, &a, p + 16, 0x1111_0001, true);
+        let second = writer(host, &a, p + PAGE + 16, 0x2222_0002, true);
+        if !crate::shadow::captures_write_marks() {
+            return release(p, Some(a)); // marks in system memory: barriers
+        }
+        let gate = host.hold_gpu();
+        host.submit(0, vec![Arc::new(first)]);
+        host.submit(0, vec![Arc::new(second)]);
+        assert_eq!(in_flight(host), 2, "both in flight");
+        drop(gate);
+        host.complete_all();
+        assert_eq!((word(p + 16), word(p + PAGE + 16)), (0x1111_0001, 0x2222_0002));
+        release(p, Some(a));
+    }
+
+    /// A preparing's refreshes complete the submissions in flight that
+    /// write their memory first: through another copy, or by bottom-of-pipe
+    /// writes (even of a copy that is clean), or under pages the title
+    /// changed in the same copy's range; not for a range of the same copy
+    /// whose pages are unchanged.
+    #[test]
+    fn refreshes_wait_for_writers_of_their_memory_in_flight() {
+        if host().is_none() {
+            return;
+        }
+        let Some((p, a)) = vram_copy(2) else { return };
+        const ELSEWHERE: u64 = u64::MAX / 2;
+        let copy = Arc::as_ptr(&a) as usize;
+        let settled = std::cell::RefCell::new(Vec::new());
+        let mut settle = |owner: u64, why: Settled| {
+            settled.borrow_mut().push((owner, format!("{why:?}")));
+            crate::shadow::land(owner);
+            a.copy_back(owner, p + PAGE, 64);
+        };
+        let mut batch = Batch::default();
+        batch.add(&a, p, 2 * PAGE);
+        batch.flush(1, &mut settle);
+        // Another copy of page 1 written in flight.
+        crate::shadow::fly(ELSEWHERE, vec![(p + PAGE, p + PAGE + 64, 1)]);
+        batch.add(&a, p, 2 * PAGE);
+        batch.flush(2, &mut settle);
+        // The same copy: none.
+        crate::shadow::fly(ELSEWHERE, vec![(p + PAGE, p + PAGE + 64, copy)]);
+        batch.add(&a, p, 2 * PAGE);
+        batch.flush(2, &mut settle);
+        crate::shadow::land(ELSEWHERE);
+        // A bottom-of-pipe write into page 0, the copy clean.
+        crate::shadow::fly(ELSEWHERE, vec![(p + 8, p + 16, crate::shadow::LABEL)]);
+        assert!(a.clean());
+        let mut batch = Batch::default();
+        batch.add(&a, p, 2 * PAGE);
+        batch.flush(3, &mut settle);
+        // Shaders of a submission in flight write page 1; the title changes it.
+        a.writing(ELSEWHERE, p + PAGE, 64, false);
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + PAGE + 200) as *mut u8).write_volatile(5) };
+        let mut batch = Batch::default();
+        batch.add(&a, p, 2 * PAGE);
+        assert_eq!(batch.flush(4, &mut settle), PAGE, "page 1 once that one went back");
+        assert_eq!(
+            settled.into_inner(),
+            [(ELSEWHERE, "Alias".to_owned()), (ELSEWHERE, "Label".to_owned()), (ELSEWHERE, "Same".to_owned())]
+        );
+        release(p, Some(a));
+    }
+}
+
 
 #[cfg(test)]
 mod withholding {
@@ -5635,7 +6172,7 @@ mod withholding {
         // SAFETY: bytes of our pools.
         let title = |k: usize, at: usize| unsafe { ((pools[k] + at) as *const u8).read_volatile() };
         let copy = |k: usize, at: usize| {
-            copies[k].update(pools[k], PAGE);
+            copies[k].update(0, pools[k], PAGE).unwrap();
             copies[k].read_host((pools[k] + at) as u64, 1)[0] & 0xff
         };
         assert_eq!((title(0, 0), copy(0, 0)), (0x22, 0x22), "an ordinary program's write goes back and stays");

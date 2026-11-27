@@ -132,7 +132,7 @@ pub(crate) enum C {
     /// the time.
     VramUpBytes,
     VramUpUs,
-    /// Completions: all, heavy ones (the next submission waits for them),
+    /// Completions: all, barriers (the next submission waits for them),
     /// those that took the views' write marks.
     Completions,
     HeavyCompletions,
@@ -196,8 +196,31 @@ pub(crate) enum C {
     MarkViewProtects,
     /// Marked pages written through the runtime's own mapping of them.
     MarkThrough,
+    /// Submissions prepared while an earlier one was still in flight.
+    PreparedOverlapping,
+    /// Submissions whose preparing first completed those in flight (any of
+    /// them, `Host::submit`): for a barrier among them, being one, title
+    /// writes at submission, the upload list, a list run again, the
+    /// eviction pass, overlapping declared ranges.
+    WaitBarrier,
+    WaitAlone,
+    WaitTitleWrites,
+    WaitUploads,
+    WaitListAgain,
+    WaitEviction,
+    WaitDeclared,
+    /// Completions during a submission's preparing (`Host::settle`), by
+    /// what it was about to read: pages the title changed under ranges of
+    /// the same copy, another copy of written memory, bottom-of-pipe
+    /// writes, title memory read directly, textures; and the time.
+    SettleSame,
+    SettleAlias,
+    SettleLabel,
+    SettleFill,
+    SettleTexture,
+    SettleUs,
 }
-const COUNTERS: usize = 113;
+const COUNTERS: usize = 127;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -465,7 +488,7 @@ pub(crate) fn log(frames: f64) {
         .collect();
     tracing::info!("  protection changes per frame by caller: {}", sites.join(", "));
     tracing::info!(
-        "  copies in video memory per frame: {:.1} completions, {:.1} heavy, {:.1} taking write marks; \
+        "  copies in video memory per frame: {:.1} completions, {:.1} barriers (heavy), {:.1} taking write marks; \
          uploads staged {:.1} MB in {:.1} ms; read back in the submission and put in the mirrors \
          {:.1} MB in {:.1} ms; pages named by marks and page bitmaps {:.0}, {:.0} of them read back in \
          the submission ({:.1} MB, {:.1} MB read for none); read back waited for {:.1} MB in {:.1} ms; \
@@ -497,6 +520,27 @@ pub(crate) fn log(frames: f64) {
         c[C::HeavyGpuWrites as usize],
         c[C::HeavyMemory as usize],
         c[C::HeapReadsOnly as usize],
+    );
+    tracing::info!(
+        "  light submissions per frame: {:.1} prepared with an earlier one in flight; waited for those in flight \
+         before preparing: {:.1} behind a barrier, {:.1} being one, {:.1} title writes at submission, {:.1} \
+         uploads, {:.1} a list again, {:.1} eviction, {:.1} overlapping declared ranges; completed while \
+         preparing: {:.1} changed pages under their ranges, {:.1} other copies, {:.1} bottom-of-pipe writes, \
+         {:.1} title reads, {:.1} textures ({:.1} ms)",
+        c[C::PreparedOverlapping as usize],
+        c[C::WaitBarrier as usize],
+        c[C::WaitAlone as usize],
+        c[C::WaitTitleWrites as usize],
+        c[C::WaitUploads as usize],
+        c[C::WaitListAgain as usize],
+        c[C::WaitEviction as usize],
+        c[C::WaitDeclared as usize],
+        c[C::SettleSame as usize],
+        c[C::SettleAlias as usize],
+        c[C::SettleLabel as usize],
+        c[C::SettleFill as usize],
+        c[C::SettleTexture as usize],
+        ms(c[C::SettleUs as usize]),
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

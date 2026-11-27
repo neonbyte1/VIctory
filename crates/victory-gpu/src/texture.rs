@@ -538,6 +538,12 @@ impl Staging {
         self.tracked.as_ref().is_none_or(|t| !t.clean())
     }
 
+    /// The title memory the texture's staging takes: `[start, end)`.
+    pub(crate) fn title_range(&self) -> (usize, usize) {
+        let start = self.memory as usize;
+        (start, start + self.layout.size as usize)
+    }
+
     /// A staging buffer with the texture memory detiled into it if it
     /// changed since the last time (and is mapped at all), and the
     /// subresources that changed (only those are detiled and to be copied).

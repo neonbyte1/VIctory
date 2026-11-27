@@ -195,9 +195,14 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
+///
+/// A submission in flight whose shaders write title memory a texture here
+/// lies in (through a buffer copy) completes first (`settle`): its writes
+/// reach the texture's memory only then.
 pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+    settle: &mut dyn FnMut(u64, crate::host::Settled),
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
@@ -267,6 +272,16 @@ pub(crate) fn uploads(
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
+    if let Some(owner) = work
+        .iter()
+        .filter_map(|(staging, _)| {
+            let (start, end) = staging.title_range();
+            crate::shadow::crossing(start, end, 0).map(|c| c.0)
+        })
+        .max()
+    {
+        settle(owner, crate::host::Settled::Texture);
+    }
     for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
         if let Some(upload) = upload {
             readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
