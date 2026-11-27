@@ -783,8 +783,10 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     })
 }
 
-/// Maps `n` pages at `address`, in place of what is mapped there; null
-/// `pages` unmaps. Returns `address`, or null if a page or the host fails.
+/// Maps `n` pages at `address`, replacing any existing mapping in that range;
+/// null `pages` unmaps. Returns `address`, or null if a page is unknown or the
+/// host fails, leaving the range unmapped after rolling back any runs mapped
+/// during this call.
 pub extern "system" fn XMemMapPhysicalPages(
     address: *mut c_void,
     n: usize,
@@ -802,6 +804,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
+            if i > 0 {
+                unmap(&mut physical, base, i * PAGE);
+            }
             return std::ptr::null_mut();
         };
         // One mapping per run of consecutive slices of one section.
@@ -815,6 +820,9 @@ pub extern "system" fn XMemMapPhysicalPages(
             })
             .count();
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+            if i > 0 {
+                unmap(&mut physical, base, i * PAGE);
+            }
             return std::ptr::null_mut();
         }
         i += run;
@@ -1604,6 +1612,51 @@ mod tests {
         assert_eq!(query(second).host.State, MEM_RESERVE);
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    fn release_placeholder(address: *mut c_void) {
+        // SAFETY: the test owns the placeholder at this address.
+        assert_ne!(unsafe { VirtualFree(address, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn failed_second_run_rolls_back_first_run() {
+        let pages = [allocate(1)[0], allocate(1)[0]];
+        // Keep the released page outside the range where concurrent XMem
+        // allocations could reserve it as a new placeholder.
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (1usize << 46) as *mut c_void,
+            ..Default::default()
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: a fresh reservation; the address requirements stay live for the call.
+        let addr = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null_mut(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                &mut parameter,
+                1,
+            )
+        };
+        assert!(!addr.is_null(), "{}", std::io::Error::last_os_error());
+        let second = addr.wrapping_byte_add(PAGE);
+        // SAFETY: split our reservation so the second page can be released.
+        let split = unsafe { VirtualFree(addr, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+        assert_ne!(split, 0);
+        release_placeholder(second);
+
+        assert!(XMemMapPhysicalPages(addr, 2, pages.as_ptr()).is_null());
+        assert!(!physical().views.contains_key(&(addr as usize)));
+        assert!(!shown_at(&pages[..1]).contains(&(addr as usize)));
+        assert_eq!(query(addr).host.State, MEM_RESERVE);
+
+        release_placeholder(addr);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
