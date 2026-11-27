@@ -2,7 +2,7 @@
 //! (tests/fixtures/hle-probe), without any game data.
 #![cfg(windows)]
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -25,11 +25,25 @@ fn host_dll() -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\version.dll")
 }
 
+fn probe_dll_override(value: Option<&OsStr>) -> Option<PathBuf> {
+    let path = value.filter(|p| !p.is_empty()).map(PathBuf::from)?;
+    assert!(
+        path.is_file(),
+        "VICTORY_HLE_PROBE_DLL must point to an existing file: {}",
+        path.display()
+    );
+    Some(path)
+}
+
 /// Builds the fixture into its own target dir (the outer cargo holds the
 /// lock on the main one while tests run), in the outer one's scratch folder
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
-/// build.
+/// build. When `VICTORY_HLE_PROBE_DLL` is set and non-empty, uses that
+/// prebuilt DLL directly instead of invoking Cargo.
 fn build_probe() -> PathBuf {
+    if let Some(path) = probe_dll_override(std::env::var_os("VICTORY_HLE_PROBE_DLL").as_deref()) {
+        return path;
+    }
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     let status = Command::new(env!("CARGO"))
@@ -313,4 +327,32 @@ fn maps_a_title_dll_the_title_loads_itself() {
     assert!(dlls[0].1.export("GetFileVersionInfoW").is_some());
     assert!(load("absent.dll", &|_| true).is_empty());
     assert!(load("late.dll", &|_| false).is_empty());
+}
+
+#[test]
+fn probe_dll_override_validates_file_paths() {
+    assert_eq!(probe_dll_override(None), None);
+    assert_eq!(probe_dll_override(Some(OsStr::new(""))), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dll = dir.path().join("custom_hle_probe.dll");
+    std::fs::write(&dll, b"MZ").unwrap();
+    assert_eq!(probe_dll_override(Some(dll.as_os_str())), Some(dll));
+
+    for invalid in [
+        dir.path().join("missing_hle_probe.dll"),
+        dir.path().to_path_buf(),
+    ] {
+        let err = std::panic::catch_unwind(|| probe_dll_override(Some(invalid.as_os_str())))
+            .expect_err("non-file override path must fail");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("VICTORY_HLE_PROBE_DLL"),
+            "expected VICTORY_HLE_PROBE_DLL in panic message, got: {msg}"
+        );
+    }
 }
