@@ -241,13 +241,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
-        let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
+        let name = if e.kind == 0 && !e.name.is_empty() {
+            match find_string(&strings, e.name.as_bytes()) {
                 Some(at) => at,
                 None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
+                    let at = strings.len();
+                    strings.extend(e.name.bytes());
+                    strings.push(0);
+                    at
                 }
             }
         } else {
@@ -308,8 +309,18 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     out
 }
 
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+/// Offset of a whole NUL-terminated entry equal to `name` in `table`
+/// (which starts with `\0` and terminates every entry with `\0`).
+fn find_string(table: &[u8], name: &[u8]) -> Option<usize> {
+    let mut at = 1;
+    while at < table.len() {
+        let end = at + table[at..].iter().position(|&b| b == 0)?;
+        if &table[at..end] == name {
+            return Some(at);
+        }
+        at = end + 1;
+    }
+    None
 }
 
 /// The container: parts in order, hashed.
@@ -550,6 +561,104 @@ mod tests {
                 *dst = word.to_le_bytes();
             }
             assert_eq!(hex(bytes), expected);
+        }
+    }
+
+    #[test]
+    fn psv_string_table_matches_whole_entries() {
+        let el = |name: &str, kind, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let inputs = [
+            el("BINORMAL", 0, 0),
+            el("NORMAL", 0, 1),
+            el("WORLD_COLOR", 0, 2),
+            el("COLOR", 0, 3),
+        ];
+        let outputs = [
+            el("SV_Position", 3, 0),
+            el("NORMAL", 0, 1),
+            el("", 0, 2),
+        ];
+        let part = psv(&Psv {
+            stage: 1,
+            flag: true,
+            inputs: &inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            gs: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        let u32_at = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap());
+        let str_len_at = 4 + u32_at(0) as usize + 4;
+        let str_len = u32_at(str_len_at) as usize;
+        let strings = &part[str_len_at + 4..str_len_at + 4 + str_len];
+        let idx_count_at = str_len_at + 4 + str_len;
+        let idx_count = u32_at(idx_count_at) as usize;
+        let elems_at = idx_count_at + 4 + 4 * idx_count + 4;
+        let offsets: Vec<u32> = (0..7).map(|i| u32_at(elems_at + 16 * i)).collect();
+        assert_eq!(strings, b"\0BINORMAL\0NORMAL\0WORLD_COLOR\0COLOR\0\0");
+        assert_eq!(offsets, [1, 10, 17, 29, 0, 10, 0]);
+        for &off in &offsets {
+            if off != 0 {
+                assert_eq!(strings[off as usize - 1], 0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn psv_suffix_semantics_validate_with_dxil() {
+        use super::super::bitcode::{Attr, Term};
+        use super::super::shader::Shader;
+
+        let el = |name: &str, kind, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let mut s = Shader::new(false);
+        let b = s.entry;
+        let inputs = vec![el("BINORMAL", 0, 0), el("NORMAL", 0, 1)];
+        let outputs = vec![el("SV_Position", 3, 0), el("COLOR", 0, 1)];
+        for id in 0..2u32 {
+            for col in 0..4u8 {
+                let load_args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &load_args);
+                let store_args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), v];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &store_args);
+            }
+        }
+        s.inputs = inputs;
+        s.outputs = outputs;
+        s.m.terminate(b, Term::Ret);
+        let container = s.finish();
+
+        let path = super::super::validator::Validator::default_path();
+        if let Ok(mut v) = super::super::validator::Validator::load(path.as_deref()) {
+            let mut copy = container.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
         }
     }
 }
