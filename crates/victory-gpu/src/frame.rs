@@ -110,7 +110,10 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
         interval: SIXTIETH,
         first: 0,
     });
-    let elapsed = c.start.elapsed().as_nanos();
+    let elapsed = c.start.elapsed();
+    #[cfg(test)]
+    let elapsed = tests::elapsed(elapsed);
+    let elapsed = elapsed.as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick = (c.first + (elapsed / interval) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
     let at = u128::from(tick - c.first) * interval;
@@ -215,20 +218,44 @@ pub(crate) extern "system" fn statistics(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    // The frame tests share CLOCK and LAST, but only override elapsed time
+    // on the current test's thread.
+    static CLOCK_TEST: Mutex<()> = Mutex::new(());
+    thread_local! {
+        static ELAPSED: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn elapsed(actual: Duration) -> Duration {
+        ELAPSED.with(Cell::get).unwrap_or(actual)
+    }
+
+    fn set_elapsed(ms: u64) {
+        ELAPSED.set(Some(Duration::from_millis(ms)));
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _serial = CLOCK_TEST.lock().unwrap();
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
+        set_elapsed(0);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
-        let before = Instant::now();
+        set_elapsed(2);
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
-        assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
-        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
+        assert_eq!(second, first + 1);
+        // The caller can be scheduled after another origin tick has already passed.
+        set_elapsed(6);
+        let mut late = 0;
+        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut late), S_OK);
+        assert_eq!(late, second + 1);
+        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut late), TIMEOUT);
+        assert_eq!(late, second + 1);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
         let flags = TOKEN_ON_TIMEOUT;
@@ -238,41 +265,42 @@ mod tests {
         );
         let mut next = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
-        assert!(early == second + 1 && next == early + 1);
-        assert!(LAST[0].load(Ordering::Relaxed) >= 2);
+        assert_eq!(early, late + 1);
+        assert_eq!(next, early + 1);
 
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip takes its own tick.
         const FLIP: u32 = 2;
-        // 50 ms ticks: a thread woken 15-30 ms late on a busy host (seen with
-        // 5 ms ticks) still makes its tick.
-        assert_eq!(set_interval(null, null, 50_000, 3, 0), S_OK);
+        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
         let mut token = 0;
-        let flips: Vec<u64> = (0..4)
-            .map(|_| {
-                let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
-                assert_eq!(
-                    wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
-                    S_OK
-                );
-                LAST[2].load(Ordering::Relaxed)
-            })
-            .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        let flips = [5, 10, 20, 25].map(|ms| {
+            set_elapsed(ms);
+            let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
+            assert_eq!(
+                wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+                S_OK
+            );
+            last(FLIP).load(Ordering::Relaxed)
+        });
+        // The wait at 20 ms arrives after a missed tick.
+        let first_flip = flips[0];
+        assert_eq!(
+            flips,
+            [first_flip, first_flip + 1, first_flip + 3, first_flip + 4]
+        );
         // Even when a flip wait begins on the tick another just ended on.
-        let (tick, _) = next_tick(FLIP, Duration::ZERO);
-        assert!(tick > flips[3]);
-        // A flip wait begun after its tick passed (two ticks missed) ends at
-        // once, on the latest tick passed; the next one waits for the next.
-        std::thread::sleep(Duration::from_millis(110));
-        let before = Instant::now();
+        let (tick, delay) = next_tick(FLIP, Duration::ZERO);
+        assert_eq!(tick, flips[3] + 1);
+        assert_eq!(delay, Duration::from_millis(5));
+        // The late wait takes the latest missed tick. The next wait, begun
+        // at the same time, must advance to a future tick.
+        set_elapsed(40);
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert!(before.elapsed() < Duration::from_millis(10), "{:?}", before.elapsed());
-        let late = LAST[2].load(Ordering::Relaxed);
-        assert!(late >= flips[3] + 2, "{late} after {}", flips[3]);
+        let late = last(FLIP).load(Ordering::Relaxed);
+        assert_eq!(late, flips[3] + 3);
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert_eq!(LAST[2].load(Ordering::Relaxed), late + 1);
+        assert_eq!(last(FLIP).load(Ordering::Relaxed), late + 1);
     }
 
     /// Two waits for one kind that begin together (two threads) take two
@@ -280,6 +308,8 @@ mod tests {
     /// none. The old code marked the tick after the sleep, so both got it.
     #[test]
     fn waits_begun_together_take_different_ticks() {
+        let _serial = CLOCK_TEST.lock().unwrap();
+        set_elapsed(0);
         const VBLANK: u32 = 1;
         let long = Duration::from_secs(1);
         let (first, _) = next_tick(VBLANK, long);
