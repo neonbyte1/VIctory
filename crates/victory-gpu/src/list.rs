@@ -575,9 +575,11 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
-/// Appends the host barriers for this title barrier.
+/// Pushes `b` onto `out` as barriers on host resources, if it names ones
+/// the host GPU has (buffers so far have none).
 #[cfg(windows)]
-fn host_barrier(list: &crate::host::HostList, b: &Barrier, out: &mut Vec<Barrier>) {
+fn push_host_barriers(list: &crate::host::HostList, b: &Barrier, out: &mut Vec<Barrier>) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     use windows::core::Interface;
     // The list names the resource until it is reset: the title may release it
     // before the list runs.
@@ -617,16 +619,54 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier, out: &mut Vec<Barrier
                 });
             });
         }
-        1 | 2 => {
-            let Some(first) = host(b.first) else { return };
-            let mut translated = Barrier { first, ..*b };
-            if b.kind == 1 {
-                let Some(second) = host(b.second as This) else { return };
-                translated.second = second as u64;
-            }
-            out.push(translated);
+        1 => {
+            let first = if b.first.is_null() {
+                b.first
+            } else {
+                let Some(h) = host(b.first) else { return };
+                h
+            };
+            let second = if b.second == 0 {
+                0
+            } else {
+                let Some(h) = host(b.second as This) else {
+                    return;
+                };
+                h as u64
+            };
+            out.push(Barrier {
+                first,
+                second,
+                ..*b
+            });
         }
-        _ => {}    }
+        2 if b.first.is_null() => out.push(*b),
+        2 => {
+            let Some(copy) = crate::resource::host_copy(b.first) else {
+                return;
+            };
+            // A depth texture's unordered views write its twin's planes, and
+            // its own host resource lacks unordered access.
+            if let Some(Some(twin)) = copy.twin.get() {
+                for plane in &twin.planes {
+                    out.push(Barrier {
+                        first: plane.texture.as_raw().cast_const().cast(),
+                        ..*b
+                    });
+                }
+                return;
+            }
+            // SAFETY: a live host resource.
+            let flags = unsafe { copy.texture.GetDesc() }.Flags;
+            if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0 {
+                out.push(Barrier {
+                    first: copy.texture.as_raw().cast_const().cast(),
+                    ..*b
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 /// An unordered access barrier on every resource: earlier shader writes
@@ -649,9 +689,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("barrier kinds {:?}", barriers.iter().map(|b| b.kind).collect::<Vec<_>>()));
-        let mut host = Vec::new();
+        let mut host = Vec::with_capacity(barriers.len());
         for b in barriers {
-            host_barrier(list, b, &mut host);        }
+            push_host_barriers(list, b, &mut host);
+        }
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
@@ -2512,7 +2553,7 @@ mod tests {
             let before = list.kept_count();
             let barrier = Barrier { kind, flags: 0, first: texture, second: 0, last: 0 };
             let mut out = Vec::new();
-            host_barrier(&list, &barrier, &mut out);
+            push_host_barriers(&list, &barrier, &mut out);
             assert_eq!(out.len(), 1);
             assert_eq!(list.kept_count(), before + 1, "kind {kind}");
         }
@@ -4279,5 +4320,138 @@ void main() {
         assert_eq!(release(allocator), 0);
         // SAFETY: `page` was allocated above with `VirtualAlloc`.
         assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uav_barriers_on_depth_textures_target_their_twin_planes() {
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let make_texture = |format: u32, flags: u32| -> This {
+            let heap = [1u32, 0, 0, 0, 0];
+            let words = [
+                3u32,
+                0,
+                0,
+                0,
+                32,
+                0,
+                32,
+                1 | 1 << 16,
+                format,
+                1,
+                0,
+                0,
+                flags,
+                0,
+            ];
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut out = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_committed(
+                    std::ptr::null(),
+                    heap.as_ptr().cast(),
+                    0,
+                    words.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut out,
+                ),
+                S_OK
+            );
+            out
+        };
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let uav_barrier = |first: This| Barrier {
+            kind: 2,
+            flags: 0,
+            first,
+            second: 0,
+            last: 0,
+        };
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let hl = host_list(list).expect("a host command list");
+
+        // Depth texture with console UAV flag (6 = depth | UAV): its host
+        // depth resource strips ALLOW_UNORDERED_ACCESS, so before any twin
+        // exists a UAV barrier on it must not name the depth resource.
+        let depth = make_texture(118, 6);
+        let depth_copy = crate::resource::host_copy(depth).expect("host depth texture");
+        let mut out = Vec::new();
+        push_host_barriers(hl, &uav_barrier(depth), &mut out);
+        assert!(
+            out.is_empty(),
+            "no UAV barrier on a depth resource without a twin"
+        );
+
+        // Once unordered views create the two-plane twin, a UAV barrier on
+        // the title depth resource expands to both twin plane resources.
+        for (fmt, plane) in [(56u32, 0u32), (62, 1)] {
+            let desc = [fmt, 4, 0, plane, 0, 0, 0, 0, 0, 0];
+            assert!(crate::twin::uav(depth, &depth_copy, Some(&desc), host.cpu_view()).is_some());
+        }
+        let twin = depth_copy
+            .twin
+            .get()
+            .and_then(Option::as_ref)
+            .expect("a twin");
+        push_host_barriers(hl, &uav_barrier(depth), &mut out);
+        let ptrs: Vec<usize> = out.iter().map(|b| b.first as usize).collect();
+        assert_eq!(
+            ptrs,
+            vec![
+                twin.planes[0].texture.as_raw() as usize,
+                twin.planes[1].texture.as_raw() as usize,
+            ]
+        );
+
+        // Regular UAV colour texture keeps its direct UAV barrier; a colour
+        // render target without ALLOW_UNORDERED_ACCESS emits none.
+        let colour_uav = make_texture(28, 4);
+        let colour_rt = make_texture(28, 1);
+        let uav_ptr = crate::resource::host_resource(colour_uav).unwrap().as_raw() as usize;
+        out.clear();
+        push_host_barriers(hl, &uav_barrier(colour_uav), &mut out);
+        push_host_barriers(hl, &uav_barrier(colour_rt), &mut out);
+        assert_eq!(
+            out.iter().map(|b| b.first as usize).collect::<Vec<_>>(),
+            vec![uav_ptr]
+        );
+
+        // Record through `barrier`, close, and submit on the host GPU.
+        let batch = [
+            uav_barrier(depth),
+            uav_barrier(colour_uav),
+            uav_barrier(colour_rt),
+        ];
+        assert_eq!(barrier(list, batch.len() as u32, batch.as_ptr()), 0);
+        assert_eq!(close(list), S_OK);
+        host.execute(&[hl]);
+        assert_eq!(host.log_messages(), None);
+        assert_eq!(reset(list, allocator, null), S_OK);
+
+        drop(depth_copy);
+        for o in [colour_rt, colour_uav, depth, list, allocator] {
+            assert_eq!(release(o), 0);
+        }
     }
 }
