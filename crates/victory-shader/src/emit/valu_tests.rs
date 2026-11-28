@@ -9764,3 +9764,63 @@ fn v_trunc_f64_rounds_a_negated_vop3_literal() {
         assert_eq!(got, 0xc028_0000, "{backend}");
     });
 }
+
+#[test]
+fn mul_and_mad_i24_clamp_the_full_result() {
+    let cases = [
+        [0xAB00_1234, 0xCD00_0100, 0, 0], // bits above bit 23 are ignored
+        [0x007F_FFFF, 0x0000_0400, 0, 0], // positive signed overflow
+        [0x0080_0000, 0x0000_0400, 0, 0], // negative signed overflow
+        [0x00FF_FFFF, 0x00FF_FFFF, 0, 0], // -1 * -1 or large unsigned product
+        [0x0020_0001, 1024, (-1025i32) as u32, 0], // MAD back to i32::MAX
+        [0x0020_0001, 1024, (-1000i32) as u32, 0], // MAD still above i32::MAX
+        [0x00DF_FFFF, 1024, 1024, 0], // MAD back to i32::MIN
+        [0x00DF_FFFF, 1024, 1000, 0], // MAD still below i32::MIN
+        [0x00FF_FFFF, 256, 255, 0], // unsigned MAD equals u32::MAX
+        [0x00FF_FFFF, 256, 256, 0], // unsigned MAD carries into the high word
+        [0x0080_0000, 1, (-7i32) as u32, 0], // signed negative result fits
+        [0xAB00_0000, 0xFFAA_BBCC, u32::MAX, 0], // zero product with a full-width addend
+    ];
+    for (opcode, signed, mad) in [
+        (0x109, true, false),
+        (0x10B, false, false),
+        (0x142, true, true),
+        (0x143, false, true),
+    ] {
+        for clamp in [true, false] {
+            let src2 = if mad { vgpr(3) } else { 0 };
+            let mut code = vop3(opcode, 0, vgpr(1), vgpr(2), src2);
+            code[0] |= u32::from(clamp) << 15;
+            let shader = try_build_valu_cs(&code)
+                .unwrap_or_else(|err| panic!("opcode {opcode:#x} clamp={clamp}: {err}"));
+            run_cases(&shader, &cases, |backend, _, [a, b, c, _], got| {
+                let operand = |x| {
+                    if signed {
+                        i64::from(((x << 8) as i32) >> 8)
+                    } else {
+                        i64::from(x & 0x00FF_FFFF)
+                    }
+                };
+                let addend = if !mad {
+                    0
+                } else if signed {
+                    i64::from(c as i32)
+                } else {
+                    i64::from(c)
+                };
+                let exact = operand(a) * operand(b) + addend;
+                let expected = if clamp && signed {
+                    exact.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                } else if clamp {
+                    exact.min(i64::from(u32::MAX))
+                } else {
+                    exact
+                } as u32;
+                assert_eq!(
+                    got, expected,
+                    "{backend}: {opcode:#x} clamp={clamp}, {a:08x} {b:08x} {c:08x}"
+                );
+            });
+        }
+    }
+}

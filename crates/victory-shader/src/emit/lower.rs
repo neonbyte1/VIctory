@@ -47,6 +47,8 @@ use code_table::CodeLoad;
 
 mod half_round;
 
+mod mul24;
+
 type Why = &'static str;
 
 mod double;
@@ -8095,6 +8097,9 @@ impl<'a> Lower<'a> {
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
+            "v_mul_i32_i24" | "v_mul_u32_u24" | "v_mad_i32_i24" | "v_mad_u32_u24" => {
+                self.valu_mul24(inst, guard)
+            }
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
@@ -9245,22 +9250,6 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            "v_mul_u32_u24" | "v_mul_i32_i24" => {
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mul_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
-                self.s.m.bin(c, Bin::Mul, a, b)
-            }
             "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
                 // The high dword of the same 48-bit product: the low 24 bits
                 // of each operand, zero- or sign-extended, multiplied.
@@ -9333,23 +9322,6 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
                 self.s.m.bin(c, Bin::Add, n, b)
-            }
-            "v_mad_u32_u24" | "v_mad_i32_i24" => {
-                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mad_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
-                let m = self.s.m.bin(c, Bin::Mul, a, b);
-                self.s.m.bin(c, Bin::Add, m, d)
             }
             "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32" | "v_msad_u8" => {
                 // src2 plus the sum of the unsigned differences |a - b| of
