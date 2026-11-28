@@ -1110,11 +1110,16 @@ impl Staging {
             // A streamed texture's smaller mips (at the start of its memory)
             // can be there before the larger ones: those are detiled from
             // the bytes they take and uploaded, the rest keep what they hold.
-            if let Some(first) = first_resident_mip(&self.layout, self.memory) {
-                let len = self.layout.bytes_from(first) as usize;
+            if let Some(first) = self
+                .layout
+                .planes
+                .first()
+                .and_then(|plane| first_resident_mip(&plane.layout, self.memory))
+            {
+                let len = self.layout.planes[0].layout.bytes_from(first) as usize;
                 // SAFETY: committed memory, `len` bytes from the texture's start.
                 let tiled = unsafe { std::slice::from_raw_parts(self.memory, len) };
-                let hash = blake3::hash(tiled);
+                let hash = content_hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, len as u64);
                 if last.hash == Some(hash) {
@@ -1763,13 +1768,24 @@ mod tests {
         // SAFETY: a private reservation for the test, freed below.
         let memory = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
         assert!(!memory.is_null());
+        let span_ranges = spans(&layout, 9, 9);
+        let layout_size = layout.size;
         let staging = Staging {
             size: total,
-            spans: spans(&layout, 9, 9),
+            spans: span_ranges,
             footprints,
             rows,
-            layout,
+            layout: victory_formats::texture::Texture {
+                planes: vec![victory_formats::texture::Plane {
+                    offset: 0,
+                    stencil: false,
+                    layout,
+                }],
+                size: layout_size,
+                alignment: 1,
+            },
             mips: 9,
+            subresources_per_plane: 9,
             memory: memory.cast(),
             tracked: None,
             last: Mutex::default(),
@@ -1778,8 +1794,8 @@ mod tests {
         };
         let pattern = |i: usize| (i.wrapping_mul(2_654_435_761) >> 13) as u8;
         for (first, len) in [
-            (4, staging.layout.bytes_from(4)),
-            (2, staging.layout.bytes_from(2)),
+            (4, staging.layout.planes[0].layout.bytes_from(4)),
+            (2, staging.layout.planes[0].layout.bytes_from(2)),
         ]
         .into_iter()
         .chain([(0, staging.layout.size)])
@@ -1813,10 +1829,12 @@ mod tests {
                 let mut want = vec![0; len];
                 staging
                     .layout
+                    .planes[0]
+                    .layout
                     .detile(tiled, mip, 0, &mut want, pitch, len)
                     .unwrap();
                 let at = f.Offset.wrapping_add(at) as usize;
-                let m = staging.layout.mips[mip as usize];
+                let m = staging.layout.planes[0].layout.mips[mip as usize];
                 let bytes = m.width as usize * 8;
                 for row in 0..rows as usize {
                     // SAFETY: the staged rows of the subresource.

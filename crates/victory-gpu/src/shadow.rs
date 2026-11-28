@@ -2005,17 +2005,17 @@ pub(crate) mod tests {
                 // other tests' pools: their copies must not name memory a
                 // later test reuses).
                 unsafe {
-                    let p = VirtualAlloc(std::ptr::null(), 3 * WINDOW as usize, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    let p = VirtualAlloc(std::ptr::null(), 3 * window() as usize, MEM_RESERVE, PAGE_READWRITE) as usize;
                     if p == 0 {
                         return None;
                     }
                     VirtualFree(p as *mut _, 0, MEM_RELEASE);
-                    let aligned = p.next_multiple_of(WINDOW as usize);
+                    let aligned = p.next_multiple_of(window() as usize);
                     let at = |q: usize| {
-                        VirtualAlloc(q as *const _, WINDOW as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize
+                        VirtualAlloc(q as *const _, window() as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize
                     };
-                    let (one, two) = (at(aligned), at(aligned + WINDOW as usize));
-                    if one == aligned && two == aligned + WINDOW as usize {
+                    let (one, two) = (at(aligned), at(aligned + window() as usize));
+                    if one == aligned && two == aligned + window() as usize {
                         return Some((one, two));
                     }
                     [one, two].into_iter().filter(|&q| q != 0).for_each(|q| {
@@ -2026,11 +2026,11 @@ pub(crate) mod tests {
             })
             .expect("a window-aligned pair of pages");
         let (one, two) = (pair.0 as u64, pair.1 as u64);
-        let Some(wide) = find(one, 2 * WINDOW) else {
+        let Some(wide) = find(one, 2 * window()) else {
             return; // no host GPU here
         };
         let before = REUSES.load(std::sync::atomic::Ordering::Relaxed);
-        let narrow = find(two, WINDOW);
+        let narrow = find(two, window());
         let Some(narrow) = narrow else {
             return; // no host GPU here (the wide one already was)
         };
@@ -2044,7 +2044,7 @@ pub(crate) mod tests {
             "the reuse is counted"
         );
         // An ask the wide window does not reach still gets its own copy.
-        let beyond = find(two, 2 * WINDOW);
+        let beyond = find(two, 2 * window());
         if let Some(beyond) = beyond {
             assert!(
                 !std::sync::Arc::ptr_eq(&wide, &beyond),
