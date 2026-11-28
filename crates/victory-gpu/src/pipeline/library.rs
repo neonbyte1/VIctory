@@ -427,6 +427,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+#[derive(Debug)]
 pub(crate) struct PipelineState {
     pub(crate) pso: ID3D12PipelineState,
     /// The library contains this PSO under its name.

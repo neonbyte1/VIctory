@@ -1206,13 +1206,15 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
-    let mut dropped = Vec::new();
+    // The pages are copied back on several threads: the dropped ones are
+    // collected under a lock.
+    let dropped = std::sync::Mutex::new(Vec::new());
     for_each_by_page(pages, |copy, page| {
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
         {
-            dropped.push(page);
+            dropped.lock().unwrap_or_else(|e| e.into_inner()).push(page);
             return;
         }
         let written = copy.copy_back_marked(page);
@@ -1227,6 +1229,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     // Dropped after the marked copy-backs above: an immediate retake on a
     // shared page would otherwise mark another copy's page changed before its
     // own copy-back runs.
+    let mut dropped = dropped.into_inner().unwrap_or_else(|e| e.into_inner());
     dropped.sort_unstable();
     dropped.dedup();
     for page in dropped {
