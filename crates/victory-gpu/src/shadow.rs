@@ -3960,6 +3960,7 @@ mod run_tests {
     /// write there counts), and nothing is checked after.
     #[test]
     fn a_run_writes_view_pages_through_our_own_mapping() {
+        let _eager = crate::watch::LazySuspended::set();
         let (a, b, _) = three_views(3);
         let t = crate::watch::track_copy(a, 3 * PAGE, true).expect("views are tracked");
         fill(a, 3 * PAGE);
@@ -3986,6 +3987,7 @@ mod run_tests {
     /// mapping too.
     #[test]
     fn a_title_write_during_a_write_through_our_mapping_lands_after_it() {
+        let _eager = crate::watch::LazySuspended::set();
         let (a, b, _) = three_views(2);
         let t = crate::watch::track_copy(a, 2 * PAGE, true).expect("views are tracked");
         fill(a, 2 * PAGE);

@@ -1858,6 +1858,10 @@ fn lazy_mode() -> u8 {
 
 /// Whether marked view pages go back lazily ([`Lease::lazify`]).
 pub(crate) fn lazy_views() -> bool {
+    #[cfg(test)]
+    if lazy_suspended() {
+        return false;
+    }
     lazy_mode() != 0
 }
 
@@ -1873,6 +1877,40 @@ pub(crate) fn owner() -> bool {
 #[cfg(test)]
 pub(crate) fn set_lazy_views(on: bool) {
     LAZY_VIEWS.store(u8::from(on), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: this thread's copies never make view pages lazy. The suite's
+    /// lazy tests flip the process-wide mode, so a test of writing back
+    /// through the runtime's own mapping pins its own copies eager.
+    static LAZY_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: whether this thread's copies keep view pages eager
+/// ([`LazySuspended`]).
+#[cfg(test)]
+pub(crate) fn lazy_suspended() -> bool {
+    LAZY_SUSPENDED.with(std::cell::Cell::get)
+}
+
+/// Tests: view pages eager for this thread until dropped
+/// ([`crate::watch::lazy_suspended`]).
+#[cfg(test)]
+pub(crate) struct LazySuspended(bool);
+
+#[cfg(test)]
+impl LazySuspended {
+    pub(crate) fn set() -> LazySuspended {
+        LazySuspended(LAZY_SUSPENDED.replace(true))
+    }
+}
+
+#[cfg(test)]
+impl Drop for LazySuspended {
+    fn drop(&mut self) {
+        LAZY_SUSPENDED.set(self.0);
+    }
 }
 
 /// Tests: [`owner`] on (lazy view pages too) or off.
