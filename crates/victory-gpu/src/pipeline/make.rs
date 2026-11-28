@@ -945,7 +945,10 @@ mod tests {
         for _ in 0..2 {
             assert!(ready(&p).is_none());
             assert!(p.used.load(Ordering::Relaxed));
-            assert!(p.queued.is_completed());
+            // `queued` is a `Once` here (our stack), where #3005's test
+            // read an `AtomicBool`: completed means the pipeline went to
+            // the workers, and the merge dropped the negation.
+            assert!(!p.queued.is_completed());
         }
     }
 
