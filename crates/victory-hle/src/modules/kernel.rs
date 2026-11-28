@@ -28,6 +28,50 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
+/// `GetModuleHandleEx` finds what [`GetModuleHandleW`] does. The title's
+/// images and our console modules stay loaded, so it takes no reference on
+/// them.
+pub extern "system" fn GetModuleHandleExW(
+    flags: u32,
+    name: *const u16,
+    out: *mut *mut c_void,
+) -> i32 {
+    let text = || (!name.is_null()).then(|| wide(name));
+    named_handle(flags, text, out).unwrap_or_else(|| host::get_module_handle_ex_w(flags, name, out))
+}
+
+/// See [`GetModuleHandleExW`].
+pub extern "system" fn GetModuleHandleExA(
+    flags: u32,
+    name: *const u8,
+    out: *mut *mut c_void,
+) -> i32 {
+    let text = || (!name.is_null()).then(|| narrow(name));
+    named_handle(flags, text, out).unwrap_or_else(|| host::get_module_handle_ex_a(flags, name, out))
+}
+
+/// `GetModuleHandleEx` for modules we know by name. `None` leaves the call
+/// to the host: host DLLs, lookups by address (where `name` is no string)
+/// and arguments it refuses.
+fn named_handle(
+    flags: u32,
+    name: impl FnOnce() -> Option<String>,
+    out: *mut *mut c_void,
+) -> Option<i32> {
+    const PIN: u32 = 1;
+    const UNCHANGED_REFCOUNT: u32 = 2;
+    if out.is_null() || !matches!(flags, 0 | PIN | UNCHANGED_REFCOUNT) {
+        return None;
+    }
+    let module = match name() {
+        Some(name) => find_module(&name, false)?,
+        None => runtime::main_image()? as *mut c_void,
+    };
+    // SAFETY: checked non-null; the title passes room for a handle.
+    unsafe { out.write(module) };
+    Some(i32::from(!module.is_null()))
+}
+
 /// A NUL-terminated string from the title.
 fn narrow(text: *const u8) -> String {
     // SAFETY: the title passes a NUL-terminated string.
@@ -407,6 +451,8 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
+            hle_export!(GetModuleHandleExW),
+            hle_export!(GetModuleHandleExA),
             hle_export!(GetModuleFileNameW),
             hle_export!(GetModuleFileNameA),
             hle_export!(LoadLibraryExA),
@@ -443,7 +489,8 @@ mod host {
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::LibraryLoader::{
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
-        GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
+        GetModuleHandleExA, GetModuleHandleExW, GetModuleHandleW, GetProcAddress, LoadLibraryExA,
+        LoadLibraryExW,
     };
     use windows_sys::Win32::System::Threading::TerminateProcess;
 
@@ -465,6 +512,24 @@ mod host {
     pub(super) fn get_module_handle_a(name: *const u8) -> *mut c_void {
         // SAFETY: see above.
         unsafe { GetModuleHandleA(name) }
+    }
+
+    pub(super) fn get_module_handle_ex_w(
+        flags: u32,
+        name: *const u16,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        // SAFETY: see above.
+        unsafe { GetModuleHandleExW(flags, name, out) }
+    }
+
+    pub(super) fn get_module_handle_ex_a(
+        flags: u32,
+        name: *const u8,
+        out: *mut *mut c_void,
+    ) -> i32 {
+        // SAFETY: see above.
+        unsafe { GetModuleHandleExA(flags, name, out) }
     }
 
     pub(super) fn get_module_file_name_w(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
@@ -589,6 +654,14 @@ mod host {
 
     pub(super) fn get_module_handle_a(_: *const u8) -> *mut c_void {
         std::ptr::null_mut()
+    }
+
+    pub(super) fn get_module_handle_ex_w(_: u32, _: *const u16, _: *mut *mut c_void) -> i32 {
+        0
+    }
+
+    pub(super) fn get_module_handle_ex_a(_: u32, _: *const u8, _: *mut *mut c_void) -> i32 {
+        0
     }
 
     pub(super) fn load_library_ex_a(_: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
@@ -880,5 +953,54 @@ mod tests {
             };
             assert_eq!(err, ERROR_PROC_NOT_FOUND);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn module_handle_ex_finds_what_module_handle_does() {
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
+        const PIN: u32 = 1;
+        const UNCHANGED: u32 = 2;
+        const FROM_ADDRESS: u32 = 4;
+        for dll in ["kernel32.dll", "api-ms-win-core-libraryloader-l1-2-0.dll"] {
+            for name in ["GetModuleHandleExA", "GetModuleHandleExW"] {
+                assert!(crate::registry::lookup(dll, name).is_some(), "{dll}!{name}");
+            }
+        }
+        let ex = |flags, name: &str| {
+            let mut out = std::ptr::dangling_mut::<c_void>();
+            let found = GetModuleHandleExW(flags, w(name).as_ptr(), &mut out);
+            (found, out)
+        };
+        let base = 0x7400_0000_0000usize;
+        runtime::set_image_path(base, std::path::Path::new(r"C:\title\Extended.dll"));
+        let mapped = base as *mut c_void;
+        for flags in [0, PIN, UNCHANGED] {
+            assert_eq!(ex(flags, "EXTENDED"), (1, mapped));
+        }
+        let mut out = std::ptr::null_mut();
+        let name = c"sub\\extended.dll".as_ptr().cast();
+        assert_eq!(GetModuleHandleExA(0, name, &mut out), 1);
+        assert_eq!(out, mapped);
+        // Our console modules; nothing outside the host policy.
+        let console = GetModuleHandleW(w("xgameruntime.dll").as_ptr());
+        assert_eq!(ex(0, "XGameRuntime.dll"), (1, console));
+        assert_eq!(ex(0, "wininet.dll"), (0, std::ptr::null_mut()));
+        // SAFETY: reads this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_MOD_NOT_FOUND);
+        // The host's: its own DLLs, addresses, arguments it refuses.
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        assert_eq!(ex(UNCHANGED, "kernel32"), (1, kernel32));
+        let flags = FROM_ADDRESS | UNCHANGED;
+        let address = kernel32.cast_const().cast();
+        assert_eq!(GetModuleHandleExW(flags, address, &mut out), 1);
+        assert_eq!(out, kernel32);
+        assert_eq!(ex(PIN | UNCHANGED, "extended.dll").0, 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            GetModuleHandleExW(0, w("extended.dll").as_ptr(), std::ptr::null_mut()),
+            0
+        );
     }
 }
