@@ -21,11 +21,14 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod code_table;
 mod dot2;
 mod phi;
 mod valu16;
 mod wave_prefix;
 mod d16;
+
+use code_table::CodeLoad;
 
 type Why = &'static str;
 
@@ -10763,6 +10766,42 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
         let (base, extra) = self.built_offset(src)?;
+        if let Source::Built {
+            address,
+            bits,
+            words: [records, word3],
+        } = *src
+            && address.param == CODE
+        {
+            if store || atomic.is_some() || typed {
+                return Err("a buffer store, atomic or typed load of a table in the code");
+            }
+            if bits >> 30 != 0 || word3 >> 23 & 1 != 0 {
+                return Err("a code table descriptor with swizzling or thread ids");
+            }
+            // OOB_SELECT (dword 3 bits 28-29): 1 checks the index, 2 only
+            // an empty buffer, 3 the offset with soffset, not the index.
+            let oob = word3 >> 28 & 3;
+            if oob == 0 {
+                return Err("a code table descriptor checking offsets against its stride");
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let load = CodeLoad {
+                bits,
+                records,
+                oob,
+                base,
+                off,
+                extra,
+                index,
+                sub,
+                count,
+                reg,
+            };
+            return self.code_table_buffer_load(inst, &load, guard);
+        }
         if base != 0 {
             let b = self.s.m.i32(base);
             off = self.s.m.bin(c, Bin::Add, off, b);
