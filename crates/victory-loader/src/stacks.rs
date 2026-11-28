@@ -16,8 +16,9 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Kernel::NT_TIB;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
-    SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+    GetCurrentProcessId, GetCurrentThreadId, GetProcessIdOfThread, GetThreadDescription,
+    OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
+    THREAD_SUSPEND_RESUME,
 };
 
 use crate::crash::locate;
@@ -125,7 +126,8 @@ pub fn dump_stacks() {
     unsafe { CloseHandle(snapshot) };
     eprintln!("VIctory: stacks of {} threads", ids.len());
     for id in ids {
-        // SAFETY: opens a thread of our own process.
+        // SAFETY: opens the thread for this ID; its owning process is verified below
+        // in case the ID was reused by another process after the snapshot.
         let thread = unsafe {
             OpenThread(
                 THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
@@ -134,6 +136,11 @@ pub fn dump_stacks() {
             )
         };
         if thread.is_null() {
+            continue;
+        }
+        if !thread_in_process(thread, process) {
+            // SAFETY: we opened it.
+            unsafe { CloseHandle(thread) };
             continue;
         }
         let (frames, walked, (priority, base)) = frames_of(thread);
@@ -151,6 +158,16 @@ pub fn dump_stacks() {
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };
     }
+}
+
+/// Whether `thread` belongs to `process`.
+fn thread_in_process(thread: HANDLE, process: u32) -> bool {
+    if thread.is_null() {
+        return false;
+    }
+    // SAFETY: `GetProcessIdOfThread` validates the handle and returns 0 on failure.
+    let owner = unsafe { GetProcessIdOfThread(thread) };
+    owner != 0 && owner == process
 }
 
 /// The thread's frames, why the walk ended early if it did, and its current
@@ -269,5 +286,23 @@ mod tests {
         };
         assert_eq!(secs("30, 5,x,-2,inf,NaN,1e20"), [0.0, 5.0, 30.0]);
         assert!(schedule("").is_empty());
+    }
+
+    #[test]
+    fn thread_in_process_verifies_handle_owner_pid() {
+        // SAFETY: plain queries for the current process and thread.
+        let (pid, tid) = unsafe { (GetCurrentProcessId(), GetCurrentThreadId()) };
+        // SAFETY: opens a query handle to the current thread.
+        let thread = unsafe { OpenThread(THREAD_QUERY_INFORMATION, 0, tid) };
+        assert!(!thread.is_null());
+        assert!(thread_in_process(thread, pid));
+        assert!(!thread_in_process(thread, pid.wrapping_add(1)));
+        assert!(!thread_in_process(thread, 0));
+        // SAFETY: opened above.
+        unsafe { CloseHandle(thread) };
+
+        assert!(!thread_in_process(std::ptr::null_mut(), pid));
+        assert!(!thread_in_process(std::ptr::null_mut(), 0));
+        assert!(!thread_in_process(INVALID_HANDLE_VALUE, pid));
     }
 }

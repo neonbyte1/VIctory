@@ -201,7 +201,11 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
             next += 1 + header.skip as usize;
             header = packet(data, next)?;
         }
-        end = next * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
+        let offset = HEADER_BITS + header.first_frame_bit as usize;
+        if offset >= PACKET_BITS {
+            return None;
+        }
+        end = next * PACKET_BITS + offset;
     }
     (end / 8 < data.len()).then_some(end)
 }
@@ -1764,6 +1768,16 @@ mod tests {
         assert!(read_frame(&data, HEADER_BITS).is_none());
         assert!(read_frame(&data, data.len() * 8).is_none());
         assert!(read_frame(&data, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn next_frame_stays_in_the_packet_that_announces_it() {
+        let mut data = vec![0; 3 * PACKET_BYTES];
+        put_bits(&mut data, 0, 32, 1 << 26);
+        put_bits(&mut data, HEADER_BITS, 15, 16);
+        let payload_bits = (PACKET_BITS - HEADER_BITS) as u32;
+        put_bits(&mut data, PACKET_BITS, 32, (1 << 26) | (payload_bits << 11));
+        assert_eq!(read_frame(&data, HEADER_BITS).unwrap().next, None);
     }
 
     #[test]

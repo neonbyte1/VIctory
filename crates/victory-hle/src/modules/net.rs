@@ -133,10 +133,19 @@ fn loopback(ip: IpAddr) -> bool {
     ip.to_canonical().is_loopback()
 }
 
+/// Parses a bare IP literal or a bracketed IPv6 literal (`[...]` per RFC 3986
+/// section 3.2.2; non-IPv6 inputs inside brackets are rejected).
+fn parse_ip_literal(name: &str) -> Option<IpAddr> {
+    if let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        inner.parse::<std::net::Ipv6Addr>().ok().map(IpAddr::V6)
+    } else {
+        name.parse().ok()
+    }
+}
+
 /// `localhost` or a loopback literal (bracketed IPv6 too).
 fn loopback_name(name: &str) -> bool {
-    let bare = name.trim_start_matches('[').trim_end_matches(']');
-    bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
+    name.eq_ignore_ascii_case("localhost") || parse_ip_literal(name).is_some_and(loopback)
 }
 
 fn shown(addr: Option<impl ToString>) -> String {
@@ -161,7 +170,7 @@ fn reachable(what: &'static str, addr: *const u8, len: i32) -> bool {
 fn reachable_name(name: Option<String>) -> bool {
     match name {
         Some(name) if !loopback_name(&name) => {
-            let literal = name.parse::<IpAddr>().is_ok();
+            let literal = parse_ip_literal(&name).is_some();
             once("network connect blocked", name);
             wsa_error(if literal {
                 WSAENETUNREACH
@@ -1296,5 +1305,40 @@ mod tests {
         let got = recv(u, buf.as_mut_ptr(), 8, 0);
         close(u);
         assert!(got <= 0, "a datagram to {lan}:{port} reached the title's socket");
+    }
+
+    #[test]
+    fn bracketed_ipv6_literal_fails_with_netunreach_not_host_not_found() {
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        assert!(loopback_name("[::1]"));
+        for bad in [
+            "[::1",
+            "::1]",
+            "[[::1]]",
+            "[::1%1]",
+            "[2001:db8::1]:443",
+            "[127.0.0.1]",
+            "[localhost]",
+        ] {
+            assert!(!loopback_name(bad), "{bad} must not match loopback");
+        }
+        assert!(!reachable_name(Some("[2001:db8::1]".into())));
+        assert_eq!(last_error(), WSAENETUNREACH);
+        for non_literal in [
+            "[1.2.3.4]",
+            "[127.0.0.1]",
+            "[localhost]",
+            "::1]",
+            "[::1%1]",
+            "[2001:db8::1]:443",
+        ] {
+            assert!(!reachable_name(Some(non_literal.into())));
+            assert_eq!(
+                last_error(),
+                WSAHOST_NOT_FOUND,
+                "{non_literal} must not classify as an IP literal"
+            );
+        }
     }
 }

@@ -627,12 +627,200 @@ fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+/// Debugging aid: `VICTORY_TITLE_ASSERTS=<n>` continues past up to `n`
+/// `int3` asserts in title code, where the first one ends the process.
+/// Each skip is logged with its address and the title's last debug output.
+///
+/// A title asserts where a check it believes it cannot recover from
+/// failed, so a run that gets past one is not a run to trust. It is how the
+/// next thing that needs work is found, though: the check is taken as
+/// passed, its caller keeps the value it computed, and the title goes on to
+/// the next failure instead of the same one.
+fn asserts_left() -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicUsize;
+    static LEFT: OnceLock<AtomicUsize> = OnceLock::new();
+    LEFT.get_or_init(|| {
+        let n = std::env::var("VICTORY_TITLE_ASSERTS")
+            .ok()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        AtomicUsize::new(n)
+    })
+}
+
+/// Skips `0xcc`, the byte a compiler emits for `__debugbreak`, at `at`: the
+/// `int3` is taken as a no-op the title asked for rather than a fault. A
+/// debugger's breakpoint is not that: it patches the code, and the byte
+/// there is the instruction it replaced, so it is left alone.
+fn skip_assert_at(at: usize, code: i32, left: &std::sync::atomic::AtomicUsize) -> bool {
+    if code != EXCEPTION_BREAKPOINT {
+        return false;
+    }
+    // The switch is off by default and the budget usually runs out: say so
+    // before the byte read and the module lookup, which together are the
+    // expensive part of an exception that is not ours to skip. `take_budget`
+    // re-checks atomically at the end, so this cannot spend a budget that is
+    // not there.
+    if left.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
+    // SAFETY: the CPU fetched the instruction at `at`, so its byte is
+    // readable.
+    if unsafe { (at as *const u8).read() } != 0xcc {
+        return false;
+    }
+    // Only the title's own image: a `0xcc` in a host DLL (ntdll's
+    // `DbgBreakPoint`, a CRT `__debugbreak`, a Rust debug assert, the D3D12
+    // debug layer) is not the title's to spend, and continuing past one would
+    // hide a real fault in code we did not write.
+    if !in_title_image(at) {
+        return false;
+    }
+    take_budget(left)
+}
+
+/// Spends one of the assertions the title may skip. The budget is taken in the
+/// same step it is checked, so two threads at the last assert cannot both pass
+/// a zero check and wrap the counter to `usize::MAX`.
+fn take_budget(left: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering;
+    left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+/// Whether `address` lies in the title's own image, which the loader maps under
+/// a name starting `victory-image-` ([`crate::prepare`]).
+fn in_title_image(address: usize) -> bool {
+    let mut module: HMODULE = std::ptr::null_mut();
+    // SAFETY: looks up the module containing `address`; no reference taken.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            address as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 {
+        return false;
+    }
+    let mut path = [0u16; 260];
+    // SAFETY: `module` is a loaded module; the buffer length is passed.
+    let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    let path = String::from_utf16_lossy(&path[..len as usize]);
+    let name = path.rsplit('\\').next().unwrap_or(&path);
+    name.starts_with("victory-image-")
+}
+
+/// [`skip_assert_at`] on the exception being dispatched, moving `rip` past
+/// the skipped `int3`. Returns whether it was skipped.
+unsafe fn past_assert(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: the system passes valid exception pointers.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        let context = &mut *(*info).ContextRecord;
+        let at = record.ExceptionAddress as usize;
+        if !skip_assert_at(at, record.ExceptionCode, asserts_left()) {
+            return false;
+        }
+        // The next instruction: read before the exception, so an `int3`
+        // that is the first byte of a debugger's patch is not skipped.
+        context.Rip = at as u64 + 1;
+        // The title's last debug output with it: asserts in a bring-up
+        // build usually say what they were checking on the lines before.
+        eprint!(
+            "VIctory: past a title assert at {} ({} left)\n{}",
+            locate(at),
+            asserts_left().load(std::sync::atomic::Ordering::Relaxed),
+            title_output()
+        );
+    }
+    true
+}
+
+/// Debugging aid (`VICTORY_STEP_OVER=<hex offset>,...`): title breakpoints
+/// at these image offsets are stepped over instead of ending the run, with
+/// how often each was hit. Grand Theft Auto VI 1.0.2.1's pool allocates trap
+/// on an empty pool right before returning NULL (`+0x5149aec`, `+0x63966f`,
+/// #698): stepped over, the allocation fails and the title goes on.
+#[cfg(feature = "diagnostics")]
+static STEP_OVER: std::sync::LazyLock<Vec<(usize, std::sync::atomic::AtomicU64)>> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("VICTORY_STEP_OVER")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim().trim_start_matches('+').trim_start_matches("0x");
+                usize::from_str_radix(s, 16).ok()
+            })
+            .map(|offset| (offset, std::sync::atomic::AtomicU64::new(0)))
+            .collect()
+    });
+
+/// Whether the breakpoint being dispatched is one listed in
+/// `VICTORY_STEP_OVER`; if so the thread resumes after it.
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+#[cfg(feature = "diagnostics")]
+unsafe fn step_over(info: *mut EXCEPTION_POINTERS) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_IMAGE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let list = &*STEP_OVER;
+    if list.is_empty() {
+        return false;
+    }
+    // SAFETY: the system passes valid exception pointers.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode != EXCEPTION_BREAKPOINT {
+        return false;
+    }
+    let at = record.ExceptionAddress as usize;
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let size = size_of::<MEMORY_BASIC_INFORMATION>();
+    // SAFETY: a query of our own address space into a local structure.
+    if unsafe { VirtualQuery(at as *const _, &mut region, size) } != size || region.Type != MEM_IMAGE {
+        return false;
+    }
+    let offset = at - region.AllocationBase as usize;
+    let Some((_, count)) = list.iter().find(|(o, _)| *o == offset) else {
+        return false;
+    };
+    // SAFETY: `at` lies in a mapped image region (queried above).
+    if unsafe { *(at as *const u8) } != 0xCC {
+        return false;
+    }
+    // SAFETY: the faulting thread's context, for the exception being dispatched.
+    let ctx = unsafe { &mut *(*info).ContextRecord };
+    if ctx.Rip as usize == at {
+        ctx.Rip += 1;
+    }
+    let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 3 || n.is_power_of_two() {
+        tracing::warn!(
+            offset = format_args!("{offset:#x}"),
+            n,
+            "stepped over the title's breakpoint (VICTORY_STEP_OVER): the code behind it goes on"
+        );
+    }
+    true
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers, for this thread.
     if unsafe { recover_unwind_fault(info) || emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
+    // SAFETY: the system passes valid exception pointers.
+    if unsafe { past_assert(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    #[cfg(feature = "diagnostics")]
     // SAFETY: as above.
+    if unsafe { step_over(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: the system passes valid exception pointers.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     if FATAL.contains(&code) {
         let to_file =
@@ -680,26 +868,52 @@ const CPP_MAGIC: usize = 0x1993_0520;
 /// # Safety
 /// `p` are the parameters of a live MSVC throw (`p[0]` the magic).
 unsafe fn thrown(p: &[usize]) -> String {
+    if p.len() < 4 || p[2] == 0 || p[3] == 0 {
+        return "unknown".into();
+    }
     // SAFETY: the throw's ThrowInfo, its RVAs relative to `p[3]`: catchable
     // type array at +12 (count, then type RVAs), each type's descriptor at
     // +4, whose decorated name starts at +16; the object is at `p[1]`.
     unsafe {
         let rva = |at: usize| (at as *const u32).read_unaligned() as usize;
-        let types = p[3] + rva(p[2] + 12);
-        let name = |i: usize| {
-            let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
-            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
-                .to_string_lossy()
+        let types_rva = rva(p[2] + 12);
+        let Some(types) = (types_rva != 0)
+            .then(|| p[3].checked_add(types_rva))
+            .flatten()
+        else {
+            return "unknown".into();
         };
-        let first = name(0);
+        let count = rva(types).min(64);
+        if count == 0 {
+            return "unknown".into();
+        }
+        let name = |i: usize| -> Option<std::borrow::Cow<'_, str>> {
+            let entry_rva = rva(types + 4 + 4 * i);
+            let entry = (entry_rva != 0)
+                .then(|| p[3].checked_add(entry_rva))
+                .flatten()?;
+            let desc_rva = rva(entry + 4);
+            let descriptor = (desc_rva != 0)
+                .then(|| p[3].checked_add(desc_rva))
+                .flatten()?;
+            Some(
+                std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
+                    .to_string_lossy(),
+            )
+        };
+        let Some(first) = name(0) else {
+            return "unknown".into();
+        };
         let value = match &*first {
             // int, unsigned, long (HRESULT), unsigned long
             ".H" | ".I" | ".J" | ".K" if p[1] != 0 => {
                 format!(" = {:#010x}", (p[1] as *const u32).read_unaligned())
             }
             // std::exception keeps its message after the table pointer.
-            _ if (0..rva(types)).any(|i| name(i) == ".?AVexception@std@@") => {
-                let message = (p[1] as *const *const std::ffi::c_char).add(1).read();
+            _ if p[1] != 0 && (0..count).any(|i| name(i).as_deref() == Some(".?AVexception@std@@")) => {
+                let message = (p[1] as *const *const std::ffi::c_char)
+                    .add(1)
+                    .read_unaligned();
                 if message.is_null() {
                     String::new()
                 } else {
@@ -910,6 +1124,42 @@ mod tests {
             }
         }
         assert!(seen.is_empty());
+    }
+
+    /// The byte decides, and the budget is spent only where it is: a
+    /// compiler's `int3` is skipped while the budget lasts, a debugger's
+    /// patched code is not, and neither is any other exception.
+    #[test]
+    fn a_title_int3_is_skipped_while_the_budget_lasts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CODE: [u8; 4] = [0xcc, 0x90, 0xcc, 0xcc];
+        let at = CODE.as_ptr() as usize;
+        let left = AtomicUsize::new(2);
+        // A `0xcc` outside the title's image is somebody else's breakpoint (a
+        // host DLL's), and the title's budget is not spent on it.
+        assert!(!skip_assert_at(at, EXCEPTION_BREAKPOINT, &left));
+        assert_eq!(left.load(Ordering::Relaxed), 2, "not spent");
+        // A debugger's breakpoint: the byte is the instruction it replaced.
+        assert!(!skip_assert_at(at + 1, EXCEPTION_BREAKPOINT, &left));
+        assert_eq!(left.load(Ordering::Relaxed), 2, "not spent");
+        // Another kind of exception is not ours to skip.
+        assert!(!skip_assert_at(
+            at + 2,
+            EXCEPTION_ILLEGAL_INSTRUCTION,
+            &left
+        ));
+        assert_eq!(left.load(Ordering::Relaxed), 2, "not spent");
+        // The budget itself: one spent per skip, and never wrapped.
+        assert!(take_budget(&left));
+        assert_eq!(left.load(Ordering::Relaxed), 1);
+        assert!(take_budget(&left));
+        assert_eq!(left.load(Ordering::Relaxed), 0);
+        assert!(!take_budget(&left), "the budget is spent");
+        assert_eq!(
+            left.load(Ordering::Relaxed),
+            0,
+            "a second thread at the last assert wraps it no further"
+        );
     }
 
     #[test]
@@ -1676,5 +1926,33 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn thrown_and_unwind_handle_rethrow_and_corrupted_rsp() {
+        // MSVC C++ rethrow (`throw;`) passes null ThrowInfo / object pointers.
+        // SAFETY: null pointers are rejected before dereference.
+        assert_eq!(unsafe { thrown(&[CPP_MAGIC, 0, 0, 0]) }, "unknown");
+
+        // Overflowing `Rsp` must stop cleanly instead of panicking or wrapping.
+        // SAFETY: zeroed CONTEXT is valid for `unwind_into`.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = 0x1000;
+        context.Rsp = u64::MAX - 3;
+        let mut frames = Vec::new();
+        let walked = crate::unwind::unwind_into(context, 0, usize::MAX, &mut frames);
+        assert!(walked.is_ok());
+        assert_eq!(frames, [0x1000]);
+
+        // Misaligned `Rsp` inside stack bounds must read without UB.
+        let stack = [0u8; 32];
+        let low = stack.as_ptr() as usize;
+        let high = low + stack.len();
+        context.Rip = 0x2000;
+        context.Rsp = (low + 1) as u64;
+        frames.clear();
+        let walked = crate::unwind::unwind_into(context, low, high, &mut frames);
+        assert!(walked.is_ok());
+        assert_eq!(frames, [0x2000]);
     }
 }

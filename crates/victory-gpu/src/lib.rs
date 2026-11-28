@@ -94,3 +94,6 @@ pub use watch::{
     UnseenWriting, Writing as KernelWrite, set_writable_alias, title_memory_aliased, title_memory_remapped,
     title_memory_unmapped, unseen_writing, writing as kernel_will_write,
 };
+/// The write watch's trackers, for other crates' tests (feature `test-hooks`).
+#[cfg(all(windows, feature = "test-hooks"))]
+pub use watch::{Tracked, track};

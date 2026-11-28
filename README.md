@@ -45,7 +45,7 @@ What each part does today and what it still needs:
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
+| Input | XInput pads, keyboard, keyboard stand-in pad, trigger rumble (one pad) | Trigger rumble with several pads |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests); occlusion, pipeline statistics and timestamp queries run on the host GPU | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; HDR and scaling are missing; console-only query types get stand-in results |
@@ -85,6 +85,9 @@ copy victory.example.toml victory.toml   # then set your paths (outside the repo
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
+
+Set `VICTORY_CONFIG` to select a different config file instead of
+`victory.toml` in the current directory.
 
 With a GPU, `cargo test -p victory-shader --lib fuzz_tests -- --ignored --nocapture`
 runs each lowered VALU instruction on every adapter and on WARP and reports
@@ -136,7 +139,10 @@ console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+title's window has focus. `VICTORY_MOUSE_LOOK=<sensitivity>` (for example
+`0.05`: 20 pixels of movement per 8 ms poll is full tilt) also moves that pad's
+right stick with the mouse; the cursor is held at the window's centre while the
+window has focus. Unset, it is off:
 
 | Keys | Pad |
 |------|-----|
@@ -195,6 +201,12 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+The differential shader tests also need a console `dxc.exe`: set
+`VICTORY_CONSOLE_DXC` to its path. The PC compiler is `VICTORY_PC_DXC`, else
+the newest Windows SDK's `dxc.exe`. If either compiler is missing, those tests
+are skipped, because `tools()` returns `None` unless both compiler paths exist.
+`VICTORY_WARP=1` draws on WARP instead of the hardware adapter.
+
 ## Experimental memory option
 
 Set `VICTORY_TRIM_IDLE_SHADERS=1` before launch to periodically remove
@@ -224,11 +236,13 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS=30:Enter,35:X:0.8` | presses keys at those seconds, focus or not, each held for the time after its second colon (0.2 s when it is not given) |
 | `VICTORY_PIPELINE_JOURNAL=1` | a pipeline whose creation crashed the process is refused from the next run on, until the translator changes (`pipeline-journal\crashed.txt` in the cache folder; delete a line to retry it; quitting mid-creation counts as a crash) |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_PATCH=<module>:<rva>:<hex bytes>,...` | writes bytes once at module load after relocation and before title protection; can patch code, unlike `VICTORY_POKE`'s repeated writes; logs replaced bytes |
+| `VICTORY_TITLE_ASSERTS=<n>` | continues past up to `n` `int3` asserts in title code, where the first one ends the process; the check is taken as passed, so what follows it is undefined |
+| `VICTORY_STEP_OVER=<hex offset>,...` | title breakpoints (`int3`) at these image offsets are stepped over instead of ending the run, each logged with its count. On Series 1.0.2.1 the pool allocator traps on an empty pool right before returning NULL (`63966f`, `5149aec`, #698): stepped over, the allocation fails and the title goes on into the world |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
@@ -248,6 +262,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 | `VICTORY_LOOSE_WINDOW_KIB=256` | loose title memory in 256 KiB windows instead of 4 MiB; less host memory, but more copying per frame |
+| `VICTORY_COPIES_IN_VIDEO_MEMORY=1` | host copies of title memory in video memory the CPU maps (a GPU upload heap, where the host has one), to measure how much of the GPU's time is shaders reading the copies over the bus; CPU reads of them become slow (for that measurement only) |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.

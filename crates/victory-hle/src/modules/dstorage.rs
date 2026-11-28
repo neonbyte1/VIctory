@@ -17,11 +17,13 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
@@ -461,12 +463,13 @@ struct Lane {
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
     /// Left out when the queue submitted itself, until the title's Submit:
-    /// reads into physical pages and the status entries behind them.
-    held: Vec<Command>,
+    /// reads into physical pages and the commands behind them, keeping their
+    /// original submission sequence numbers.
+    held: Vec<(u64, Command)>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
-    statuses: VecDeque<(u64, Status)>,
+    reads: BTreeMap<u64, Request>,
+    statuses: BTreeMap<u64, Status>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
@@ -606,13 +609,13 @@ impl Lanes {
             self.lanes
                 .iter()
                 .filter_map(|(&id, lane)| {
-                    let (seq, request) = lane.reads.front()?;
-                    let staging = staging_bytes(request);
+                    let (&seq, &request) = lane.reads.first_key_value()?;
+                    let staging = staging_bytes(&request);
                     if without_staging && staging != 0 {
                         return None;
                     }
                     let class = lane.class;
-                    Some((self.clock[class], class, lane.clock, *seq, id, staging))
+                    Some((self.clock[class], class, lane.clock, seq, id, staging))
                 })
                 .min()
         };
@@ -631,7 +634,8 @@ impl Lanes {
             selected
         };
         let lane = self.lanes.get_mut(&id)?;
-        let (seq, request) = lane.reads.pop_front()?;
+        let (&seq, &request) = lane.reads.first_key_value()?;
+        lane.reads.pop_first();
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -670,7 +674,8 @@ impl Lanes {
     /// Grand Theft Auto VI fills for the batch in its own submit path, right
     /// before Submit (`sub_1400e88f0`), so until then they name no page or a
     /// page that now holds something else. A status entry behind a held
-    /// read waits with it.
+    /// read waits with it, and reads behind a held status entry wait so they
+    /// cannot jump ahead of that fence.
     fn submit_as(&mut self, id: u64, explicit: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
@@ -691,22 +696,33 @@ impl Lanes {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
         let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
-        commands.append(&mut lane.unsubmitted);
-        for command in commands {
+        for command in std::mem::take(&mut lane.unsubmitted) {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            commands.push((seq, command));
+        }
+        let mut held_status = lane
+            .held
+            .iter()
+            .any(|(_, c)| matches!(c, Command::Status(_)));
+        for (seq, command) in commands {
             let hold = !explicit
                 && match &command {
-                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                    Command::Read(r) => held_status || r.options & PAGE_DESTINATION != 0,
                     Command::Status(_) => !lane.held.is_empty(),
                 };
             if hold {
-                lane.held.push(command);
+                held_status |= matches!(command, Command::Status(_));
+                lane.held.push((seq, command));
                 continue;
             }
-            let seq = self.next_seq;
-            self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
-                Command::Status(status) => lane.statuses.push_back((seq, status)),
+                Command::Read(request) => {
+                    lane.reads.insert(seq, request);
+                }
+                Command::Status(status) => {
+                    lane.statuses.insert(seq, status);
+                }
             }
         }
         lane.flush();
@@ -721,8 +737,8 @@ impl Lane {
             clock: 0,
             unsubmitted: Vec::new(),
             held: Vec::new(),
-            reads: VecDeque::new(),
-            statuses: VecDeque::new(),
+            reads: BTreeMap::new(),
+            statuses: BTreeMap::new(),
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
             closed: false,
@@ -740,12 +756,12 @@ impl Lane {
 
     /// Writes the status entries whose earlier reads have all finished.
     fn flush(&mut self) {
-        while let Some(&(seq, _)) = self.statuses.front() {
-            let waiting = self.reads.front().map(|r| r.0);
+        while let Some((&seq, _)) = self.statuses.first_key_value() {
+            let waiting = self.reads.first_key_value().map(|(&s, _)| s);
             if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
                 return;
             }
-            let Some((_, status)) = self.statuses.pop_front() else {
+            let Some((_, status)) = self.statuses.pop_first() else {
                 return;
             };
             let later = self.failures.split_off(&seq);
@@ -1109,6 +1125,13 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::builtin().map_err(|e| format!("the built-in BCPack tables: {e}"))
 }
 
+#[cfg(test)]
+fn load_bcpack_tables() -> Result<Tables, String> {
+    let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
+    let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
+    Tables::parse(&bytes).map_err(|e| e.to_string())
+}
+
 /// Tests decode streams made against tables of their own, from this folder.
 #[cfg(test)]
 static BCPACK_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -1116,13 +1139,6 @@ static BCPACK_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
 #[cfg(test)]
 fn use_bcpack_tables(dir: std::path::PathBuf) {
     let _ = BCPACK_DIR.set(dir);
-}
-
-#[cfg(test)]
-fn load_bcpack_tables() -> Result<Tables, String> {
-    let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
-    let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
-    Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
@@ -1225,6 +1241,8 @@ fn into_destination(
     // milliseconds before failing: the title never looks at a request's
     // result, so a failed one is a model or texture left unwritten.
     if pages.contains(&0) {
+        #[cfg(test)]
+        LATE_DESTINATION.store(request.destination as usize, Ordering::SeqCst);
         for _ in 0..LATE_LIST_TRIES {
             std::thread::sleep(std::time::Duration::from_millis(1));
             snapshot(&mut pages);
@@ -1270,6 +1288,11 @@ static AUTO_SUBMITS: AtomicU32 = AtomicU32::new(0);
 const LATE_LIST_TRIES: u32 = 8;
 /// Page lists filled after their request started (written late).
 static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
+/// Tests: the destination whose copy found its page list empty and began
+/// waiting (`a_page_list_filled_after_its_request_starts`), so the fill can
+/// happen *while* it waits instead of on a fixed sleep that races the wait.
+#[cfg(test)]
+static LATE_DESTINATION: AtomicUsize = AtomicUsize::new(0);
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
 /// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
@@ -2010,7 +2033,18 @@ mod tests {
         );
         let number = page[0];
         let filler = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            // Fill the list once the copy has found it empty and begun
+            // waiting for it. A fixed sleep is late on a busy machine (the
+            // wait lasts 8 ms) and may be early on a quiet one, so it does
+            // not reliably reach the retry path at all.
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while LATE_DESTINATION.load(Ordering::SeqCst) != at {
+                assert!(
+                    std::time::Instant::now() < limit,
+                    "the copy never waited for the page list"
+                );
+                std::hint::spin_loop();
+            }
             // SAFETY: the leaked aligned list, alive for the whole test; paired
             // with the worker's atomic loads in `into_destination`.
             unsafe {
@@ -2050,6 +2084,128 @@ mod tests {
         assert!(!l.lanes[&0].statuses.is_empty());
         l.finish(&paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    #[test]
+    fn a_queue_that_submits_itself_holds_reads_after_held_status() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(4);
+        let entries = array.cast::<Instance<StatusArray>>();
+        let push_status = |l: &mut Lanes, index: u32| {
+            add_ref_instance(entries);
+            let status = Status {
+                array: entries,
+                index,
+            };
+            status.entry().store(E_PENDING, Ordering::Release);
+            l.lanes
+                .get_mut(&0)
+                .unwrap()
+                .unsubmitted
+                .push(Command::Status(status));
+        };
+
+        // [R1(PAGE_DESTINATION), S1] held on auto-submit, then later [R2(plain), S2]
+        // auto-submitted: R2 must not overtake S1 or misattribute its error to S1.
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        push_status(&mut l, 0);
+        l.submit_as(0, false);
+        assert!(l.start().is_none());
+        assert_eq!(result(array, 0), E_PENDING);
+
+        read(&mut l, 0, 0, 16);
+        push_status(&mut l, 1);
+        l.submit_as(0, false);
+        assert!(
+            l.start().is_none(),
+            "plain read must not overtake held status"
+        );
+        assert_eq!(result(array, 0), E_PENDING);
+        assert_eq!(result(array, 1), E_PENDING);
+
+        l.submit(0);
+        let r1 = l.start().unwrap();
+        assert_eq!(r1.request.options, PAGE_DESTINATION);
+        l.finish(&r1, Ok(()));
+        assert_eq!(result(array, 0), S_OK);
+        assert_eq!(result(array, 1), E_PENDING);
+
+        let r2 = l.start().unwrap();
+        assert_eq!(r2.request.options, 0);
+        assert!(l.start().is_none());
+        l.finish(&r2, Err(END_OF_FILE));
+        assert_eq!(result(array, 0), S_OK);
+        assert_eq!(result(array, 1), END_OF_FILE);
+
+        // [R3(PAGE_DESTINATION), S3, R4(plain), S4] in the same auto-submit batch:
+        // R4 must stay held behind S3 as well.
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        push_status(&mut l, 2);
+        read(&mut l, 0, 0, 16);
+        push_status(&mut l, 3);
+        l.submit_as(0, false);
+        assert!(
+            l.start().is_none(),
+            "plain read in same batch must not overtake held status"
+        );
+        assert_eq!(result(array, 2), E_PENDING);
+        assert_eq!(result(array, 3), E_PENDING);
+
+        l.submit(0);
+        let r3 = l.start().unwrap();
+        assert_eq!(r3.request.options, PAGE_DESTINATION);
+        l.finish(&r3, Ok(()));
+        assert_eq!(result(array, 2), S_OK);
+        assert_eq!(result(array, 3), E_PENDING);
+
+        let r4 = l.start().unwrap();
+        assert_eq!(r4.request.options, 0);
+        l.finish(&r4, Err(END_OF_FILE));
+        assert_eq!(result(array, 2), S_OK);
+        assert_eq!(result(array, 3), END_OF_FILE);
+
+        release(entries);
+    }
+
+    #[test]
+    fn a_queue_that_submits_itself_keeps_enqueue_order_for_first_failure() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(1);
+        let entries = array.cast::<Instance<StatusArray>>();
+        add_ref_instance(entries);
+        let status = Status {
+            array: entries,
+            index: 0,
+        };
+        status.entry().store(E_PENDING, Ordering::Release);
+
+        // [R1(PAGE_DESTINATION, fails INVALID_DATA), R2(plain, fails END_OF_FILE), S0]:
+        // R2 starts early while R1 and S0 wait, yet S0 must still report R1's
+        // earlier failure in enqueue order rather than R2's earlier completion.
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        read(&mut l, 0, 0, 16);
+        l.lanes
+            .get_mut(&0)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Status(status));
+        l.submit_as(0, false);
+
+        let r2 = l.start().unwrap();
+        assert_eq!(r2.request.options, 0);
+        assert!(l.start().is_none());
+        l.finish(&r2, Err(END_OF_FILE));
+        assert_eq!(result(array, 0), E_PENDING);
+
+        l.submit(0);
+        let r1 = l.start().unwrap();
+        assert_eq!(r1.request.options, PAGE_DESTINATION);
+        l.finish(&r1, Err(INVALID_DATA));
+        assert_eq!(result(array, 0), INVALID_DATA);
+
+        release(entries);
     }
 
     #[test]
