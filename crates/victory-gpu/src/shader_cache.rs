@@ -270,6 +270,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     // (and to `decode`).
     let HostShader {
         stage,
+        wave_size,
         dxil,
         user_data,
         samplers,
@@ -288,6 +289,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|x| x == stage).unwrap_or(0) as u32;
     word(&mut out, stage);
+    word(&mut out, wave_size.unwrap_or(0));
     word(&mut out, dxil.len() as u32);
     out.extend(dxil);
     word(&mut out, user_data.len() as u32);
@@ -361,6 +363,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         return None;
     }
     let stage = *STAGES.get(r.word()? as usize)?;
+    let wave_size = Some(r.word()?).filter(|&size| size != 0);
     let dxil = r.list()?;
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
@@ -397,6 +400,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let memory = r.word()?;
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
+        wave_size,
         dxil,
         user_data,
         samplers,
@@ -420,6 +424,7 @@ mod tests {
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
+            wave_size: None,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
@@ -523,8 +528,8 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit) makes another key, so no entry
-    /// written before it is read.
+    /// this file's encoding, the loop limit, the view heap size) makes
+    /// another key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
         let k = key("0123456789abcdef", b"encoding", 1 << 20, 1 << 21);
@@ -582,8 +587,14 @@ mod tests {
 
     #[test]
     fn entries_round_trip_and_reject_damage() {
+        for wave_size in [None, Some(32), Some(64)] {
+            let shader = Ok(HostShader {
+                wave_size,
+                ..shader()
+            });
+            assert_eq!(decode(&encode(&shader)), Some(shader));
+        }
         let bytes = encode(&Ok(shader()));
-        assert_eq!(decode(&bytes), Some(Ok(shader())));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);

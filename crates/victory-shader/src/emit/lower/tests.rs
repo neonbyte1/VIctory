@@ -7,7 +7,7 @@ use crate::{io, ir, resource, structure};
 mod image_refusals;
 mod size_handles;
 
-const S_ENDPGM: u32 = 0xBF81_0000;
+pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// A program's constant table starts after its instructions, unless a
 /// load at a fixed offset reads below that.
@@ -79,7 +79,7 @@ fn lowers_as(words: &[u32], rsrc2: u32, per_lane_only: bool) -> Result<(), crate
 
 /// Lowers a compute program with the root parameters `layout` (in user
 /// SGPRs from s0 on) and the used resources `used`.
-fn lower_with(
+pub(super) fn lower_with(
     words: &[u32],
     layout: Vec<RootParam>,
     used: Vec<UsedResource>,
@@ -131,7 +131,7 @@ fn lower_wave(
 }
 
 /// Root parameter `slot` in user SGPRs from `user_data` on.
-fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+pub(super) fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
     RootParam {
         root,
         table_offset_dwords: 0,
@@ -360,6 +360,41 @@ fn perm_features(selector: u32) -> u64 {
     u64::from_le_bytes(features.data.try_into().unwrap())
 }
 
+/// Lowers `alu` on the thread id v0 into v3, kept by an LDS store.
+fn refactoring(alu: &[u32]) -> (bool, Vec<String>) {
+    let mut words = alu.to_vec();
+    words.extend([
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xD834_0000, // ds_write_b32 v4, v3
+        0x0000_0304,
+        S_ENDPGM,
+    ]);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let names = ir::build(&code, false, 256).unwrap().blocks[0]
+        .insts
+        .iter()
+        .map(|i| i.name().to_string())
+        .collect();
+    let lowered = lower_with(&words, vec![], vec![]).unwrap();
+    (lowered.refactoring, names)
+}
+
+#[test]
+fn only_programs_with_fmad_let_the_host_refactor() {
+    let (fused, names) = refactoring(&[
+        0xD54B_0003, // v_fma_f32 v3, v0, v0, v0
+        0x0402_0100,
+    ]);
+    assert_eq!(names[0], "v_fma_f32");
+    assert!(fused, "FMad needs refactoring to fuse");
+    let (apart, names) = refactoring(&[
+        0x1006_0100, // v_mul_f32 v3, v0, v0
+        0x0606_0103, // v_add_f32 v3, v3, v0
+    ]);
+    assert_eq!(names[..2], ["v_mul_f32", "v_add_f32"]);
+    assert!(!apart, "a multiply and an add stay apart");
+}
+
 #[test]
 fn perm_constant_selector_needs_no_int64() {
     assert_eq!(perm_features(128) & 0x8000, 0);
@@ -413,7 +448,7 @@ fn a_descriptor_selected_by_scc_picks_its_heap_index() {
 }
 
 /// Tables of 2D textures at s0 and samplers at s1.
-fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+pub(super) fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
     let range = |kind, user_data, slot| UsedResource {
         kind,
         root: RootType::Table,
@@ -1514,4 +1549,180 @@ fn scalar_64_bit_field_ops_lower() {
         let words: Vec<u32> = consts.iter().chain(body).chain(&tail).copied().collect();
         lowers(&words, 0).unwrap();
     }
+}
+
+#[test]
+fn sdwa_16bit_reserved_dst_unused_is_refused() {
+    for dst_sel in [4u32, 5] {
+        // v_cvt_i16_f16_sdwa v1, v0 dst_sel:{WORD_0,WORD_1} dst_unused:3 (reserved);
+        // ds_write_b32 v0, v1 to keep v1 live.
+        let sdwa_ext = (dst_sel << 8) | (3 << 11) | (4 << 16);
+        let words = [
+            0x7E02_A6F9, // v_cvt_i16_f16 v1, sdwa
+            sdwa_ext,
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let err = lowers(&words, 1 << 15).expect_err("reserved dst_unused must fail");
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "an SDWA destination of a 16-bit operation",
+                    ..
+                }
+            ),
+            "unexpected error for dst_sel={dst_sel}: {err}"
+        );
+    }
+}
+
+
+#[test]
+fn writelane_and_readlane_lower_and_validate_in_wave32_and_wave64() {
+    for wave64 in [false, true] {
+        let wave = if wave64 { 64 } else { 32 };
+        let words: &[u32] = &[
+            0x7E02_0200, // v_mov_b32 v1, v0
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0xD761_0001, // v_writelane_b32 v1, 42, 65 (constant > wave)
+            (128 + 42) | 0xFF << 9,
+            65,
+            0xD761_0001, // v_writelane_b32 v1, s0, s1 (dynamic selector)
+            1 << 9,
+            0xD760_0004, // v_readlane_b32 s4, v1, -1 (inline negative constant)
+            257 | 193 << 9,
+            0x4A02_0204, // v_add_nc_u32 v1, s4, v1
+            0xD834_0000, // ds_write_b32 v0, v1
+            0x0000_0100,
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (2 << 1) | (1 << 15),
+                threads: [wave, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, wave64, native.vgprs).expect("ir");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, HwStage::Cs, Some(&st)).expect("res");
+        let io = io::raise(&p, &native).expect("io");
+        let mut out = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            target: super::super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
+            view_marks: false,
+        })
+        .expect("lower");
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil).expect("DXIL validation");
+        }
+    }
+}
+
+#[test]
+fn duplicate_branch_target_back_edge_produces_valid_dxil() {
+    // Entry (block 0) -> loop header (block 1) -> latch (block 2) -> back to
+    // block 1 via a degenerate Branch whose taken == not_taken.
+    let words = [
+        0xBE80_0380, // s_mov_b32 s0, 0
+        // header (word 1):
+        0x8100_8100, // s_add_i32 s0, s0, 1
+        0xBF0A_8300, // s_cmp_lt_u32 s0, 3
+        0xBF84_0002, // s_cbranch_scc0 -> exit (word 6)
+        // latch (word 4):
+        0xBF85_FFFC, // s_cbranch_scc1 -> header (word 1)
+        S_ENDPGM,
+        // exit (word 6):
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let mut p = ir::build(&native.code, false, 4).unwrap();
+    let mut st = structure::structure(&p).unwrap();
+    // Force the latch exit (block 2) into a degenerate Branch where both
+    // targets are the loop header (block 1) and mirror the duplicate pred.
+    let structure::LaneExit::Branch { taken, .. } = st.exits[2] else {
+        panic!("expected branch exit in latch, got {:?}", st.exits[2]);
+    };
+    st.exits[2] = structure::LaneExit::Branch {
+        when: structure::Bool::TRUE,
+        taken,
+        not_taken: taken,
+    };
+    let pos = p.blocks[taken]
+        .preds
+        .iter()
+        .position(|&pred| pred == 2)
+        .unwrap();
+    p.blocks[taken].preds.push(2);
+    for phi in &mut p.blocks[taken].phis {
+        let v = phi.args[pos];
+        phi.args.push(v);
+    }
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        target: super::super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
+        view_marks: false,
+    })
+    .expect("lower degenerate back-edge");
+    #[cfg(windows)]
+    if let Ok(mut v) = crate::emit::validator::Validator::load(
+        crate::emit::validator::Validator::default_path().as_deref(),
+    ) {
+        let mut dxil = lowered.dxil;
+        v.validate(&mut dxil).expect("DXIL validation failed");
+    }
+    #[cfg(not(windows))]
+    let _ = lowered;
 }

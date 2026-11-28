@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -78,6 +78,10 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
+    pub const NO_REFACTORING: u64 = 1 << 1;
+    /// `[earlydepthstencil]`: depth and stencil are tested before the
+    /// program runs (no feature bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLE_EXTENSIONS: u64 = 1 << 6;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -148,6 +152,9 @@ pub(crate) struct Shader {
     pub root_uavs: Vec<(u8, V)>,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
+    /// The null raw SRV heap index (entry 0 of block 0 in the page table),
+    /// loaded once in the entry block.
+    pub memory_null: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
     pub memory_dirty: Option<V>,
     /// The view addresses' handle, once a descriptor's address is read.
@@ -165,8 +172,13 @@ pub(crate) struct Shader {
     pub texture_index: std::collections::HashMap<V, V>,
     pub texture_reads: Vec<V>,
     pub flags: u64,
+    /// A fused multiply-add (`FMad`) was emitted: the driver may then fuse.
+    pub fused: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Resource properties of each heap handle made, in creation order.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -260,6 +272,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             memory: None,
+            memory_null: None,
             memory_dirty: None,
             view_addresses: None,
             view_marks: None,
@@ -268,7 +281,10 @@ impl Shader {
             texture_index: std::collections::HashMap::new(),
             texture_reads: Vec::new(),
             flags: 0,
+            fused: false,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            heap_props: Vec::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -496,6 +512,22 @@ impl Shader {
         h
     }
 
+    /// The null raw SRV heap index (block 0's first entry in the page table,
+    /// at byte offset `4096 * 4`), loaded once in the entry block.
+    pub fn memory_null(&mut self) -> V {
+        if let Some(v) = self.memory_null {
+            return v;
+        }
+        let map = self.memory_handle();
+        let b = self.entry;
+        let (at, u, mask, al) = (self.m.i32(4096 * 4), self.m.undef(self.t.i32), self.m.i8(1), self.m.i32(4));
+        let r = self.op(b, "rawBufferLoad.f32", Attr::ReadOnly, self.t.res_ret, 139, &[map, at, u, mask, al]);
+        let x = self.m.extract(b, r, 0);
+        let v = self.m.cast(b, Cast::Bitcast, x, self.t.i32);
+        self.memory_null = Some(v);
+        v
+    }
+
     /// The handle of the view addresses (`t1` in [`MEMORY_SPACE`], a raw
     /// buffer: per resource-heap index, a descriptor's dwords 0-3 as far as
     /// the host knows them, `emit` "View addresses"), made in the entry
@@ -649,6 +681,8 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        #[cfg(test)]
+        self.heap_props.push(props);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
         let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { view_heap_limit() } - 1);
@@ -670,11 +704,20 @@ impl Shader {
         if !sampler && (kind == 10 || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
             self.view_index.insert(h, index);
         }
-        // Texture shader views (kinds 1-9).
-        if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&kind) {
+        // Texture views (kinds 1-9), including UAVs so heap-direct texture
+        // loads sharing a written descriptor keep their read marks.
+        if !sampler && (1..=9).contains(&kind) {
             self.texture_index.insert(h, index);
         }
         h
+    }
+
+    /// Refactoring lets the host fuse a multiply and an add the console
+    /// rounds apart (Intel UHD does); only `FMad` needs it, to fuse at all.
+    pub(crate) fn settle_flags(&mut self) {
+        if !self.fused {
+            self.flags |= flags::NO_REFACTORING;
+        }
     }
 
     /// The finished container.
@@ -698,8 +741,14 @@ impl Shader {
             (flags::INT64, uses.int64),
             (flags::TYPED_UAV_LOADS, uses.typed_uav_loads),
             (flags::ROVS, uses.rovs),
+            (flags::ATOMIC64_TYPED, uses.atomic64_typed),
+            (flags::ATOMIC64_HEAP, uses.atomic64_heap),
         ] {
-            self.flags = if used { self.flags | flag } else { self.flags & !flag };
+            self.flags = if used {
+                self.flags | flag
+            } else {
+                self.flags & !flag
+            };
         }
         // UAVs outside pixel and compute programs (the write and read marks
         // of vertex, geometry and mesh programs), as DXC counts them: UAV
@@ -973,6 +1022,7 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        self.settle_flags();
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -1304,6 +1354,49 @@ mod tests {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
+        }
+    }
+
+    /// A pruned `ReadOnly` typed UAV load clears `TYPED_UAV_LOADS` so SFI0
+    /// and the DXIL entry flags match the emitted bitcode under `dxil.dll`.
+    #[test]
+    fn pruned_typed_uav_load_clears_flag_and_validates() {
+        let mut s = Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        let entry = s.entry;
+        let b_live = s.m.new_block();
+        let b_dead = s.m.new_block();
+        let zero = s.m.i32(0);
+        let yes = s.m.bool(true);
+        let iu = s.m.undef(s.t.i32);
+        let h = s.heap_handle(entry, zero, false, false, (10 | 0x1000, 0x409));
+        s.flags |= flags::TYPED_UAV_LOADS;
+        let loaded = s.op(
+            entry,
+            "bufferLoad.f32",
+            Attr::ReadOnly,
+            s.t.res_ret,
+            68,
+            &[h, zero, iu],
+        );
+        let x = s.m.extract(entry, loaded, 0);
+        let mask = s.m.i8(1);
+        let _sink = s.op(
+            b_dead,
+            "bufferStore.f32",
+            Attr::NoUnwind,
+            s.t.void,
+            69,
+            &[h, zero, iu, x, x, x, x, mask],
+        );
+        s.m.terminate(entry, Term::CondBr(yes, b_live, b_dead));
+        s.m.terminate(b_live, Term::Ret);
+        s.m.terminate(b_dead, Term::Ret);
+        assert!(!s.m.uses().typed_uav_loads);
+        let mut dxil = s.finish();
+        let path = super::super::validator::Validator::default_path();
+        if let Ok(mut v) = super::super::validator::Validator::load(path.as_deref()) {
+            v.validate(&mut dxil).unwrap();
         }
     }
 }

@@ -299,6 +299,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
     })
     .map_err(e)?;
     Ok(HostShader {
+        wave_size: lowered.wave_size,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -556,7 +557,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut hosts: Vec<(&str, bool, Host)> = Vec::new();
     let mut errors = Vec::new();
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         match Host::new(warp) {
             Ok(h) => hosts.push((label, warp, h)),
             Err(e) => errors.push(format!("{label}: {e}")),
@@ -3113,6 +3114,58 @@ fn f16_arithmetic_rounds_once() {
     defect(p, F16_TWICE);
 }
 
+/// A small opposite-sign half can disappear in the intermediate f32 sum.
+/// Rounding to zero must still produce the half immediately below the
+/// larger magnitude. A subsequent reset to nearest-even is the control.
+#[test]
+fn f16_add_sub_round_to_zero_once() {
+    let inputs = vec![
+        [0xEC00_6C00, 0x0400_8400, 0, OLD], // add: +/-4096 toward zero
+        [0xEC00_6C00, 0x8400_0400, 0, OLD], // subtract: +/-4096 toward zero
+        [0x0400_8400, 0xEC00_6C00, 0, OLD], // swap the add operands
+        [0x8400_0400, 0xEC00_6C00, 0, OLD], // reverse subtract toward zero
+        [0xC000_4000, 0x0001_8001, 0, OLD], // halfway between two f32s
+        [0xBC00_3C00, 0x1000_9000, 0, OLD], // a half midpoint
+        [0x8400_0400, 0x0001_8001, 0, OLD], // subnormal result
+        [0xFBFF_7BFF, 0xFBFF_7BFF, 0, OLD], // overflow
+        [0x8000_0000, 0x8000_0000, 0, OLD], // signed zeros
+        [0xFC00_7C00, 0x8000_0000, 0, OLD], // infinities
+        [0xBC00_3C00, 0x3C00_BC00, 0, OLD], // exact cancellation
+    ];
+    let setreg = |mode| [0xBA80_0881, mode];
+    type Op = fn(f64, f64) -> f64;
+    let operations: [(u16, Op); 3] = [
+        (0x32, |a, b| a + b),
+        (0x33, |a, b| a - b),
+        (0x34, |a, b| b - a),
+    ];
+    let mut probes = Vec::new();
+    for (opcode, op) in operations {
+        let mut body = setreg(3).to_vec();
+        body.push(vop2(opcode, 5, v(1), 2));
+        body.extend(setreg(0));
+        body.push(vop2(opcode, 6, v(1), 2));
+        probes.push(probe(body, inputs.clone(), F16, move |i| {
+            let exact = op(h(i[0]), h(i[1]));
+            [true, false]
+                .map(|rtz| i[3] & 0xFFFF_0000 | to_f16(exact, rtz))
+                .to_vec()
+        }));
+    }
+    let mut body = setreg(3).to_vec();
+    body.extend(vop3p(0x0F, 5, [v(1), v(2), 0], 0, 7, [0, 0]));
+    body.extend(setreg(0));
+    body.extend(vop3p(0x0F, 6, [v(1), v(2), 0], 0, 7, [0, 0]));
+    probes.push(probe(body, inputs, Kind::Halves { ulps: 0 }, |i| {
+        let lo = h(i[0]) + h(i[1]);
+        let hi = h(i[0] >> 16) + h(i[1] >> 16);
+        [true, false]
+            .map(|rtz| to_f16(lo, rtz) | to_f16(hi, rtz) << 16)
+            .to_vec()
+    }));
+    assert_clean(check(&probes));
+}
+
 /// `s_min_*`/`s_max_*` set SCC to whether the first operand was chosen
 /// (RDNA2 ISA). Was a defect: SCC was `result != 0`.
 #[test]
@@ -3234,12 +3287,16 @@ fn whole_wave_sections_keep_rounding_mode_changes() {
 #[test]
 fn hosts_that_do_not_fuse_are_named() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(warp) = Host::new(true) {
-        assert_eq!(warp.fuses_fmad(), Ok(false), "WARP");
-    }
-    if let Ok(hardware) = Host::new(false) {
-        let fuses = hardware.fuses_fmad().expect("the check runs");
-        eprintln!("hardware adapter fuses FMad: {fuses}");
+    for (label, warp) in Host::test_backends() {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let fuses = host.fuses_fmad().expect("the check runs");
+        if warp {
+            assert!(!fuses, "{label}");
+        } else {
+            eprintln!("{label} adapter fuses FMad: {fuses}");
+        }
     }
 }
 

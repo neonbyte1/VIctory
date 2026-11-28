@@ -939,6 +939,7 @@ fn effects(
                         indexed(d, &mut r)?;
                     }
                 }
+                "v_div_fmas_f32" | "v_div_fmas_f64" => r.extend(mask(VCC)),
                 _ => {}
             }
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {
@@ -1050,8 +1051,10 @@ fn effects(
         }
     }
     if vector {
-        r.extend(mask(EXEC));
-        // Lanes disabled in EXEC keep the old value.
+        if !matches!(name, "v_readlane_b32" | "v_writelane_b32") {
+            r.extend(mask(EXEC));
+        }
+        // Lanes disabled in EXEC (or untouched by `v_writelane_b32`) keep the old value.
         r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
     }
     let mut seen = Vec::with_capacity(r.len());
@@ -1585,4 +1588,86 @@ mod tests {
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
     }
+
+    #[test]
+    fn readlane_and_writelane_do_not_read_exec_implicitly() {
+        for wave64 in [false, true] {
+            let p = build_words(
+                &[
+                    0xD761_0001, // v_writelane_b32 v1, s0, 0
+                    0x0001_0000,
+                    0xD760_0002, // v_readlane_b32 s2, v1, 0
+                    0x0001_0101,
+                    0xD761_0001, // v_writelane_b32 v1, exec_lo, 0
+                    0x0001_007E,
+                    S_ENDPGM,
+                ],
+                wave64,
+            );
+            let [wl, rl, wl_exec, _] = &p.blocks[0].insts[..] else {
+                panic!()
+            };
+            assert_eq!(wl.read(Reg::S(EXEC)), None);
+            assert_eq!(wl.read(Reg::S(EXEC + 1)), None);
+            assert!(
+                wl.read(Reg::V(1)).is_some(),
+                "untouched lanes keep v1's prior value"
+            );
+            assert_eq!(rl.read(Reg::S(EXEC)), None);
+            assert_eq!(rl.read(Reg::S(EXEC + 1)), None);
+            assert!(
+                wl_exec.read(Reg::S(EXEC)).is_some(),
+                "explicit exec_lo operand stays a scalar read"
+            );
+            assert_eq!(wl_exec.read(Reg::S(EXEC + 1)), None);
+        }
+    }
+    #[test]
+    fn v_swaprel_b32_deduplicates_overlapping_vgpr_reads_and_writes() {
+        let code: Vec<u8> = [
+            0x7E02_D101_u32, // v_swaprel_b32 v1, v1
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build(&code, false, 4).unwrap();
+        let [swap, _] = &p.blocks[0].insts[..] else {
+            panic!()
+        };
+        let vgprs = |regs: &[(Reg, Value)]| -> Vec<u8> {
+            regs.iter()
+                .filter_map(|r| match r.0 {
+                    Reg::V(v) => Some(v),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(vgprs(&swap.reads), [1, 2, 3]);
+        assert_eq!(vgprs(&swap.writes), [1, 2, 3]);
+        assert!(swap.read(Reg::S(M0)).is_some());
+    }
+    #[test]
+    fn scalar_pack_does_not_clobber_scc() {
+        let p = build_words(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0x9902_0100, // s_pack_ll_b32_b16 s2, s0, s1
+                0x9983_0100, // s_pack_lh_b32_b16 s3, s0, s1
+                0x9A04_0100, // s_pack_hh_b32_b16 s4, s0, s1
+                0x8505_8081, // s_cselect_b32 s5, 1, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [cmp, ll, lh, hh, csel, _] = &p.blocks[0].insts[..] else {
+            panic!("{:?}", p.blocks[0].insts);
+        };
+        for pack in [ll, lh, hh] {
+            assert_eq!(pack.read(Reg::Scc), None, "{}", pack.name());
+            assert_eq!(pack.write(Reg::Scc), None, "{}", pack.name());
+        }
+        assert_eq!(csel.read(Reg::Scc), cmp.write(Reg::Scc));
+    }
 }
+

@@ -1264,7 +1264,7 @@ fn cube_gradients_pick_the_level() {
         .collect();
     let mut ran = 0;
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;

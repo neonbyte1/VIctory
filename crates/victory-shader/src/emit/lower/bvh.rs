@@ -184,23 +184,37 @@ impl Lower<'_> {
                 // shortcut: the root address is taken to be 256-byte aligned
                 // (the descriptor drops its low byte, not known here).
                 let (k, dynamic) = self.built_offset(src)?;
-                let three = self.s.m.i32(3);
-                let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
-                let k = self.s.m.i32(k);
-                at = self.s.m.bin(c, Bin::Add, at, k);
-                if let Some(d) = dynamic {
-                    at = self.s.m.bin(c, Bin::Add, at, d);
-                }
-                // A root view is title memory there (bounds-checked).
+                // A root view is title memory there (bounds-checked); a BVH
+                // larger than 2 GiB has node offsets a 32-bit shift cannot
+                // hold, so the shift and the adds happen in 64 bits, as the
+                // explicit-descriptor path below does.
                 let nodes = match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
                         let base = wide64(self, root_lo, root_hi);
                         let zero = self.s.m.i32(0);
-                        let at = wide64(self, at, zero);
+                        let at = wide64(self, lo, zero);
+                        let three = self.s.m.int_const(i64t, 3);
+                        let mut at = self.s.m.bin(c, Bin::Shl, at, three);
+                        let k = self.s.m.int_const(i64t, i64::from(k));
+                        at = self.s.m.bin(c, Bin::Add, at, k);
+                        if let Some(d) = dynamic {
+                            let d = self.s.m.cast(c, Cast::ZExt, d, i64t);
+                            at = self.s.m.bin(c, Bin::Add, at, d);
+                        }
                         Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
                     }
-                    None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
+                    None => {
+                        // A buffer view's offset is what D3D12 takes: 32 bits.
+                        let three = self.s.m.i32(3);
+                        let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
+                        let k = self.s.m.i32(k);
+                        at = self.s.m.bin(c, Bin::Add, at, k);
+                        if let Some(d) = dynamic {
+                            at = self.s.m.bin(c, Bin::Add, at, d);
+                        }
+                        Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at)
+                    }
                 };
                 (nodes, BoxSort::Static(bits & 0x8000_0000 != 0))
             }

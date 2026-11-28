@@ -103,6 +103,17 @@ impl Source {
             s => vec![s],
         }
     }
+
+    /// Whether lanes may hold different descriptors.
+    fn per_lane(&self) -> bool {
+        match self {
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => true,
+            Source::Phi { args, .. } | Source::Select { args, .. } => {
+                args.iter().any(Source::per_lane)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +402,7 @@ fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+const SRC_SCC: u8 = 253;
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -1053,14 +1065,43 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// `v` written by `s_add_u32 x, src_scc` (or `s_add_u32 src_scc, x`), or
+    /// `s_mov_b32 v, src_scc` (implicitly `0 + src_scc`): the non-carry term.
+    fn add_scc(&self, v: Value) -> Option<Term> {
+        let inst = self.def(v)?;
+        if inst.writes.first()?.1 != v || inst.read(Reg::Scc).is_none() {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        match (inst.name(), src.as_slice()) {
+            ("s_mov_b32", [Operand::Const(SRC_SCC)]) => Some(Term::Const(0)),
+            ("s_add_u32", [x, c] | [c, x])
+                if matches!(c, Operand::Const(SRC_SCC))
+                    && !matches!(x, Operand::Const(SRC_SCC)) =>
+            {
+                self.term(inst, x)
+            }
+            _ => None,
+        }
+    }
+
     /// `hi` is `high` (0 for a table), possibly plus a carry.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
-        hi == want
-            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
-                |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
-            ))
-            || self.joined_on_taken_edges(hi) == Some(want)
+        if hi == want || self.joined_on_taken_edges(hi) == Some(want) {
+            return true;
+        }
+        let Term::Value(v) = hi else {
+            return false;
+        };
+        if self.add_scc(v) == Some(want) {
+            return true;
+        }
+        self.sop2(v, &["s_addc_u32"]).is_some_and(|(_, [a, b])| {
+            a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+        })
     }
 
     /// What phi `t` holds in every lane that reads it: the one value its
@@ -1081,12 +1122,15 @@ impl<'a> Tracer<'a> {
         taken.all(|x| x == first).then_some(first)
     }
 
-    /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
-    /// `v_add_co_ci_u32` with `high` as an operand.
+    /// `hi` adds something (with carry) to `high`: `s_addc_u32`,
+    /// `s_add_u32 ... src_scc`, or `v_add_co_ci_u32` with `high` as an operand.
     fn carried(&self, hi: Term, high: Value, known: &[(Bool, bool)], unguarded: &mut bool) -> bool {
         let Term::Value(v) = hi else { return false };
         if v == high {
             return true;
+        }
+        if let Some(x) = self.add_scc(v) {
+            return self.carried(x, high, known, unguarded);
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
             return self.carried(a, high, known, unguarded)
@@ -1201,6 +1245,11 @@ impl<'a> Tracer<'a> {
         let words = self.words(inst, op)?;
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Read from the first active lane at the access, as a waterfall loop
+        // does (`track` proves the loop): the dwords each lane holds.
+        if let Some(lanes) = self.first_lanes(&words) {
+            return self.per_lane(&lanes, &mut Vec::new(), &mut known);
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1222,11 +1271,27 @@ impl<'a> Tracer<'a> {
             Term::Value(v) => self.first_lane_source(v),
             Term::Const(_) => None,
         };
-        if let Some(sources) = words.iter().map(read).collect::<Option<Vec<_>>>() {
-            // Read from the first active lane, as a waterfall loop does: the
-            // dwords each lane holds.
-            let lanes: Vec<Term> = sources.into_iter().map(Term::Value).collect();
-            return self.per_lane(&lanes, joins, known);
+        if let Some(lanes) = self.first_lanes(words) {
+            // Read from the first active lane where no waterfall loop at the
+            // access proves them each lane's own (picked or joined after the
+            // reads, or copied back to the VGPRs a loop reads): the dwords
+            // must be the same in every lane that runs the reads, any of
+            // which may be the first.
+            let block = |w: &Term| match *w {
+                Term::Value(v) => self.defs[v.0 as usize].map(|s| s.0),
+                Term::Const(_) => None,
+            };
+            let mut runs = match (self.lanes, block(&words[0])) {
+                (Some(l), Some(b)) if words.iter().all(|w| block(w) == Some(b)) => {
+                    vec![(l.reach[b], true)]
+                }
+                _ => Vec::new(),
+            };
+            let source = self.per_lane(&lanes, joins, &mut runs)?;
+            if source.per_lane() {
+                return Err("a descriptor read from the first lane outside a waterfall loop");
+            }
+            return Ok(source);
         }
         if words.iter().any(|w| read(w).is_some()) {
             return Err("a descriptor partly read from the first lane");
@@ -1609,6 +1674,18 @@ impl<'a> Tracer<'a> {
             return None;
         };
         inst.read(Reg::V(reg))
+    }
+
+    /// The VGPR values `words` read from the first active lane, when every
+    /// dword is a `v_readfirstlane_b32` result.
+    fn first_lanes(&self, words: &[Term]) -> Option<Vec<Term>> {
+        words
+            .iter()
+            .map(|w| match *w {
+                Term::Value(v) => self.first_lane_source(v).map(Term::Value),
+                Term::Const(_) => None,
+            })
+            .collect()
     }
 
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
@@ -2219,9 +2296,14 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
+        let mask = if self.p.wave64 { 63 } else { 31 };
+        self.spilled(
+            inst.read(Reg::V(reg))?,
+            lane_of(lane)? & mask,
+            &mut Vec::new(),
+        )
+        .ok()
+        .flatten()
     }
 
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
@@ -2253,7 +2335,8 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        let mask = if self.p.wave64 { 63 } else { 31 };
+        if (lane_of(*at).ok_or(())? & mask) != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
@@ -2630,6 +2713,128 @@ pub(crate) mod tests {
             r.params.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
             [(0, 0)]
         );
+    }
+
+    #[test]
+    fn add_scc_carries_into_address_high_halves() {
+        // Table/heap addresses (`high = None`): `s_add_u32` with `src_scc` (in
+        // either operand order) and `s_mov_b32 hi, src_scc`.
+        for hi_inst in [
+            0x8007_FD80u32, // s_add_u32 s7, 0, src_scc
+            0x8007_80FD,    // s_add_u32 s7, src_scc, 0
+            0xBE87_03FD,    // s_mov_b32 s7, src_scc
+        ] {
+            let r = track_words(
+                &[
+                    0x8F01_8500, // s_lshl_b32 s1, s0, 5
+                    0x8006_0104, // s_add_u32 s6, s4, s1
+                    hi_inst,
+                    0xF408_0203,
+                    0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], null
+                    0xE070_1000,
+                    0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen
+                    S_ENDPGM,
+                ],
+                &[param(Constants, 0, 1), param(Table, 4, 1)],
+                HwStage::Cs,
+            );
+            let Address {
+                param: p,
+                offset,
+                dynamic,
+            } = r.scalar[0].1;
+            assert_eq!(r.scalar[0].0, (0, 3));
+            assert_eq!((p, offset), (1, 0));
+            assert!(dynamic.is_some());
+        }
+
+        // Root descriptor (`high = Some(base_hi)`): `s_add_u32 hi, base_hi, src_scc`.
+        let root = track_words(
+            &[
+                0x8F01_8500, // s_lshl_b32 s1, s0, 5
+                0x8006_0102, // s_add_u32 s6, s2, s1
+                0x8007_FD03, // s_add_u32 s7, s3, src_scc
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], null
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 1), param(Descriptor, 2, 2)],
+            HwStage::Cs,
+        );
+        let Address {
+            param: p,
+            offset,
+            dynamic,
+        } = root.scalar[0].1;
+        assert_eq!(root.scalar[0].0, (0, 3));
+        assert_eq!((p, offset), (1, 0));
+        assert!(dynamic.is_some());
+
+        // Code table (`s_getpc_b64` + `s_add_u32` + `src_scc`).
+        let code = track_words(
+            &[
+                0xBE86_1F00, // s_getpc_b64 s[6:7]
+                0x8006_9006, // s_add_u32 s6, s6, 16
+                0x8007_FD07, // s_add_u32 s7, s7, src_scc
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert_eq!(code.scalar, [((0, 3), at(CODE, 20))]);
+
+        // Adding another SGPR (not `src_scc`) to a descriptor heap's high half
+        // must still be refused.
+        let code_words: Vec<u8> = [
+            0x8F05_8500u32, // s_lshl_b32 s5, s0, 5
+            0x8006_0504,    // s_add_u32 s6, s4, s5
+            0x8007_0180,    // s_add_u32 s7, 0, s1
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], null
+            0xE070_1000,
+            0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code_words, false, 256).unwrap();
+        let err = track(
+            &p,
+            &[param(Constants, 0, 2), param(Table, 4, 1)],
+            HwStage::Cs,
+            lanes(&p).as_ref(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "an address into a descriptor heap with an untracked high half",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        // `s_mov_b32 hi, src_scc` on a root descriptor drops `base_hi`, so it
+        // must not track as the root descriptor (falls back to title memory).
+        let dropped = track_words(
+            &[
+                0xBE89_0303, // s_mov_b32 s9, s3 (keep base_hi live on entry)
+                0x8F01_8500, // s_lshl_b32 s1, s0, 5
+                0x8006_0102, // s_add_u32 s6, s2, s1
+                0xBE87_03FD, // s_mov_b32 s7, src_scc
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], null
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 1), param(Descriptor, 2, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(dropped.scalar, [((0, 4), at(MEMORY, 0))]);
     }
 
     #[test]
@@ -4807,5 +5012,69 @@ pub(crate) mod tests {
         assert_eq!(run_mov(0xD581_0000, 8).scalar[0].1.param, 0);
         assert_eq!(run_mov(0xD581_8000, 8).scalar[0].1.param, MEMORY);
         assert_eq!(run_mov(0xD581_0000, 0x0800_0008).scalar[0].1.param, MEMORY);
+    }
+    #[test]
+    fn first_lane_reads_no_waterfall_loop_proves_are_not_each_lanes_own() {
+        // WATERFALL_FETCHED_WAVE32 with the loaded dwords read from the
+        // first lane and copied back before the loop: every lane holds the
+        // first lane's entry, not its own.
+        let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
+        let at = word_at(&words, 0xBF8C_0070) + 1;
+        // v_readfirstlane_b32 s(24+k), v(4+k), then v_mov_b32 v(4+k), s(24+k).
+        let reads = (0..8).map(|k| 0x7E30_0504 + (k << 17) + k);
+        let copies = (0..8).map(|k| 0x7E08_0218 + (k << 17) + k);
+        words.splice(at..at, reads.chain(copies));
+        assert_eq!(refusal(&words, false), NO_LOOP);
+        // Every lane holds the second buffer (0x20), lanes from 16 on the
+        // first (0) instead. Whatever s_cselect picks, the dwords read from
+        // the first lane are lane 0's, the second; the lanes that access
+        // them all hold the first.
+        let words: &[u32] = &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0602,
+            0xFA00_0000, // s_load_dwordx4 s[24:27], s[4:5], 0x0
+            0xF408_0702,
+            0xFA00_0020, // s_load_dwordx4 s[28:31], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E08_021C, // v_mov_b32 v4, s28
+            0x7E0A_021D, // v_mov_b32 v5, s29
+            0x7E0C_021E, // v_mov_b32 v6, s30
+            0x7E0E_021F, // v_mov_b32 v7, s31
+            0x7D86_0090, // v_cmp_le_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0x7E08_0218, // v_mov_b32 v4, s24
+            0x7E0A_0219, // v_mov_b32 v5, s25
+            0x7E0C_021A, // v_mov_b32 v6, s26
+            0x7E0E_021B, // v_mov_b32 v7, s27
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0x7E18_0504, // v_readfirstlane_b32 s12, v4
+            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x858C_1C0C, // s_cselect_b64 s[12:13], s[12:13], s[28:29]
+            0x858E_1E0E, // s_cselect_b64 s[14:15], s[14:15], s[30:31]
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> end
+            0xE030_2000,
+            0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 idxen
+            0x887E_157E, // end: s_or_b32 exec_lo, exec_lo, s21
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 0, 1), param(Constants, 1, 1)];
+        let err = track(&p, &layout, HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a per-lane descriptor written where some lanes may keep the old one",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }

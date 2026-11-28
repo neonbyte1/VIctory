@@ -1069,6 +1069,12 @@ mod library;
 mod make;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
+/// The `VICTORY_PIPELINE_THREADS` count when set and usable, for callers
+/// that compile pipelines on threads of their own.
+#[cfg(windows)]
+pub fn env_workers() -> Option<usize> {
+    make::env_workers()
+}
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

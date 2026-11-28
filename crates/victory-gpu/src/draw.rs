@@ -4173,6 +4173,7 @@ uint ps() : SV_Target { return 1; }
             crate::pipeline::Translated {
                 atomics64: false,
                 host: HostShader {
+                    wave_size: None,
                     stage: HwStage::Cs,
                     dxil,
                     user_data,
