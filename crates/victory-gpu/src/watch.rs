@@ -697,11 +697,29 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
     };
     let unmapped = |page: usize| {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
-        n == 0 || info.State != MEM_COMMIT
+        // Windows commits memory at 4 KiB granularity while `PAGE` is 64 KiB:
+        // inspect every sub-region of `[page * PAGE, (page + 1) * PAGE)` so a
+        // leading reserved 4 KiB page cannot hide committed sub-pages after it.
+        let mut at = page * PAGE;
+        let end = at.saturating_add(PAGE);
+        while at < end {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            if n == 0 {
+                return true;
+            }
+            if info.State == MEM_COMMIT {
+                return false;
+            }
+            let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+            if next <= at {
+                return false;
+            }
+            at = next;
+        }
+        true
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
@@ -1184,6 +1202,87 @@ pub(crate) mod tests {
         let t = track(p, 2 * PAGE, true).expect("tracked");
         assert_eq!(t.take_split(p, p + 2 * PAGE), (vec![(p, p + PAGE)], vec![(p + PAGE, p + 2 * PAGE)]));
         assert!(t.take(p, p + 2 * PAGE).is_empty(), "both taken");
+        drop(t);
+        free(p);
+    }
+
+    /// A 64 KiB page whose leading 4 KiB OS page is reserved while a later
+    /// 4 KiB sub-page is committed must not be treated as unmapped: it stays
+    /// in the copy list and remains changed until the whole 64 KiB page can
+    /// be guarded.
+    #[test]
+    fn partially_committed_pages_are_not_taken_as_unmapped() {
+        const OS_PAGE: usize = 4096;
+        // Two 64 KiB pages: page 0 commits only its tail [4 KiB, 64 KiB);
+        // page 1 commits only its last 4 KiB [60 KiB, 64 KiB).
+        // SAFETY: a fresh write-watched reservation of two 64 KiB pages, freed below.
+        let p = unsafe {
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(
+                VirtualAlloc(
+                    (p + OS_PAGE) as *const _,
+                    PAGE - OS_PAGE,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                ) as usize,
+                0
+            );
+            assert_ne!(
+                VirtualAlloc(
+                    (p + 2 * PAGE - OS_PAGE) as *const _,
+                    OS_PAGE,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                ) as usize,
+                0
+            );
+            p
+        };
+        let t = track(p, 2 * PAGE, true).expect("tracked");
+        assert_eq!(
+            t.take_split(p, p + 2 * PAGE),
+            (vec![(p, p + 2 * PAGE)], Vec::new()),
+            "partially committed pages must be copied, not zero-filled as unmapped"
+        );
+        assert!(
+            t.changed(p / PAGE) && t.changed(p / PAGE + 1) && !t.clean(),
+            "partially committed pages cannot be guarded and must stay changed"
+        );
+        t.taken(&[p / PAGE, p / PAGE + 1]);
+        assert!(
+            t.changed(p / PAGE) && t.changed(p / PAGE + 1),
+            "`taken` must not clear pages that still have unguarded committed sub-pages"
+        );
+
+        // Once the reserved leading sub-pages of page 0 are committed, page 0
+        // becomes guardable while page 1 stays changed.
+        // SAFETY: commits the remaining reserved 4 KiB of our own reservation.
+        let committed =
+            unsafe { VirtualAlloc(p as *const _, OS_PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(committed, 0);
+        assert_eq!(
+            t.take_split(p, p + 2 * PAGE),
+            (vec![(p, p + 2 * PAGE)], Vec::new())
+        );
+        assert!(
+            !t.changed(p / PAGE),
+            "wholly committed page 0 is now guarded"
+        );
+        assert!(
+            t.changed(p / PAGE + 1),
+            "page 1 is still partially committed"
+        );
+        assert_eq!(
+            t.take_split(p, p + 2 * PAGE),
+            (vec![(p + PAGE, p + 2 * PAGE)], Vec::new())
+        );
+
         drop(t);
         free(p);
     }
