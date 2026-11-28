@@ -3668,9 +3668,12 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
+            // Without Device10 the resource uses the legacy creation path: no
+            // shared host texture either way.
             // SAFETY: a live resource.
             let own = unsafe { a.texture.GetDesc() }.Format.0 as u32;
             let shared = shared
+                && host.device.cast::<windows::Win32::Graphics::Direct3D12::ID3D12Device10>().is_ok()
                 && (crate::resource::family(own) == crate::resource::family(format)
                     || a.castable
                         .iter()
