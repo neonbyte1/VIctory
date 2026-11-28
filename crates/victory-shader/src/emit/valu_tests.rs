@@ -5536,3 +5536,123 @@ fn v_pk_int16_clamp_saturates_as_rdna2() {
         },
     );
 }
+
+#[test]
+fn v_mad_16_and_int16_clamp_match_rdna2() {
+    let vop3_clamp = |op: u16, s0: u16, s1: u16, s2: u16, clamp: bool| {
+        let [mut w0, w1] = vop3(op, 0, s0, s1, s2);
+        if clamp {
+            w0 |= 1 << 15;
+        }
+        [w0, w1]
+    };
+    let with_sentinel = |words: [u32; 2]| {
+        build_valu_cs(&[
+            vop1(0x001, 0, vgpr(4)), // v_mov_b32 v0, v4 (sentinel upper half)
+            words[0],
+            words[1],
+        ])
+    };
+
+    // VOP3 opcodes: 0x303=v_add_nc_u16, 0x304=v_sub_nc_u16, 0x340=v_mad_u16, 0x35e=v_mad_i16.
+    let mad_u16_wrap = with_sentinel(vop3_clamp(0x340, vgpr(1), vgpr(2), vgpr(3), false));
+    let mad_i16_wrap = with_sentinel(vop3_clamp(0x35e, vgpr(1), vgpr(2), vgpr(3), false));
+    let add_u16_sat = with_sentinel(vop3_clamp(0x303, vgpr(1), vgpr(2), 0, true));
+    let sub_u16_sat = with_sentinel(vop3_clamp(0x304, vgpr(1), vgpr(2), 0, true));
+
+    let sentinel = 0xBEEF_0000u32;
+
+    // v_mad_u16 wrapping (CLAMP=1 stays refused until hardware-measured on RDNA2)
+    let u_cases: &[(u16, u16, u16, u16)] = &[
+        (20, 30, 40, 640),
+        (300, 300, 100, (90_100u32 & 0xFFFF) as u16),
+        (u16::MAX, u16::MAX, u16::MAX, 0),
+    ];
+    let u_in: Vec<[u32; 4]> = u_cases
+        .iter()
+        .map(|&(a, b, c, _)| [u32::from(a), u32::from(b), u32::from(c), sentinel])
+        .collect();
+    run_cases(&mad_u16_wrap, &u_in, |backend, i, _, got| {
+        let want = sentinel | u32::from(u_cases[i].3);
+        assert_eq!(got, want, "{backend}: v_mad_u16 wrap case {i}");
+    });
+
+    // v_mad_i16 wrapping (CLAMP=1 stays refused until hardware-measured on RDNA2)
+    let i_cases: &[(i16, i16, i16, i16)] = &[
+        (-10, 20, 50, -150),
+        (i16::MIN, i16::MIN, i16::MAX, i16::MAX),
+        (i16::MIN, i16::MAX, i16::MIN, 0),
+        (200, 200, 100, (40_100i32 as i16)),
+        (-200, 200, -100, (-40_100i32 as i16)),
+    ];
+    let i_in: Vec<[u32; 4]> = i_cases
+        .iter()
+        .map(|&(a, b, c, _)| [u32::from(a as u16), u32::from(b as u16), u32::from(c as u16), sentinel])
+        .collect();
+    run_cases(&mad_i16_wrap, &i_in, |backend, i, _, got| {
+        let want = sentinel | u32::from(i_cases[i].3 as u16);
+        assert_eq!(got, want, "{backend}: v_mad_i16 wrap case {i}");
+    });
+
+    for op in [0x340u16, 0x35e] {
+        let err = try_build_valu_cs(&vop3_clamp(op, vgpr(1), vgpr(2), vgpr(3), true))
+            .expect_err("clamped v_mad_{u16,i16} must stay refused");
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "modifiers on a 16-bit integer operation",
+                    ..
+                }
+            ),
+            "op {op:#x}: {err:?}"
+        );
+    }
+
+    // v_add_nc_u16 clamp & v_sub_nc_u16 clamp
+    run_cases(
+        &add_u16_sat,
+        &[
+            [60000, 10000, 0, sentinel],
+            [123, 456, 0, sentinel],
+        ],
+        |backend, i, _, got| {
+            let want = sentinel | [u32::from(u16::MAX), 579][i];
+            assert_eq!(got, want, "{backend}: v_add_nc_u16 clamp case {i}");
+        },
+    );
+    run_cases(
+        &sub_u16_sat,
+        &[
+            [5, 10, 0, sentinel],
+            [500, 200, 0, sentinel],
+        ],
+        |backend, i, _, got| {
+            let want = sentinel | [0, 300][i];
+            assert_eq!(got, want, "{backend}: v_sub_nc_u16 clamp case {i}");
+        },
+    );
+
+    // CLAMP=1 is a no-op (wrapped low 16 bits) on mul_lo, 16-bit shifts, and min/max.
+    let noop_ops: &[(u16, &str, u16, u16, u16)] = &[
+        (0x305, "v_mul_lo_u16", 300, 300, (90_000u32 & 0xFFFF) as u16),
+        (0x314, "v_lshlrev_b16", 1, 0x8001, 0x0002),
+        (0x307, "v_lshrrev_b16", 4, 0x8020, 0x0802),
+        (0x308, "v_ashrrev_i16", 4, 0x8020, 0xF802),
+        (0x309, "v_max_u16", 0xFFF0, 12, 0xFFF0),
+        (0x30b, "v_min_u16", 0xFFF0, 12, 12),
+        (0x30a, "v_max_i16", (-16i16) as u16, 12, 12),
+        (0x30c, "v_min_i16", (-16i16) as u16, 12, (-16i16) as u16),
+    ];
+    for &(op, label, s0, s1, want_lo) in noop_ops {
+        let cs = with_sentinel(vop3_clamp(op, vgpr(1), vgpr(2), 0, true));
+        run_cases(
+            &cs,
+            &[[u32::from(s0), u32::from(s1), 0, sentinel]],
+            |backend, _, _, got| {
+                let want = sentinel | u32::from(want_lo);
+                assert_eq!(got, want, "{backend}: {label} clamp no-op");
+            },
+        );
+    }
+}

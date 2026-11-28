@@ -7793,6 +7793,8 @@ impl<'a> Lower<'a> {
             "v_sub_nc_i16",
             "v_subrev_nc_u16",
             "v_mul_lo_u16",
+            "v_mad_u16",
+            "v_mad_i16",
             "v_lshlrev_b16",
             "v_lshrrev_b16",
             "v_ashrrev_i16",
@@ -7956,7 +7958,26 @@ impl<'a> Lower<'a> {
         }
         // 16-bit integer results keep the low 16 bits after any saturation.
         let signed_add_sub = matches!(name, "v_add_nc_i16" | "v_sub_nc_i16");
-        if (v.clamp && !signed_add_sub) || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // 16-bit integers: computed on the low halves, the low 16 bits kept.
+        let saturates = matches!(name, "v_add_nc_u16" | "v_sub_nc_u16" | "v_subrev_nc_u16");
+        // Hardware measurement on RDNA2 (gfx1036) confirms the VOP3 CLAMP bit
+        // has no effect (result is the wrapped low 16 bits) on these eight ops.
+        let clamp_noop = matches!(
+            name,
+            "v_mul_lo_u16"
+                | "v_lshlrev_b16"
+                | "v_lshrrev_b16"
+                | "v_ashrrev_i16"
+                | "v_max_u16"
+                | "v_min_u16"
+                | "v_max_i16"
+                | "v_min_i16"
+        );
+        if (v.clamp && !signed_add_sub && !saturates && !clamp_noop)
+            || v.omod != 0
+            || v.abs != 0
+            || v.neg != 0
+        {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -7990,7 +8011,7 @@ impl<'a> Lower<'a> {
                     b = sext(self, b);
                 }
                 let k15 = self.s.m.i32(15);
-                match name {
+                let r = match name {
                     "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
                     "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
                     "v_add_nc_i16" | "v_sub_nc_i16" => {
@@ -8019,6 +8040,14 @@ impl<'a> Lower<'a> {
                     }
                     "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                     "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
+                    "v_mad_u16" | "v_mad_i16" => {
+                        let mut d = self.half_src(inst, 2)?;
+                        if name == "v_mad_i16" {
+                            d = sext(self, d);
+                        }
+                        let m = self.s.m.bin(c, Bin::Mul, a, b);
+                        self.s.m.bin(c, Bin::Add, m, d)
+                    }
                     "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
                         // src0 is the shift (4 bits), src1 the value.
                         let sh = self.s.m.bin(c, Bin::And, a, k15);
@@ -8044,6 +8073,22 @@ impl<'a> Lower<'a> {
                         let t = self.s.m.cmp(c, p, a, b);
                         self.s.m.select(c, t, a, b)
                     }
+                };
+                if v.clamp && saturates {
+                    match name {
+                        "v_add_nc_u16" => {
+                            let hi = self.s.m.i32(0xFFFF);
+                            let over = self.s.m.cmp(c, pred::IUGT, r, hi);
+                            self.s.m.select(c, over, hi, r)
+                        }
+                        _ => {
+                            let z = self.s.m.i32(0);
+                            let under = self.s.m.cmp(c, pred::SLT, r, z);
+                            self.s.m.select(c, under, z, r)
+                        }
+                    }
+                } else {
+                    r
                 }
             }
         };
