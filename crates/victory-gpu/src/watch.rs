@@ -864,7 +864,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // What it showed is gone already: nothing to keep. Only these pages: a
     // mapping that still shows the same physical pages shows what it did, and
     // its tracker (armed for a marked write, say) keeps it (#2414).
+||||||| f3578e386
+    // What it showed is gone already: nothing to keep.
     changed_here(&mut g, first, last, false);
+||||||| f3578e386
+    changed(&mut g, first, last, false);
+    open_guarded(&mut g, first, last);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -874,6 +879,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
                 if links.is_empty() {
                     g.alias_of.remove(&other);
                 }
+            }
+            if !g.holders.contains_key(&other)
+                && !g
+                    .alias_of
+                    .get(&other)
+                    .is_some_and(|links| links.iter().any(|p| g.holders.contains_key(p)))
+            {
+                open(&mut g, other);
             }
         }
     }

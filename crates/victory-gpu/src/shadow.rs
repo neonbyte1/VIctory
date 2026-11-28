@@ -2014,6 +2014,50 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    /// Unmapping another mapping of an armed page leaves the copy's mapping
+    /// guarded and clean: the shaders' marked writes still go back, and a
+    /// title write to the surviving mapping still saves the page's old bytes
+    /// so both writers survive.
+    #[test]
+    fn remapping_an_alias_does_not_drop_marked_writes_on_the_surviving_copy() {
+        let (a, b) = crate::watch::tests::twin_views(2);
+        let len = 2 * PAGE;
+        register(a, a as u64, len as u64);
+        let Some(copy) = find(a as u64, len as u64) else {
+            unregister(a, a as u64);
+            return; // no host GPU here
+        };
+        copy.update(a, len);
+        copy.writing(a, len, true);
+        // The shaders write a byte in each page; the runtime unmaps the
+        // other mapping of both pages while the submission runs.
+        copy.write_host((a + 10) as u64, &[0xaa]);
+        copy.write_host((a + PAGE + 20) as u64, &[0xbb]);
+        crate::watch::title_memory_remapped(b, len);
+        // The title then writes page 1 through the surviving mapping: it
+        // must still be guarded so the page's old bytes are saved first.
+        // SAFETY: a byte of our surviving mapping.
+        unsafe { ((a + PAGE + 40) as *mut u8).write_volatile(0x11) };
+        assert!(
+            copy.copy_back_marked(a) > 0,
+            "page 0's shader write goes back"
+        );
+        assert!(
+            copy.copy_back_marked(a + PAGE) > 0,
+            "page 1's shader write goes back"
+        );
+        // SAFETY: bytes of our surviving mapping.
+        let read = |at: usize| unsafe { ((a + at) as *const u8).read_volatile() };
+        assert_eq!(read(10), 0xaa, "page 0 kept the shader's write");
+        assert_eq!(
+            (read(PAGE + 20), read(PAGE + 40)),
+            (0xbb, 0x11),
+            "page 1 kept both writers' bytes"
+        );
+        copy.copy_back(a, len);
+        unregister(a, a as u64);
+    }
+
     /// Mark bits are handed out in runs and come back joined.
     #[test]
     fn mark_runs_are_reused_and_joined() {
