@@ -126,6 +126,36 @@ pub(crate) struct VramCopy {
 static VRAM_UPLOADS: Mutex<Vec<VramCopy>> = Mutex::new(Vec::new());
 static VRAM_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Copies in system memory now, and their bytes (diagnostics: the
+/// store-cliff line, `crate::copystat`).
+#[cfg(feature = "diagnostics")]
+static SYSTEM_COPIES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// See [`SYSTEM_COPIES`].
+#[cfg(feature = "diagnostics")]
+pub(crate) fn system_copies() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SYSTEM_COPIES[0].load(Relaxed),
+        SYSTEM_COPIES[1].load(Relaxed),
+    )
+}
+
+/// Counts shaders' writes into a copy in system memory (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn sys_write(
+    copy: &Shadow,
+    counter: crate::copystat::C,
+    bytes_counter: crate::copystat::C,
+    bytes: usize,
+) {
+    if !copy.vram {
+        crate::copystat::add(counter, 1);
+        crate::copystat::add(bytes_counter, bytes as u64);
+    }
+}
+
 fn try_vram_shadow(size: u64, max_single: u64) -> Option<ID3D12Resource> {
     if size > max_single {
         return None;
@@ -499,6 +529,13 @@ impl Shadow {
         if let Some(t) = &self.tracked {
             t.taken(&[page / PAGE]);
         }
+        #[cfg(feature = "diagnostics")]
+        sys_write(
+            self,
+            crate::copystat::C::SysTablePages,
+            crate::copystat::C::SysTableBytes,
+            n,
+        );
         n
     }
 
@@ -542,6 +579,12 @@ impl Shadow {
             base: slice.map_or(0, |s| s.offset),
             slice,
         });
+        #[cfg(feature = "diagnostics")]
+        if !b.vram {
+            use std::sync::atomic::Ordering::Relaxed;
+            SYSTEM_COPIES[0].fetch_add(1, Relaxed);
+            SYSTEM_COPIES[1].fetch_add(len, Relaxed);
+        }
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
@@ -648,6 +691,13 @@ impl Shadow {
         let mut subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
         let sub = sub_of(&mut subs, owner);
         sub.pending.insert((address, address + len, marked));
+        #[cfg(feature = "diagnostics")]
+        sys_write(
+            self,
+            crate::copystat::C::SysDeclared,
+            crate::copystat::C::SysDeclaredBytes,
+            len,
+        );
         // Its shaders may write the copy over a lazy page of it: that page's
         // earlier bytes are then no longer the copy's (`crate::watch::withheld`).
         self.wrote_over();
@@ -1432,6 +1482,12 @@ impl Drop for Shadow {
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|u| u.dst.as_raw() != raw || u.dst_off < from || u.dst_off >= to);
         }
+        #[cfg(feature = "diagnostics")]
+        if !self.vram {
+            use std::sync::atomic::Ordering::Relaxed;
+            SYSTEM_COPIES[0].fetch_sub(1, Relaxed);
+            SYSTEM_COPIES[1].fetch_sub(self.len, Relaxed);
+        }
         // Census: its bytes are freed below.
         #[cfg(feature = "diagnostics")]
         crate::census::drop_copy(self as *const Shadow as usize);
@@ -1984,6 +2040,10 @@ pub(crate) fn copy_back_marks(
     if !held.is_empty() {
         let m = marks();
         for (copy, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            #[cfg(feature = "diagnostics")]
+            if !copy.vram {
+                crate::copystat::sys_written(copy.start, copy.len, 1);
+            }
             copy.wrote_over();
             crate::memory::drop_withheld(page, PAGE);
         }
@@ -2000,6 +2060,10 @@ pub(crate) fn copy_back_marks(
         for (copy, _) in &pages {
             if bumped.insert(Arc::as_ptr(copy) as usize) {
                 copy.wrote_over();
+            }
+            #[cfg(feature = "diagnostics")]
+            if !copy.vram {
+                crate::copystat::sys_written(copy.start, copy.len, 1);
             }
         }
     }
@@ -2044,6 +2108,9 @@ pub(crate) fn copy_back_marks(
             {
                 crate::copystat::add(crate::copystat::C::MarkedPages, 1);
                 crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+                if !copy.vram {
+                    crate::copystat::add(crate::copystat::C::SysMarkedBytes, written as u64);
+                }
             }
             #[cfg(not(feature = "diagnostics"))]
             let _ = written;
@@ -2055,6 +2122,9 @@ pub(crate) fn copy_back_marks(
         {
             use crate::copystat::{C, add};
             add(C::MarkedPages, run.len() as u64);
+            if !copy.vram {
+                add(C::SysMarkedBytes, (back.written * PAGE) as u64);
+            }
             add(C::MarkedBytes, (back.written * PAGE) as u64);
             add(C::MarkedKept, back.kept as u64);
             add(C::MarkRuns, 1);

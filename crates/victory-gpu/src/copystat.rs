@@ -322,6 +322,18 @@ pub(crate) enum C {
     /// (`crate::pipeline::builder`, `VICTORY_BVH_HALVES`).
     BvhRun,
     BvhHeld,
+    /// Shaders' writes into host copies in system memory (CUSTOM L0, not
+    /// video memory), where a store pattern other than lane-coalesced
+    /// dwords runs at ~0.1 GB/s (SharedMem): marked pages (view and table
+    /// bitmaps, withheld ones too) and the bytes that went back of them;
+    /// declared ranges and their bytes; owned pages of page tables gone
+    /// back and their bytes.
+    SysMarkedPages,
+    SysMarkedBytes,
+    SysDeclared,
+    SysDeclaredBytes,
+    SysTablePages,
+    SysTableBytes,
     /// Not a counter: how many there are. Keep it last.
     Count,
 }
@@ -418,6 +430,64 @@ pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
         .get_or_insert_with(HashMap::new)
         .entry((start, len))
         .or_default() += bytes;
+}
+
+/// Marked pages per host copy in system memory (its title start and
+/// length), for the store-cliff line's top copies.
+static SYS_WRITTEN: Mutex<Option<HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+/// Shaders marked `pages` pages of the copy of `[start, start + len)`, a
+/// copy in system memory.
+pub(crate) fn sys_written(start: u64, len: u64, pages: u64) {
+    add(C::SysMarkedPages, pages);
+    *SYS_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .entry((start, len))
+        .or_default() += pages;
+}
+
+/// The store-cliff line: shaders' writes into copies in system memory
+/// (counters per frame `c`), the copies there now, and what the bytes
+/// would cost on the GPU coalesced (26 GB/s) and at the cliff (~0.09
+/// GB/s; SharedMem's probe).
+fn log_sys_writes(c: &[f64], frames: f64) {
+    let (copies, bytes) = crate::shadow::system_copies();
+    let mut top: Vec<((u64, u64), u64)> = SYS_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .into_iter()
+        .flatten()
+        .collect();
+    top.sort_by_key(|&(_, pages)| std::cmp::Reverse(pages));
+    let top: Vec<String> = top
+        .iter()
+        .take(6)
+        .map(|((start, len), pages)| format!("{start:#x}+{len:#x} {:.1}", *pages as f64 / frames))
+        .collect();
+    let written = c[C::SysMarkedBytes as usize] + c[C::SysTableBytes as usize];
+    let declared = c[C::SysDeclaredBytes as usize];
+    tracing::info!(
+        "  GPU writes into copies in system memory per frame: {copies} copies there ({:.0} MB); \
+         {:.1} marked pages ({:.2} MB of them went back), {:.1} declared ranges ({:.2} MB), \
+         {:.1} page-table pages ({:.2} MB went back); the bytes that went back cost {:.2} ms \
+         written coalesced, {:.1} ms at the store cliff; declared bytes {:.2} / {:.1} ms; \
+         most marked pages: {}",
+        bytes as f64 / 1e6,
+        c[C::SysMarkedPages as usize],
+        c[C::SysMarkedBytes as usize] / 1e6,
+        c[C::SysDeclared as usize],
+        declared / 1e6,
+        c[C::SysTablePages as usize],
+        c[C::SysTableBytes as usize] / 1e6,
+        written / 26e6,
+        written / 0.09e6,
+        declared / 26e6,
+        declared / 0.09e6,
+        top.join(", "),
+    );
 }
 
 /// Our process's working set, bytes.
@@ -661,6 +731,7 @@ pub(crate) fn log(frames: f64) {
         c[C::MarkViewProtects as usize],
         c[C::MarkThrough as usize],
     );
+    log_sys_writes(&c, frames);
     let (checks, missed, last) = crate::watch::take_lazy_checks();
     tracing::info!(
         "  lazy view pages per frame (on: {}, owner: {}): {:.0} offered, {:.0} made lazy (not copied back), {:.0} marked \
