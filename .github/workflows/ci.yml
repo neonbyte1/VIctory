@@ -16,6 +16,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The title's own platform. No GPU: D3D12 lands on WARP, the software
+  # adapter a machine without one falls back to, so the device tests run.
   check:
     runs-on: windows-latest
     timeout-minutes: 60
@@ -29,5 +31,117 @@ jobs:
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
+      # --no-fail-fast: one failing binary does not hide the ones after it.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
+
+  # The Linux/Wine harness (docs/linux.md): cross-compile for the Windows
+  # target with the MSVC CRT/SDK from xwin and run the test exes under Wine.
+  # A runner has no GPU, so D3D12 is vkd3d-proton on Mesa's lavapipe
+  # (software Vulkan): the device tests run there, and one that needs what
+  # the device does not have skips with a printed reason, as on WARP.
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      WINEPREFIX: ${{ github.workspace }}/target/wine-prefix
+      WINEDEBUG: "-all"
+      WINEDLLOVERRIDES: "d3d12,d3d12core=n;winedbg.exe=d"
+      # Ubuntu 24.04's wine64 package has no `wine` wrapper.
+      WINE: /usr/lib/wine/wine64
+      # Pinned so a run is the same harness every time (docs/linux.md §1-2).
+      XWIN_VERSION: "0.6.7"
+      VKD3D_PROTON_VERSION: "3.1"
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml, target too.
+      - run: rustup toolchain install
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm wine64 xvfb xauth mesa-vulkan-drivers libvulkan1 zstd
+          # Ubuntu keeps clang-cl under LLVM's own bin and links only clang.
+          llvm=$(ls -d /usr/lib/llvm-* | sort -V | tail -1)
+          for tool in clang-cl lld-link llvm-lib; do
+            command -v "$tool" >/dev/null || sudo ln -sf "$llvm/bin/$tool" "/usr/local/bin/$tool"
+          done
+          clang-cl --version | head -1
+          "$WINE" --version
+      - name: Cache xwin's CRT/SDK and vkd3d-proton
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.xwin
+            ~/vkd3d-proton
+          key: linux-wine-${{ env.XWIN_VERSION }}-${{ env.VKD3D_PROTON_VERSION }}
+      - name: xwin splat
+        run: |
+          if [ ! -d ~/.xwin/crt ]; then
+            cargo install xwin --version "$XWIN_VERSION" --locked
+            xwin --accept-license splat --output ~/.xwin
+          fi
+      - name: vkd3d-proton
+        run: |
+          if [ ! -d ~/vkd3d-proton/x64 ]; then
+            curl -fsSL -o /tmp/vkd3d.tar.zst \
+              "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v$VKD3D_PROTON_VERSION/vkd3d-proton-$VKD3D_PROTON_VERSION.tar.zst"
+            tar --zstd -xf /tmp/vkd3d.tar.zst -C /tmp
+            mv "/tmp/vkd3d-proton-$VKD3D_PROTON_VERSION" ~/vkd3d-proton
+          fi
+          ls ~/vkd3d-proton/x64
+      - name: Clippy
+        run: |
+          . tools/linux/env.sh
+          cargo clippy --workspace --all-targets --locked \
+            --target x86_64-pc-windows-msvc -- -D warnings
+          cargo clippy --workspace --all-targets --all-features --locked \
+            --target x86_64-pc-windows-msvc -- -D warnings
+      # Runs on Linux: the test that does it under Wine has no `git` there,
+      # and the run below skips it (this step is that check).
+      - name: Asset policy
+        run: cargo xtask policy
+      - name: Build the test exes
+        run: |
+          . tools/linux/env.sh
+          cargo test --workspace --locked --no-run \
+            --target x86_64-pc-windows-msvc \
+            --message-format=json > target/test-binaries.json
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test) |
+                 .executable | select(. != null)' \
+            target/test-binaries.json | sort -u > target/test-exes.txt
+          wc -l < target/test-exes.txt
+      - name: Wine prefix
+        run: |
+          mkdir -p "$WINEPREFIX"
+          # A prefix of this run's own, as `cargo xtask wine-test` makes one.
+          xvfb-run -a "$WINE" wineboot -i
+          # vkd3d-proton's D3D12 in place of Wine's own (no shader model 6.6).
+          cp ~/vkd3d-proton/x64/d3d12.dll ~/vkd3d-proton/x64/d3d12core.dll \
+            "$WINEPREFIX/drive_c/windows/system32/"
+      - name: Tests under Wine
+        run: |
+          . tools/linux/env.sh
+          # The loader's end-to-end test cannot start cargo from inside Wine:
+          # build its fixture here and name it, as `cargo xtask wine-test` does.
+          cargo build --quiet --target x86_64-pc-windows-msvc \
+            --manifest-path tests/fixtures/hle-probe/Cargo.toml \
+            --target-dir target/hle-probe
+          export VICTORY_HLE_PROBE="Z:$(realpath target/hle-probe/x86_64-pc-windows-msvc/debug/hle_probe.dll | tr / '\\')"
+          status=0
+          while read -r exe; do
+            name=$(basename "$exe")
+            # One GPU: tests sharing it collide (docs/linux.md §5).
+            args=(--test-threads=1)
+            # The policy test runs `git`, which Wine does not have; the step
+            # above is that check on this platform.
+            case "$name" in
+              xtask-*) args+=(--skip policy::tests::repository_passes_policy) ;;
+            esac
+            echo "::group::$name"
+            timeout --signal=KILL --kill-after=30 900 xvfb-run -a "$WINE" "$exe" "${args[@]}" \
+              || { echo "::error::$name failed"; status=1; }
+            echo "::endgroup::"
+          done < target/test-exes.txt
+          exit "$status"
