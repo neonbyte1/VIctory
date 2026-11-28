@@ -33,6 +33,8 @@ mod mark_tests;
 pub(super) use mark_tests::synthetic_mark_dxil;
 #[cfg(test)]
 mod user_data_tests;
+#[cfg(test)]
+mod subdword_tests;
 
 use code_table::CodeLoad;
 
@@ -109,6 +111,18 @@ pub(crate) struct Lowered {
     /// Written `cbufferLoadLegacy.i32` calls and extracts in the module.
     #[cfg(test)]
     pub cbuf_stats: super::bitcode::CbufStats,
+    /// Number of `atomicCompareExchange.i32` CAS loops emitted.
+    #[cfg(test)]
+    pub cas_loops: usize,
+    /// Number of `dx.op.atomicBinOp.i32` calls emitted.
+    #[cfg(test)]
+    pub atomic_bin_ops: usize,
+    /// Number of `dx.op.atomicCompareExchange.i32` calls emitted.
+    #[cfg(test)]
+    pub atomic_cas_ops: usize,
+    /// Number of `dx.op.rawBufferLoad.f32` calls emitted.
+    #[cfg(test)]
+    pub raw_buffer_loads: usize,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -1575,6 +1589,14 @@ impl<'a> Lower<'a> {
             early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
             #[cfg(test)]
             cbuf_stats: self.s.m.cbuf_load_stats(),
+            #[cfg(test)]
+            cas_loops: self.s.m.cas_loop_count(),
+            #[cfg(test)]
+            atomic_bin_ops: self.s.m.call_count("dx.op.atomicBinOp.i32"),
+            #[cfg(test)]
+            atomic_cas_ops: self.s.m.call_count("dx.op.atomicCompareExchange.i32"),
+            #[cfg(test)]
+            raw_buffer_loads: self.s.m.call_count("dx.op.rawBufferLoad.f32"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -11239,8 +11261,10 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let (true, Some((width, _))) = (store, sub) {
-            // The field of the dword holding it, by two atomics on that dword
-            // (clear, then set): other lanes' fields in it are left alone.
+            // The field of the dword holding it, updated by a compare-exchange
+            // loop so concurrent stores to the same byte or half never race
+            // between a separate clear and set while other lanes' fields stay
+            // intact.
             // shortcut: the field is taken not to cross a dword.
             let d = data.as_ref().ok_or("buffer store data")?;
             let x = self.vgprs(inst, d, 1)?[0];
@@ -11261,7 +11285,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, coords, mark_byte) = match index {
+            let (h, _coords, mark_byte) = match index {
                 Some(index) => {
                     // shortcut: on a structured view an offset at or past
                     // `stride` is dropped on the host, while the hardware
@@ -11282,14 +11306,27 @@ impl<'a> Lower<'a> {
                 }
             };
             let begin = self.begin_guarded(guard);
+            let pre = self.cur;
+            let old0 = self.raw_dword(h, at);
+            let cas = self.s.m.new_block();
+            let exit = self.s.m.new_block();
+            self.s.m.terminate(pre, Term::Br(cas));
             let i32t = self.s.t.i32;
-            for (op, v) in [(1, keep), (2, x)] {
-                let mut args = vec![h, self.s.m.i32(op)];
-                args.extend(coords);
-                args.push(v);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
-            }
+            let old = self.s.m.phi(cas, i32t);
+            let kept = self.s.m.bin(cas, Bin::And, old, keep);
+            let next = self.s.m.bin(cas, Bin::Or, kept, x);
+            let prev = self.s.op(
+                cas,
+                "atomicCompareExchange.i32",
+                Attr::NoUnwind,
+                i32t,
+                79,
+                &[h, at, iu, iu, old, next],
+            );
+            self.s.m.set_phi(old, vec![(old0, pre), (prev, cas)]);
+            let done = self.s.m.cmp(cas, pred::EQ, prev, old);
+            self.s.m.terminate(cas, Term::CondBr(done, exit, cas));
+            self.cur = exit;
             self.mark_view_write(h, mark_byte, 4, None);
             self.end_guarded(begin, &[]);
             return Ok(());

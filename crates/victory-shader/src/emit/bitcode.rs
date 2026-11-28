@@ -616,6 +616,104 @@ impl Module {
         u
     }
 
+    #[cfg(test)]
+    pub(crate) fn call_count(&self, name: &str) -> usize {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.body)
+            .filter(|&&i| {
+                matches!(
+                    &self.insts[i as usize].op,
+                    Op::Call(f, _) if self.funcs[*f as usize].name == name
+                )
+            })
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cas_loop_count(&self) -> usize {
+        let is_const = |v: V, want: i64| match v {
+            V::Const(i) => matches!(self.consts[i as usize].1, Const::Int(n) if n == want),
+            _ => false,
+        };
+        let mut count = 0;
+        for (b_idx, b) in self.blocks.iter().enumerate() {
+            let Some(Term::CondBr(V::Inst(done_i), exit, back)) = b.term else {
+                continue;
+            };
+            if back != b_idx || exit == b_idx || !b.body.contains(&done_i) {
+                continue;
+            }
+            let Op::Cmp(pred::EQ, lhs, rhs) = self.insts[done_i as usize].op else {
+                continue;
+            };
+            let (prev, old) = match (lhs, rhs) {
+                (V::Inst(p), V::Inst(o)) if b.phis.contains(&o) && b.body.contains(&p) => (p, o),
+                (V::Inst(o), V::Inst(p)) if b.phis.contains(&o) && b.body.contains(&p) => (p, o),
+                _ => continue,
+            };
+            let Op::Call(fn_id, args) = &self.insts[prev as usize].op else {
+                continue;
+            };
+            if self.funcs[*fn_id as usize].name != "dx.op.atomicCompareExchange.i32"
+                || args.len() != 7
+                || !is_const(args[0], 79)
+                || args[5] != V::Inst(old)
+            {
+                continue;
+            }
+            // next = (old & keep) | x
+            let V::Inst(next_i) = args[6] else {
+                continue;
+            };
+            let Op::Bin(Bin::Or, V::Inst(kept_i), _) = self.insts[next_i as usize].op else {
+                continue;
+            };
+            let Op::Bin(Bin::And, kept_lhs, kept_rhs) = self.insts[kept_i as usize].op else {
+                continue;
+            };
+            if kept_lhs != V::Inst(old) && kept_rhs != V::Inst(old) {
+                continue;
+            }
+            // old = phi [ (old0, pre), (prev, cas) ]
+            let Op::Phi(incoming) = &self.insts[old as usize].op else {
+                continue;
+            };
+            if incoming.len() != 2 || !incoming.contains(&(V::Inst(prev), b_idx)) {
+                continue;
+            }
+            let Some(&(V::Inst(old0_i), pre)) = incoming.iter().find(|&&(_, blk)| blk != b_idx)
+            else {
+                continue;
+            };
+            if !matches!(self.blocks[pre].term, Some(Term::Br(t)) if t == b_idx)
+                || !self.blocks[pre].body.contains(&old0_i)
+            {
+                continue;
+            }
+            // old0 = bitcast (extractvalue (rawBufferLoad.f32(h, at, ...)), 0)
+            let Op::Cast(Cast::Bitcast, V::Inst(ext_i)) = self.insts[old0_i as usize].op else {
+                continue;
+            };
+            let Op::Extract(V::Inst(load_i), 0) = self.insts[ext_i as usize].op else {
+                continue;
+            };
+            let Op::Call(load_fn, load_args) = &self.insts[load_i as usize].op else {
+                continue;
+            };
+            if self.funcs[*load_fn as usize].name == "dx.op.rawBufferLoad.f32"
+                && load_args.len() >= 3
+                && is_const(load_args[0], 139)
+                && load_args[1] == args[1]
+                && load_args[2] == args[2]
+                && self.blocks[pre].body.contains(&load_i)
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Which instructions are written: those [`Module::rooted`], the
     /// branch conditions, and whatever they read, transitively (a phi or a
     /// value nothing reads is dropped: lowering makes size queries for

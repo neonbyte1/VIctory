@@ -1880,3 +1880,328 @@ fn indexed_tbuffer_and_subdword_stores_refuse_unknown_stride_and_record_limit() 
     let msg = err.to_string();
     assert!(msg.contains("record limit"), "unexpected refusal {msg}");
 }
+/// User data: s2 a table with a raw UAV. Lanes 4k..4k+3 write distinct bytes
+/// 0x11, 0x22, 0x33, 0x44 to bytes 0..3 of dword k (`0x44332211`).
+const BYTE_STORE_DISTINCT_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3602_0083, // v_and_b32 v1, 3, v0
+    0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+    0x3404_0284, // v_lshlrev_b32 v2, 4, v1
+    0x3804_0501, // v_or_b32 v2, v1, v2
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE060_1000,
+    0x8004_0200, // buffer_store_byte v2, v0, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// Same as [`BYTE_STORE_DISTINCT_WAVE32`], guarded so only lanes 0..3 execute
+/// `buffer_store_byte`; higher dwords must remain untouched.
+const BYTE_STORE_GUARDED_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3602_0083, // v_and_b32 v1, 3, v0
+    0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+    0x3404_0284, // v_lshlrev_b32 v2, 4, v1
+    0x3804_0501, // v_or_b32 v2, v1, v2
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7DA8_0084, // v_cmpx_gt_u32 exec_lo, 4, v0
+    0xE060_1000,
+    0x8004_0200, // buffer_store_byte v2, v0, s[16:19], 0 offen
+    0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s2 a table with a raw UAV. Even lanes write 0x1234 to the low
+/// half and odd lanes write 0xABCD to the high half of each dword
+/// (`0xABCD1234`).
+const HALF_STORE_DISTINCT_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3602_0081, // v_and_b32 v1, 1, v0
+    0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+    0x7E04_02FF,
+    0x0000_ABCD, // v_mov_b32 v2, 0xABCD
+    0x7E06_02FF,
+    0x0000_1234, // v_mov_b32 v3, 0x1234
+    0x0204_0702, // v_cndmask_b32 v2, v2, v3, vcc_lo
+    0x3402_0081, // v_lshlrev_b32 v1, 1, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE068_1000,
+    0x8004_0201, // buffer_store_short v2, v1, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s2 a table with a raw UAV. Lanes 2k and 2k+1 concurrently write
+/// disjoint bit patterns `0x55` and `0xAA` to the exact same byte offset k.
+/// Under the old AND+OR lowering, lockstep lanes interleave clears and sets
+/// to produce `0xFF`; a CAS loop must always leave strictly `0x55` or `0xAA`.
+const BYTE_STORE_RACE_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3602_0081, // v_and_b32 v1, 1, v0
+    0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+    0x7E04_02FF,
+    0x0000_00AA, // v_mov_b32 v2, 0xAA
+    0x7E06_02FF,
+    0x0000_0055, // v_mov_b32 v3, 0x55
+    0x0204_0702, // v_cndmask_b32 v2, v2, v3, vcc_lo
+    0x2C02_0081, // v_lshrrev_b32 v1, 1, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE060_1000,
+    0x8004_0201, // buffer_store_byte v2, v1, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s2 a table with a raw UAV. Lanes 2k and 2k+1 concurrently write
+/// disjoint bit patterns `0x0F0F` and `0xF0F0` to the exact same halfword
+/// byte offset `2k`. A CAS loop must always leave strictly `0x0F0F` or
+/// `0xF0F0`, never `0xFFFF`.
+const HALF_STORE_RACE_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3602_0081, // v_and_b32 v1, 1, v0
+    0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+    0x7E04_02FF,
+    0x0000_F0F0, // v_mov_b32 v2, 0xF0F0
+    0x7E06_02FF,
+    0x0000_0F0F, // v_mov_b32 v3, 0x0F0F
+    0x0204_0702, // v_cndmask_b32 v2, v2, v3, vcc_lo
+    0x2C02_0081, // v_lshrrev_b32 v1, 1, v0
+    0x3402_0281, // v_lshlrev_b32 v1, 1, v1
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE068_1000,
+    0x8004_0201, // buffer_store_short v2, v1, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+fn build_subdword_store(words: &[u32], threads: u32) -> HostShader {
+    build(
+        words,
+        vec![param(RootType::Table, 2)],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        threads,
+    )
+}
+
+/// Dispatches a single-UAV sub-dword store shader over a buffer initialised to
+/// `init` on every available SM 6.6 host (hardware GPU and WARP).
+fn run_subdword_store(
+    shader: &HostShader,
+    init: &[u32],
+    groups: [u32; 3],
+    mut check: impl FnMut(&str, &[u32]),
+) {
+    let views = [View::Memory(init), View::Pair];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            assert_eq!((u.root, u.slot), (RootType::Table, 2));
+            // View::Memory places its raw UAV at heap index 1 (32 bytes in).
+            ud[u.index as usize] = 32;
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        check(label, &words[0]);
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn subdword_cas_shaders_lower_and_validate() {
+    let cases: [(&str, &[u32], u32, &[&str]); 5] = [
+        (
+            "BYTE_STORE_DISTINCT_WAVE32",
+            BYTE_STORE_DISTINCT_WAVE32,
+            32,
+            &[
+                "s_mov_b32 s12, s2",
+                "s_mov_b32 s13, 0",
+                "s_load_dwordx4 s[16:19], s[12:13], null",
+                "v_and_b32 v1, 3, v0",
+                "v_add_nc_u32 v1, 1, v1",
+                "v_lshlrev_b32 v2, 4, v1",
+                "v_or_b32 v2, v1, v2",
+                "s_waitcnt lgkmcnt(0)",
+                "buffer_store_byte v2, v0, s[16:19], 0 offen",
+                "s_endpgm",
+            ],
+        ),
+        (
+            "BYTE_STORE_GUARDED_WAVE32",
+            BYTE_STORE_GUARDED_WAVE32,
+            32,
+            &[
+                "s_mov_b32 s12, s2",
+                "s_mov_b32 s13, 0",
+                "s_load_dwordx4 s[16:19], s[12:13], null",
+                "v_and_b32 v1, 3, v0",
+                "v_add_nc_u32 v1, 1, v1",
+                "v_lshlrev_b32 v2, 4, v1",
+                "v_or_b32 v2, v1, v2",
+                "s_waitcnt lgkmcnt(0)",
+                "v_cmpx_gt_u32 exec_lo, 4, v0",
+                "buffer_store_byte v2, v0, s[16:19], 0 offen",
+                "s_mov_b32 exec_lo, -1",
+                "s_endpgm",
+            ],
+        ),
+        (
+            "HALF_STORE_DISTINCT_WAVE32",
+            HALF_STORE_DISTINCT_WAVE32,
+            32,
+            &[
+                "s_mov_b32 s12, s2",
+                "s_mov_b32 s13, 0",
+                "s_load_dwordx4 s[16:19], s[12:13], null",
+                "v_and_b32 v1, 1, v0",
+                "v_cmp_eq_u32 vcc_lo, 0, v1",
+                "v_mov_b32 v2, lit(0x0000abcd)",
+                "v_mov_b32 v3, lit(0x00001234)",
+                "v_cndmask_b32 v2, v2, v3, vcc_lo",
+                "v_lshlrev_b32 v1, 1, v0",
+                "s_waitcnt lgkmcnt(0)",
+                "buffer_store_short v2, v1, s[16:19], 0 offen",
+                "s_endpgm",
+            ],
+        ),
+        (
+            "BYTE_STORE_RACE_WAVE32",
+            BYTE_STORE_RACE_WAVE32,
+            64,
+            &[
+                "s_mov_b32 s12, s2",
+                "s_mov_b32 s13, 0",
+                "s_load_dwordx4 s[16:19], s[12:13], null",
+                "v_and_b32 v1, 1, v0",
+                "v_cmp_eq_u32 vcc_lo, 0, v1",
+                "v_mov_b32 v2, lit(0x000000aa)",
+                "v_mov_b32 v3, lit(0x00000055)",
+                "v_cndmask_b32 v2, v2, v3, vcc_lo",
+                "v_lshrrev_b32 v1, 1, v0",
+                "s_waitcnt lgkmcnt(0)",
+                "buffer_store_byte v2, v1, s[16:19], 0 offen",
+                "s_endpgm",
+            ],
+        ),
+        (
+            "HALF_STORE_RACE_WAVE32",
+            HALF_STORE_RACE_WAVE32,
+            64,
+            &[
+                "s_mov_b32 s12, s2",
+                "s_mov_b32 s13, 0",
+                "s_load_dwordx4 s[16:19], s[12:13], null",
+                "v_and_b32 v1, 1, v0",
+                "v_cmp_eq_u32 vcc_lo, 0, v1",
+                "v_mov_b32 v2, lit(0x0000f0f0)",
+                "v_mov_b32 v3, lit(0x00000f0f)",
+                "v_cndmask_b32 v2, v2, v3, vcc_lo",
+                "v_lshrrev_b32 v1, 1, v0",
+                "v_lshlrev_b32 v1, 1, v1",
+                "s_waitcnt lgkmcnt(0)",
+                "buffer_store_short v2, v1, s[16:19], 0 offen",
+                "s_endpgm",
+            ],
+        ),
+    ];
+    for (name, words, threads, want_sp3) in cases {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let disasm: Vec<String> = crate::gfx10::decode(&code)
+            .unwrap_or_else(|e| panic!("{name}: decode failed: {e}"))
+            .iter()
+            .map(|inst| inst.text(false))
+            .collect();
+        assert_eq!(disasm, want_sp3, "{name}: unexpected disassembly");
+        let _ = build_subdword_store(words, threads);
+    }
+}
+
+/// 4 lanes writing distinct bytes (`0x11, 0x22, 0x33, 0x44`) into one dword
+/// produce `0x44332211`, 2 lanes writing halves (`0x1234, 0xABCD`) produce
+/// `0xABCD1234`, and a lane-guarded byte store leaves untouched dwords intact.
+#[test]
+fn subdword_buffer_stores_pack_distinct_lanes_in_one_dword() {
+    let bytes = build_subdword_store(BYTE_STORE_DISTINCT_WAVE32, 32);
+    run_subdword_store(&bytes, &[0xA5A5_A5A5; 8], [1, 1, 1], |label, got| {
+        assert_eq!(got, &[0x4433_2211; 8], "{label}: distinct byte lanes");
+    });
+
+    let halves = build_subdword_store(HALF_STORE_DISTINCT_WAVE32, 32);
+    run_subdword_store(&halves, &[0xFFFF_FFFF; 16], [1, 1, 1], |label, got| {
+        assert_eq!(got, &[0xABCD_1234; 16], "{label}: distinct half lanes");
+    });
+
+    let guarded = build_subdword_store(BYTE_STORE_GUARDED_WAVE32, 32);
+    run_subdword_store(&guarded, &[0xDEAD_BEEF; 2], [1, 1, 1], |label, got| {
+        assert_eq!(
+            got,
+            &[0x4433_2211, 0xDEAD_BEEF],
+            "{label}: guarded byte lanes"
+        );
+    });
+}
+
+/// Concurrent lanes writing disjoint bit patterns (`0x55` vs `0xAA` for byte,
+/// `0x0F0F` vs `0xF0F0` for short) to the exact same byte or halfword must
+/// never tear into `0xFF` or `0xFFFF`.
+#[test]
+fn subdword_buffer_stores_do_not_tear_concurrent_same_slot_writes() {
+    let byte_race = build_subdword_store(BYTE_STORE_RACE_WAVE32, 64);
+    run_subdword_store(&byte_race, &[0x3333_3333; 8], [16, 1, 1], |label, got| {
+        for (dword, &word) in got.iter().enumerate() {
+            for slot in 0..4 {
+                let b = (word >> (slot * 8)) & 0xFF;
+                assert!(
+                    b == 0x55 || b == 0xAA,
+                    "{label}: dword {dword} byte {slot} tore to {b:#04x} (word {word:#010x})"
+                );
+            }
+        }
+    });
+
+    let half_race = build_subdword_store(HALF_STORE_RACE_WAVE32, 64);
+    run_subdword_store(&half_race, &[0x3333_3333; 16], [16, 1, 1], |label, got| {
+        for (dword, &word) in got.iter().enumerate() {
+            for slot in 0..2 {
+                let h = (word >> (slot * 16)) & 0xFFFF;
+                assert!(
+                    h == 0x0F0F || h == 0xF0F0,
+                    "{label}: dword {dword} half {slot} tore to {h:#06x} (word {word:#010x})"
+                );
+            }
+        }
+    });
+}
