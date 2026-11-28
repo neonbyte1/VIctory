@@ -5489,20 +5489,31 @@ impl<'a> Lower<'a> {
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
     // bytes or more as dword-aligned.
-    fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    fn format_load(
+        &mut self,
+        h: V,
+        index: Option<V>,
+        off: V,
+        format: u8,
+        channels: u32,
+    ) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
             let mask = l.s.m.i8((1u8 << n) - 1);
+            let (c0, c1) = match index {
+                Some(ix) => (ix, at),
+                None => (at, u),
+            };
             let r = l.s.op(
                 c,
                 "rawBufferLoad.f32",
                 Attr::ReadOnly,
                 l.s.t.res_ret,
                 139,
-                &[h, at, u, mask, align],
+                &[h, c0, c1, mask, align],
             );
             (0..n)
                 .map(|k| {
@@ -10750,7 +10761,9 @@ impl<'a> Lower<'a> {
         }
         // A descriptor built around a root view has the stride the code puts
         // in dword 1 (bits 16-29) and no record limit (dword 2 is -1): an
-        // index is a byte offset into the raw root view.
+        // index is a byte offset into the raw root view. MTBUF instructions
+        // carry the format themselves, so they index raw root views the same
+        // way.
         let (index, row_aligned_index) = match (src, index) {
             (
                 Source::Built {
@@ -10759,7 +10772,7 @@ impl<'a> Lower<'a> {
                     words,
                 },
                 Some(ix),
-            ) if address.param < self.x.native.layout.len() && !typed => {
+            ) if address.param < self.x.native.layout.len() && (!typed || format.is_some()) => {
                 if bits >> 30 != 0 || words[0] != u32::MAX {
                     return Err("a root view indexed with swizzling or a record limit");
                 }
@@ -10832,7 +10845,7 @@ impl<'a> Lower<'a> {
         // so no stride: its bytes are addressed as the hardware does, the
         // element times the view's stride (the host's table) plus the offset.
         let index = match index {
-            Some(i) if used.is_none() && !typed => {
+            Some(i) if used.is_none() && (!typed || format.is_some()) => {
                 let stride = self.view_stride(src)?;
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
                 off = self.s.m.bin(c, Bin::Add, rows, off);
@@ -10904,9 +10917,6 @@ impl<'a> Lower<'a> {
             // The field of the dword holding it, by two atomics on that dword
             // (clear, then set): other lanes' fields in it are left alone.
             // shortcut: the field is taken not to cross a dword.
-            if index.is_some() {
-                return Err("a byte or half buffer store by index");
-            }
             let d = data.as_ref().ok_or("buffer store data")?;
             let x = self.vgprs(inst, d, 1)?[0];
             // `_d16_hi`: the field is taken from the VGPR's high half.
@@ -10926,15 +10936,36 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), true, guard)?;
+            let (h, coords, mark_byte) = match index {
+                Some(index) => {
+                    // shortcut: on a structured view an offset at or past
+                    // `stride` is dropped on the host, while the hardware
+                    // reaches into the next record.
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    let h = self.handle(site, src, false, (12 | 0x1000, stride))?;
+                    let s = self.s.m.i32(stride);
+                    let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                    let mark_byte = self.s.m.bin(self.cur, Bin::Add, row, at);
+                    (h, [index, at, iu], mark_byte)
+                }
+                None => {
+                    let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), true, guard)?;
+                    (h, [at, iu, iu], at)
+                }
+            };
             let begin = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
-                let args = [h, self.s.m.i32(op), at, iu, iu, v];
+                let mut args = vec![h, self.s.m.i32(op)];
+                args.extend(coords);
+                args.push(v);
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
             }
-            self.mark_view_write(h, at, 4, None);
+            self.mark_view_write(h, mark_byte, 4, None);
             self.end_guarded(begin, &[]);
             return Ok(());
         }
@@ -11042,14 +11073,31 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(f) = *format {
-            if index.is_some() {
-                return Err("a typed-format load by index");
-            }
-            let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
+            let (bits, _) = buffer_format(f).ok_or("a buffer format")?;
+            let total: u32 = bits.iter().sum();
+            let bytes = total.div_ceil(32) * 4;
+            let (h, index, off) = match index {
+                Some(index) => {
+                    // shortcut: on a structured view an offset at or past
+                    // `stride` reads 0 on the host, while the hardware reaches
+                    // into the next record.
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    (h, Some(index), off)
+                }
+                None => {
+                    let (h, off) =
+                        self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
+                    (h, None, off)
+                }
+            };
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            let mut xs = self.format_load(h, off, f, count)?;
+            let mut xs = self.format_load(h, index, off, f, count)?;
             if d16 {
                 xs = self.d16_channels(f, xs)?;
             }

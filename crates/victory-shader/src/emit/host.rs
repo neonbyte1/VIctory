@@ -1737,6 +1737,8 @@ pub enum View<'a> {
     Levels(u32, u32),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A structured buffer UAV initialized with these dwords and element byte stride.
+    StructuredUav { data: &'a [u32], stride: u32 },
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -2234,6 +2236,48 @@ impl Host {
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
                         keep.push(zero(&b, None, n)?);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, n, rb));
+                    }
+                    View::StructuredUav { data, stride } => {
+                        let n = data.len() as u32;
+                        let bytes = u64::from(n) * 4;
+                        assert!(
+                            stride >= 4
+                                && stride.is_multiple_of(4)
+                                && (bytes as u32).is_multiple_of(stride),
+                            "structured UAV size must be a multiple of its dword-aligned stride"
+                        );
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(up);
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_UNKNOWN,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: (bytes as u32) / stride,
+                                    StructureByteStride: stride,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
