@@ -158,13 +158,22 @@ fn try_build_valu_cs_in_wave(body: &[u32], wave64: bool) -> Result<HostShader, c
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
-    try_lower_valu_cs(&words, 16, 1)
+    try_lower_valu_cs_in_wave(&words, 16, 1, wave64)
 }
 
 fn try_lower_valu_cs(
     words: &[u32],
     vgprs: u16,
     threads_x: u32,
+) -> Result<HostShader, crate::ShaderError> {
+    try_lower_valu_cs_in_wave(words, vgprs, threads_x, false)
+}
+
+fn try_lower_valu_cs_in_wave(
+    words: &[u32],
+    vgprs: u16,
+    threads_x: u32,
+    wave64: bool,
 ) -> Result<HostShader, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
@@ -5817,11 +5826,13 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) 
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })
     .expect("lower wave prefix");
 
     let shader = HostShader {
+        wave_size: lowered.wave_size,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
