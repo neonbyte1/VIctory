@@ -861,7 +861,7 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
     BITMAPS[usize::from(memory)]
         .get_or_init(|| {
             // Written pages, then one read mark per heap index.
-            let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS;
+            let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS_MAX;
             let bytes = u64::from(bits / 8);
             let (buffer, data) = host()?.shared_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages and read slots".into());
@@ -894,7 +894,7 @@ static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()))
 /// at (`victory_shader::emit`, "Read marks"), each once until
 /// [`forget_read`]. Clears the slots forgotten since first.
 pub(crate) fn take_reads() -> Vec<u32> {
-    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let words = (victory_shader::emit::HEAP_VIEWS_MAX / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     // Both bitmaps: shaders that use title memory mark their reads in theirs.
     let mut maps: Vec<&mut [u32]> = [false, true]
@@ -938,7 +938,7 @@ pub(crate) fn take_reads() -> Vec<u32> {
 /// has seen every mark: its own record of slots seen keeps a slot read
 /// again from being reported as new.
 pub(crate) fn reads_since() -> Vec<u32> {
-    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let words = (victory_shader::emit::HEAP_VIEWS_MAX / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     let mut slots = Vec::new();
     for b in [false, true].into_iter().filter_map(bitmap) {

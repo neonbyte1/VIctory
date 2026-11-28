@@ -273,6 +273,40 @@ fn wait(event: HANDLE, fence: &ID3D12Fence, dev: &ID3D12Device, value: u64) -> R
         Ok(())
     }
 }
+/// Whether the test host's adapter makes a shader-visible view heap of
+/// `count` slots (NVIDIA refuses more than 1,000,000), for
+/// [`super::heap_views`] in the translator's own tests: the default
+/// adapter, or WARP with `VICTORY_WARP=1` (as [`Host::new`]). Without a
+/// device, yes: no test runs on a host then.
+#[cfg(test)]
+pub(crate) fn takes_view_heap(count: u32) -> bool {
+    let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    // SAFETY: plain DXGI/device and heap creation with valid out pointers.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        let made = if warp {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|factory| factory.EnumWarpAdapter::<IDXGIAdapter1>())
+                .and_then(|adapter| {
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                })
+        } else {
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+        };
+        if made.is_err() {
+            return true;
+        }
+        let Some(device) = device else { return true };
+        device
+            .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: count,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .is_ok()
+    }
+}
 
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
@@ -1726,8 +1760,8 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
+    /// Last in the heap, which then has [`super::heap_views`] slots: the
+    /// host's null raw buffer SRV at [`super::null_buffer_view`] and UAV
     /// below it.
     NullBuffers,
 }
@@ -1940,7 +1974,7 @@ impl Host {
                 Ok::<_, String>(zeros)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => super::heap_views() as usize,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -2360,7 +2394,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = super::null_buffer_view() as usize;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;

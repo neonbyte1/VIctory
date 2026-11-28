@@ -3263,6 +3263,7 @@ uint ps() : SV_Target { return 1; }
             "compute",
             crate::pipeline::Translated {
                 host: HostShader {
+                    wave_size: None,
                     stage: HwStage::Cs,
                     dxil,
                     user_data,

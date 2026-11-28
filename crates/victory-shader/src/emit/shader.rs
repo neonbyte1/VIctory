@@ -27,16 +27,54 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+/// View heap indices are clamped below [`heap_views`], which is this where
+/// the host takes a shader-visible view heap this large.
+pub const HEAP_VIEWS_MAX: u32 = 1 << 21;
+/// The largest shader-visible view heap every host takes (resource binding
+/// tiers 1 and 2); NVIDIA caps tier 3 heaps here too.
+pub const HEAP_VIEWS_PORTABLE: u32 = 1_000_000;
+/// Sampler heap indices are clamped below this: the host's sampler heaps
+/// are at least this large, the slots past their own null.
 pub const HEAP_SAMPLERS: u32 = 2048;
+
+static HEAP_VIEWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// View heap indices are clamped below this (`emit`, "Heap indices"): the
+/// host's view heaps are at least this large, the slots past their own
+/// null. The host that runs the translations says what its adapter takes
+/// ([`set_heap_views`]: `victory-gpu`, [`HEAP_VIEWS_PORTABLE`] on NVIDIA,
+/// where an index past the heap faults the device); without one,
+/// [`HEAP_VIEWS_MAX`]. The translator itself opens no device for it (its
+/// own tests excepted: their test host's adapter, WARP with
+/// `VICTORY_WARP=1`). Fixed for the process at first use; the value is part
+/// of the translation, so the shader cache must key on it (`victory-gpu`'s
+/// does).
+pub fn heap_views() -> u32 {
+    *HEAP_VIEWS.get_or_init(|| {
+        #[cfg(all(windows, test))]
+        if !super::host::takes_view_heap(HEAP_VIEWS_MAX) {
+            return HEAP_VIEWS_PORTABLE;
+        }
+        HEAP_VIEWS_MAX
+    })
+}
+
+/// The host's view heaps take `views` slots ([`HEAP_VIEWS_PORTABLE`] or
+/// [`HEAP_VIEWS_MAX`]): [`heap_views`] from now on, before the first
+/// translation. Returns the size in effect, another one if [`heap_views`]
+/// was already fixed (a translation before this call).
+pub fn set_heap_views(views: u32) -> u32 {
+    *HEAP_VIEWS.get_or_init(|| views)
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
-/// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// (`emit`, "Buffer views at computed heap indices"): the last two slots
+/// below [`heap_views`].
+pub fn null_buffer_view() -> u32 {
+    heap_views() - 2
+}
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -50,7 +88,8 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// The first bit of the read marks of texture views (`emit`, "Read
 /// marks"), after the written pages in the same bitmap: one bit per
-/// resource-heap index, [`HEAP_VIEWS`] of them.
+/// resource-heap index, [`HEAP_VIEWS_MAX`] of them (every index
+/// [`heap_views`] lets through).
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
@@ -610,7 +649,7 @@ impl Shader {
         self.heap_props.push(props);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { heap_views() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
