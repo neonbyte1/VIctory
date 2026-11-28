@@ -21,7 +21,7 @@
 //! ([`declared_overlap`]).
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -3139,7 +3139,8 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if crate::crumbs::on() {
-                if let Err(e) = self.fence.SetEventOnCompletion(submitted.value, self.event) {
+                // SAFETY: our fence and event, both live.
+                if let Err(e) = unsafe { self.fence.SetEventOnCompletion(submitted.value, self.event) } {
                     tracing::warn!(error = %e, "host submission not waited for");
                 }
                 self.wait_crumbed(&[all[i]], submitted.value);

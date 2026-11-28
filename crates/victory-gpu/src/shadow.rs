@@ -17,7 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -2639,11 +2639,6 @@ pub(crate) fn generation() -> u64 {
 fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
-
-/// The longest title buffer registered so far (it stays after the buffer is
-/// released): a buffer starting further below an address than this cannot
-/// hold it. Changed under `BUFFERS`' lock.
-static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
 
 /// Counts title buffers made and released: which buffer is the innermost
 /// one holding some bytes ([`find`]) may differ when it changed.

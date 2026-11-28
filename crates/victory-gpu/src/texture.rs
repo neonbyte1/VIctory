@@ -1435,7 +1435,6 @@ pub(crate) fn staging_for(
     if let Some(s) = held.as_ref() {
         return Some(s.clone());
     }
-    let texture = &copy.texture;
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(mut layout) = crate::resource::texture_layout(&desc) else {
         once!(
