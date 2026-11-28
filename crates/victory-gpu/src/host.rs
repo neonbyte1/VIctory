@@ -8492,24 +8492,31 @@ mod withholding {
         let inner = crate::shadow::find(p as u64, PAGE as u64).unwrap();
         assert!(!std::sync::Arc::ptr_eq(&outer, &inner));
         let list = host.new_list().unwrap();
+        // The copies take title memory before the submission: its refreshes
+        // would otherwise run after the shaders' writes below (both are
+        // deferred to the submission), and a copy in video memory is brought
+        // up to date by an upload of the mirror over its video memory.
+        assert_eq!(outer.update(0, p, 2 * PAGE), Ok(2 * PAGE));
+        assert_eq!(inner.update(0, p, PAGE), Ok(PAGE));
         {
             // Outer has a withheld marked range, plus an overlapping ordinary
             // marked write whose mark lands in the ordinary bitmap.
             let _writer = list.writer_uses_memory(true);
-            outer.refresh(&list, p as u64, (2 * PAGE) as u64);
             outer.gpu_writes(&list, p as u64, (2 * PAGE) as u64, true);
         }
         {
             let _writer = list.writer_uses_memory(false);
             outer.gpu_writes(&list, p as u64, PAGE as u64, true);
-            inner.refresh(&list, p as u64, PAGE as u64);
             inner.gpu_writes(&list, p as u64, PAGE as u64, true);
         }
         let (o, i) = (outer.clone(), inner.clone());
         list.defer_host(move || {
-            o.write_host((p + 16) as u64, &[0xaa]);
+            // The shaders' writes, as they reach a copy in video memory: the
+            // read-back after the submission brings them to its mirror (a
+            // copy in system memory holds them there already).
+            o.write_gpu((p + 16) as u64, &[0xaa]);
             o.mark_page_for_test(p, false);
-            i.write_host((p + 32) as u64, &[0xbb]);
+            i.write_gpu((p + 32) as u64, &[0xbb]);
             i.mark_page_for_test(p, false);
         });
         list.defer_missed(|| true);

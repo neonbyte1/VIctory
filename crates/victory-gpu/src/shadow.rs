@@ -355,6 +355,30 @@ impl Shadow {
         }
     }
 
+    /// Writes `bytes` into the copy at title address `address` as a shader
+    /// does (tests): into the copy in video memory only, whose bytes the
+    /// submission's read-back then brings to the mirror. [`Shadow::write_host`]
+    /// writes the mirror too, which through `Host::execute` reads as the
+    /// copy's bytes from before the submission: its read-back would find the
+    /// page as the copy held it and skip the copy-back (`crate::host`'s
+    /// `unchanged`). With the copy in system memory the mirror is the copy's
+    /// bytes, written here.
+    #[cfg(test)]
+    pub(crate) fn write_gpu(&self, address: u64, bytes: &[u8]) {
+        let at = (address - self.start) as usize;
+        assert!(at + bytes.len() <= self.len as usize);
+        if self.vram
+            && let Some(h) = host()
+        {
+            // The refreshes' uploads first: the shaders' write is the last.
+            h.flush_test_vram_uploads();
+            h.test_upload_buffer(&self.buffer, self.base + at as u64, bytes.as_ptr(), bytes.len() as u64);
+        } else {
+            // SAFETY: inside the mapping (checked).
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+        }
+    }
+
     /// Submission `owner`'s snapshot segments, as (offset, bytes) (tests).
     #[cfg(test)]
     pub(crate) fn segments(&self, owner: u64) -> Vec<(usize, usize)> {
