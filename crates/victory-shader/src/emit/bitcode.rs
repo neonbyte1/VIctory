@@ -1252,6 +1252,41 @@ impl Writer {
 }
 
 #[cfg(test)]
+pub(super) fn two_function_bitcode() -> Vec<u8> {
+    let mut w = Writer::default();
+    w.bytes(b"BC\xC0\xDE");
+    w.enter(MODULE_BLOCK, 3);
+    w.record(1, &[1]); // relative value ids
+    w.enter(TYPE_BLOCK, 3);
+    w.record(1, &[4]);
+    w.record(2, &[]); // void
+    w.record(7, &[32]); // i32
+    w.record(3, &[]); // float
+    w.record(21, &[0, 0]); // void ()
+    w.exit();
+    for _ in 0..2 {
+        w.record(8, &[3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    w.enter(CONSTANTS_BLOCK, 3);
+    w.record(1, &[1]);
+    w.record(4, &[2]); // i32 1
+    w.record(1, &[2]);
+    w.record(6, &[u64::from(1.0f32.to_bits())]);
+    w.exit();
+    // The second body's relative id would find the first body's result
+    // if it was still in the value table.
+    for constant in [2, 1] {
+        w.enter(FUNCTION_BLOCK, 4);
+        w.record(1, &[1]);
+        w.record(2, &[constant, constant, 0]);
+        w.record(10, &[]);
+        w.exit();
+    }
+    w.exit();
+    w.finish()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

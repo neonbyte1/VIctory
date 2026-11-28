@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+use victory_shader::emit::{self, counts::Counts, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -75,6 +75,10 @@ struct Tally {
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+    /// With `--count`: the instructions of the emitted shaders, by stage
+    /// (with the programs counted) and in all.
+    count: bool,
+    counted: BTreeMap<&'static str, (usize, Counts)>,
 }
 
 impl Tally {
@@ -155,6 +159,11 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        for (stage, (n, counts)) in other.counted {
+            let total = self.counted.entry(stage).or_default();
+            total.0 += n;
+            total.1.add(&counts);
+        }
         for (reason, (n, example)) in other.failed {
             self.record_failure(reason, n, example);
         }
@@ -210,6 +219,7 @@ pub fn run(
     validate: bool,
     pipelines: bool,
     list: bool,
+    count: bool,
     jobs: Option<usize>,
     host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
@@ -267,6 +277,7 @@ pub fn run(
                         s.spawn(|| {
                             let mut t = Tally {
                                 list,
+                                count,
                                 ..Tally::default()
                             };
                             let host = pipelines.then(|| Host::new(false).ok()).flatten();
@@ -335,46 +346,70 @@ pub fn run(
          {} vertex values; exports {:?}, {} still f16 pairs)",
         t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
     );
+    // A check nobody asked for has no result: not a zero, which a reader
+    // of a pasted report takes for "none passed".
+    let checks = |validated: usize, made: usize| {
+        let validated = if validate {
+            format!("{validated} validated")
+        } else {
+            "validation not checked".to_owned()
+        };
+        let made = if pipelines {
+            format!("{made} pipelines")
+        } else {
+            "pipelines not made".to_owned()
+        };
+        format!("{validated}, {made}")
+    };
     println!(
-        "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
-        t.emitted, t.emit_programs, t.validated, t.pipelines
+        "DXIL         {} emitted of {} vertex and pixel programs; {}",
+        t.emitted,
+        t.emit_programs,
+        checks(t.validated, t.pipelines)
     );
     println!(
-        "             {} emitted of {} compute programs; {} validated, {} pipelines",
-        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
+        "             {} emitted of {} compute programs; {}",
+        t.cs_emitted,
+        t.cs_programs,
+        checks(t.cs_validated, t.cs_pipelines)
     );
     println!(
-        "             {} emitted of {} mesh programs; {} validated, {} pipelines",
-        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
+        "             {} emitted of {} mesh programs; {}",
+        t.ms_emitted,
+        t.ms_programs,
+        checks(t.ms_validated, t.ms_pipelines)
     );
     println!("wave sizes   {}", t.wave_summary());
-    if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
-        let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in pairs {
-            let made = match (find(v), find(p)) {
-                // A mesh pair is named the same way the census names it
-                // everywhere else: the host without mesh shaders says so
-                // instead of failing to make the pipeline with an error that
-                // reads like the shaders' fault.
-                (Some((_, vs)), Some((_, ps))) => {
-                    let made = if vs.stage == HwStage::Ms {
-                        if host.mesh_shaders() {
-                            host.mesh_pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
-                        } else {
-                            Err("the host has no mesh shaders".to_owned())
-                        }
-                    } else {
-                        host.pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
-                    };
-                    made.map(|()| "pipeline created".to_owned()).unwrap_or_else(|e| e)
-                }
-                _ => "not emitted".to_owned(),
-            };
-            println!("pair {v} + {p}: {made}");
-        }
+    if count {
+        print_counts(&t.counted);
     }
+    if !pairs.is_empty() {
+    let host = Host::new(false).map_err(anyhow::Error::msg)?;
+    let kept = lock(&kept);
+    let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
+    for (v, p) in pairs {
+        let made = match (find(v), find(p)) {
+            // A mesh pair is named the same way the census names it
+            // everywhere else: the host without mesh shaders says so
+            // instead of failing to make the pipeline with an error that
+            // reads like the shaders' fault.
+            (Some((_, vs)), Some((_, ps))) => {
+                let made = if vs.stage == HwStage::Ms {
+                    if host.mesh_shaders() {
+                        host.mesh_pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+                    } else {
+                        Err("the host has no mesh shaders".to_owned())
+                    }
+                } else {
+                    host.pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+                };
+                made.map(|()| "pipeline created".to_owned()).unwrap_or_else(|e| e)
+            }
+            _ => "not emitted".to_owned(),
+        };
+        println!("pair {v} + {p}: {made}");
+    }
+}
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
@@ -675,6 +710,30 @@ fn check(
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
+    if t.count {
+        match emit::counts::of(&shader.dxil) {
+            Ok(counts) => {
+                if t.list {
+                    t.lines.push(format!(
+                        "{}  {} host instructions in {} blocks",
+                        label(),
+                        counts.instructions,
+                        counts.blocks
+                    ));
+                }
+                let stage = match shader.stage {
+                    HwStage::Cs => "compute",
+                    HwStage::Ms => "mesh",
+                    HwStage::Ps => "pixel",
+                    _ => "vertex",
+                };
+                let total = t.counted.entry(stage).or_default();
+                total.0 += 1;
+                total.1.add(&counts);
+            }
+            Err(e) => t.fail(format!("count: {e}"), &label),
+        }
+    }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
         && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
@@ -752,6 +811,31 @@ fn check(
             }
             t.fail(format!("validator: {first}"), label);
         }
+    }
+}
+
+/// With `--count`: what the emitted shaders hold, by stage and then by kind
+/// of instruction (most first). Counts only, so it can be posted as it is.
+fn print_counts(counted: &BTreeMap<&'static str, (usize, Counts)>) {
+    let mut all = (0, Counts::default());
+    for (n, counts) in counted.values() {
+        all.0 += n;
+        all.1.add(counts);
+    }
+    println!(
+        "host code    {} instructions in {} blocks of {} emitted programs",
+        all.1.instructions, all.1.blocks, all.0
+    );
+    for (stage, (n, counts)) in counted {
+        println!(
+            "             {stage}: {} instructions in {} blocks of {n} programs",
+            counts.instructions, counts.blocks
+        );
+    }
+    let mut kinds: Vec<_> = all.1.kinds.iter().collect();
+    kinds.sort_by_key(|&(kind, n)| (std::cmp::Reverse(*n), kind));
+    for (kind, n) in kinds {
+        println!("  {n:>11}  {kind}");
     }
 }
 
@@ -961,7 +1045,7 @@ mod tests {
         // SAFETY: no other test in this binary touches the environment.
         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, Some(1), None).unwrap_err();
+        let err = super::run(vec![missing], false, false, false, false, Some(1), None).unwrap_err();
         // SAFETY: as above; unset so a later test's `run` is not refused.
         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(
