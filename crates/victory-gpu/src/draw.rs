@@ -1035,16 +1035,15 @@ impl State {
                 }
             }
             if let Some(param) = stage.view_addresses {
-                let table = (self.heaps[0] != 0)
+                let gpu = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                     .flatten()
-                    .and_then(|h| h.view_addresses());
-                let Some((table, _, gpu)) = table else {
+                    .and_then(|h| kept_view_addresses(list, h));
+                let Some(gpu) = gpu else {
                     once!("a shader reading a view's address dropped: no view heap");
                     not_run("view addresses without a view heap");
                     return false;
                 };
-                list.keep(table);
                 // SAFETY: an open list; the table lives while the list holds it.
                 unsafe {
                     if compute {
@@ -2803,6 +2802,15 @@ fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
 }
 
+/// The host address of `heap`'s view-address table, which `list` keeps until
+/// it is reset: the title may release the heap while the GPU still reads the
+/// table as a root view.
+fn kept_view_addresses(list: &HostList, heap: &crate::descriptor::host::HostHeap) -> Option<u64> {
+    let (table, _, gpu) = heap.view_addresses()?;
+    list.keep(table);
+    Some(gpu)
+}
+
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
@@ -3177,6 +3185,9 @@ mod tests {
         let list = host.new_list().unwrap();
         let before = list.kept_count();
         let (table, _, gpu) = heap.view_addresses().expect("a table");
+        // Making the table keeps nothing; the list that binds it keeps it.
+        assert_eq!(list.kept_count(), before);
+        assert_eq!(kept_view_addresses(&list, &heap), Some(gpu));
         assert_eq!(list.kept_count(), before + 1);
         // SAFETY: a live buffer.
         assert_eq!(gpu, unsafe { table.GetGPUVirtualAddress() });
