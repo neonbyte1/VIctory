@@ -1373,17 +1373,37 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        list.defer(move || copy_title_memory(dst as usize, src as usize, len));
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
+}
+
+/// Copies title memory `[src, src + len)` over `[dst, dst + len)` through the
+/// kernel, without faulting on unmapped or read-only pages. Disjoint ranges
+/// copy directly in one pass with no temporary buffer; overlapping ranges
+/// stage through a buffer bounded by committed memory for `memmove` order.
+#[cfg(windows)]
+fn copy_title_memory(dst: usize, src: usize, len: usize) {
+    if len == 0 || dst == src {
+        return;
+    }
+    // Bounds absurd sizes before walking pieces or allocating a staging buffer.
+    if !crate::texture::committed(src as *const u8, len) {
+        return;
+    }
+    let overlaps = src < dst.saturating_add(len) && dst < src.saturating_add(len);
+    if !overlaps {
+        let _writing = crate::watch::writing(dst, len);
+        crate::host::write_mapped(dst as *mut u8, src as *const u8, len);
+        return;
+    }
+    let mut bytes = vec![0u8; len];
+    if !crate::host::read_into(src as *const u8, &mut bytes) {
+        return;
+    }
+    let _writing = crate::watch::writing(dst, len);
+    crate::host::write_mapped(dst as *mut u8, bytes.as_ptr(), len);
 }
 
 /// `DriverHintX(feature, value)`: no hints for the host.
@@ -2649,6 +2669,41 @@ mod tests {
             assert_eq!(list.kept_count(), before + 1, "kind {kind}");
         }
         list.close();
+    }
+
+    /// CopyMemoryToMemoryX at submission: disjoint and overlapping ranges
+    /// both copy without faulting on read-only destinations or huge sizes.
+    #[cfg(windows)]
+    #[test]
+    fn memory_copies_do_not_fault_on_read_only_destinations() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        // SAFETY: a fresh allocation of two pages, freed below.
+        let page = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!page.is_null());
+        // SAFETY: bytes of our allocation.
+        unsafe { (0..16).for_each(|i| page.add(i).write(i as u8)) };
+        let at = page as usize;
+        // Disjoint copy (no staging buffer).
+        copy_title_memory(at + 32, at, 8);
+        // SAFETY: as above.
+        let disjoint: Vec<u8> = (32..40).map(|i| unsafe { page.add(i).read() }).collect();
+        assert_eq!(disjoint, [0, 1, 2, 3, 4, 5, 6, 7]);
+        // Overlapping copy (`memmove` order).
+        copy_title_memory(at + 4, at, 8);
+        // SAFETY: as above.
+        let moved: Vec<u8> = (0..16).map(|i| unsafe { page.add(i).read() }).collect();
+        assert_eq!(moved, [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]);
+        let mut old = 0;
+        // SAFETY: the second page of our allocation.
+        assert!(unsafe { VirtualProtect(page.add(4096).cast(), 4096, PAGE_READONLY, &mut old) } != 0);
+        copy_title_memory(at + 4096, at, 8);
+        // A size no memory has is no copy (and no allocation).
+        copy_title_memory(at + 64, at, usize::MAX / 4);
+        copy_title_memory(at + 64, at, usize::MAX);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 
     #[test]
