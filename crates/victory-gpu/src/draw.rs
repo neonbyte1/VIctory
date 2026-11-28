@@ -120,12 +120,14 @@ pub(crate) struct State {
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
     /// Slots made for unordered access clears in this list
-    /// ([`State::clear_view`]): keyed by view heap, view, and host view
-    /// identity, so that clears of one view (a stand-in's, at each dispatch of
-    /// its program) share one. The slots are among [`Self::dynamic`], held
-    /// until the list is reset (which drops this with them) or released.
-    /// The slot holds both the host resource and any arena slice in the key.
-    /// Made again in each segment of the list, as root views are.
+    /// ([`State::clear_view`]): keyed by view heap, view, host view
+    /// identity and clearing kind (float or uint: the slot's descriptor is
+    /// the clear's typed one), so that clears of one view (a stand-in's, at
+    /// each dispatch of its program) share one. The slots are among
+    /// [`Self::dynamic`], held until the list is reset (which drops this with
+    /// them) or released. The slot holds both the host resource and any arena
+    /// slice in the key. Made again in each segment of the list, as root views
+    /// are.
     clear_slots: std::collections::BTreeMap<(usize, View, (usize, usize), bool), u32>,
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
@@ -1210,8 +1212,12 @@ impl State {
 
     /// The clear of [`Self::clear_unordered`] of `view`. Whether it was
     /// recorded. Its shader-visible slot is a dynamic one the list holds
-    /// until reset, one per view however often the list clears it
-    /// (`clear_slots`).
+    /// until reset, one per view and clearing kind however often the list
+    /// clears it (`clear_slots`).
+    ///
+    /// The slot's descriptor is the clear's own: typed over the view's words
+    /// (`crate::descriptor::host::For::Clear`), since vkd3d-proton leaves a raw
+    /// UAV's float clear a no-op, where the view's slot for shaders stays raw.
     fn clear_view(
         &mut self,
         list: &HostList,
