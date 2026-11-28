@@ -166,18 +166,48 @@ fn map_dll(
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
-    let name = name.to_ascii_lowercase();
-    let path = dirs.0.join(&name);
-    if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
+    let key = name.to_ascii_lowercase();
+    if !seen.insert(key.clone()) || !wanted(&key) {
         return Ok(());
     }
+    let Some(path) = find_dll_file(dirs.0, name) else {
+        return Ok(());
+    };
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image =
-        load(&prepared, dirs.1, &name).with_context(|| format!("loading {}", path.display()))?;
+        load(&prepared, dirs.1, name).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
-    loaded.push((name, image));
+    loaded.push((key, image));
     Ok(())
+}
+
+fn find_dll_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let exact = dir.join(name);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    scan_dll_file(dir, name)
+}
+
+fn scan_dll_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    select_dll_entry(entries.flatten().map(|entry| entry.path()), name, |path| {
+        path.is_file()
+    })
+}
+
+fn select_dll_entry(
+    paths: impl IntoIterator<Item = PathBuf>,
+    name: &str,
+    mut is_file: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
+    paths.into_iter().find(|path| {
+        path.file_name()
+            .and_then(|file| file.to_str())
+            .is_some_and(|file| file.eq_ignore_ascii_case(name))
+            && is_file(path)
+    })
 }
 
 /// Resolves through `inner`, then through the exports of the title's DLLs.
@@ -849,5 +879,66 @@ mod tests {
             // SAFETY: never attached, and no pointer into it outlives the test.
             unsafe { dll.unload() };
         }
+    }
+
+    #[test]
+    fn select_dll_entry_matches_ignoring_ascii_case_and_skips_colliding_folders() {
+        let entries = [
+            (PathBuf::from("/title/Other.dll"), true),
+            (PathBuf::from("/title/LATE.DLL"), false),
+            (PathBuf::from("/title/Late.dll"), true),
+        ];
+        let lookup = |query: &str| {
+            select_dll_entry(entries.iter().map(|(p, _)| p.clone()), query, |path| {
+                entries
+                    .iter()
+                    .find(|(p, _)| p == path)
+                    .is_some_and(|(_, is_file)| *is_file)
+            })
+        };
+
+        for query in ["Late.dll", "LATE.DLL", "late.dll", "lAtE.dLl"] {
+            assert_eq!(
+                lookup(query).as_deref(),
+                Some(Path::new("/title/Late.dll")),
+                "query {query}",
+            );
+        }
+        assert_eq!(lookup("absent.dll"), None);
+
+        let folder_only = [(PathBuf::from("/title/LATE.DLL"), false)];
+        assert_eq!(
+            select_dll_entry(
+                folder_only.iter().map(|(p, _)| p.clone()),
+                "late.dll",
+                |_| false,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn directory_scan_matches_files_ignoring_ascii_case_and_skips_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("SubDir.dll")).unwrap();
+        let real = dir.path().join("MixedCase.DLL");
+        std::fs::write(&real, b"placeholder").unwrap();
+
+        for query in [
+            "MixedCase.DLL",
+            "mixedcase.dll",
+            "MIXEDCASE.DLL",
+            "mIxEdCaSe.DlL",
+        ] {
+            assert_eq!(
+                scan_dll_file(dir.path(), query).as_deref(),
+                Some(real.as_path())
+            );
+            let found = find_dll_file(dir.path(), query).expect("matched file");
+            assert_eq!(std::fs::read(found).unwrap(), b"placeholder");
+        }
+        assert_eq!(scan_dll_file(dir.path(), "subdir.dll"), None);
+        assert_eq!(find_dll_file(dir.path(), "subdir.dll"), None);
+        assert_eq!(find_dll_file(dir.path(), "absent.dll"), None);
     }
 }

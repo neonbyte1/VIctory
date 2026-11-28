@@ -356,3 +356,38 @@ fn probe_dll_override_validates_file_paths() {
         );
     }
 }
+
+#[test]
+fn maps_mixed_case_title_dlls_and_reports_matched_filename() {
+    let title_dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    std::fs::copy(
+        r"C:\Windows\System32\version.dll",
+        title_dir.path().join("Late.dll"),
+    )
+    .unwrap();
+
+    for spelling in ["Late.dll", "LATE.DLL", "late.dll", "lAtE.dLl"] {
+        let dlls =
+            victory_loader::load_title_dll(spelling, title_dir.path(), cache.path(), &|_| true)
+                .unwrap();
+        assert_eq!(dlls.len(), 1, "spelling {spelling}");
+        assert_eq!(dlls[0].0, "late.dll");
+        assert!(dlls[0].1.export("GetFileVersionInfoW").is_some());
+        for (_, img) in dlls {
+            // SAFETY: test image was never attached or called.
+            unsafe { img.unload() };
+        }
+    }
+
+    std::fs::write(title_dir.path().join("BrokenMod.DLL"), b"not a pe").unwrap();
+    let err =
+        victory_loader::load_title_dll("brokenmod.dll", title_dir.path(), cache.path(), &|_| true)
+            .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.to_ascii_lowercase().contains("brokenmod.dll"),
+        "unexpected error: {msg}",
+    );
+}
