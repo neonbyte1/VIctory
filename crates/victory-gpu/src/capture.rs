@@ -489,7 +489,6 @@ pub(crate) fn dump_targets(frame: u64) {
 }
 
 fn dump_target_images(frame: u64, targets: &Targets) {
-    use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
@@ -1279,11 +1278,7 @@ mod tests {
 
     // These fixtures can share the RGBA8 callsite. Keep its registration
     // from racing the test that installs a scoped tracing subscriber.
-    static RGBA8_TRACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    // These fixtures can share the RGBA8 callsite. Keep its registration
-    // from racing the test that installs a scoped tracing subscriber.
-    static RGBA8_TRACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static RGBA8_TRACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn crc_matches_the_png_check_value() {
@@ -1371,6 +1366,8 @@ mod tests {
 
 #[cfg(test)]
 mod r32_tests {
+    use super::tests::RGBA8_TRACE;
+
     #[test]
     fn r32_integer_captures_scale_numeric_values() {
         let unsigned = [1u32, 2, 3].map(u32::to_le_bytes).concat();
