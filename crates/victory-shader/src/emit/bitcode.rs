@@ -308,6 +308,27 @@ impl Module {
         }
     }
 
+    /// The bits of a known f32, including an immediate viewed as a float.
+    pub fn float_bits(&self, value: V) -> Option<u32> {
+        match value {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Float(bits) => Some(bits),
+                _ => None,
+            },
+            V::Inst(i) => {
+                let inst = &self.insts[i as usize];
+                if self.types[inst.ty.0 as usize] == TypeDef::Float
+                    && let Op::Cast(Cast::Bitcast, source) = inst.op
+                {
+                    self.int_value(source).map(|bits| bits as u32)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub fn has_function(&self, name: &str) -> bool {
         self.func_ids.contains_key(name)
