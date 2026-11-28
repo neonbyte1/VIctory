@@ -84,6 +84,9 @@ pub(crate) struct Lowered {
     /// `dx.op.waveActiveBallot` calls emitted into the module.
     #[cfg(test)]
     pub wave_ballots: u32,
+    /// Resource properties of each heap handle made, in creation order.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -224,11 +227,13 @@ struct Lower<'a> {
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
-    /// dword ([`Lower::root_view`]).
-    root_views: HashMap<u32, V>,
+    /// dword and global-coherence flag ([`Lower::root_view`]).
+    root_views: HashMap<(u32, bool), V>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Tracked descriptor addresses stored to or modified atomically.
+    written_uavs: HashSet<(usize, u32, Option<Value>)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
@@ -500,6 +505,19 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
         .collect()
 }
 
+const UAV_PROP: u32 = 0x1000;
+const GLOBALLY_COHERENT_PROP: u32 = 0x4000;
+
+fn uav_bits(uav: bool, glc: bool) -> u32 {
+    if !uav {
+        0
+    } else if glc {
+        UAV_PROP | GLOBALLY_COHERENT_PROP
+    } else {
+        UAV_PROP
+    }
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -582,6 +600,34 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        let scalar: HashMap<Site, Address> = x.res.scalar.iter().copied().collect();
+        let desc_addr = |load: Site, first: u8| {
+            let a = scalar.get(&load)?;
+            Some((
+                a.param,
+                a.offset.wrapping_add(4 * u32::from(first)),
+                a.dynamic,
+            ))
+        };
+        let mut written_uavs = HashSet::new();
+        for d in x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+        {
+            let name = p.blocks[d.site.0].insts[d.site.1].name();
+            if !(name.contains("store") || name.contains("atomic")) {
+                continue;
+            }
+            for leaf in d.source.leaves() {
+                if let &(Source::Loaded { load, first } | Source::Fetched { load, first }) = leaf
+                    && let Some(addr) = desc_addr(load, first)
+                {
+                    written_uavs.insert(addr);
+                }
+            }
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             let name = i.name();
@@ -687,7 +733,8 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
+            written_uavs,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -1467,6 +1514,8 @@ impl<'a> Lower<'a> {
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
             wave_ballots: self.s.m.written_calls("dx.op.waveActiveBallot").count() as u32,
+            #[cfg(test)]
+            heap_props: self.s.heap_props.clone(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -1762,12 +1811,13 @@ impl<'a> Lower<'a> {
     /// and root UAVs"); offsets from the root address move by
     /// [`Lower::root_view_offset`]. Host root views have no bounds; a view's
     /// reads past the copy give 0 and its writes there are dropped.
-    fn root_view(&mut self, param: usize, uav: bool) -> V {
+    fn root_view(&mut self, param: usize, uav: bool, glc: bool) -> V {
         let rp = self.x.native.layout[param];
         // The descriptor's two user-data dwords hold its address on the
         // console; such a program never reads them as data (`user`).
         let index = u32::from(rp.user_data);
-        if let Some(&h) = self.root_views.get(&index) {
+        let key = (index, uav && glc);
+        if let Some(&h) = self.root_views.get(&key) {
             return h;
         }
         let i = self.user_at(UserData {
@@ -1776,9 +1826,9 @@ impl<'a> Lower<'a> {
             root: RootType::Descriptor,
             dword: if uav { super::ROOT_UAV_VIEW } else { super::ROOT_SRV_VIEW },
         });
-        let props = if uav { (11 | 0x1000, 0) } else { (11, 0) };
+        let props = (11 | uav_bits(uav, glc), 0);
         let h = self.s.heap_handle(self.s.entry, i, false, false, props);
-        self.root_views.insert(index, h);
+        self.root_views.insert(key, h);
         h
     }
 
@@ -4562,6 +4612,7 @@ impl<'a> Lower<'a> {
             data,
             offset,
             soffset,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -4647,8 +4698,10 @@ impl<'a> Lower<'a> {
             && matches!(kind, Some(u) if u.kind == ResourceType::Uav)
             && matches!(src, Source::Built { address, .. }
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
-        if srv || root_uav {
-            let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
+        let uav = !root_uav && self.is_uav(src);
+        if uav || srv || root_uav {
+            let props = (11 | uav_bits(uav, cache.glc), 0);
+            let (h, addr) = self.raw_view(site, src, addr, 4 * count, props, false, None)?;
             let c = self.cur;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -4811,10 +4864,8 @@ impl<'a> Lower<'a> {
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
         let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let uav = un.contains("store") || un.contains("atomic") || self.is_uav(&src);
+        let u = uav_bits(uav, false);
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
@@ -5808,6 +5859,25 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, word, bits))
     }
 
+    fn desc_addr(&self, load: Site, first: u8) -> Option<(usize, u32, Option<Value>)> {
+        let a = self.scalar.get(&load)?;
+        Some((
+            a.param,
+            a.offset.wrapping_add(4 * u32::from(first)),
+            a.dynamic,
+        ))
+    }
+
+    fn is_uav(&self, src: &Source) -> bool {
+        let in_written = src.leaves().iter().any(|l| match **l {
+            Source::Loaded { load, first } | Source::Fetched { load, first } => self
+                .desc_addr(load, first)
+                .is_some_and(|a| self.written_uavs.contains(&a)),
+            _ => false,
+        });
+        in_written || self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Uav)
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -5964,18 +6034,19 @@ impl<'a> Lower<'a> {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) if !self.root_memory => {
-                        Ok(self.root_view(address.param, false))
+                        Ok(self.root_view(address.param, false, false))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
-                    (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
+                    (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B | 0x500B)
                     | (RootType::Descriptor, Some(ResourceType::Uav), 11)
                         if !self.root_memory =>
                     {
-                        Ok(self.root_view(address.param, true))
+                        let glc = props.0 & GLOBALLY_COHERENT_PROP != 0;
+                        Ok(self.root_view(address.param, true, glc))
                     }
-                    (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
+                    (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B | 0x500B)
                     | (RootType::Descriptor, Some(ResourceType::Uav), 11) => {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }
@@ -9407,8 +9478,10 @@ impl<'a> Lower<'a> {
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.s.texture_reads.clear();
         let lowered = self.image_op(inst, b, i);
+        let reads = !inst.name().starts_with("image_store")
+            && !inst.name().starts_with("image_atomic_");
         for index in std::mem::take(&mut self.s.texture_reads) {
-            if lowered.is_ok() {
+            if lowered.is_ok() && reads {
                 self.mark_view_read(index);
             }
         }
@@ -9454,6 +9527,7 @@ impl<'a> Lower<'a> {
             d16,
             tfe,
             lwe,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -9526,11 +9600,8 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
-        let uav = store
-            || self
-                .used_kind(src)
-                .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let uav = store || self.is_uav(src);
+        let props = (kind | uav_bits(uav, cache.glc), 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // DXIL's atomic operations on a 32-bit integer texture UAV; the
             // old value returns with glc. Sub is the add of the negation.
@@ -9546,9 +9617,6 @@ impl<'a> Lower<'a> {
                 "swap" => 8,
                 "cmpswap" => u32::MAX,
                 _ => return Err(name),
-            };
-            let Fields::Image { cache, .. } = &inst.fields else {
-                unreachable!()
             };
             // 16-bit coordinates (a16) are read as `addr_val` reads them.
             if *d16 {
@@ -9605,7 +9673,7 @@ impl<'a> Lower<'a> {
                 // host device must support both (D3D12 options 9 and 11).
                 self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
             }
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let h = self.handle(site, src, false, (kind | uav_bits(true, cache.glc), 0x105))?;
             let at = self.begin_guarded(guard);
             let (ty, suffix) = if wide {
                 (i64t, "i64")
@@ -10455,6 +10523,7 @@ impl<'a> Lower<'a> {
             offset,
             offen,
             idxen,
+            cache,
             format,
             lds,
             tfe,
@@ -10661,8 +10730,8 @@ impl<'a> Lower<'a> {
             }
             index => index,
         };
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let uav = store || atomic.is_some() || self.is_uav(src);
+        let u = uav_bits(uav, cache.glc);
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -10687,7 +10756,7 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
             };
-            let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
+            let returns = cache.glc;
             let old = match inst.read(Reg::V(reg)) {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
@@ -10747,7 +10816,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
+            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), true, guard)?;
             let begin = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
@@ -12107,7 +12176,7 @@ mod tests {
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
-    fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+    pub(super) fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
         RootParam {
             root,
             table_offset_dwords: 0,
@@ -13377,3 +13446,6 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod glc_tests;
