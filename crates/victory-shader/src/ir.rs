@@ -941,6 +941,23 @@ fn effects(
                     if let Some(d) = &v.dst {
                         indexed(d, &mut r)?;
                     }
+                    // Overlapping M0-relative ranges must emit one read and
+                    // one write per VGPR so `ssa()` and `Inst::write` agree on
+                    // the post-instruction Value.
+                    let mut seen = Vec::new();
+                    w.retain(|reg| {
+                        !seen.contains(reg) && {
+                            seen.push(*reg);
+                            true
+                        }
+                    });
+                    seen.clear();
+                    r.retain(|reg| {
+                        !seen.contains(reg) && {
+                            seen.push(*reg);
+                            true
+                        }
+                    });
                 }
                 "v_div_fmas_f32" | "v_div_fmas_f64" => r.extend(mask(VCC)),
                 _ => {}
