@@ -811,7 +811,7 @@ mod tests {
         for _ in 0..2 {
             assert!(ready(&p).is_none());
             assert!(p.used.load(Ordering::Relaxed));
-            assert!(!p.queued.load(Ordering::Relaxed));
+            assert!(p.queued.is_completed());
         }
     }
 

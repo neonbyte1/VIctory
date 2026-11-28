@@ -398,8 +398,8 @@ const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
 /// The buffer footprint format of a depth or stencil plane in a two-plane texture.
 pub(crate) fn planar_depth_copy_format(format: u32, plane: u32) -> Option<u32> {
     match (format, plane) {
-        (19..=22 | 44..=47, 0) => (39, 512, mip), // DXGI_FORMAT_R32_TYPELESS
-        (19..=22 | 44..=47, 1) => (60, 512, mip), // DXGI_FORMAT_R8_TYPELESS
+        (19..=22 | 44..=47, 0) => Some(39), // DXGI_FORMAT_R32_TYPELESS
+        (19..=22 | 44..=47, 1) => Some(60), // DXGI_FORMAT_R8_TYPELESS
         _ => None,
     }
 }
