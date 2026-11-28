@@ -4,11 +4,12 @@
 //! 255 ms; one heap 32 ms, then placed 3 ms).
 //!
 //! Textures without render-target, depth or unordered-access use, up to a
-//! quarter of a heap, go into heaps of [`HEAP`] bytes, first fit. A
-//! texture's range is free again once nothing else holds its resource
-//! (heap slots keep views' resources until the running submission has run,
-//! lists until they are reset), so no view or list sees its memory reused.
-//! Empty heaps past [`SPARE`] are released.
+//! quarter of a heap, go into heaps of [`heap_bytes`] bytes, first fit
+//! (with `VICTORY_VRAM_FIT=1`, the fullest heap first). A texture's range
+//! is free again once nothing else holds its resource (heap slots keep
+//! views' resources until the running submission has run, lists until they
+//! are reset), so no view or list sees its memory reused. Empty heaps past
+//! [`SPARE`] are released.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -16,8 +17,12 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
-/// Bytes of one heap.
-const HEAP: u64 = 64 << 20;
+/// Bytes of one heap: 64 MiB, or 16 MiB on cards with a small budget
+/// (`crate::vram_fit`).
+fn heap_bytes() -> u64 {
+    crate::vram_fit::heap_bytes()
+}
+
 /// Empty heaps kept for the next textures.
 const SPARE: usize = 2;
 /// Placement alignment of textures that are not render targets.
@@ -112,7 +117,7 @@ impl Heaps {
                 i += 1;
             }
         }
-        let empty = |h: &Heap| h.free.get(&0) == Some(&HEAP);
+        let empty = |h: &Heap| h.free.get(&0) == Some(&heap_bytes());
         let mut spare = 0;
         self.heaps.retain(|h| {
             if !empty(h) {
@@ -130,7 +135,15 @@ impl Heaps {
         size: u64,
         align: u64,
     ) -> Option<(ID3D12Heap, Placement)> {
-        for h in &mut self.heaps {
+        // With the switch, the fullest heap that fits first: a long-lived
+        // texture then keeps a heap that is full anyway, and sparse heaps
+        // empty out and are released.
+        let mut order: Vec<usize> = (0..self.heaps.len()).collect();
+        if crate::vram_fit::on() {
+            order.sort_by_key(|&i| self.heaps[i].free.values().sum::<u64>());
+        }
+        for i in order {
+            let h = &mut self.heaps[i];
             if let Some(offset) = take(&mut h.free, size, align) {
                 return Some((
                     h.heap.clone(),
@@ -143,7 +156,7 @@ impl Heaps {
             }
         }
         let desc = D3D12_HEAP_DESC {
-            SizeInBytes: HEAP,
+            SizeInBytes: heap_bytes(),
             Properties: D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_DEFAULT,
                 ..Default::default()
@@ -159,7 +172,7 @@ impl Heaps {
         let id = self.next;
         self.next += 1;
         let mut free = BTreeMap::new();
-        free.insert(0, HEAP);
+        free.insert(0, heap_bytes());
         let offset = take(&mut free, size, align)?;
         self.heaps.push(Heap {
             heap: heap.clone(),
@@ -192,7 +205,7 @@ pub(crate) fn fits(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
     }
     // SAFETY: a plain query.
     let info = unsafe { device.GetResourceAllocationInfo(0, &[*desc]) };
-    info.SizeInBytes != u64::MAX && info.SizeInBytes <= HEAP / 4 && info.Alignment <= ALIGN
+    info.SizeInBytes != u64::MAX && info.SizeInBytes <= heap_bytes() / 4 && info.Alignment <= ALIGN
 }
 
 /// Room for a texture of `desc` in a heap ([`fits`] first): the heap and
@@ -249,7 +262,11 @@ pub(crate) fn stats() -> (usize, u64, u64) {
     };
     h.reap();
     let free: u64 = h.heaps.iter().flat_map(|h| h.free.values()).sum();
-    (h.heaps.len(), h.heaps.len() as u64 * HEAP - free, free)
+    (
+        h.heaps.len(),
+        h.heaps.len() as u64 * heap_bytes() - free,
+        free,
+    )
 }
 
 impl Placement {

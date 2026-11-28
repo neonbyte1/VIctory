@@ -87,6 +87,8 @@ mod title_copy;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
+mod vram_fit;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -7166,6 +7166,7 @@ impl Meter {
                         crate::list::UPLOADS[0].load(Ordering::Relaxed),
                         crate::list::UPLOADS[1].load(Ordering::Relaxed) as f64 / 1e6,
                     );
+                    crate::vram_fit::log(report_frames, local, budget);
                 }
                 let [gpu, title] =
                     crate::resource::texture_census().map(|r| r.map(|b| b as f64 / 1e6));

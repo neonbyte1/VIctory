@@ -1989,6 +1989,8 @@ pub(crate) fn evict_unused() {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+        // The copies' room in video memory for the frame (`crate::vram_fit`).
+        crate::vram_fit::frame(used, budget);
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
         let used = used - crate::placement::free_bytes() as f64 / 1e6;

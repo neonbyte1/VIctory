@@ -156,7 +156,11 @@ fn sys_write(
     }
 }
 
+/// Room in video memory for a copy of `size` bytes: up to `max_single`, in
+/// the fixed quarter of the budget, or past it on the card's room
+/// (`crate::vram_fit`, `VICTORY_VRAM_FIT=1`).
 fn try_vram_shadow(size: u64, max_single: u64) -> Option<ID3D12Resource> {
+    use std::sync::atomic::Ordering::Relaxed;
     if size > max_single {
         return None;
     }
@@ -165,18 +169,44 @@ fn try_vram_shadow(size: u64, max_single: u64) -> Option<ID3D12Resource> {
     if budget == 0 {
         return None;
     }
-    VRAM_BYTES
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |cur| cur.checked_add(size).filter(|&next| next <= budget),
-        )
-        .ok()?;
+    let fixed = VRAM_BYTES
+        .fetch_update(Relaxed, Relaxed, |cur| {
+            cur.checked_add(size).filter(|&next| next <= budget)
+        })
+        .is_ok();
+    if !fixed {
+        if !crate::vram_fit::take(size) {
+            return None;
+        }
+        VRAM_BYTES.fetch_add(size, Relaxed);
+    }
     let Some(buf) = h.default_uav_buffer(size) else {
-        VRAM_BYTES.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+        VRAM_BYTES.fetch_sub(size, Relaxed);
+        if !fixed {
+            crate::vram_fit::give_back(size);
+        }
         return None;
     };
     Some(buf)
+}
+
+/// Bytes of the copies in video memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn vram_bytes() -> u64 {
+    VRAM_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bytes lists asked copies for (their uses), of copies in video memory
+/// and in system memory: what shaders may read there (diagnostics).
+#[cfg(feature = "diagnostics")]
+static ASKED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`ASKED`] since the last call: (video memory, system memory).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_asked() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (ASKED[0].swap(0, Relaxed), ASKED[1].swap(0, Relaxed))
 }
 
 struct Backing {
@@ -543,6 +573,8 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
+        #[cfg(feature = "diagnostics")]
+        ASKED[usize::from(!self.vram)].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
