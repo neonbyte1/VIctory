@@ -1039,10 +1039,12 @@ fn try_lower(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: None,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         static_samplers: lowered
