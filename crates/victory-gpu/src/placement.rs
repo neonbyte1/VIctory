@@ -488,12 +488,12 @@ mod tests {
             return; // no host GPU here
         };
         let mut heaps = Heaps::default();
-        // A whole heap, then two fifths of it given back: 60 % full.
+        // A whole heap, so that a little goes into a second one; then two
+        // fifths of the first given back: 60 % full.
         let (_, big) = heaps.allocate(&host.device, heap_bytes(), ALIGN).unwrap();
-        give(&mut heaps.heaps[0].free, 0, heap_bytes() / 5 * 2);
-        // A little in a second heap.
         let (_, small) = heaps.allocate(&host.device, ALIGN, ALIGN).unwrap();
         assert_ne!(small.heap, big.heap);
+        give(&mut heaps.heaps[0].free, 0, heap_bytes() / 5 * 2);
         let ids = heaps.mark_draining(true);
         assert_eq!(ids, [small.heap].into(), "under a quarter full: drains");
         let (_, next) = heaps.allocate(&host.device, ALIGN, ALIGN).unwrap();
