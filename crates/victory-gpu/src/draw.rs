@@ -1400,6 +1400,20 @@ impl State {
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let read_only_depth = self.read_only_depth(compute);
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        // Only a host heap smaller than its title heap has tables to make
+        // afresh: with none bound (as on most hosts), each entry is made
+        // from its own slot, without looking each up twice.
+        let capped = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .any(|&h| crate::descriptor::heap(h as This).capped());
+        if !capped {
+            for u in used.iter().filter(tables) {
+                self.table_entry(list, u, compute);
+            }
+            return Vec::new();
+        }
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
@@ -2108,9 +2122,12 @@ fn readable_for_draw(
     // Constant buffers (raw views) to their copy's end at most; others in
     // the copy their host view reads.
     let range = match *view {
-        View::Constant(address, size) => crate::shadow::find(address, 1).and_then(|s| {
+        // The copy holding its first byte holds the rest up to its end, and
+        // a lookup of that longer range finds the same copy (the innermost
+        // buffer, or the same window of loose memory): one lookup.
+        View::Constant(address, size) => crate::shadow::find(address, 1).map(|s| {
             let len = u64::from(size).min(s.left(address));
-            crate::shadow::find(address, len).map(|s| (s, address, len))
+            (s, address, len)
         }),
         _ => crate::descriptor::host::view_copy(view),
     };

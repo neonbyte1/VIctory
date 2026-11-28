@@ -119,6 +119,14 @@ impl Heap {
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
     }
+
+    /// Whether its host heap holds fewer slots than it has (the host's cap,
+    /// or a paged heap's): only then does a draw make tables afresh
+    /// (`crate::draw`), for the title's slots past the host's.
+    #[cfg(windows)]
+    pub(crate) fn capped(&self) -> bool {
+        self.host().is_some_and(|host| host.count() < self.desc.count)
+    }
 }
 
 const VIEWS_KIND: u32 = 0;
