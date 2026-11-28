@@ -5303,6 +5303,9 @@ impl HostList {
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes. What it writes in title memory is not named:
     /// the submission completes before the next is prepared ([`barrier`]).
+    /// Only diagnostics' work and tests use it now (page tables' is
+    /// [`HostList::defer_after_table`]).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         let mut d = self.deferred();
         d.after.push(Box::new(work));
