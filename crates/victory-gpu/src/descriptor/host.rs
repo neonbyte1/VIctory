@@ -575,9 +575,9 @@ impl HostHeap {
         }
     }
 
-    /// The host address of the slots' view addresses (see the field), made
-    /// on first use from the slots made so far.
-    pub(crate) fn view_addresses(&self) -> Option<u64> {
+    /// The view-address table (see the field) and its GPU address, made on
+    /// first use from the slots made so far.
+    pub(crate) fn view_addresses(&self) -> Option<(&ID3D12Resource, u64)> {
         if let Some(made) = self.addresses.get() {
             return made.as_ref().map(|m| m.2);
         }
@@ -606,7 +606,7 @@ impl HostHeap {
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             Some((buffer, data, gpu))
         });
-        made.as_ref().map(|m| m.2)
+        made.as_ref().map(|(buffer, _, gpu)| (buffer, *gpu))
     }
 
     /// The slots the view addresses have an entry for: the title's and the
@@ -3425,5 +3425,33 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         heap.free_pair(slot);
+    }
+
+    #[test]
+    fn view_addresses_buffer_stays_alive_on_list() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let (table, _) = heap.view_addresses().unwrap();
+        let table = table.clone();
+        // SAFETY: live D3D12 resource and COM refcount inspection.
+        unsafe {
+            let list = host.new_list().unwrap();
+            list.keep(&table);
+            drop(heap);
+            let references = |b: &ID3D12Resource| {
+                let raw = windows::core::Interface::as_raw(b);
+                let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+                ((**unknown).AddRef)(raw);
+                ((**unknown).Release)(raw)
+            };
+            assert_eq!(references(&table), 2, "kept alive by command list after heap drop");
+            list.close();
+            list.reset();
+            assert_eq!(references(&table), 1, "released when command list resets");
+        }
     }
 }
