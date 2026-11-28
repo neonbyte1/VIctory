@@ -255,6 +255,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 | `VICTORY_LOOSE_WINDOW_KIB=256` | loose title memory in 256 KiB windows instead of 4 MiB; less host memory, but more copying per frame |
+| `VICTORY_COPIES_IN_VIDEO_MEMORY=1` | host copies of title memory in video memory the CPU maps (a GPU upload heap, where the host has one), to measure how much of the GPU's time is shaders reading the copies over the bus; CPU reads of them become slow (for that measurement only) |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
