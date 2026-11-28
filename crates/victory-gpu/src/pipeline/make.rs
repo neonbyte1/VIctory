@@ -309,16 +309,18 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // Listed for an early start in later runs from its first use, made or
-    // not: one a run never got made is the one it should start early.
-    if !p.used.swap(true, Ordering::Relaxed) {
+    // not. Once listed, a lookup only needs to read the flag. The swap
+    // chooses one recorder when several threads reach the first use.
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
         #[cfg(feature = "diagnostics")]
         log("used", &p.key, String::new);
     }
-    if p.made.get().is_none() {
-        start(p, true);
-        wait(p, crate::frame::current());
+    if let Some(made) = p.made.get() {
+        return made.as_ref();
     }
+    start(p, true);
+    wait(p, crate::frame::current());
     p.made.get()?.as_ref()
 }
 
@@ -795,6 +797,22 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
         assert_eq!(zero_demands, [false; 3]);
         assert!(nonempty_demand);
+    }
+    #[test]
+    fn first_use_of_a_finished_pipeline_is_recorded_without_queueing() {
+        let p = Arc::new(Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        assert!(p.made.set(None).is_ok());
+        assert!(!p.used.load(Ordering::Relaxed));
+        for _ in 0..2 {
+            assert!(ready(&p).is_none());
+            assert!(p.used.load(Ordering::Relaxed));
+            assert!(!p.queued.load(Ordering::Relaxed));
+        }
     }
 
     #[cfg(feature = "diagnostics")]
