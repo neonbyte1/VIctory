@@ -914,28 +914,26 @@ pub(crate) fn view_writes(memory: bool) -> Option<u64> {
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
 /// slot's stays set in the bitmap until [`forget_read`]), and the slots to
-/// clear at the next [`take_reads`].
+/// clear before the next submission runs ([`clear_forgotten_reads`]).
 static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
 
-/// After a submission: the heap slots its shaders first read texture views
-/// at (`victory_shader::emit`, "Read marks"), each once until
-/// [`forget_read`]. Clears the slots forgotten since first.
-pub(crate) fn take_reads() -> Vec<u32> {
+/// The read marks of both bitmaps (shaders that use title memory mark their
+/// reads in theirs), when no submission runs.
+fn read_marks() -> Vec<&'static mut [u32]> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
-    // Both bitmaps: shaders that use title memory mark their reads in theirs.
-    let mut maps: Vec<&mut [u32]> = [false, true]
+    [false, true]
         .into_iter()
         .filter_map(bitmap)
         // SAFETY: the mapped bitmap's read marks; the GPU is done with them
         // (one submission runs at a time).
         .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
-        .collect();
-    if maps.is_empty() {
-        return Vec::new();
-    }
-    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
-    let (seen, forgotten) = &mut *reads;
+        .collect()
+}
+
+/// The marks of slots forgotten since go, from the bitmaps and the seen.
+fn clear_forgotten(maps: &mut [&mut [u32]], (seen, forgotten): &mut (Vec<u32>, Vec<u32>)) {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     seen.resize(words, 0);
     for slot in forgotten.drain(..) {
         let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
@@ -944,11 +942,34 @@ pub(crate) fn take_reads() -> Vec<u32> {
             seen[w] &= !bit;
         }
     }
+}
+
+/// Before a submission: the marks of slots forgotten since the last one go
+/// now (a placed texture written, one given up), so the reads of the
+/// submission about to run are the ones [`take_reads`] finds after it.
+pub(crate) fn clear_forgotten_reads() {
+    let mut maps = read_marks();
+    if !maps.is_empty() {
+        let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+        clear_forgotten(&mut maps, &mut reads);
+    }
+}
+
+/// After a submission: the heap slots its shaders first read texture views
+/// at (`victory_shader::emit`, "Read marks"), each once until
+/// [`forget_read`]. Clears the slots forgotten while it ran first.
+pub(crate) fn take_reads() -> Vec<u32> {
+    let mut maps = read_marks();
+    if maps.is_empty() {
+        return Vec::new();
+    }
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    clear_forgotten(&mut maps, &mut reads);
+    let mut new = Vec::new();
     // Slots past every view heap's are no heap's (`descriptor::view_slots`):
     // their marks are left for a larger heap to find.
-    let used = (crate::descriptor::view_slots().div_ceil(32) as usize).min(words);
-    let mut new = Vec::new();
-    for (w, s) in seen[..used].iter_mut().enumerate() {
+    let used = (crate::descriptor::view_slots().div_ceil(32) as usize).min(reads.0.len());
+    for (w, s) in reads.0[..used].iter_mut().enumerate() {
         let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
         *s |= fresh;
         while fresh != 0 {
@@ -1640,6 +1661,19 @@ pub(crate) mod tests {
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    /// Records a GPU write setting `slot`'s read mark in the bitmap, as a
+    /// shader reading that heap slot does during a submission.
+    pub(crate) fn record_mark_read(list: &crate::host::HostList, memory: bool, slot: u32) {
+        let b = bitmap(memory).expect("a host GPU");
+        let (src, data) = host().unwrap().upload_buffer(4).unwrap();
+        // SAFETY: our 4-byte upload buffer.
+        unsafe { data.cast::<u32>().write_unaligned(1u32 << (slot % 32)) };
+        let offset = u64::from(victory_shader::emit::VIEW_READS / 8) + u64::from(slot / 32) * 4;
+        // SAFETY: an open list, live buffers, 4 bytes inside both.
+        unsafe { list.list.CopyBufferRegion(&b._buffer, offset, &src, 0, 4) };
+        list.keep(&src);
     }
 
     /// The title writes a constant under a range an earlier list of the

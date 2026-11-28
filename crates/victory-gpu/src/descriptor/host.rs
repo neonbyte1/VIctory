@@ -615,12 +615,6 @@ impl HostHeap {
         self.count + self.dynamic
     }
 
-    /// The view-address table, once made ([`HostHeap::view_addresses`]): a
-    /// list that names it keeps it until it is reset.
-    pub(crate) fn view_addresses_buffer(&self) -> Option<&ID3D12Resource> {
-        self.addresses.get()?.as_ref().map(|m| &m.0)
-    }
-
     /// Slot `index` now holds `view` (or no view): its view address.
     fn note_address(&self, index: u32, view: Option<&View>) {
         if index < self.address_slots()

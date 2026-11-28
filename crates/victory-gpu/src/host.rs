@@ -590,6 +590,51 @@ pub(crate) mod tests {
         assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
     }
 
+    /// A slot left null (a placed texture written into the heap, or one given
+    /// up) has its forgotten mark cleared before the next submission runs, so
+    /// a read in that very submission makes the texture instead of having its
+    /// mark wiped out after it.
+    #[test]
+    fn forgotten_slot_read_in_the_next_submission_is_made() {
+        let Some(host) = host() else { return };
+        let (null, mut heap) = (std::ptr::null(), std::ptr::null());
+        let desc: [u32; 8] = [0, 800, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let hr = crate::descriptor::create_heap(null, desc.as_ptr().cast(), &iid, &mut heap);
+        assert_eq!(hr, 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let (slot, memory) = (768u32, vec![0u8; 1 << 16]);
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let at = title_heap.start + u64::from(slot) * 32;
+        crate::descriptor::create_placed_srv(null, &words, &view, at);
+        let heap_host = title_heap.host().expect("a host view heap");
+        assert!(!heap_host.kept(slot), "placed texture left null until read");
+        let list = host.new_list().unwrap();
+        crate::shadow::tests::record_mark_read(&list, false, slot);
+        list.close();
+        host.execute(&[&list]);
+        assert!(heap_host.kept(slot), "made after its first read");
+        let texture = crate::resource::texture_at(address, &words).expect("its resource");
+        assert!(crate::resource::give_up_now(texture));
+        assert!(!heap_host.kept(slot), "given up");
+        list.reset();
+        crate::shadow::tests::record_mark_read(&list, false, slot);
+        list.close();
+        host.execute(&[&list]);
+        assert!(heap_host.kept(slot), "made again after its first read");
+        type Release = extern "system" fn(crate::object::This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(heap, 0x10)(heap), 0);
+    }
+
     /// The textures shaders read through the heap since the last eviction
     /// pass are named again at each pass (a slot's read is reported as new
     /// only once), and the marks are cleared for the next.
@@ -1689,6 +1734,9 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut prep_us = started.elapsed().as_micros() as u64;
         let mut gpu = std::time::Duration::ZERO;
+        // Clear read marks of slots forgotten before this submission (placed
+        // textures written or evicted) so reads in it are not wiped after it.
+        crate::shadow::clear_forgotten_reads();
         let mut removed_in = None;
         let mut chunk_base = 0usize;
         let mut batches = Vec::new();
