@@ -911,13 +911,13 @@ impl State {
                 let gpu = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                     .flatten()
-                    .and_then(|h| h.view_addresses());
+                    .and_then(|h| kept_view_addresses(list, h));
                 let Some(gpu) = gpu else {
                     once!("a shader reading a view's address dropped: no view heap");
                     not_run("view addresses without a view heap");
                     return false;
                 };
-                // SAFETY: an open list; the heap's buffer lives with the heap.
+                // SAFETY: an open list; the table is kept by the list.
                 unsafe {
                     if compute {
                         l.SetComputeRootShaderResourceView(param, gpu);
@@ -2195,6 +2195,16 @@ fn describe(view: Option<&View>) -> String {
 fn is_view_offset(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
 }
+/// The host address of `heap`'s view-address table, which the list keeps
+/// until it is reset: the title may release the heap while the GPU still
+/// reads it.
+fn kept_view_addresses(list: &HostList, heap: &crate::descriptor::host::HostHeap) -> Option<u64> {
+    let gpu = heap.view_addresses()?;
+    if let Some(table) = heap.view_addresses_buffer() {
+        list.keep(table);
+    }
+    Some(gpu)
+}
 
 /// A user-data entry that takes the heap index of a root view's view.
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
@@ -2354,7 +2364,21 @@ mod tests {
         // SAFETY: our allocation.
         unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
-
+    /// A draw that reads view addresses makes its list keep the table: the
+    /// title may release the heap before the list runs.
+    #[test]
+    fn a_list_keeps_the_view_address_table_it_binds() {
+        let (Some(host), Some(heap)) = (crate::host::host(), crate::descriptor::host::HostHeap::new(false, 4)) else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let before = list.kept_count();
+        let gpu = kept_view_addresses(&list, &heap).expect("a table");
+        assert_eq!(list.kept_count(), before + 1);
+        // SAFETY: a live buffer.
+        assert_eq!(gpu, unsafe { heap.view_addresses_buffer().unwrap().GetGPUVirtualAddress() });
+        list.close();
+    }
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;

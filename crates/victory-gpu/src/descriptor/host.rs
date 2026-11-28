@@ -578,6 +578,12 @@ impl HostHeap {
     /// The host address of the slots' view addresses (see the field), made
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
+        if let Some(made) = self.addresses.get() {
+            return made.as_ref().map(|m| m.2);
+        }
+        // Held until the table is published: `mirror` (which holds it while
+        // it notes an address) neither slips in between nor is lost.
+        let slots = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let made = self.addresses.get_or_init(|| {
             // The view is a root view, which has no bounds: an entry for
             // every slot a table can lie in, the dynamic ones too (a table
@@ -587,8 +593,7 @@ impl HostHeap {
             let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
+            for (i, &key) in slots.iter().enumerate() {
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_ref());
             }
@@ -608,6 +613,12 @@ impl HostHeap {
     /// dynamic ones.
     fn address_slots(&self) -> u32 {
         self.count + self.dynamic
+    }
+
+    /// The view-address table, once made ([`HostHeap::view_addresses`]): a
+    /// list that names it keeps it until it is reset.
+    pub(crate) fn view_addresses_buffer(&self) -> Option<&ID3D12Resource> {
+        self.addresses.get()?.as_ref().map(|m| &m.0)
     }
 
     /// Slot `index` now holds `view` (or no view): its view address.
