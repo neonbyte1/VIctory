@@ -1,6 +1,7 @@
 # Working together on VIctory (fork `neonbyte1/VIctory`)
 
 Welcome. This is how we work from this fork towards upstream (`Marvisak/VIctory`), what is going on right now, and where your machines (RTX 4080 and RTX 2060, Windows 11) help most.
+New to this? [docs/testing.md](testing.md) is a step-by-step guide for testing on your own PC without coding.
 
 ## 1. The ground rules
 

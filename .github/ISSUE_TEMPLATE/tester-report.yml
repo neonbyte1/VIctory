@@ -1,0 +1,59 @@
+name: Test report (no coding needed)
+description: You ran VIctory on your PC and want to tell us how it went. See docs/testing.md.
+title: "Test report: "
+labels: ["kind: result", "status: measuring"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing! Steps and explanations: [docs/testing.md](https://github.com/neonbyte1/VIctory/blob/main/docs/testing.md).
+        Game data never leaves your machine: please don't attach game files, shader dumps, screenshots, captured frames or full logs.
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      description: The commit shown at the start of the log or by `git log -1 --format=%h`, or "main of <date>" if you downloaded a ZIP.
+      placeholder: "4bf6079  or  main of 2026-11-28"
+    validations: {required: true}
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      description: GPU, VRAM, CPU, RAM, OS and GPU driver version. Task Manager → Performance shows most of it.
+      placeholder: |
+        GPU: NVIDIA RTX 4070, 12 GB
+        CPU: Ryzen 5 5600
+        RAM: 32 GB
+        OS / driver: Windows 11 23H2, driver 566.36
+    validations: {required: true}
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: Did it start? Did you reach the world? Did it crash, and after how long? What did the picture look like (words only)?
+    validations: {required: true}
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summarizer output
+      description: Paste what `summarize-run` printed for your 420 s run.
+      render: markdown
+    validations: {required: true}
+  - type: textarea
+    id: comparison
+    attributes:
+      label: Comparison run (optional)
+      description: A second run with one thing changed (driver, setting, build), run right next to the first. Paste its summarizer output and say what you changed.
+  - type: checkboxes
+    id: policy
+    attributes:
+      label: Game data
+      options:
+        - label: I did not upload game files or screenshots.
+          required: true
+  - type: textarea
+    id: ai
+    attributes:
+      label: AI use
+      value: "_No AI used._"
+    validations: {required: true}

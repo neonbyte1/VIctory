@@ -3,3 +3,6 @@ contact_links:
   - name: Claims, status and short notes
     url: https://github.com/neonbyte1/VIctory/issues/1
     about: Post claims (CLAIM / DONE / DROPPED) and short notes as comments on the coordination issue.
+  - name: How to test (no coding needed)
+    url: https://github.com/neonbyte1/VIctory/blob/main/docs/testing.md
+    about: Step-by-step guide for players who want to contribute test results.
