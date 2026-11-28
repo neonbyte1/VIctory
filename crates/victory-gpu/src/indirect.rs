@@ -749,7 +749,7 @@ pub(crate) fn bound(
     spread: bool,
 ) -> Option<ID3D12Resource> {
     #[cfg(feature = "diagnostics")]
-    note_clamp(list, "clamp");
+    note_clamp(list, "clamp", crate::passes::Class::Clamp);
     // An open window first: its draws come before this, in order.
     end_window(list);
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
@@ -1052,12 +1052,15 @@ pub(crate) fn count_alone(alone: Option<Alone>) {
 /// (`VICTORY_TIMED_CLAMP=1`, diagnostics): the GPU timing table charges
 /// it, its barriers and the bindings its execution then needs again to a
 /// row of its own (`clamp`, `clamp window`), not to the command before.
+/// GPU pass timing (`crate::passes`) always charges it to `class`.
 #[cfg(feature = "diagnostics")]
-fn note_clamp(list: &HostList, what: &'static str) {
+fn note_clamp(list: &HostList, what: &'static str, class: crate::passes::Class) {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| crate::switch::on("VICTORY_TIMED_CLAMP"));
     if *ON {
-        list.note_op(|| what.to_owned());
+        list.note_pass(|| crate::passes::Key::class(class), || what.to_owned());
+    } else {
+        list.note_class(class);
     }
 }
 
@@ -1335,7 +1338,7 @@ pub(crate) fn windowed(
     }
     if !takes {
         #[cfg(feature = "diagnostics")]
-        note_clamp(list, "clamp window");
+        note_clamp(list, "clamp window", crate::passes::Class::ClampWindow);
         if let Some(old) = window.open.take() {
             done(list, &old.out);
         }

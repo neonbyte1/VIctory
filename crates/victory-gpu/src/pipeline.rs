@@ -388,6 +388,13 @@ mod timing {
 
 #[cfg(windows)]
 impl Shader {
+    /// The console container (diagnostics: GPU pass timing works out how
+    /// it is lowered, `crate::passes`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -576,6 +583,28 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// What GPU pass timing keys a command by (`crate::passes`): the title
+/// pipeline's host pipeline, held until the timing report.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) type PassProgram = Arc<make::Pending>;
+
+/// A title pipeline's [`PassProgram`], and whether it is one of the
+/// acceleration-structure builder's ([`builder`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn pass_program(this: This) -> Option<(PassProgram, bool)> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    Some((p.host.clone(), p.builder))
+}
+
+/// The shaders of a [`PassProgram`], in stage order.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn pass_shaders(program: &PassProgram) -> &[Arc<Shader>] {
+    program.shaders()
 }
 
 /// Whether a dispatch with the title pipeline is held back: it is the

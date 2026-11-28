@@ -518,6 +518,8 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
         side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
         && list.crumbed(Crumb::Copy, Some("depth twin copy (ours)"), || {
+            #[cfg(feature = "diagnostics")]
+            list.note_class(crate::passes::Class::Copy);
             twin.copy(
                 &list.list,
                 depth,
