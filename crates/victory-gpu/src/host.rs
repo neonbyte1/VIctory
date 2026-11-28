@@ -3121,6 +3121,15 @@ impl HostList {
         Some((buffer, data))
     }
 
+    /// A mapped readback buffer of `size` bytes, alive until the list is
+    /// reset.
+    pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let (buffer, data) = host.mapped_buffer(size, true)?;
+        name(&buffer, || format!("list readback {size:#x}"));
+        self.deferred().uploads.push(buffer.clone());
+        Some((buffer, data))
+    }
+
     /// `len` bytes of read-back memory (8-byte aligned) until the list is
     /// reset, for what its query resolves write: the buffer, the offset in
     /// it and the CPU pointer, read once the list has run. The buffers are
