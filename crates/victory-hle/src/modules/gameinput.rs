@@ -1412,27 +1412,34 @@ extern "system" fn key_count(this: *const Reading) -> u32 {
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
     called!("IGameInputReading::GetKeyState");
-    let Value::Keys(keys) = &reading(this).value else {
-        return 0;
-    };
-    if out.is_null() {
+    if out.is_null() || count == 0 {
         return 0;
     }
+    let keys: &[KeyState] = match &reading(this).value {
+        Value::Keys(keys) => keys,
+        Value::Pad(_) => &[],
+    };
     let n = keys.len().min(count as usize);
     // SAFETY: the title passes room for `count` keys.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
+    if n < count as usize {
+        // SAFETY: the slot after the last key is inside the caller's array.
+        unsafe { out.add(n).write(KeyState::default()) };
+    }
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
     called!("IGameInputReading::GetGamepadState");
-    match &reading(this).value {
-        Value::Pad(state) if !out.is_null() => {
-            // SAFETY: checked non-null.
-            unsafe { out.write(*state) };
-            true
-        }
-        _ => false,
+    if out.is_null() {
+        return false;
     }
+    let (state, valid) = match &reading(this).value {
+        Value::Pad(state) => (*state, true),
+        Value::Keys(_) => (PadState::default(), false),
+    };
+    // SAFETY: checked non-null; the caller supplies a gamepad state.
+    unsafe { out.write(state) };
+    valid
 }
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
@@ -2088,6 +2095,34 @@ mod tests {
         for r in order {
             release(r);
         }
+    }
+
+    #[test]
+    fn keyboard_reading_clears_previous_gamepad_state() {
+        let (hub, _) = fake();
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let mut state = PadState { buttons: A, left_trigger: 1.0, ..Default::default() };
+        assert!(!gamepad_state(r, &mut state));
+        assert_eq!(state, PadState::default());
+        release(r);
+    }
+
+    #[test]
+    fn key_state_terminates_a_reused_buffer() {
+        let (hub, host) = fake();
+        host.lock().unwrap().keys = vec![key(b'W')];
+        hub.poll();
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let mut got = [key(b'A'); 2];
+        assert_eq!(key_state(r, 1, got.as_mut_ptr()), 1);
+        assert_eq!(got, [key(b'W'), key(b'A')]);
+        assert_eq!(key_state(r, 2, got.as_mut_ptr()), 1);
+        assert_eq!(got, [key(b'W'), KeyState::default()]);
+        release(r);
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(key_state(r, 2, got.as_mut_ptr()), 0);
+        assert_eq!(got[0], KeyState::default());
+        release(r);
     }
 
     #[test]
