@@ -42,6 +42,7 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            "oleaut32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
@@ -373,6 +374,42 @@ mod tests {
         assert_eq!(
             policy.resolve("kernel32.dll", &name("GetTick\0Count")),
             None
+        );
+    }
+
+    #[test]
+    fn default_policy_allows_oleaut32() {
+        assert!(HostPolicy::default().allows("oleaut32.dll"));
+        assert!(HostPolicy::default().allows("OLEAUT32.dll"));
+        assert!(!HostPolicy::none().allows("oleaut32.dll"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn oleaut32_bstr_ordinals_resolve_to_host() {
+        let alloc = function("oleaut32.dll", "SysAllocStringLen");
+        let free = function("oleaut32.dll", "SysFreeString");
+        assert!(alloc.is_some());
+        assert!(free.is_some());
+
+        let policy = HostPolicy::default();
+        assert_eq!(
+            policy.resolve("OLEAUT32.dll", &ImportSymbol::Ordinal(4)),
+            alloc,
+        );
+        assert_eq!(
+            policy.resolve("OLEAUT32.dll", &ImportSymbol::Ordinal(6)),
+            free,
+        );
+
+        let resolver = crate::HleResolver::default();
+        assert_eq!(
+            resolver.classify("OLEAUT32.dll", &ImportSymbol::Ordinal(4)),
+            Some(victory_loader::Provenance::Host),
+        );
+        assert_eq!(
+            resolver.classify("OLEAUT32.dll", &ImportSymbol::Ordinal(6)),
+            Some(victory_loader::Provenance::Host)
         );
     }
 }
