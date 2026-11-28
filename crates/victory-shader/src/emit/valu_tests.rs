@@ -4779,4 +4779,202 @@ fn lane_mask_phi_whole_read_and_readlane_execute_correctly() {
         })
         .collect();
     dispatch_wave32("per_lane_submask_whole_mask_and_readlane", &sub_shader, true, &sub_cases);
+/// VOP2 `op vdst, src0, vsrc1` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
+const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+/// VOP3P `op vdst, src0, src1, src2` with its packed modifiers: `op_sel` and
+/// `op_sel_hi` pick each source's half for the low and high lanes of the
+/// operation (bit k for source k), `neg_lo`/`neg_hi` negate them.
+#[allow(clippy::too_many_arguments)]
+const fn vop3p_mods(
+    op: u8,
+    vdst: u8,
+    [src0, src1, src2]: [u16; 3],
+    op_sel: u8,
+    op_sel_hi: u8,
+    neg_lo: u8,
+    neg_hi: u8,
+    clamp: bool,
+) -> [u32; 2] {
+    [
+        0x33 << 26
+            | (op as u32 & 0x7F) << 16
+            | (clamp as u32) << 15
+            | (op_sel_hi as u32 >> 2 & 1) << 14
+            | (op_sel as u32 & 7) << 11
+            | (neg_hi as u32 & 7) << 8
+            | vdst as u32,
+        (src0 as u32 & 0x1FF)
+            | (src1 as u32 & 0x1FF) << 9
+            | (src2 as u32 & 0x1FF) << 18
+            | (op_sel_hi as u32 & 3) << 27
+            | (neg_lo as u32 & 7) << 29,
+    ]
+}
+
+/// Inputs `[src0, src1, src2, _]` and the f32 bits RDNA2 gives for
+/// `src0.f16[0] * src1.f16[0] + src0.f16[1] * src1.f16[1] + src2.f32`: f16
+/// products are exact in f32, so 65504 * 65504 does not overflow as it would
+/// in f16.
+const DOT2_F32_F16_CASES: &[([u32; 4], u32)] = &[
+    // (1, 2) . (3, 4) + 0.5 = 11.5
+    ([0x4000_3c00, 0x4400_4200, 0x3f00_0000, 0], 0x4138_0000),
+    // (-1.5, 0.25) . (2, -8) - 1 = -6
+    ([0x3400_be00, 0xc800_4000, 0xbf80_0000, 0], 0xc0c0_0000),
+    // (65504, 65504) . (65504, 0) + 0 = 4290774016
+    ([0x7bff_7bff, 0x0000_7bff, 0, 0], 0x4f7f_c004),
+    // (inf, 0) . (1, 0) + 0 = inf
+    ([0x0000_7c00, 0x0000_3c00, 0, 0], 0x7f80_0000),
+];
+
+#[test]
+fn v_dot2_f32_f16_sums_f16_products_in_f32() {
+    // v0 = v_dot2_f32_f16 v1, v2, v3 (no modifiers: op_sel_hi = 0b111)
+    let body = vop3p_mods(0x13, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 0b111, 0, 0, false);
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = DOT2_F32_F16_CASES.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = DOT2_F32_F16_CASES[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot2_f32_f16({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_dot2_f32_f16_applies_op_sel_and_negation_per_half() {
+    // src0's halves swapped (op_sel bit 0 set, op_sel_hi bit 0 clear), src1's
+    // low half negated (neg_lo bit 1), src0's high-lane half negated (neg_hi
+    // bit 0): (1, 2) . (3, 4) + 0.5 becomes 2 * -3 + -1 * 4 + 0.5 = -9.5.
+    let body = vop3p_mods(
+        0x13,
+        0,
+        [vgpr(1), vgpr(2), vgpr(3)],
+        0b001,
+        0b110,
+        0b010,
+        0b001,
+        false,
+    );
+    let shader = build_valu_cs(&body);
+    let cases: &[([u32; 4], u32)] = &[
+        ([0x4000_3c00, 0x4400_4200, 0x3f00_0000, 0], 0xc118_0000),
+        // (-1.5, 0.25) . (2, -8) - 1 with the same modifiers:
+        // 0.25 * -2 + 1.5 * -8 - 1 = -13.5
+        ([0x3400_be00, 0xc800_4000, 0xbf80_0000, 0], 0xc158_0000),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot2_f32_f16 with modifiers({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_dot2_f32_f16_clamps_to_zero_one() {
+    let body = vop3p_mods(0x13, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 0b111, 0, 0, true);
+    let shader = build_valu_cs(&body);
+    let cases: &[([u32; 4], u32)] = &[
+        // 11.5 clamps to 1.0, -6 to 0.0
+        ([0x4000_3c00, 0x4400_4200, 0x3f00_0000, 0], 0x3f80_0000),
+        ([0x3400_be00, 0xc800_4000, 0xbf80_0000, 0], 0),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot2_f32_f16 clamp({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_dot2c_f32_f16_accumulates_into_its_destination() {
+    // v3 = v_dot2c_f32_f16 v1, v2 (v3 += v1 . v2), then v0 = v3.
+    let body = [vop2(0x02, 3, vgpr(1), 2), vop1(0x001, 0, vgpr(3))];
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = DOT2_F32_F16_CASES.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = DOT2_F32_F16_CASES[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot2c_f32_f16({:#010x}, {:#010x}) + {:#010x} = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_dot2c_f32_f16_refuses_inline_constants() {
+    // v3 = v_dot2c_f32_f16 1.0, v2 (242) and 1, v2 (129): how VOP2 widens an
+    // inline constant to a pair of halves is not measured.
+    for constant in [242, 129] {
+        let body = [vop2(0x02, 3, constant, 2), vop1(0x001, 0, vgpr(3))];
+        let refused = try_build_valu_cs(&body);
+        assert!(
+            matches!(
+                refused,
+                Err(crate::ShaderError::Unsupported {
+                    what: "an inline constant of v_dot2c_f32_f16",
+                    ..
+                })
+            ),
+            "source {constant}: {:?}",
+            refused.err()
+        );
+    }
+}
+
+/// Inputs where rounding the sum of the two products before adding the
+/// addend gives a different f32 than RDNA2, which rounds the exact
+/// `p0 + p1 + addend` once (measured on gfx1036 in #465).
+const DOT2_ROUNDED_ONCE_CASES: &[([u32; 4], u32)] = &[
+    // (1, 2^-12) . (1, 2^-12) - 1 = 2^-24; 1 + 2^-24 rounded first gives 0.
+    ([0x0c00_3c00, 0x0c00_3c00, 0xbf80_0000, 0], 0x3380_0000),
+    // (1, 2^-14) . (1, 2^-14) + 2^24 = 2^24 + 1 + 2^-28: above the tie
+    // between 2^24 and 2^24 + 2, so it rounds up; 1 + 2^-28 rounded first
+    // lands on the tie, which rounds to even (2^24).
+    ([0x0400_3c00, 0x0400_3c00, 0x4b80_0000, 0], 0x4b80_0001),
+    // (-0, -0) . (1, 1) - 0 = -0: the sign of an all-negative-zero sum.
+    ([0x8000_8000, 0x3c00_3c00, 0x8000_0000, 0], 0x8000_0000),
+];
+
+#[test]
+fn v_dot2_f32_f16_rounds_the_exact_sum_once() {
+    let body = vop3p_mods(0x13, 0, [vgpr(1), vgpr(2), vgpr(3)], 0, 0b111, 0, 0, false);
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = DOT2_ROUNDED_ONCE_CASES.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = DOT2_ROUNDED_ONCE_CASES[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot2_f32_f16({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_dot2c_f32_f16_rounds_the_exact_sum_once() {
+    let body = [vop2(0x02, 3, vgpr(1), 2), vop1(0x001, 0, vgpr(3))];
+    let shader = build_valu_cs(&body);
+    let inputs: Vec<[u32; 4]> = DOT2_ROUNDED_ONCE_CASES.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = DOT2_ROUNDED_ONCE_CASES[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_dot2c_f32_f16({:#010x}, {:#010x}) + {:#010x} = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
 }

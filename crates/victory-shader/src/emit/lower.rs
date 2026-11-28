@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod dot2;
 mod phi;
 
 type Why = &'static str;
@@ -6999,6 +7000,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_dot2_f32_f16" | "v_dot2c_f32_f16" => self.dot2_f32_f16(inst, guard),
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let m = if name == "v_mad_legacy_f32" {
