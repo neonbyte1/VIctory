@@ -2219,9 +2219,14 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
+        let mask = if self.p.wave64 { 63 } else { 31 };
+        self.spilled(
+            inst.read(Reg::V(reg))?,
+            lane_of(lane)? & mask,
+            &mut Vec::new(),
+        )
+        .ok()
+        .flatten()
     }
 
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
@@ -2253,7 +2258,8 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        let mask = if self.p.wave64 { 63 } else { 31 };
+        if (lane_of(*at).ok_or(())? & mask) != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {

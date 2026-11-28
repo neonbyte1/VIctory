@@ -1051,8 +1051,10 @@ fn effects(
         }
     }
     if vector {
-        r.extend(mask(EXEC));
-        // Lanes disabled in EXEC keep the old value.
+        if !matches!(name, "v_readlane_b32" | "v_writelane_b32") {
+            r.extend(mask(EXEC));
+        }
+        // Lanes disabled in EXEC (or untouched by `v_writelane_b32`) keep the old value.
         r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
     }
     let mut seen = Vec::with_capacity(r.len());
@@ -1585,5 +1587,39 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn readlane_and_writelane_do_not_read_exec_implicitly() {
+        for wave64 in [false, true] {
+            let p = build_words(
+                &[
+                    0xD761_0001, // v_writelane_b32 v1, s0, 0
+                    0x0001_0000,
+                    0xD760_0002, // v_readlane_b32 s2, v1, 0
+                    0x0001_0101,
+                    0xD761_0001, // v_writelane_b32 v1, exec_lo, 0
+                    0x0001_007E,
+                    S_ENDPGM,
+                ],
+                wave64,
+            );
+            let [wl, rl, wl_exec, _] = &p.blocks[0].insts[..] else {
+                panic!()
+            };
+            assert_eq!(wl.read(Reg::S(EXEC)), None);
+            assert_eq!(wl.read(Reg::S(EXEC + 1)), None);
+            assert!(
+                wl.read(Reg::V(1)).is_some(),
+                "untouched lanes keep v1's prior value"
+            );
+            assert_eq!(rl.read(Reg::S(EXEC)), None);
+            assert_eq!(rl.read(Reg::S(EXEC + 1)), None);
+            assert!(
+                wl_exec.read(Reg::S(EXEC)).is_some(),
+                "explicit exec_lo operand stays a scalar read"
+            );
+            assert_eq!(wl_exec.read(Reg::S(EXEC + 1)), None);
+        }
     }
 }

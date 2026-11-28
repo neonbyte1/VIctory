@@ -789,6 +789,11 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
+                        (_, Fields::Valu(_))
+                            if matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32") =>
+                        {
+                            None
+                        }
                         (&Some(e), _) => {
                             if let Some((prev, guard)) = last_guard
                                 && prev == e
@@ -2014,5 +2019,29 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn readlane_and_writelane_are_unguarded_under_narrowed_exec() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec_lo, 0, v0
+                0xD761_0001, // v_writelane_b32 v1, s0, 0
+                0x0001_0000,
+                0xD761_0002, // v_writelane_b32 v2, exec_lo, 0
+                0x0001_007E,
+                0xD760_0003, // v_readlane_b32 s3, v1, 0
+                0x0001_0101,
+                0x7E08_0280, // v_mov_b32 v4, 0 (control VALU)
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        assert_eq!(s.guards[0][0], None);
+        assert_eq!(s.guards[0][1], None);
+        assert_eq!(s.guards[0][2], None);
+        assert_eq!(s.guards[0][3], None);
+        assert!(s.guards[0][4].is_some(), "ordinary VALU remains guarded");
     }
 }
