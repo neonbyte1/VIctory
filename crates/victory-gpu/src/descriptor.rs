@@ -106,6 +106,12 @@ impl Heap {
             .as_ref()
     }
 
+    /// The host heap if already created, without allocating it (diagnostics).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn existing_host(&self) -> Option<&host::HostHeap> {
+        self.host.get()?.as_ref()
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);

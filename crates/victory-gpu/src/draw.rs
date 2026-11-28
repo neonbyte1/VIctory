@@ -1622,22 +1622,37 @@ impl State {
                         let mut text = describe(view.as_ref());
                         // The title's view words, and whether the host slot
                         // the shader reads was made from a view.
-                        if let Some(View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w))) = &view {
+                        if let Some(View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w))) =
+                            &view
+                        {
                             text.push_str(&format!(" words {w:?}"));
                         }
-                        let slot = (self.heaps[0] != 0)
-                            .then(|| crate::descriptor::heap(self.heaps[0] as This))
-                            .and_then(|h| {
-                                let i = handle.checked_sub(h.start)? / 32;
-                                h.host()?.describe_slot(u32::try_from(i).ok()?)
-                            });
-                        let current: String = view.as_ref().map(|v| format!("{v:?}")).unwrap_or_default().chars().take(120).collect();
-                        text.push_str(match slot.as_deref() {
+                        let host_slot = self.heap_of(handle).and_then(|h| {
+                            let index = h.index(handle)?;
+                            let host = h.existing_host()?;
+                            Some((host.describe_slot(index)?, host.slot_host(index)))
+                        });
+                        let current: String = view
+                            .as_ref()
+                            .map(|v| format!("{v:?}"))
+                            .unwrap_or_default()
+                            .chars()
+                            .take(120)
+                            .collect();
+                        text.push_str(match host_slot.as_ref().map(|(s, _)| s.as_str()) {
                             Some("null") => " slot null",
-                            Some(s) if s.starts_with(&current) => " slot made",
+                            Some(s) if !current.is_empty() && s.starts_with(&current) => {
+                                " slot made"
+                            }
                             Some(_) => " slot stale",
                             None => " slot unknown",
                         });
+                        if u.kind != ResourceType::Sampler
+                            && let Some((_, Some(kept))) = &host_slot
+                        {
+                            text.push(' ');
+                            text.push_str(kept);
+                        }
                         text
                     }
                     (root, _) => format!("{root:?}"),
