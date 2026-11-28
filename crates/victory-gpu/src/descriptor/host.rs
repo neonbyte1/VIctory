@@ -1563,6 +1563,9 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
     (kept, MARK.with(std::cell::Cell::take))
 }
 
+/// Typed depth formats with the colour formats shaders read them as.
+const DEPTH_READABLE: [(u32, u32); 4] = [(20, 21), (40, 41), (45, 46), (55, 56)];
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -1602,7 +1605,17 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     {
         format.0 = linear as i32;
     }
-    let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    let mut view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // Shaders read a depth texture through its readable format; the host
+    // refuses a typed depth format in a shader resource view.
+    if !unordered
+        && let Some(&(_, readable)) = DEPTH_READABLE.iter().find(|&&(depth, _)| depth == view)
+    {
+        view = readable;
+        if let Some(format) = format.as_deref_mut() {
+            format.0 = readable as i32;
+        }
+    }
     // A typed unordered view in a format the host cannot store to
     // (B5G5R5A1_UNORM on NVIDIA) removes the device when made, in the
     // texture's own format too: the slot stays null, its writes dropped.
@@ -2671,6 +2684,34 @@ mod tests {
         assert!(host.made(0) && !host.made(1) && host.made(2), "a cleared record leaves its slot");
     }
 
+    /// A shader resource view of a depth texture the host made typeless,
+    /// described in the typed depth format, is made in the readable one.
+    #[test]
+    fn depth_formats_in_shader_resource_views_are_made_readable() {
+        let Some(host) = host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; our out pointer.
+        let made = unsafe {
+            host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
+        };
+        let (Ok(()), Some(texture)) = (made, texture) else { return };
+        let mut format = DXGI_FORMAT_D32_FLOAT;
+        assert!(fits(&texture, &[], Some(&mut format), false));
+        assert_eq!(format, DXGI_FORMAT_R32_FLOAT);
+    }
+
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
@@ -3074,8 +3115,8 @@ mod tests {
             );
         }
         for (offset, (res_fmt, view_fmt, expect_real)) in [
-            (39u32, 40u32, false), // R32_TYPELESS + D32_FLOAT SRV -> null fallback
-            (53u32, 55u32, false), // R16_TYPELESS + D16_UNORM SRV -> null fallback
+            (39u32, 40u32, true),  // R32_TYPELESS + D32_FLOAT SRV -> R32_FLOAT SRV
+            (53u32, 55u32, true),  // R16_TYPELESS + D16_UNORM SRV -> R16_UNORM SRV
             (29u32, 0u32, true),   // R8G8B8A8_UNORM_SRGB + UAV + UNKNOWN SRV -> 29
             (91u32, 0u32, true),   // B8G8R8A8_UNORM_SRGB + UAV + UNKNOWN SRV -> 91
         ]
