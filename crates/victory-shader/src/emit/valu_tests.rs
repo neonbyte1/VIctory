@@ -2035,6 +2035,73 @@ fn v_cvt_norm_i16_and_u16_f16_round_the_exact_product() {
     }
 }
 
+// Binary64 values with known frexp decompositions. The subnormals carry
+// bits across the dword boundary during normalization.
+const FREXP_F64: &[(u64, i32, u64)] = &[
+    (0x3ff0_0000_0000_0000, 1, 0x3fe0_0000_0000_0000),
+    (0xc029_0000_1234_5678, 4, 0xbfe9_0000_1234_5678),
+    (0x0010_0000_0000_0000, -1021, 0x3fe0_0000_0000_0000),
+    (0x7fef_ffff_ffff_ffff, 1024, 0x3fef_ffff_ffff_ffff),
+    (0x000f_ffff_ffff_ffff, -1022, 0x3fef_ffff_ffff_fffe),
+    (0x0000_0000_0020_0001, -1052, 0x3fe0_0000_8000_0000),
+    (0x0000_0000_0010_0001, -1053, 0x3fe0_0001_0000_0000),
+    (0x8000_0000_0008_0001, -1054, 0xbfe0_0002_0000_0000),
+    (0x0000_0000_0000_0001, -1073, 0x3fe0_0000_0000_0000),
+    (0x0000_0000_0000_0000, 0, 0x0000_0000_0000_0000),
+    (0x8000_0000_0000_0000, 0, 0x8000_0000_0000_0000),
+    (0x7ff0_0000_0000_0000, 0, 0x7ff0_0000_0000_0000),
+    (0xfff8_0000_0065_4321, 0, 0xfff8_0000_0065_4321),
+    (0x7ff0_0000_0000_0001, 0, 0x7ff0_0000_0000_0001),
+];
+
+fn frexp_f64_inputs() -> Vec<[u32; 4]> {
+    FREXP_F64
+        .iter()
+        .map(|&(bits, _, _)| [bits as u32, (bits >> 32) as u32, 0, 0])
+        .collect()
+}
+
+#[test]
+fn v_frexp_exp_i32_f64_extracts_the_exponent() {
+    let shader = build_valu_cs(&[vop1(0x03c, 0, vgpr(1))]);
+    run_cases(&shader, &frexp_f64_inputs(), |backend, i, _, got| {
+        assert_eq!(got as i32, FREXP_F64[i].1, "{backend}: case {i}");
+    });
+}
+
+#[test]
+fn v_frexp_mant_f64_extracts_the_significand() {
+    let cases = frexp_f64_inputs();
+    for (word, shift) in [(6, 0), (7, 32)] {
+        let shader = build_valu_cs(&[vop1(0x03d, 6, sgpr(0)), vop1(0x001, 0, vgpr(word))]);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            assert_eq!(
+                got,
+                (FREXP_F64[i].2 >> shift) as u32,
+                "{backend}: case {i}, dword v{word}"
+            );
+        });
+    }
+}
+
+#[test]
+fn v_frexp_f64_uses_binary64_immediates_and_sign_modifiers() {
+    // VOP3 v_frexp_mant_f64 v[6:7], -24.0 (literal high word plus NEG).
+    let [op, sources] = vop3(0x1bd, 6, 255, 0, 0);
+    let words = [op, sources | 1 << 29, 0x4038_0000, vop1(0x001, 0, vgpr(7))];
+    let mantissa = build_valu_cs(&words);
+    let exponent = build_valu_cs(&[vop1(0x03c, 0, 129)]); // integer inline 1 as raw binary64 bits
+    for (shader, expected) in [(&mantissa, 0xbfe8_0000), (&exponent, (-1073_i32) as u32)] {
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let bits = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(bits & 0x8001, 0, "SFI0 doubles and int64 feature bits");
+        run_cases(shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}");
+        });
+    }
+}
+
 #[test]
 fn v_sin_and_v_cos_f32_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x035, 0, vgpr(1))]);

@@ -27,6 +27,7 @@ mod phi;
 mod valu16;
 mod wave_prefix;
 mod d16;
+mod frexp;
 #[cfg(all(test, windows))]
 mod mark_tests;
 #[cfg(all(test, windows))]
@@ -7523,6 +7524,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_frexp_exp_i32_f64" | "v_frexp_mant_f64" => self.frexp64(inst, guard),
             "v_rcp_f32" | "v_rcp_iflag_f32" => {
                 // shortcut: the hardware reciprocal is approximate (1 ULP); this divides.
                 let a = f(self, 0)?;
