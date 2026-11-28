@@ -324,16 +324,13 @@ mod tests {
 
     #[test]
     fn a_large_source_gets_its_own_cap_and_only_its_own() {
-        let big = vec![b'a'; 600 * 1024];
-        assert!(check("crates/victory-shader/src/emit/lower.rs", &big).is_empty());
-        assert!(!check("crates/victory-shader/src/emit/other.rs", &big).is_empty());
-        assert!(
-            !check(
-                "crates/victory-shader/src/emit/lower.rs",
-                &vec![b'a'; 1100 * 1024]
-            )
-            .is_empty()
-        );
+        // Source-like lines, so only the size rule applies (a run of one byte
+        // would also trip the encoded-data rule).
+        let source = |kib: usize| "fn f() {}\n".repeat(kib * 1024 / 10).into_bytes();
+        let lower = "crates/victory-shader/src/emit/lower.rs";
+        assert!(check(lower, &source(600)).is_empty());
+        assert!(!check("crates/victory-shader/src/emit/other.rs", &source(600)).is_empty());
+        assert!(!check(lower, &source(1100)).is_empty());
     }
 
     #[test]
