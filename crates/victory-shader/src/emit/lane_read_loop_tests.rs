@@ -229,3 +229,120 @@ fn lane_read_loop_with_a_joined_exec_back_edge() {
         eprintln!("{name}: joined back edge exact");
     }
 }
+
+/// A loop entered by some lanes and left by each at its own iteration, in
+/// the shape the console's compiler gives a loop with a `break`: a
+/// `v_cmpx` and `s_cbranch_execz` let lanes t < `wave * 3 / 4` in; in the
+/// loop `s[16:17]` holds the lanes still looping, `s[18:19]` this
+/// iteration's EXEC; a `v_cmpx` makes EXEC the lanes leaving,
+/// `s_andn2_b64 s[16:17], s[16:17], exec` takes them out and
+/// `s_cbranch_scc1` goes back while any lane is left, to a latch that sets
+/// EXEC to `s[18:19] & s[16:17]`. Lane t that enters loops (t & 3) + 1
+/// times and stores that count; the other lanes store 0. A `v_readlane`
+/// in the loop makes it run in the console flow, where every lane goes
+/// along every edge.
+fn break_program(wave: u32) -> crate::NativeProgram {
+    let wave64 = wave == 64;
+    let k = |n: u32| 128 + n; // inline integer constant
+    let b = |b64: u32, b32: u32| if wave64 { b64 } else { b32 };
+    let words = [
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF408_0101,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x3602_0083, // v_and_b32 v1, 3, v0
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        b(0xBE8C_047E, 0xBE8C_037E), // s_mov_b64 s[12:13], exec
+        0x7DA8_0000 | k(wave * 3 / 4), // v_cmpx_gt_u32 exec, 3/4 wave, v0
+        0xBF88_000A,                   // s_cbranch_execz end
+        b(0xBE90_047E, 0xBE90_037E),   // s_mov_b64 s[16:17], exec
+        0xBF82_0001,                   // s_branch body
+        // latch:
+        b(0x87FE_1012, 0x877E_1012), // s_and_b64 exec, s[18:19], s[16:17]
+        // body:
+        0xD760_0009,
+        k(1) << 9 | 0x100,           // v_readlane_b32 s9, v0, 1
+        0x4A04_0481,                 // v_add_nc_u32 v2, 1, v2
+        b(0xBE92_047E, 0xBE92_037E), // s_mov_b64 s[18:19], exec
+        0x7DA6_0501,                 // v_cmpx_le_u32 exec, v1, v2
+        b(0x8A90_7E10, 0x8A10_7E10), // s_andn2_b64 s[16:17], s[16:17], exec
+        0xBF85_FFF8,                 // s_cbranch_scc1 latch
+        // end:
+        b(0xBEFE_040C, 0xBEFE_030C), // s_mov_b64 exec, s[12:13]
+        0x3406_0082,                 // v_lshlrev_b32 v3, 2, v0
+        0xE070_1000,
+        0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    crate::NativeProgram {
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        ..program(wave, 0, false)
+    }
+}
+
+/// The per-edge lane masks of a loop's EXEC joins (#385) are what lanes
+/// know on taking the edge; in the console flow the lanes that did not
+/// take it go along too, so a join must take the masks themselves. With
+/// the per-edge masks the lanes that never enter ran the loop, and a lane
+/// that had left came back into the lanes still looping, which kept the
+/// loop going to its iteration bound.
+#[test]
+fn lanes_leave_a_loop_by_a_saved_mask_in_the_console_flow() {
+    let mut wrong = Vec::new();
+    let mut ran = 0;
+    for wave in [32, 64] {
+        let native = break_program(wave);
+        // Emission for a host without 64-lane waves, where no device runs it.
+        emit(
+            &native,
+            super::Target {
+                lanes_min: 32,
+                lanes_max: 32,
+            },
+        );
+        let want: Vec<u32> = (0..wave)
+            .map(|t| if t < wave * 3 / 4 { (t & 3) + 1 } else { 0 })
+            .collect();
+        for (name, host) in devices() {
+            let cs = emit(&native, host.target());
+            let (root, pso) = host
+                .compute_pipeline(&cs)
+                .unwrap_or_else(|e| panic!("{name}: wave{wave}: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(
+                            0,
+                            Root::Constants(vec![0; (cs.user_data_dwords() as usize).max(1)]),
+                        )],
+                        views: &[View::RawUav(wave)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{name}: wave{wave}: {e}"))
+                .remove(0);
+            ran += 1;
+            let bad: Vec<String> = (0..wave as usize)
+                .filter(|&t| out[t] != want[t])
+                .map(|t| format!("{t}: {} (want {})", out[t], want[t]))
+                .collect();
+            if bad.is_empty() {
+                eprintln!("{name}: wave{wave} exact");
+            } else {
+                eprintln!("{name}: wave{wave}: {} lanes wrong: {}", bad.len(), bad.join(", "));
+                wrong.push(format!("{name} wave{wave}"));
+            }
+        }
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    }
+    assert!(wrong.is_empty(), "wrong on {wrong:?}");
+}
