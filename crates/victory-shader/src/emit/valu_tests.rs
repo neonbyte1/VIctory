@@ -9119,3 +9119,54 @@ fn v_mov_b32_modifiers_are_bitwise() {
         );
     });
 }
+
+#[test]
+fn v_trunc_f64_rounds_toward_zero_in_both_words() {
+    let values = [
+        0.0,
+        -0.0,
+        0.875,
+        -0.875,
+        1.99,
+        -12.95,
+        f64::from_bits(1),
+        f64::from_bits(1 << 63 | 1),
+        // Fractional tails of 33, 32, and 31 bits.
+        524_288.75,
+        -1_048_576.75,
+        2_097_152.625,
+        4_503_599_627_370_495.5,
+        4_503_599_627_370_496.0,
+        f64::MAX,
+        f64::NEG_INFINITY,
+    ];
+    let inputs: Vec<_> = values
+        .iter()
+        .map(|&value| {
+            let bits = value.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+    for source in [vgpr(1), sgpr(0)] {
+        for (word, shift) in [(6, 0), (7, 32)] {
+            let shader = build_valu_cs(&[vop1(0x017, 6, source), vop1(0x001, 0, vgpr(word))]);
+            run_cases(&shader, &inputs, |backend, case, _, got| {
+                let expected = (values[case].trunc().to_bits() >> shift) as u32;
+                assert_eq!(got, expected, "{backend}: source {source}, case {case}, v{word}");
+            });
+        }
+    }
+}
+
+#[test]
+fn v_trunc_f64_rounds_a_negated_vop3_literal() {
+    let [op, sources] = vop3(0x197, 6, 255, 0, 0);
+    let shader = build_valu_cs(&[op, sources | 1 << 29, 0x4029_0000, vop1(0x001, 0, vgpr(7))]);
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let features = container.part(crate::FourCC::SFI0).unwrap();
+    let bits = u64::from_le_bytes(features.data.try_into().unwrap());
+    assert_eq!(bits & 0x8001, 0, "SFI0 doubles and int64 feature bits");
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 0xc028_0000, "{backend}");
+    });
+}

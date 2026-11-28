@@ -28,6 +28,7 @@ mod valu16;
 mod wave_prefix;
 mod d16;
 mod frexp;
+mod trunc;
 #[cfg(all(test, windows))]
 mod mark_tests;
 #[cfg(all(test, windows))]
@@ -6960,6 +6961,7 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 Ok(())
             }
+            "v_trunc_f64" => self.trunc_f64(inst, guard),
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
                 // 32 × 32 → 64-bit product plus a 64-bit addend (address
                 // arithmetic); the carry out is a lane mask.
