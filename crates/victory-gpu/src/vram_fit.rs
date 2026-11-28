@@ -111,11 +111,12 @@ pub(crate) fn log(frames: f64, used_mb: f64, budget_mb: f64) {
         .1
         .saturating_sub(heap_used) as f64;
     let rest = used_mb * 1e6 - copies - heap_total - committed;
-    let (asked_vram, asked_system) = crate::shadow::take_asked();
+    let [uses_vram, bound_vram, uses_system, bound_system] = crate::shadow::take_asked();
     tracing::info!(
         "video memory fit (VICTORY_VRAM_FIT={}): {used_mb:.0} MB used of a {budget_mb:.0} MB budget, \
          copies' target {:.0} MB, room {:.0} MB; copies {:.0} MB in video memory, {:.0} MB in system memory \
-         (asked for per frame by lists: {:.0} MB of those in video memory, {:.0} MB of those in system memory); \
+         (uses by lists per frame: {:.0} of copies in video memory, binding ranges of {:.1} GB, {:.0} of copies in system \
+         memory, binding {:.1} GB; ranges bound, not bytes read); \
          past the fixed quarter per frame: {:.1} copies took the room ({:.1} MB), {:.1} did not fit it ({:.1} MB); \
          since the start {} ({:.0} MB) and {} ({:.0} MB); heaps of textures {heaps} of {} MiB, {:.0} MB ({:.0} MB free); \
          committed textures {:.0} MB; the rest {:.0} MB",
@@ -124,8 +125,10 @@ pub(crate) fn log(frames: f64, used_mb: f64, budget_mb: f64) {
         mb(ROOM.load(Relaxed) as f64),
         mb(copies),
         mb(system as f64),
-        mb(asked_vram as f64) / frames.max(1.0),
-        mb(asked_system as f64) / frames.max(1.0),
+        uses_vram as f64 / frames.max(1.0),
+        bound_vram as f64 / 1e9 / frames.max(1.0),
+        uses_system as f64 / frames.max(1.0),
+        bound_system as f64 / 1e9 / frames.max(1.0),
         f(N::Roomed),
         mb(f(N::RoomedBytes)),
         f(N::Refused),

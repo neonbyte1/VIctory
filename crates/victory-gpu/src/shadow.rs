@@ -196,17 +196,21 @@ pub(crate) fn vram_bytes() -> u64 {
     VRAM_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Bytes lists asked copies for (their uses), of copies in video memory
-/// and in system memory: what shaders may read there (diagnostics).
+/// Lists' uses of copies (refreshes asked for: a draw or dispatch binding a
+/// range of the copy) and the bytes of the ranges bound, of copies in video
+/// memory and in system memory (diagnostics). A range is bound whole
+/// (often to the copy's end) however little of it shaders read: the bytes
+/// say where the uses point, not what crosses PCI Express.
 #[cfg(feature = "diagnostics")]
-static ASKED: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static ASKED: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// [`ASKED`] since the last call: (video memory, system memory).
+/// [`ASKED`] since the last call: uses and bytes bound of copies in video
+/// memory, then of copies in system memory.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn take_asked() -> (u64, u64) {
+pub(crate) fn take_asked() -> [u64; 4] {
     use std::sync::atomic::Ordering::Relaxed;
-    (ASKED[0].swap(0, Relaxed), ASKED[1].swap(0, Relaxed))
+    std::array::from_fn(|i| ASKED[i].swap(0, Relaxed))
 }
 
 struct Backing {
@@ -574,7 +578,12 @@ impl Shadow {
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
         #[cfg(feature = "diagnostics")]
-        ASKED[usize::from(!self.vram)].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let at = 2 * usize::from(!self.vram);
+            ASKED[at].fetch_add(1, Relaxed);
+            ASKED[at + 1].fetch_add(len, Relaxed);
+        }
         list.defer_refresh(self, address as usize, len as usize);
     }
 
