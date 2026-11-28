@@ -3236,6 +3236,58 @@ mod tests {
         assert_eq!(mesh_groups(5, u32::MAX, u32::MAX), Some(5));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_raw_buffer_clear_keeps_words_outside_an_odd_offset_view() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap;
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        let mut list = null;
+        let mut heap = null;
+        let desc = [0u32, 1, 1, 0, 0, 0, 0, 0];
+        let iid = ID3D12DescriptorHeap::IID;
+        let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
+        assert_eq!(
+            crate::descriptor::create_heap(null, desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let heap_slot = if has_newer_table(list) { newer_slot(0x100 / 8) * 8 } else { 0x100 };
+        slot::<extern "system" fn(This, u32, *const This)>(list, heap_slot)(list, 1, &heap);
+
+        let buffer = crate::resource::test_buffer(128);
+        let (data, _) = crate::resource::buffer_bytes(buffer).unwrap();
+        let words = data.cast::<[u32; 8]>();
+        let initial = [101, 102, 103, 104, 105, 106, 107, 108];
+        // SAFETY: the new buffer has room for eight DWORDs.
+        unsafe { words.write(initial) };
+        let handle = crate::descriptor::heap(heap).start;
+        // RAW R32_TYPELESS buffer view, first DWORD 1, four DWORDs.
+        let view = [39, 1, 1, 0, 4, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, buffer, null, &view, handle);
+        let clear = [23u32, 31, 37, 41];
+        slot::<extern "system" fn(This, u64, u64, This, *const [u32; 4], u32, *const RECT)>(
+            list, 0x1a8,
+        )(list, handle, handle, buffer, &clear, 0, null.cast());
+        let native = host_list(list).unwrap();
+        assert_eq!(close(list), S_OK);
+        host.execute(&[native]);
+        // SAFETY: the list submission and its copyback are complete.
+        let readback = unsafe { words.read() };
+        for object in [list, allocator, heap, buffer] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        assert_eq!(readback, [101, 23, 23, 23, 23, 106, 107, 108]);
+    }
+
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();

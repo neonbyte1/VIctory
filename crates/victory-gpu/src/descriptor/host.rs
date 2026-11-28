@@ -1388,7 +1388,17 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let flags = match view {
+        View::Unordered(_, _, Some(words)) => words[8],
+        View::Placed(true, _, words) => words[8],
+        _ => 0,
+    };
+    // Use the same shadow as the descriptor for refresh and copyback.
+    let alignment = buffer_uav_alignment(
+        D3D12_BUFFER_UAV_FLAGS(flags as i32),
+        u64::from(view_stride(view)),
+    );
+    let (shadow, _) = crate::shadow::for_view(address, len, alignment)?;
     Some((shadow, address, len))
 }
 
@@ -1564,6 +1574,15 @@ fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
         .is_some_and(|(start, len)| start <= width && len <= width - start)
 }
 
+fn buffer_uav_alignment(flags: D3D12_BUFFER_UAV_FLAGS, element: u64) -> u64 {
+    if flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        // A raw view has 4-byte elements, but its host offset must be aligned to 16 bytes.
+        u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+    } else {
+        element
+    }
+}
+
 /// An unordered access view of title buffer memory at `address` (`len`
 /// bytes) on its host copy, as [`buffer_srv`]; false if the copy cannot be
 /// written by shaders (upload memory).
@@ -1593,7 +1612,9 @@ fn buffer_uav(
     }
     let (start, bytes) =
         checked_view_span(address, buffer.FirstElement, buffer.NumElements, element)?;
-    let (shadow, own) = crate::shadow::for_view(start, bytes, element)?;
+    let alignment = buffer_uav_alignment(buffer.Flags, element);
+    let (shadow, own) =
+        crate::shadow::for_view(start, bytes, alignment)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
