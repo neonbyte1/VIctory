@@ -1363,6 +1363,70 @@ fn normalized_buffer_formats_load_correctly_rounded_quotients() {
     }
 }
 
+#[test]
+fn v_rndne_f64_rounds_ties_to_even_across_both_words() {
+    let values = [
+        -0.0,
+        0.0,
+        f64::from_bits(1),
+        f64::from_bits(0x8000_0000_0000_0001),
+        f64::from_bits(0x3fdf_ffff_ffff_ffff),
+        0.5,
+        -0.5,
+        f64::from_bits(0x3fe0_0000_0000_0001),
+        f64::from_bits(0xbfe0_0000_0000_0001),
+        1.5,
+        2.5,
+        -3.5,
+        -4.5,
+        // Fractional fields of 33, 32 and 31 bits.
+        524_288.5,
+        524_289.5,
+        1_048_576.5,
+        1_048_577.5,
+        2_097_152.5,
+        2_097_153.5,
+        // A remainder that crosses a word boundary, including a sticky bit.
+        f64::from_bits(524_288.5f64.to_bits() + 1),
+        f64::from_bits(1_048_576.5f64.to_bits() - 1),
+        2_097_153.75,
+        4_503_599_627_370_495.5,
+        4_503_599_627_370_496.0,
+        f64::MAX,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let inputs: Vec<_> = values
+        .iter()
+        .map(|value| {
+            let bits = value.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+    for source in [vgpr(1), sgpr(0)] {
+        for (word, shift) in [(6, 0), (7, 32)] {
+            let shader = build_valu_cs(&[vop1(0x019, 6, source), vop1(0x001, 0, vgpr(word))]);
+            run_cases(&shader, &inputs, |backend, case, _, got| {
+                let expected = (values[case].round_ties_even().to_bits() >> shift) as u32;
+                assert_eq!(got, expected, "{backend}: source {source}, case {case}, v{word}");
+            });
+        }
+    }
+}
+
+#[test]
+fn v_rndne_f64_rounds_a_negated_vop3_literal() {
+    let [op, sources] = vop3(0x199, 6, 255, 0, 0);
+    let shader = build_valu_cs(&[op, sources | 1 << 29, 0x402b_0000, vop1(0x001, 0, vgpr(7))]);
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let features = container.part(crate::FourCC::SFI0).unwrap();
+    let bits = u64::from_le_bytes(features.data.try_into().unwrap());
+    assert_eq!(bits & 0x8001, 0, "SFI0 doubles and int64 feature bits");
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 0xc02c_0000, "{backend}: -13.5 rounds to -14");
+    });
+}
+
 /// A title truncates `x * (2^n - 1)` back to the code it stored (the
 /// material index a mesh program reads from a vertex colour's alpha, as
 /// `v_mul_legacy_f32` by 255.0 then `v_cvt_u32_f32`): every code comes back
