@@ -1471,6 +1471,70 @@ fn packed_add_selects_halves_of_inline_constants() {
 }
 
 #[test]
+fn directed_f64_ceil_and_floor_write_both_words() {
+    let values = [
+        0.0,
+        -0.0,
+        f64::from_bits(1),
+        f64::from_bits(0x8000_0000_0000_0001),
+        0.75,
+        -0.75,
+        1.0,
+        -1.0,
+        1.5,
+        -1.5,
+        // Fractional fields of 33, 32 and 31 bits.
+        524_288.0,
+        f64::from_bits(524_288.0f64.to_bits() + 1),
+        -524_288.75,
+        1_048_576.125,
+        -1_048_576.125,
+        2_097_152.625,
+        -2_097_152.625,
+        4_503_599_627_370_495.5,
+        -4_503_599_627_370_495.5,
+        4_503_599_627_370_496.0,
+        f64::MAX,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let inputs: Vec<_> = values
+        .iter()
+        .map(|value| {
+            let bits = value.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+    let operations = [(0x018, f64::ceil as fn(f64) -> f64), (0x01a, f64::floor)];
+    for (op, expected) in operations {
+        for source in [vgpr(1), sgpr(0)] {
+            for (word, shift) in [(6, 0), (7, 32)] {
+                let shader = build_valu_cs(&[vop1(op, 6, source), vop1(0x001, 0, vgpr(word))]);
+                run_cases(&shader, &inputs, |backend, case, _, got| {
+                    let want = (expected(values[case]).to_bits() >> shift) as u32;
+                    assert_eq!(got, want, "{backend}: op {op:#x}, source {source}, case {case}, v{word}");
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn directed_f64_vop3_negated_literal_rounds_in_both_directions() {
+    for (opcode, expected) in [(0x19a, 0xc02c_0000), (0x198, 0xc02a_0000)] {
+        let [op, sources] = vop3(opcode, 6, 255, 0, 0);
+        let shader = build_valu_cs(&[op, sources | 1 << 29, 0x402b_0000, vop1(0x001, 0, vgpr(7))]);
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let bits = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(bits & 0x8001, 0, "SFI0 doubles and int64 feature bits");
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}: opcode {opcode:#x}, -13.5");
+        });
+    }
+}
+
+#[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
     let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
