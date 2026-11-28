@@ -35,6 +35,8 @@ pub(super) use mark_tests::synthetic_mark_dxil;
 mod user_data_tests;
 #[cfg(test)]
 mod subdword_tests;
+#[cfg(test)]
+mod lookup_tests;
 
 use code_table::CodeLoad;
 
@@ -299,6 +301,8 @@ struct Lower<'a> {
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
+    /// Per IR block: whether the block contains a `done` export.
+    done_export: Vec<bool>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
@@ -336,8 +340,11 @@ struct Lower<'a> {
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
     balloting: HashSet<Value>,
-    /// Block writing each value.
-    def_block: HashMap<Value, usize>,
+    /// Block defining each value (phi or instruction), indexed by `Value.0`.
+    def_block: Vec<Option<usize>>,
+    /// Instruction site `(block, index)` defining each value, indexed by
+    /// `Value.0` (`None` for phis and program inputs).
+    def_site: Vec<Option<Site>>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -761,6 +768,40 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let exports: HashMap<Site, &'a Export> = x.io.exports.iter().map(|e| (e.site, e)).collect();
+        let mut done_export = vec![false; p.blocks.len()];
+        for (&(b, i), e) in &exports {
+            if e.done && p.blocks.get(b).is_some_and(|block| i < block.insts.len()) {
+                done_export[b] = true;
+            }
+        }
+        let value_count = p
+            .inputs
+            .iter()
+            .map(|&(_, v)| v.0 as usize + 1)
+            .chain(p.blocks.iter().flat_map(|block| {
+                block.phis.iter().map(|phi| phi.value.0 as usize + 1).chain(
+                    block
+                        .insts
+                        .iter()
+                        .flat_map(|inst| inst.writes.iter().map(|&(_, v)| v.0 as usize + 1)),
+                )
+            }))
+            .max()
+            .unwrap_or(0);
+        let mut def_block = vec![None; value_count];
+        let mut def_site = vec![None; value_count];
+        for (b, block) in p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                def_block[phi.value.0 as usize] = Some(b);
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.writes {
+                    def_block[v.0 as usize] = Some(b);
+                    def_site[v.0 as usize] = Some((b, i));
+                }
+            }
+        }
         Lower {
             s,
             x,
@@ -794,7 +835,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             scalar,
             written_uavs,
-            exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
+            exports,
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             entry_handles: HashMap::new(),
@@ -803,6 +844,7 @@ impl<'a> Lower<'a> {
             size_entry_handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
+            done_export,
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
@@ -823,18 +865,8 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
-            def_block: p
-                .blocks
-                .iter()
-                .enumerate()
-                .flat_map(|(b, block)| {
-                    block
-                        .insts
-                        .iter()
-                        .flat_map(move |i| i.writes.iter().map(move |w| (w.1, b)))
-                        .chain(block.phis.iter().map(move |phi| (phi.value, b)))
-                })
-                .collect(),
+            def_block,
+            def_site,
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
@@ -1608,8 +1640,7 @@ impl<'a> Lower<'a> {
     }
 
     fn has_done_export(&self, b: usize) -> bool {
-        (0..self.x.p.blocks[b].insts.len())
-            .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+        self.done_export.get(b).copied().unwrap_or(false)
     }
 
     /// Values of the program's input registers.
@@ -2038,11 +2069,11 @@ impl<'a> Lower<'a> {
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
-                let at = match self.def_block.get(&lo) {
+                let at = match self.def_block(lo) {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                    Some(b) if b == self.cur_ir => self.cur,
+                    Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
@@ -2083,12 +2114,8 @@ impl<'a> Lower<'a> {
         {
             return Err("a register joining a lane mask and data, read as data");
         }
-        let &b = self.def_block.get(&lo).ok_or(ELSEWHERE)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))
-            .ok_or(ELSEWHERE)?;
+        let (b, i) = self.def_site(lo).ok_or(ELSEWHERE)?;
+        let inst = &p.blocks[b].insts[i];
         let Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
             src,
@@ -3042,11 +3069,7 @@ impl<'a> Lower<'a> {
                 .find(|q| q.reg == h)
                 .map(|q| q.value);
         }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let inst = self.def_inst(lo)?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
         inst.write(pick(reg)?)
     }
@@ -3062,6 +3085,9 @@ impl<'a> Lower<'a> {
     /// the `done` export later in block b without its own guard holding,
     /// i.e. is discarded there.
     fn discarded_at_done(&self, b: usize, i: usize) -> bool {
+        if !self.has_done_export(b) {
+            return false;
+        }
         let guards = &self.x.st.guards[b];
         let g = guards[i].unwrap_or(Bool::TRUE);
         self.exports.iter().any(|(&(eb, ei), e)| {
@@ -10890,7 +10916,7 @@ impl<'a> Lower<'a> {
             }
             return Some(never_nan);
         }
-        let Some(&b) = self.def_block.get(&v) else {
+        let Some((b, i)) = self.def_site(v) else {
             // A VGPR no one set reads zero.
             let vgpr = p
                 .inputs
@@ -10899,11 +10925,7 @@ impl<'a> Lower<'a> {
             let io = self.x.io.inputs.iter().any(|i| i.0 == v);
             return (vgpr && !io).then_some(true);
         };
-        let (i, inst) = p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))?;
+        let inst = &p.blocks[b].insts[i];
         let Fields::Valu(f) = &inst.fields else {
             return None;
         };
@@ -12213,20 +12235,20 @@ impl<'a> Lower<'a> {
         r
     }
 
-    /// The block, instruction index, and instruction writing `v`.
-    fn def_site(&self, v: Value) -> Option<(usize, usize, &'a Inst)> {
-        let b = *self.def_block.get(&v)?;
-        let (i, inst) = self.x.p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, inst)| inst.writes.iter().any(|w| w.1 == v))?;
-        Some((b, i, inst))
+    /// The IR block defining `v` (a phi or instruction).
+    fn def_block(&self, v: Value) -> Option<usize> {
+        self.def_block.get(v.0 as usize).copied().flatten()
+    }
+
+    /// The instruction site `(block, index)` writing `v`.
+    fn def_site(&self, v: Value) -> Option<Site> {
+        self.def_site.get(v.0 as usize).copied().flatten()
     }
 
     /// The instruction writing `v`.
     fn def_inst(&self, v: Value) -> Option<&'a Inst> {
-        self.def_site(v).map(|(_, _, inst)| inst)
+        let (b, i) = self.def_site(v)?;
+        Some(&self.x.p.blocks[b].insts[i])
     }
 
     /// The constant `v` holds, `env` giving phi values: unguarded moves of
@@ -12235,7 +12257,8 @@ impl<'a> Lower<'a> {
         if let Some(&k) = env.get(&v) {
             return Some(k);
         }
-        let (b, i, inst) = self.def_site(v)?;
+        let (b, i) = self.def_site(v)?;
+        let inst = &self.x.p.blocks[b].insts[i];
         if self.x.st.guards[b][i].is_some() {
             return None;
         }
