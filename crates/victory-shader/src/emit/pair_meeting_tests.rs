@@ -90,6 +90,36 @@ fn emit(
     target: Target,
     pair_meetings: bool,
 ) -> Result<HostShader, String> {
+    through(native, target, pair_meetings, super::emit_with)
+}
+
+/// How [`emit`] lowers `native` (`super::form_with`).
+fn form(native: &crate::NativeProgram, target: Target) -> Result<super::Form, String> {
+    through(
+        native,
+        target,
+        true,
+        |c, native, p, st, io, res, options| {
+            super::lowered(c, native, p, st, io, res, options).map(|(_, form)| form)
+        },
+    )
+}
+
+/// The stages before emitting `native`, then `then` with what they made.
+fn through<T>(
+    native: &crate::NativeProgram,
+    target: Target,
+    pair_meetings: bool,
+    then: impl FnOnce(
+        &crate::Container,
+        &crate::NativeProgram,
+        &crate::ir::Program,
+        &crate::structure::Structured,
+        &crate::io::Io,
+        &crate::resource::Resources,
+        Options,
+    ) -> Result<T, crate::ShaderError>,
+) -> Result<T, String> {
     let c = crate::Container {
         digest: [0; 16],
         version: (1, 0),
@@ -106,7 +136,22 @@ fn emit(
         target,
         pair_meetings,
     };
-    super::emit_with(&c, native, &p, &st, &io, &res, options).map_err(|e| e.to_string())
+    then(&c, native, &p, &st, &io, &res, options).map_err(|e| e.to_string())
+}
+
+/// The form a translation reports: pair meetings for a group of several
+/// console waves on a 32-lane host, the console flow in halves for a group
+/// of one; both split into 32-lane host waves.
+#[test]
+fn the_form_names_pair_meetings_and_halves() {
+    let several = form(&looping([256, 1], 40), NVIDIA).expect("lowered");
+    assert_eq!(
+        (several.flow, several.split),
+        (super::Flow::PairMeetings, true)
+    );
+    let one = form(&looping([64, 1], 40), NVIDIA).expect("lowered");
+    assert_eq!((one.flow, one.split), (super::Flow::ConsoleHalves, true));
+    assert_eq!(one.to_string(), "console flow in halves");
 }
 
 /// Without pair meetings a group of several console waves is refused on a

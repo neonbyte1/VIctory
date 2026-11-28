@@ -1830,7 +1830,7 @@ pub(crate) struct HostList {
     /// The window of indirect draws clamped together (`crate::indirect`,
     /// `VICTORY_CLAMP_WINDOW`).
     clamp_window: Mutex<crate::indirect::Window>,
-    /// The texts of the markers `note_op` set, in order (for device-removed
+    /// The texts of the markers `note_pass` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
@@ -1838,10 +1838,18 @@ pub(crate) struct HostList {
     /// or writes, and the pipeline that first wrote each (diagnostics).
     #[cfg(feature = "diagnostics")]
     targets: Mutex<Vec<(usize, String)>>,
-    /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
-    /// and at the end, and where they are read back.
+    /// With `VICTORY_GPU_TIMING`, or when its passes are timed: a GPU
+    /// timestamp before each noted command and at the end, and where they
+    /// are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Whether this recording's passes are timed (`crate::passes`, chosen
+    /// where it starts), and the noted commands' keys, in step with the
+    /// notes.
+    #[cfg(feature = "diagnostics")]
+    passes: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "diagnostics")]
+    keys: Mutex<Vec<crate::passes::Key>>,
     /// With `VICTORY_GPU_BREADCRUMBS`: the commands recorded since the
     /// reset, each with an id the GPU writes when it starts and finishes it.
     #[cfg(feature = "diagnostics")]
@@ -2759,6 +2767,10 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
+                passes: false.into(),
+                #[cfg(feature = "diagnostics")]
+                keys: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 crumbs: Mutex::new(trail),
             };
             #[cfg(feature = "diagnostics")]
@@ -3590,6 +3602,15 @@ impl Host {
         let waiting = std::time::Instant::now();
         self.wait_for(record.value);
         SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Diagnostics: the timed lists' commands (`VICTORY_GPU_PASSES`).
+        #[cfg(feature = "diagnostics")]
+        if crate::passes::on() {
+            crate::passes::submission(|add| {
+                for r in runs {
+                    r.pass_times(&mut *add);
+                }
+            });
+        }
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::RAN, record.value, 0);
         // The host resets a device whose submission runs for about 2 s (from
@@ -4134,10 +4155,11 @@ fn record_capture_target(targets: &mut Vec<(usize, String)>, resource: usize, by
 }
 
 impl HostList {
-    /// The timestamp heap and its read-back buffer (diagnostics, timing on).
+    /// The timestamp heap and its read-back buffer (diagnostics, timing on
+    /// or the list's passes timed).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
+        if !timing() && !self.passes.load(Ordering::Relaxed) {
             return None;
         }
         self.stamps
@@ -4190,14 +4212,53 @@ impl HostList {
             .as_ref()
     }
 
-    /// With `VICTORY_GPU_TIMING`: a first note where the list starts
+    /// With `VICTORY_GPU_TIMING`, or if this recording's passes are timed
+    /// (`crate::passes::sampled`): a first note where the list starts
     /// (`list start`), so the list's stamps span it all and the first row
     /// is the GPU's time before its first noted command (state moves,
     /// clamps' and twins' work recorded first).
     #[cfg(feature = "diagnostics")]
     fn note_start(&self) {
-        if timing() {
-            self.note_op(|| "list start".to_owned());
+        let passes = crate::passes::sampled();
+        self.passes.store(passes, Ordering::Relaxed);
+        if timing() || passes {
+            self.note_pass(
+                || crate::passes::Key::class(crate::passes::Class::ListStart),
+                || "list start".to_owned(),
+            );
+        }
+    }
+
+    /// Hands the timed commands of the run that just completed to `add`
+    /// (diagnostics, if this recording's passes are timed).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pass_times(&self, add: &mut dyn FnMut(crate::passes::Timed<'_>)) {
+        if !self.passes.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some((_, back)) = self.stamps() else {
+            return;
+        };
+        let keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        let count = keys.len().min(STAMPS as usize - 1);
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE {
+            Begin: 0,
+            End: (count + 1) * 8,
+        };
+        // SAFETY: a read-back buffer the finished list resolved `count + 1`
+        // stamps into when it closed.
+        unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return;
+            }
+            add(crate::passes::Timed {
+                stamps: std::slice::from_raw_parts(data.cast::<u64>(), count + 1),
+                keys: &keys[..count],
+                ours: self.ours.load(Ordering::Relaxed),
+                untimed: keys.len() - count,
+            });
+            back.Unmap(0, Some(&D3D12_RANGE::default()));
         }
     }
 
@@ -4359,6 +4420,8 @@ impl HostList {
             .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets
             .lock()
@@ -4690,23 +4753,50 @@ impl HostList {
     /// Notes what the command about to be recorded does, as a marker
     /// command whose text the list keeps (diagnostics, with device-removed
     /// data on): the report pairs the breadcrumbs' marker commands with the
-    /// texts in order and names the commands a fault stopped among.
+    /// texts in order and names the commands a fault stopped among. `key`
+    /// is what GPU pass timing charges the command to (`crate::passes`).
     #[cfg(feature = "diagnostics")]
-    pub(crate) fn note_op(&self, what: impl FnOnce() -> String) {
-        self.note(what, None);
+    pub(crate) fn note_pass(
+        &self,
+        key: impl FnOnce() -> crate::passes::Key,
+        what: impl FnOnce() -> String,
+    ) {
+        self.note(key, what, None);
     }
 
-    /// As [`HostList::note_op`], for a copy that reads the host GPU range
+    /// Notes a command of `class` only if this recording's passes are timed
+    /// (a command the other notes leave out).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_class(&self, class: crate::passes::Class) {
+        if self.passes.load(Ordering::Relaxed) {
+            self.note(
+                || crate::passes::Key::class(class),
+                || class.name().to_owned(),
+                None,
+            );
+        }
+    }
+
+    /// As [`HostList::note_pass`], for a copy that reads the host GPU range
     /// `(address, bytes)`: the report places the faulting address in it.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_read(&self, what: impl FnOnce() -> String, range: (u64, u64)) {
-        self.note(what, Some(range));
+        self.note(
+            || crate::passes::Key::class(crate::passes::Class::Copy),
+            what,
+            Some(range),
+        );
     }
 
     #[cfg(feature = "diagnostics")]
-    fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        let dred = dred_on();
-        if !dred && !timing() {
+    fn note(
+        &self,
+        key: impl FnOnce() -> crate::passes::Key,
+        what: impl FnOnce() -> String,
+        range: Option<(u64, u64)>,
+    ) {
+        let (dred, passes) = (dred_on(), self.passes.load(Ordering::Relaxed));
+        if !dred && !timing() && !passes {
             return;
         }
         let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
@@ -4716,7 +4806,18 @@ impl HostList {
             // SAFETY: an open list and our query heap.
             unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
         }
-        let what = what();
+        if passes {
+            self.keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(key());
+        }
+        // Pass timing alone needs no text (making it reads title memory).
+        let what = if dred || timing() {
+            what()
+        } else {
+            String::new()
+        };
         // Timing uses the labels and queries; DRED also gets GPU markers.
         if dred {
             traced(&what);
@@ -7184,6 +7285,9 @@ impl Meter {
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
+                if let Some(host) = host() {
+                    crate::passes::log(report_frames, host.timestamp_frequency());
+                }
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
@@ -8010,7 +8114,7 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
 /// The commands that may have been running where a list stopped at
 /// command `done`: those between the barriers around it (work between
 /// barriers overlaps on the GPU), by kind, and what the markers just
-/// before them say (`HostList::note_op`: diagnostics builds with
+/// before them say (`HostList::note_pass`: diagnostics builds with
 /// device-removed data on).
 fn in_flight(
     history: &[D3D12_AUTO_BREADCRUMB_OP],

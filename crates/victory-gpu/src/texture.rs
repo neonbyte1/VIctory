@@ -721,6 +721,8 @@ fn copies(
     subresources: &[u32],
     name: impl Fn() -> String,
 ) {
+    #[cfg(feature = "diagnostics")]
+    list.note_class(crate::passes::Class::Copy);
     for &i in subresources {
         let i = i as usize;
         let mut footprint = staging.footprints[i];
