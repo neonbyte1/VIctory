@@ -5704,9 +5704,6 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, empty, l1, entry)
     }
 
-    /// Sets bit `n` in the title-memory dirty bitmap `bitmap`.
-    /// Called inside the access guard: only lanes that owe a mark participate.
-
     /// The level-2 page-table index, block, and level-1 index of title
     /// address `(hi:lo)` (`block == 0` when the 256 MiB region has no block).
     fn memory_page(&mut self, lo: V, hi: V) -> (V, V, V) {
