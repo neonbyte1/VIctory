@@ -1752,17 +1752,7 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
-                // SAFETY: the vertices lie in a title buffer (checked when
-                // recorded) and the scratch memory is the list's.
-                let (src, dst) = unsafe {
-                    (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
-                    )
-                };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
-            });
+            list.defer_host(move || expand_title_rects(from, to, n, stride, &elements));
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
                 SizeInBytes: dst_bytes,
@@ -2238,7 +2228,20 @@ fn written_texture_words(bytes: &[u8], pitch: usize, row_bytes: usize) -> (usize
     let first = words.take(8).map(f32::from_bits).collect();
     (total, set, first)
 }
-
+/// Expands `n` rectangles of `stride`-byte vertices of title memory at
+/// `from` into the list's scratch memory at `to` (`State::rectangles`). The
+/// title may have unmapped the vertices since the draw was recorded: then
+/// the scratch keeps what it held.
+#[cfg(windows)]
+fn expand_title_rects(from: usize, to: usize, n: usize, stride: usize, elements: &[(u32, u32)]) {
+    let mut src = vec![0u8; n * 3 * stride];
+    if !crate::host::read_into(from as *const u8, &mut src) {
+        return;
+    }
+    // SAFETY: the scratch memory is the list's, `n * 6 * stride` bytes.
+    let dst = unsafe { std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride) };
+    crate::primitive::expand_rects(&src, dst, stride, elements);
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2324,6 +2327,34 @@ mod tests {
         assert!(!is_view_offset(&entry(RootType::Constants, victory_shader::emit::ROOT_VIEW_OFFSET)));
         assert!(!is_view_offset(&entry(RootType::Descriptor, 0)));
     }
+    /// Rectangles expand from title memory at submission; vertices the
+    /// title unmapped since the draw was recorded leave the scratch alone.
+    #[test]
+    fn rectangles_of_unmapped_vertices_are_skipped() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        // SAFETY: a fresh allocation of two pages, freed below.
+        let page = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!page.is_null());
+        let at = page as usize;
+        let (stride, n) = (4, 1);
+        // SAFETY: bytes of our allocation.
+        unsafe { (0..12).for_each(|i| page.add(i).write(i as u8)) };
+        let mut out = [0xEEu8; 24];
+        expand_title_rects(at, out.as_mut_ptr() as usize, n, stride, &[]);
+        assert_eq!(out[..12], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], "v0 v1 v2");
+        let mut old = 0;
+        // SAFETY: the second page of our allocation.
+        assert!(unsafe { VirtualProtect(page.add(4096).cast(), 4096, PAGE_NOACCESS, &mut old) } != 0);
+        let mut out = [0xEEu8; 24];
+        // The rectangle's last vertex is on the unmapped page.
+        expand_title_rects(at + 4096 - 8, out.as_mut_ptr() as usize, n, stride, &[]);
+        assert_eq!(out, [0xEE; 24]);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+    }
+
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
