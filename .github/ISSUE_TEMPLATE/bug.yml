@@ -1,0 +1,27 @@
+name: Bug in our stack
+description: Something broken on stack/nvidia-wine or main. If it also happens on upstream-main, report it upstream instead.
+title: "Bug: "
+labels: ["kind: bug"]
+body:
+  - type: input
+    id: tree
+    attributes: {label: Tree (branch @ commit) and exe sha}
+    validations: {required: true}
+  - type: dropdown
+    id: upstream
+    attributes: {label: Does it happen on upstream-main too?, options: ["no (only our stack)", "yes (report upstream instead)", "not tested"]}
+    validations: {required: true}
+  - type: textarea
+    id: repro
+    attributes: {label: Repro (command, env, test name or run spec)}
+    validations: {required: true}
+  - type: textarea
+    id: log
+    attributes: {label: Log lines (no game content), render: text}
+  - type: input
+    id: hardware
+    attributes: {label: Hardware (link)}
+  - type: textarea
+    id: ai
+    attributes: {label: AI use, value: "_AI-assisted (<tool>); no game data shared._"}
+    validations: {required: true}

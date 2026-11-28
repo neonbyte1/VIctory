@@ -1,0 +1,13 @@
+name: Hardware
+description: A contributor's machines, referenced from results.
+title: "Hardware: "
+labels: ["kind: hardware"]
+body:
+  - type: textarea
+    id: machines
+    attributes:
+      label: Machines
+      value: |
+        | Role (coding/test) | CPU | RAM | GPU (VRAM) | Driver | OS | ReBAR |
+        |---|---|---|---|---|---|---|
+    validations: {required: true}
