@@ -1239,6 +1239,7 @@ mod tests {
             let s = super::super::shader(stage, bytes);
             s.translated.get_or_init(|| {
                 Some(super::super::Translated {
+                    atomics64: false,
                     host: victory_shader::emit::HostShader {
                         stage: hw,
                         dxil: bytes.to_vec(),

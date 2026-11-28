@@ -63,16 +63,6 @@ enum Seen {
     Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64)),
 }
 
-fn same_seen(a: &Seen, b: &Seen) -> bool {
-    match (a, b) {
-        (Seen::Buffer(sa, aa, la, ua), Seen::Buffer(sb, ab, lb, ub)) => {
-            Arc::ptr_eq(sa, sb) && aa == ab && la == lb && ua == ub
-        }
-        (Seen::Texture(a), Seen::Texture(b)) => a == b,
-        (Seen::Left(a), Seen::Left(b)) => a == b,
-        _ => false,
-    }
-}
 
 /// Kinds of views left without a host view, for the census.
 #[cfg(feature = "diagnostics")]
@@ -733,7 +723,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             } else {
                 0x2000_0000 + ((i as usize) % TEX_COUNT) * 64
             };
-            inner2.set_seen(slot, Some(Seen::Texture(tex)));
+            inner2.replace(slot, Some(Seen::Texture(tex)));
         }
         let set_ms = t2.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(inner2.textures.len());
