@@ -232,6 +232,14 @@ impl GraphicsState {
         }
     }
 
+    /// A stream with neither a depth-stencil subobject nor a depth format
+    /// defaults to disabled depth testing.
+    pub(super) fn apply_stream_defaults(&mut self, has_depth_stencil: bool) {
+        if !has_depth_stencil && self.depth_format == DXGI_FORMAT_UNKNOWN {
+            self.depth.DepthEnable = false.into();
+        }
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -448,21 +456,9 @@ impl HostPipeline {
         let _creation_timer = HostCreationTimer(std::time::Instant::now());
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
-        let atomics64 = stages.iter().any(|(s, _)| {
-            let Some(t) = s.translated() else {
-                return false;
-            };
-            victory_shader::Container::parse(&t.host.dxil)
-                .ok()
-                .and_then(|c| {
-                    c.part(victory_shader::FourCC::SFI0)?
-                        .data
-                        .get(..4)?
-                        .try_into()
-                        .ok()
-                })
-                .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
-        });
+        let atomics64 = stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.atomics64));
         if atomics64 && !host.heap_atomics64() {
             return refuse(
                 "the host GPU has no 64-bit atomics on typed heap resources",
@@ -958,6 +954,7 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
+    use super::super::read_stream;
     use super::*;
 
     #[test]
@@ -1031,6 +1028,7 @@ mod tests {
             shader
                 .translated
                 .set(Some(Translated {
+                        atomics64: false,
                     host: host_shader,
                     used: vec![],
                 }))
@@ -1154,6 +1152,158 @@ mod tests {
             slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
         }
         assert_eq!(actual, [2, 6, 8, 24, 0, 2]);
+    }
+
+    fn read_graphics(words: &[u32]) -> GraphicsState {
+        let stream: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        read_stream(&stream, |_, _| None).1
+    }
+
+    #[test]
+    fn omitted_stream_depth_defaults_to_dsv_format() {
+        let state = read_graphics(&[]);
+        assert_eq!(state.depth_format, DXGI_FORMAT_UNKNOWN);
+        assert!(!state.depth.DepthEnable.as_bool());
+
+        for (format, enabled) in [(DXGI_FORMAT_UNKNOWN, false), (DXGI_FORMAT_D32_FLOAT, true)] {
+            let state = read_graphics(&[16, format.0 as u32]);
+            assert_eq!(state.depth_format, format);
+            assert_eq!(state.depth.DepthEnable.as_bool(), enabled, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_stream_depth_overrides_dsv_default() {
+        for (format, enabled) in [(DXGI_FORMAT_UNKNOWN, true), (DXGI_FORMAT_D32_FLOAT, false)] {
+            for (kind, words, bounds) in [(11, 14, false), (21, 16, true)] {
+                let mut depth = [0; 16];
+                depth[..6].copy_from_slice(&[
+                    kind,
+                    u32::from(enabled),
+                    D3D12_DEPTH_WRITE_MASK_ZERO.0 as u32,
+                    D3D12_COMPARISON_FUNC_GREATER.0 as u32,
+                    1,                                      // StencilEnable
+                    u32::from_le_bytes([0x12, 0x34, 0, 0]), // Stencil masks and padding
+                ]);
+                depth[14] = u32::from(bounds); // DepthBoundsTestEnable in DESC1
+                let dsv = [16, format.0 as u32];
+                let state = read_graphics(&[&depth[..words], &dsv].concat());
+                assert_eq!(state.depth_format, format);
+                assert_eq!(
+                    state.depth.DepthEnable.as_bool(),
+                    enabled,
+                    "{format:?}, kind {kind}"
+                );
+                assert_eq!(state.depth.DepthWriteMask, D3D12_DEPTH_WRITE_MASK_ZERO);
+                assert_eq!(state.depth.DepthFunc, D3D12_COMPARISON_FUNC_GREATER);
+                assert!(state.depth.StencilEnable.as_bool());
+                assert_eq!(state.depth.StencilReadMask, 0x12);
+                assert_eq!(state.depth.StencilWriteMask, 0x34);
+                assert_eq!(state.depth_bounds, bounds);
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_stream_depth_builds_forced_sample_count_pipeline() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let compile = |source: &[u8], profile: PCSTR, stage: &'static str, hw| {
+            let mut blob = None;
+            // SAFETY: constant shader source and profile strings.
+            unsafe {
+                windows::Win32::Graphics::Direct3D::Fxc::D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    PCSTR::null(),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    profile,
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .unwrap();
+            }
+            let blob = blob.unwrap();
+            // SAFETY: `blob` owns the compiled bytecode slice.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+            };
+            let s = super::super::shader(stage, bytes);
+            s.translated.get_or_init(|| {
+                Some(super::super::Translated {
+                    atomics64: false,
+                    host: victory_shader::emit::HostShader {
+                        stage: hw,
+                        dxil: bytes.to_vec(),
+                        user_data: Vec::new(),
+                        samplers: Vec::new(),
+                        static_samplers: Vec::new(),
+                        root_cbvs: Vec::new(),
+                        root_srvs: Vec::new(),
+                        root_uavs: Vec::new(),
+                        memory: false,
+                        memory_writes: false,
+                        view_addresses: false,
+                        heap: false,
+                        heap_writes: false,
+                        view_marks: false,
+                    },
+                    used: Vec::new(),
+                })
+            });
+            s
+        };
+        let vs = compile(
+            b"float4 main(uint id : SV_VertexID) : SV_Position { return 0; }",
+            windows::core::s!("vs_5_1"),
+            "vertex",
+            victory_shader::HwStage::Vs,
+        );
+        let ps = compile(
+            b"float4 main() : SV_Target { return 1; }",
+            windows::core::s!("ps_5_1"),
+            "pixel",
+            victory_shader::HwStage::Ps,
+        );
+
+        #[repr(C)]
+        struct Stream {
+            raster_kind: u32,
+            raster: D3D12_RASTERIZER_DESC,
+            topology: [u32; 2],
+            rtv_kind: u32,
+            rtvs: D3D12_RT_FORMAT_ARRAY,
+        }
+        let stream = Stream {
+            raster_kind: 10,
+            raster: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                ForcedSampleCount: 1,
+                ..Default::default()
+            },
+            topology: [14, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32],
+            rtv_kind: 15,
+            rtvs: targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]),
+        };
+        // SAFETY: `stream` is a packed sequence of initialized subobjects.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(std::ptr::from_ref(&stream).cast::<u8>(), size_of_val(&stream))
+        };
+        let state = read_stream(bytes, |_, _| None).1;
+        assert_eq!(state.rasterizer.ForcedSampleCount, 1);
+        assert_eq!(state.topology, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        assert_eq!(state.targets.NumRenderTargets, 1);
+        assert!(!state.depth.DepthEnable.as_bool());
+        assert!(HostPipeline::new(&[vs, ps], Some(&state)).is_some());
     }
 
     fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
@@ -1354,6 +1504,7 @@ mod tests {
                 item.shaders[0]
                     .translated
                     .set(Some(Translated {
+                        atomics64: false,
                         host,
                         used: Vec::new()
                     }))
@@ -1502,6 +1653,120 @@ mod tests {
                     assert_eq!(gfx_new, gfx_old);
                 }
             }
+        }
+    }
+
+    /// A title's graphics state blending (MAX, which the console allows on
+    /// integer formats) into three targets, the last `R8_UINT`; with
+    /// `independent` false, target 0's description stands for all three and
+    /// the others keep their defaults (unblended), as a title's need not match.
+    fn blending_into_an_integer_target(independent: bool) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = independent.into();
+        let described = if independent { 8 } else { 1 };
+        for t in &mut g.blend.RenderTarget[..described] {
+            t.BlendEnable = true.into();
+            t.BlendOp = D3D12_BLEND_OP_MAX;
+            t.BlendOpAlpha = D3D12_BLEND_OP_MAX;
+        }
+        g.depth.DepthEnable = false.into();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        g
+    }
+
+    /// With one description for every target, the others are copied from
+    /// target 0, not taken from entries the title left at their defaults:
+    /// a float target keeps the blending target 0 describes.
+    /// (`integer_targets_do_not_blend` gives every entry the same blend, so
+    /// it would pass without the copy.)
+    #[test]
+    fn a_shared_blend_description_is_copied_to_every_target() {
+        let g = blending_into_an_integer_target(false);
+        let blend = host_blend(&g.blend, &g.targets);
+        assert!(blend.IndependentBlendEnable.as_bool());
+        assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(blend.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(blend.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
+        assert!(!blend.RenderTarget[2].BlendEnable.as_bool());
+    }
+
+    /// The host takes such a pipeline (it was refused with E_INVALIDARG).
+    #[test]
+    fn the_host_takes_a_pipeline_blending_into_an_integer_target() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        const SOURCE: &str = r#"
+#define RS "RootFlags(0)"
+struct Out { float4 a : SV_Target0; float4 b : SV_Target1; uint c : SV_Target2; };
+[RootSignature(RS)]
+float4 vs(uint v : SV_VertexID) : SV_Position { return float4(v & 1, v >> 1, 0, 1); }
+Out ps() { Out o; o.a = 1; o.b = 1; o.c = 1; return o; }
+"#;
+        let blob = |entry: PCSTR, target: PCSTR| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names outlive the call.
+            unsafe {
+                D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    s!("blend"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+            }
+            .unwrap();
+            code.unwrap()
+        };
+        let (vs, ps) = (blob(s!("vs"), s!("vs_5_1")), blob(s!("ps"), s!("ps_5_1")));
+        // SAFETY: the blobs' own bytes.
+        let bytes = |b: &ID3DBlob| unsafe {
+            D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.GetBufferPointer(),
+                BytecodeLength: b.GetBufferSize(),
+            }
+        };
+        // SAFETY: a compiled shader with its root signature inside.
+        let root: ID3D12RootSignature = unsafe {
+            host.device.CreateRootSignature(
+                0,
+                std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize()),
+            )
+        }
+        .unwrap();
+        for independent in [true, false] {
+            let g = blending_into_an_integer_target(independent);
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed for the call.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                VS: bytes(&vs),
+                PS: bytes(&ps),
+                BlendState: host_blend(&g.blend, &g.targets),
+                SampleMask: g.sample_mask,
+                RasterizerState: g.rasterizer,
+                DepthStencilState: g.depth,
+                PrimitiveTopologyType: host_topology(&g),
+                NumRenderTargets: g.targets.NumRenderTargets,
+                RTVFormats: g.targets.RTFormats,
+                SampleDesc: g.samples,
+                ..Default::default()
+            };
+            // SAFETY: a complete description.
+            let made: windows::core::Result<ID3D12PipelineState> =
+                unsafe { host.device.CreateGraphicsPipelineState(&desc) };
+            assert!(made.is_ok(), "independent: {independent}: {:?}", made.err());
         }
     }
 }

@@ -241,7 +241,9 @@ mod tests {
     fn waits_end_on_ticks_and_count_frames() {
         let _serial = CLOCK_TEST.lock().unwrap();
         let null = std::ptr::null();
-        assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
+        // 50 ms ticks, as below: with 2 ms ones a runner a tick late (seen on
+        // CI) found the next tick passed where a time-out was due.
+        assert_eq!(set_interval(null, null, 50_000, 1, 0), S_OK);
         set_elapsed(0);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);

@@ -10,6 +10,7 @@
 //! `crate::watch`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +18,37 @@ use crate::descriptor::View;
 use crate::host::HostList;
 use crate::object::This;
 use crate::shadow::Shadow;
+
+/// Fast non-cryptographic hasher for internal heap slot/range/texture maps.
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(i)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// What a title heap slot views that title memory feeds.
 #[derive(Clone)]
@@ -30,6 +62,7 @@ enum Seen {
     /// console bytes.
     Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64)),
 }
+
 
 /// Kinds of views left without a host view, for the census.
 #[cfg(feature = "diagnostics")]
@@ -62,24 +95,24 @@ struct Viewing {
 
 #[derive(Default)]
 struct Inner {
-    slots: HashMap<u32, Seen>,
-    ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
+    slots: FxMap<u32, Seen>,
+    ranges: FxMap<Range, (u32, Arc<Shadow>)>,
     /// Distinct title-written textures viewed in this heap ([`Viewing`]) —
     /// the reverse index release walks, and the cache [`uploads`] checks so
     /// clean and idle textures skip `Resource::host` and
     /// `HostTexture::staging` locks.
-    textures: BTreeMap<usize, Viewing>,
+    textures: FxMap<usize, Viewing>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
     /// run perf4).
-    hulls: HashMap<(usize, bool), Hull>,
+    hulls: FxMap<(usize, bool), Hull>,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
-    ends: HashMap<(usize, bool), Ends>,
+    ends: FxMap<(usize, bool), Ends>,
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
@@ -162,6 +195,7 @@ impl Inner {
             Seen::Left(_) => {}
         }
     }
+
 }
 
 impl Viewed {
@@ -538,7 +572,8 @@ pub(crate) fn log(frames: f64) {
         let all_hulls: u64 = hulls.iter().map(|r| r.2).sum();
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         let copies = {
-            let mut c: Vec<usize> = inner.ranges.keys().map(|k| k.0).collect();
+            let mut c: Vec<usize> = inner.ends.keys().map(|k| k.0).collect();
+            c.sort_unstable();
             c.dedup();
             c.len()
         };
@@ -695,6 +730,105 @@ void main(uint3 id : SV_DispatchThreadID) {
         set(2, None);
         assert!(hull().is_empty());
         crate::shadow::unregister(at as usize, at);
+    }
+
+    /// Texture reverse-index tracking: single-slot and multi-slot textures,
+    /// identical overwrites, rebinds, and `forget_resource` stay consistent
+    /// with `slots`.
+    #[test]
+    fn texture_reverse_index_tracks_multi_slot_and_forget() {
+        let mut inner = Inner::default();
+        // Single-slot texture and multi-slot texture + unrelated Left slot.
+        inner.replace(0, Some(Seen::Texture(0x1000)));
+        inner.replace(1, Some(Seen::Texture(0x2000)));
+        inner.replace(2, Some(Seen::Texture(0x2000)));
+        inner.replace(3, Some(Seen::Texture(0x2000)));
+        inner.replace(4, Some(Seen::Left((2, 0x4000, 0x1000))));
+        // Identical overwrite is a no-op (must not duplicate slot 1 in 0x2000).
+        inner.replace(1, Some(Seen::Texture(0x2000)));
+        inner.replace(99, None);
+        assert_eq!(inner.slots.len(), 5);
+        assert_eq!(inner.textures.len(), 2);
+
+        // Rebind one slot of 0x2000 -> 0x1000.
+        inner.replace(2, Some(Seen::Texture(0x1000)));
+        assert_eq!(inner.textures.len(), 2);
+
+        // Forget 0x2000: removes slots 1 and 3, keeps 0, 2, 4.
+        inner.forget_texture(0x2000);
+        assert!(!inner.textures.contains_key(&0x2000));
+        assert!(!inner.slots.contains_key(&1));
+        assert!(!inner.slots.contains_key(&3));
+        assert!(inner.slots.contains_key(&0));
+        assert!(inner.slots.contains_key(&2));
+        assert!(inner.slots.contains_key(&4));
+
+        // Re-forgetting a missing texture is a no-op.
+        inner.forget_texture(0x2000);
+        // Clear slot 2 -> 0x1000 collapses back to single slot 0.
+        inner.replace(2, None);
+        assert!(inner.textures.contains_key(&0x1000));
+        assert!(!inner.slots.contains_key(&2));
+        // Forget 0x1000 -> removes slot 0, leaves only slot 4.
+        inner.forget_texture(0x1000);
+        assert!(inner.textures.is_empty());
+        assert_eq!(inner.slots.len(), 1);
+        assert!(inner.slots.contains_key(&4));
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_bindless_forget_and_set() {
+        const SLOTS: u32 = 130_000;
+        const TEX_COUNT: usize = 2_000;
+
+        let build = || {
+            let mut inner = Inner::default();
+            for s in 0..SLOTS {
+                let seen = if (s as usize) < TEX_COUNT * 2 {
+                    Seen::Texture(0x1000_0000 + ((s as usize) / 2) * 64)
+                } else {
+                    Seen::Left((0, u64::from(s) * 32, 32))
+                };
+                inner.replace(s, Some(seen));
+            }
+            inner
+        };
+
+        // 1) 500 texture forgets on a 130,000-slot heap.
+        let mut inner = build();
+        let t0 = std::time::Instant::now();
+        for i in 0..500usize {
+            inner.forget_texture(0x1000_0000 + i * 64);
+        }
+        let forget_hit_ms = t0.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(inner.slots.len());
+
+        // 2) 10,000 forget misses (non-bindless buffers/textures).
+        let t1 = std::time::Instant::now();
+        for i in 0..10_000usize {
+            inner.forget_texture(0x9000_0000 + i * 64);
+        }
+        let forget_miss_us = t1.elapsed().as_secs_f64() * 1e6;
+
+        // 3) 100,000 slot updates (50% identical target, 50% changing texture).
+        let mut inner2 = build();
+        let t2 = std::time::Instant::now();
+        for i in 0..100_000u32 {
+            let slot = i % (TEX_COUNT as u32 * 2);
+            let tex = if i & 1 == 0 {
+                0x1000_0000 + ((slot as usize) / 2) * 64
+            } else {
+                0x2000_0000 + ((i as usize) % TEX_COUNT) * 64
+            };
+            inner2.replace(slot, Some(Seen::Texture(tex)));
+        }
+        let set_ms = t2.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(inner2.textures.len());
+
+        eprintln!(
+            "bindless (130k slots): 500 forget_hit={forget_hit_ms:.3} ms, 10k forget_miss={forget_miss_us:.1} us, 100k set={set_ms:.3} ms"
+        );
     }
 
     /// The title writes a buffer and a texture, and views of them and of an

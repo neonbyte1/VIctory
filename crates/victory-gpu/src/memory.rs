@@ -426,6 +426,19 @@ pub(crate) fn forget_misses() {
     MISSED_IN.store(MISS_NEVER, Relaxed);
 }
 
+/// Whether shader writes withheld from title memory in `[from, to)` stay in
+/// the host copies until the frame's end ([`retake_dropped`]): there the
+/// copies differ from title memory on purpose (diagnostics: the stale
+/// check passes them by).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn withheld_until_frame_end(from: usize, to: usize) -> bool {
+    DROPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(at, len)| at < to && from < at.saturating_add(len))
+}
+
 /// At a frame's end: what the frame withheld leaves the host copies, so
 /// that results computed from memory with no copy (garbage record arrays
 /// and node pointers of the BVH builder) do not feed later frames whose
@@ -1202,7 +1215,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        // Past the dynamic slots where the heap has room for pairs there;
+        // a capped heap (NVIDIA) keeps them in held dynamic slots instead.
+        if let Some(start) = views.pair_start() {
+            assert!(pairs.0 >= start && pairs.1 >= start, "past the dynamic slots");
+        }
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {

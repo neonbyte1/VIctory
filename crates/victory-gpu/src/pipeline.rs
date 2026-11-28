@@ -86,6 +86,8 @@ struct ShaderCache {
 }
 
 impl ShaderCache {
+    /// The shader cached under `full`, made from `stage` and `bytes`.
+    #[cfg(test)]
     fn get(
         &mut self,
         full: blake3::Hash,
@@ -93,8 +95,13 @@ impl ShaderCache {
         bytes: &[u8],
         trim: bool,
     ) -> Arc<Shader> {
-        if let Some(shader) = self.entries.get(full.as_bytes()) {
-            return shader.clone();
+        self.get_or_insert(full, Arc::new(Shader::new(stage, bytes)), trim)
+    }
+
+    /// As [`ShaderCache::get`], with the shader already hashed and made.
+    fn get_or_insert(&mut self, full: blake3::Hash, shader: Arc<Shader>, trim: bool) -> Arc<Shader> {
+        if let Some(existing) = self.entries.get(full.as_bytes()) {
+            return existing.clone();
         }
         if trim {
             self.misses_since_trim += 1;
@@ -103,7 +110,6 @@ impl ShaderCache {
                 self.trim_idle();
             }
         }
-        let shader = Arc::new(Shader::new(stage, bytes));
         self.entries.insert(*full.as_bytes(), shader.clone());
         shader
     }
@@ -134,15 +140,29 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         matches!(std::env::var("VICTORY_TRIM_IDLE_SHADERS").as_deref(), Ok("1"))
     });
     let full = blake3::hash(bytes);
+    let key = *full.as_bytes();
+    {
+        let shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = shaders.as_ref().and_then(|map| map.entries.get(&key)) {
+            return existing.clone();
+        }
+    }
+    let candidate = Arc::new(Shader::with_hash(stage, bytes, full));
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders.get_or_insert_with(ShaderCache::default).get(full, stage, bytes, trim)
+    shaders
+        .get_or_insert_with(ShaderCache::default)
+        .get_or_insert(full, candidate, trim)
 }
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        Self::with_hash(stage, bytes, blake3::hash(bytes))
+    }
+
+    fn with_hash(stage: &'static str, bytes: &[u8], full: blake3::Hash) -> Shader {
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash: full.to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
@@ -176,6 +196,8 @@ pub(crate) fn translated_for_test(
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Whether `host.dxil` declares 64-bit atomics on typed or heap resources (`SFI0`).
+    pub(crate) atomics64: bool,
 }
 
 #[cfg(all(windows, any(feature = "diagnostics", test)))]
@@ -427,14 +449,32 @@ fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
+/// Whether `dxil` declares 64-bit atomics on typed (`0x0040_0000`) or heap
+/// (`0x1000_0000`) resources in its `SFI0` feature flags.
+#[cfg(windows)]
+fn dxil_atomics64(dxil: &[u8]) -> bool {
+    victory_shader::Container::parse(dxil)
+        .ok()
+        .and_then(|c| {
+            c.part(victory_shader::FourCC::SFI0)?
+                .data
+                .get(..4)?
+                .try_into()
+                .ok()
+        })
+        .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
+}
+
 #[cfg(windows)]
 fn with_resources(
     container: &[u8],
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
+    let atomics64 = dxil_atomics64(&host.dxil);
     Ok(Translated {
         host,
         used: container_used(container)?,
+        atomics64,
     })
 }
 
@@ -605,6 +645,56 @@ pub(crate) fn not_dispatched(this: This, why: &str) {
     }
 }
 
+#[cfg(all(windows, test))]
+pub(crate) fn mip_test_pipeline(
+    mut native: host::HostPipeline,
+    used: victory_shader::UsedResource,
+) -> This {
+    let translated = Translated {
+        atomics64: false,
+        host: victory_shader::emit::HostShader {
+            stage: victory_shader::HwStage::Ps,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
+            view_marks: false,
+        },
+        used: vec![used],
+    };
+    let shader = Arc::new(Shader {
+        stage: "pixel",
+        hash: "mip-test".into(),
+        container: Vec::new(),
+        translated: OnceLock::from(Some(translated)),
+    });
+    native.stages.push(host::Stage {
+        shader,
+        user_data: None,
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        memory: None,
+        memory_dirty: None,
+        view_addresses: None,
+    });
+    let mut handle = std::ptr::null();
+    assert_eq!(
+        hand_out(Vec::new(), None, &[], &PIPELINE_IIDS[0], &mut handle),
+        crate::object::S_OK
+    );
+    pipeline(handle).host.set_mip_test_pipeline(native);
+    handle
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -624,7 +714,7 @@ pub(crate) fn take_waited_ms() -> f64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(feature = "diagnostics", any(windows, test)))]
+#[cfg(any(windows, test))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -644,7 +734,17 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The hashes the user asked to drop (`VICTORY_SKIP_PIPELINES`, a
+/// comma-separated list of shader hashes), read once.
+///
+/// The switch answers one question - "is the device removal (or the wrong
+/// picture) this shader?" - and that question is asked of the build that
+/// removes it, which is a release build without the diagnostics feature: a
+/// diagnostics build takes the removal away on the machines seen so far (a
+/// slower frame never reaches the TDR). So this and `skipped_shader` are
+/// here in every build; only the reporting around them (`note_drop`,
+/// `dropped`, `shaders_of`) is diagnostics.
+#[cfg(windows)]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
@@ -653,7 +753,7 @@ fn skip_hashes() -> &'static [String] {
     })
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
@@ -664,9 +764,8 @@ fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && pipeline(this).host.skipped_shader.is_some()
+    !this.is_null() && skipped_shader(&pipeline(this).shaders, skip_hashes()).is_some()
 }
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).
@@ -906,6 +1005,8 @@ fn read_stream(
     let mut shaders = Vec::new();
     #[allow(unused_mut, clippy::let_unit_value)]
     let mut graphics = Graphics::default();
+    #[cfg(windows)]
+    let mut has_depth_stencil = false;
     let mut at = 0;
     while at + 8 <= stream.len() {
         let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
@@ -927,12 +1028,15 @@ fn read_stream(
             shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(kind, stream.as_ptr().add(at))
-        };
+        {
+            // SAFETY: a whole subobject of this kind lies at `at`.
+            unsafe { graphics.read(kind, stream.as_ptr().add(at)) };
+            has_depth_stencil |= matches!(kind, 11 | 21);
+        }
         at += size;
     }
+    #[cfg(windows)]
+    graphics.apply_stream_defaults(has_depth_stencil);
     (shaders, graphics)
 }
 
@@ -1205,6 +1309,7 @@ mod tests {
         Shader::for_test(
             "compute",
             Translated {
+                atomics64: false,
                 host,
                 used: native.used,
             },
@@ -1463,6 +1568,37 @@ mod tests {
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+
+    #[test]
+    fn shader_reuses_single_hash_and_dxil_atomics64_reads_sfi0() {
+        let bytes = b"unique-shader-container-for-single-hash-test";
+        let a = shader("pixel", bytes);
+        let b = shader("pixel", bytes);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.hash, blake3::hash(bytes).to_hex()[..16]);
+
+        #[cfg(windows)]
+        {
+            let make_dxbc = |sfi0: u64| -> Vec<u8> {
+                let mut out = Vec::new();
+                out.extend_from_slice(b"DXBC");
+                out.extend_from_slice(&[0u8; 16]);
+                out.extend_from_slice(&1u32.to_le_bytes());
+                let total = 32u32 + 4 + 8 + 8;
+                out.extend_from_slice(&total.to_le_bytes());
+                out.extend_from_slice(&1u32.to_le_bytes());
+                out.extend_from_slice(&36u32.to_le_bytes());
+                out.extend_from_slice(b"SFI0");
+                out.extend_from_slice(&8u32.to_le_bytes());
+                out.extend_from_slice(&sfi0.to_le_bytes());
+                out
+            };
+            assert!(!dxil_atomics64(&make_dxbc(0)));
+            assert!(dxil_atomics64(&make_dxbc(0x0040_0000)));
+            assert!(dxil_atomics64(&make_dxbc(0x1000_0000)));
+            assert!(!dxil_atomics64(b"not-a-dxbc"));
+        }
     }
 }
 

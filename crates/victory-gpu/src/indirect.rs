@@ -27,7 +27,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Interface, PCSTR, s};
 
 use crate::compute::{compute, constants, root_view};
-use crate::host::{HostList, host, transition};
+use crate::host::{Crumb, HostList, host, transition};
 
 /// The groups of a mesh dispatch record, shared by the single clamp and the
 /// window's pass so the two cannot drift apart.
@@ -758,7 +758,7 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
         // One group walks every record.
-        l.Dispatch(records.min(1), 1, 1);
+        list.crumbed(Crumb::Dispatch, Some("indirect argument clamp (ours)"), || l.Dispatch(records.min(1), 1, 1));
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),

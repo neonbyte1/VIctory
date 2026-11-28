@@ -22,6 +22,10 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// lists frames counted from the first one that ran 500 draws (the world's
 /// first, whose number depends on how fast the title loaded).
 pub(crate) fn listed(n: u64) -> bool {
+    #[cfg(test)]
+    if with_test_state(|_| ()).is_some() {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
         || WORLD
@@ -80,7 +84,16 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    let Some(folder) = folder() else { return };
+    #[cfg(test)]
+    let test_folder = with_test_state(|capture| capture.folder.clone());
+    #[cfg(test)]
+    let folder = match &test_folder {
+        Some(folder) => Some(folder),
+        None => folder(),
+    };
+    #[cfg(not(test))]
+    let folder = folder();
+    let Some(folder) = folder else { return };
     // Keep the last sample when the input width or height is odd.
     let (w, h) = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
@@ -300,10 +313,54 @@ pub(crate) fn save_read_back(
 /// (`-by-<pipeline>` in the name; `-black` when its colour is all zeros).
 /// `VICTORY_DUMP_WRITERS` (shader hashes) adds, in any frame, the textures
 /// a pipeline with one of them writes, the first frame it runs.
-#[allow(clippy::type_complexity)]
-static TARGETS: std::sync::Mutex<
-    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>,
-> = std::sync::Mutex::new(Vec::new());
+type Targets = Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>;
+static TARGETS: std::sync::Mutex<Targets> = std::sync::Mutex::new(Vec::new());
+
+fn with_targets<R, F: FnOnce(&mut Targets) -> R>(f: F) -> R {
+    let global = |f: F| f(&mut TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(test)]
+    return TEST_CAPTURE.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(capture) => f(&mut capture.targets),
+        None => global(f),
+    });
+    #[cfg(not(test))]
+    global(f)
+}
+
+#[cfg(test)]
+struct TestCapture {
+    folder: PathBuf,
+    targets: Targets,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CAPTURE: std::cell::RefCell<Option<TestCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_test_state<R>(f: impl FnOnce(&mut TestCapture) -> R) -> Option<R> {
+    TEST_CAPTURE.with(|slot| slot.borrow_mut().as_mut().map(f))
+}
+
+/// Records and submits a synthetic capture on this test's thread.
+#[cfg(test)]
+pub(crate) fn with_test_capture(folder: &std::path::Path, test: impl FnOnce()) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CAPTURE.with(|slot| slot.take());
+            WRITER.with(|writer| writer.borrow_mut().clear());
+        }
+    }
+    TEST_CAPTURE.with(|slot| {
+        assert!(slot.borrow().is_none(), "nested capture test");
+        slot.replace(Some(TestCapture { folder: folder.into(), targets: Vec::new() }));
+    });
+    binding("");
+    let _reset = Reset;
+    test();
+}
 
 thread_local! {
     /// The pipeline whose draw or dispatch this thread is binding.
@@ -318,6 +375,10 @@ pub(crate) fn binding(pipeline: &str) {
 }
 
 pub(crate) fn dump_on() -> bool {
+    #[cfg(test)]
+    if with_test_state(|_| ()).is_some() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
@@ -335,10 +396,19 @@ static BUFFERS: std::sync::Mutex<Vec<(usize, Vec<u8>, String)>> = std::sync::Mut
 /// command of `list`, whose submission dumps it again when the frame is
 /// listed).
 pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object::This) {
+    note_write(list, resource, true);
+}
+
+/// Clears write a texture directly, without the bound pipeline.
+pub(crate) fn note_clear(list: &crate::host::HostList, resource: crate::object::This) {
+    note_write(list, resource, false);
+}
+
+fn note_write(list: &crate::host::HostList, resource: crate::object::This, by_pipeline: bool) {
     if resource.is_null() || !dump_on() {
         return;
     }
-    let by = WRITER.with(|w| w.borrow().clone());
+    let by = if by_pipeline { WRITER.with(|w| w.borrow().clone()) } else { String::new() };
     // Lists are recorded ahead of the frame that submits them.
     list.note_target(resource as usize, &by);
     if !listed(crate::queue::presented() + 1) {
@@ -361,12 +431,15 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
             return;
         }
     }
-    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
-    {
-        targets.push((resource as usize, copy, by));
-    }
+    with_targets(|targets| {
+        if let Some((_, _, writer)) = targets.iter_mut().find(|(r, _, _)| *r == resource as usize) {
+            if writer.is_empty() {
+                *writer = by;
+            }
+        } else if let Some(copy) = crate::resource::host_copy(resource) {
+            targets.push((resource as usize, copy, by));
+        }
+    });
 }
 
 /// Whether textures wait to be dumped at this present.
@@ -377,8 +450,12 @@ pub(crate) fn has_targets() -> bool {
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let targets = with_targets(std::mem::take);
+    #[cfg(test)]
+    if with_test_state(|_| ()).is_some() {
+        dump_target_images(frame, &targets);
+        return;
+    }
     let buffers = std::mem::take(&mut *BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
     // Writers dumped once.
     if let Some(writers) = WRITERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -408,6 +485,10 @@ pub(crate) fn dump_targets(frame: u64) {
             "a buffer the named pipeline writes, at the present"
         );
     }
+    dump_target_images(frame, &targets);
+}
+
+fn dump_target_images(frame: u64, targets: &Targets) {
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
@@ -416,10 +497,8 @@ pub(crate) fn dump_targets(frame: u64) {
         if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
-        // Every submission has run; the dump's list moves it there and back.
-        let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}"), target, &d);
+        dump_one(host, copy, &format!("frame-{frame}"), target, &d);
     }
 }
 
@@ -427,7 +506,6 @@ pub(crate) fn dump_targets(frame: u64) {
 /// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
 /// then, to follow a frame pass by pass).
 pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
-    use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     let frame = crate::queue::presented() + 1;
     peek(&format!("frame-{frame}-s{sub:04}"));
@@ -441,9 +519,8 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
         if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
-        let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
+        dump_one(host, &copy, &format!("frame-{frame}-s{sub:04}"), target, &d);
         // A depth texture's writable twin (`crate::twin`): what unordered
         // views wrote, which reaches the depth texture at its next use.
         for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
@@ -451,7 +528,7 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
             let pd = unsafe { plane.texture.GetDesc() };
             let by = format!("{by}-twin{p}");
             let target = (i, *resource as crate::object::This, by.as_str());
-            dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
+            dump_one(host, plane, &format!("frame-{frame}-s{sub:04}"), target, &pd);
         }
     }
 }
@@ -585,30 +662,15 @@ pub(crate) fn read_indirect(
 
 fn dump_one(
     host: &crate::host::Host,
-    texture: &ID3D12Resource,
-    state: u32,
+    copy: &crate::resource::HostTexture,
     prefix: &str,
     (i, resource, by): (usize, crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
-    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
-    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    // SAFETY: an open list of ours and a live texture.
-    let read = unsafe {
-        if state != copy {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
-        }
-        let read = read_back(&host.device, &list.list, texture);
-        if state != copy {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
-        }
-        read
-    };
-    list.close();
-    host.execute(&[&list]);
+    let read = host.execute_texture_read(&list, copy, 0, |list| {
+        read_back(&host.device, list, &copy.texture)
+    });
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
@@ -622,13 +684,7 @@ fn dump_one(
         // Tiny targets (exposure, averages): their values as they are.
         if f.Width * f.Height <= 16 {
             let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
-            let words: Vec<String> = (0..f.Height as usize)
-                .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
-                .map(|c| {
-                    let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
-                    format!("{w:#x}={}", f32::from_bits(w))
-                })
-                .collect();
+            let words = tiny_words(rows, pitch, f.Width as usize * texel, f.Height as usize);
             tracing::info!(?resource, format = f.Format.0, "tiny target {prefix}-{i:02}: {}", words.join(" "));
         }
         // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
@@ -657,6 +713,22 @@ fn dump_one(
     }
 }
 
+fn tiny_words(rows: &[u8], pitch: usize, row_bytes: usize, height: usize) -> Vec<String> {
+    (0..height)
+        .flat_map(|y| rows[y * pitch..][..row_bytes].chunks(4))
+        .map(|c| {
+            let mut bytes = [0; 4];
+            bytes[..c.len()].copy_from_slice(c);
+            let w = u32::from_le_bytes(bytes);
+            if c.len() == 4 {
+                format!("{w:#x}={}", f32::from_bits(w))
+            } else {
+                format!("{w:#0width$x}", width = 2 + 2 * c.len())
+            }
+        })
+        .collect()
+}
+
 fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
@@ -680,7 +752,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
-/// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
+/// Rows of a host format as 8-bit RGBA: unsigned 8-bit color as is, everything else
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
@@ -699,7 +771,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
-        27..=32 => {
+        27..=30 => {
             // The PNG drops alpha: its range and how many texels have each
             // channel zero are logged.
             let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
@@ -716,6 +788,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
             return Some(out);
         }
+        31..=32 => (4, Box::new(|b| [0, 1, 2].map(|i| f32::from(b[i] as i8)))),
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
         87 | 88 | 90..=93 => {
             for y in 0..h {
@@ -725,6 +798,18 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
                 }
             }
             return Some(out);
+        }
+        85 | 86 | 115 => {
+            // Packed B5G6R5, B5G5R5A1, or B4G4R4A4. The PNG drops alpha.
+            let rgb = match format {
+                85 => [(11, 31), (5, 63), (0, 31)],
+                86 => [(10, 31), (5, 31), (0, 31)],
+                _ => [(8, 15), (4, 15), (0, 15)],
+            };
+            (2, Box::new(move |b| {
+                let v = u16_at(b, 0);
+                rgb.map(|(shift, mask)| f32::from((v >> shift) & mask) / f32::from(mask))
+            }))
         }
         23..=25 | 89 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
@@ -759,9 +844,12 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             [0, 9, 18].map(|shift| ((v >> shift) & 0x1ff) as f32 * scale)
         })),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
+        // R32G32_UINT: both color channels are unsigned integers.
+        17 => (8, Box::new(move |b| [u32_at(b, 0) as f32, u32_at(b, 1) as f32, 0.0])),
         35..=36 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         37..=38 => (4, Box::new(move |b| [f32::from(i16_at(b, 0)), f32::from(i16_at(b, 1)), 0.0])),
-        48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        48..=50 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        51..=52 => (2, Box::new(|b| [f32::from(b[0] as i8), f32::from(b[1] as i8), 0.0])),
         // Single channels (and depth planes): shown as grey.
         39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
@@ -769,10 +857,11 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
         55..=57 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
         58..=59 => (2, Box::new(move |b| [f32::from(i16_at(b, 0)); 3])),
-        60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        60..=62 | 65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        63..=64 => (1, Box::new(|b| [f32::from(b[0] as i8); 3])),
         _ => return None,
     };
-    let values: Vec<[f32; 3]> = (0..h)
+    let mut values: Vec<[f32; 3]> = (0..h)
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
@@ -803,8 +892,18 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let (p50, p99) = (at(0.5), at(0.99));
     let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
     let high = if grey || p99 == 0.0 { max } else { p99 };
+    // Halve both endpoints and the samples if the finite span overflows f32.
+    let reported_low = low;
+    let (low, high) = if high - low == f32::INFINITY {
+        for channel in values.iter_mut().flatten() {
+            *channel *= 0.5;
+        }
+        (low * 0.5, high * 0.5)
+    } else {
+        (low, high)
+    };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
+    tracing::info!(format, low = reported_low, high = max, p50, p99, nonzero, not_finite, "target values");
     // A constant nonzero grey target has no contrast to stretch. Keep it
     // distinguishable from an all-zero target in the dump.
     let flat_nonzero = grey && low == high && low != 0.0;
@@ -859,6 +958,18 @@ fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8>
     let (p50, p99) = (at(0.5), at(0.99));
     tracing::info!(format, low, high, p50, p99, nonzero, not_finite = 0, "target values");
     out
+}
+
+#[cfg(test)]
+#[test]
+fn grayscale_capture_preserves_contrast_across_a_wide_float_range() {
+    let format = DXGI_FORMAT_R32_FLOAT.0 as u32;
+    let expected = [0, 127, 191, 255].map(|gray| [gray, gray, gray, 255]);
+    for max in [f32::MAX / 4.0, f32::MAX] {
+        let rows = [-max, 0.0, f32::MAX, max / 2.0, max, f32::MAX].map(f32::to_le_bytes);
+        let rgba = to_rgba(format, 2, 2, 12, rows.as_flattened());
+        assert_eq!(rgba.as_deref(), Some(expected.as_flattened()), "range -{max} to {max}");
+    }
 }
 
 #[test]
@@ -1115,6 +1226,45 @@ mod tests {
     }
 
     #[test]
+    fn tiny_capture_keeps_short_words_on_each_row() {
+        // A complete float word retains its existing description.
+        assert_eq!(
+            super::tiny_words(&1.0f32.to_le_bytes(), 4, 4, 1),
+            ["0x3f800000=1"]
+        );
+
+        // Two three-texel R16 rows with different padding after each row.
+        let rows = [0, 0, 128, 63, 0, 60, 222, 173, 0, 0, 0, 64, 1, 0, 190, 239];
+        assert_eq!(
+            super::tiny_words(&rows, 8, 6, 2),
+            ["0x3f800000=1", "0x3c00", "0x40000000=2", "0x0001"]
+        );
+
+        // A one-texel R8 row and a three-texel R8 row.
+        let row = [0x7f, 0x34, 0x12, 0xee];
+        assert_eq!(super::tiny_words(&row, 4, 1, 1), ["0x7f"]);
+        assert_eq!(super::tiny_words(&row, 4, 3, 1), ["0x12347f"]);
+    }
+
+    #[test]
+    fn packed_unorm_captures_decode_each_rgb_width() {
+        let cases: [(u32, [u16; 4], u8); 3] = [
+            (85, [0xffff, 0x03ff, 0xf800, 0], 125),
+            (86, [0x7fff, 0x81ff, 0x7c00, 0x8000], 123),
+            (115, [0x0fff, 0xa07f, 0x0f00, 0xf000], 119),
+        ];
+        let actual = cases.map(|(format, [white, blue_with_green, red, black], _)| {
+            // Two pixels per row, then a nonzero padding word.
+            let rows = [white, blue_with_green, 0xffff, red, black, 0xffff].map(u16::to_le_bytes);
+            super::to_rgba(format, 2, 2, 6, rows.as_flattened())
+        });
+        let expected = cases.map(|(_, _, green)| {
+            Some(vec![255, 255, 255, 255, 0, green, 255, 255, 255, 0, 0, 255, 0, 0, 0, 255])
+        });
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn constant_nonzero_grayscale_targets_do_not_look_black() {
         let capture = |format, values: [f32; 2]| {
             let row: Vec<_> = values.into_iter().flat_map(f32::to_le_bytes).collect();
@@ -1129,6 +1279,10 @@ mod tests {
         assert_eq!(capture(depth, [0.0; 2]), black.repeat(2));
         assert_eq!(capture(depth, [0.25, 0.75]), [black, white].concat());
     }
+
+    // These fixtures can share the RGBA8 callsite. Keep its registration
+    // from racing the test that installs a scoped tracing subscriber.
+    pub(super) static RGBA8_TRACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn crc_matches_the_png_check_value() {
@@ -1172,6 +1326,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rg32_uint_channels_are_unsigned_and_skip_padding() {
+        let format = super::DXGI_FORMAT_R32G32_UINT.0 as u32;
+        let rows: Vec<_> = [0x8000_0000, 0x4000_0000, u32::MAX, 0, 0x8000_0000, u32::MAX]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        assert_eq!(
+            super::to_rgba(format, 1, 2, 12, &rows),
+            Some(vec![255, 127, 0, 255, 0, 255, 0, 255])
+        );
+    }
+
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
     /// not B8G8R8A8.
     #[test]
@@ -1203,6 +1370,8 @@ mod tests {
 
 #[cfg(test)]
 mod r32_tests {
+    use super::tests::RGBA8_TRACE;
+
     #[test]
     fn r32_integer_captures_scale_numeric_values() {
         let unsigned = [1u32, 2, 3].map(u32::to_le_bytes).concat();
@@ -1248,5 +1417,105 @@ mod r32_tests {
         let expected = Some([0, 0, 0, 255].repeat(2));
         assert_eq!(super::to_rgba(42, 2, 1, 8, &[0; 8]), expected);
         assert_eq!(super::to_rgba(43, 2, 1, 8, &[0; 8]), expected);
+    }
+
+    #[test]
+    fn signed_rgba8_clamps_negative_colour_and_keeps_alpha_opaque() {
+        let _trace = RGBA8_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = [0xff, 64, 32, 0];
+        let actual = [31, 32].map(|format| super::to_rgba(format, 1, 1, 4, &rows).unwrap());
+        assert_eq!(actual, [[0, 255, 127, 255]; 2]);
+    }
+
+    #[test]
+    fn signed_rg8_clamps_negative_colour() {
+        let rows = [0xff, 64];
+        let actual = [51, 52].map(|format| super::to_rgba(format, 1, 1, 2, &rows).unwrap());
+        assert_eq!(actual, [[0, 255, 0, 255]; 2]);
+    }
+
+    #[test]
+    fn signed_r8_grayscale_uses_signed_extrema() {
+        let rows = [0x80, 0xff, 0, 0x7f];
+        let actual = [63, 64].map(|format| super::to_rgba(format, 4, 1, 4, &rows).unwrap());
+        let expected = [0, 127, 128, 255].map(|grey| [grey, grey, grey, 255]).concat();
+        assert_eq!(actual, [expected.clone(), expected]);
+    }
+
+    #[test]
+    fn unsigned_srgb_and_alpha_only_keep_their_byte_interpretation() {
+        let _trace = RGBA8_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = [0xff, 64, 32, 0];
+        for format in [27, 28, 29, 30] {
+            assert_eq!(super::to_rgba(format, 1, 1, 4, &rows).unwrap(), [255, 64, 32, 255]);
+        }
+        for format in [48, 49, 50] {
+            assert_eq!(super::to_rgba(format, 1, 1, 2, &rows).unwrap(), [255, 64, 0, 255]);
+        }
+        for format in [60, 61, 62, 65] {
+            assert_eq!(
+                super::to_rgba(format, 2, 1, 2, &rows).unwrap(),
+                [255, 255, 255, 255, 0, 0, 0, 255],
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_rgba8_logs_raw_channel_stats_excluding_row_padding() {
+        use std::collections::BTreeMap;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tracing::{Event, Metadata, Subscriber, field, span};
+
+        #[derive(Default)]
+        struct Fields(BTreeMap<&'static str, String>);
+
+        impl field::Visit for Fields {
+            fn record_debug(&mut self, field: &field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name(), format!("{value:?}"));
+            }
+        }
+
+        struct RgbaStats(Arc<AtomicUsize>);
+
+        impl Subscriber for RgbaStats {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.is_event()
+                    && metadata.target() == "victory_gpu::capture"
+                    && metadata.fields().field("zero").is_some()
+            }
+
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                unreachable!()
+            }
+
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                assert_eq!(fields.0["low"], "[0, 0, 3, 0]");
+                assert_eq!(fields.0["high"], "[250, 7, 11, 255]");
+                assert_eq!(fields.0["zero"], "[1, 2, 0, 3]");
+                assert_eq!(fields.0["texels"], "4");
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let _trace = RGBA8_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = [0, 2, 5, 0, 250, 0, 3, 0, 99, 99, 99, 99, 100, 0, 8, 255, 10, 7, 11, 0];
+        let expected = [0, 2, 5, 255, 250, 0, 3, 255, 100, 0, 8, 255, 10, 7, 11, 255];
+        let events = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::with_default(RgbaStats(events.clone()), || {
+            for format in 27..=30 {
+                assert_eq!(super::to_rgba(format, 2, 2, 12, &rows).unwrap(), expected);
+                assert_eq!(events.load(Ordering::Relaxed), (format - 26) as usize);
+            }
+        });
     }
 }

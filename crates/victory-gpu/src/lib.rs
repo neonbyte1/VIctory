@@ -30,6 +30,8 @@ mod census;
 mod compute;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod crumbs;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;
@@ -51,6 +53,8 @@ mod fx;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod library_timing;
 pub mod list;
 #[cfg(windows)]
 mod memory;

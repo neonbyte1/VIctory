@@ -27,7 +27,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::s;
 
 use crate::compute::{compute, constants, root_view};
-use crate::host::{HostList, host, transition};
+use crate::host::{Crumb, HostList, host, transition};
 use crate::object::This;
 use crate::resource::HostTexture;
 
@@ -382,14 +382,21 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
-        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
+        && list.crumbed(Crumb::Copy, Some("depth twin copy (ours)"), || {
+            twin.copy(&list.list, depth, to_depth, &mut |texture, wanted, barriers| {
+                    list.move_texture(texture, wanted, barriers);
+                })
+        })
     {
         list.need_rebind();
     }
     if side == DEPTH {
         return false;
     }
-    let barriers: Vec<_> = twin.planes.iter().filter_map(|p| list.move_texture(p, UNORDERED_ACCESS)).collect();
+    let mut barriers = Vec::new();
+    for plane in &twin.planes {
+        list.move_texture(plane, UNORDERED_ACCESS, &mut barriers);
+    }
     if !barriers.is_empty() {
         // SAFETY: an open list and live textures.
         unsafe { list.list.ResourceBarrier(&barriers) };
@@ -456,8 +463,9 @@ pub(crate) fn at_submission<'a>(uses: impl Iterator<Item = &'a Use>) -> Vec<(Arc
     copies
 }
 
-/// Moves a texture to a state for a copy: the barrier, if any.
-pub(crate) type Mover<'a> = dyn FnMut(&Arc<HostTexture>, u32) -> Option<D3D12_RESOURCE_BARRIER> + 'a;
+/// Appends the barriers that move a texture to the state for a copy.
+pub(crate) type Mover<'a> =
+    dyn FnMut(&Arc<HostTexture>, u32, &mut Vec<D3D12_RESOURCE_BARRIER>) + 'a;
 
 impl Twin {
     /// Records into `l` the copy of the newer side into the other: from
@@ -467,8 +475,11 @@ impl Twin {
     /// list's compute root signature and pipeline.
     pub(crate) fn copy(&self, l: &ID3D12GraphicsCommandList, depth: &Arc<HostTexture>, to_depth: bool, mv: &mut Mover) -> bool {
         let (src, dst) = if to_depth { (COPY_SOURCE, COPY_DEST) } else { (COPY_DEST, COPY_SOURCE) };
-        let mut barriers: Vec<_> = self.planes.iter().filter_map(|p| mv(p, src)).collect();
-        barriers.extend(mv(depth, dst));
+        let mut barriers = Vec::new();
+        for plane in &self.planes {
+            mv(plane, src, &mut barriers);
+        }
+        mv(depth, dst, &mut barriers);
         let at = |r: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the copy does not release.
             pResource: unsafe { std::mem::transmute_copy(r) },
@@ -555,7 +566,18 @@ cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uin
 // Offsets and pitches are in bytes, all multiples of 4 (placed footprints).
 RWStructuredBuffer<uint> buf : register(u0);
 uint depth(uint u) { return asuint((float)u * asfloat(0x37800080)); }
-uint u16(uint d) { return (uint)(saturate(asfloat(d)) * 65535.0 + 0.5); }
+uint u16(uint d) {
+    float value = saturate(asfloat(d));
+    float scaled = value * 65536.0;
+    float fraction = frac(scaled);
+    // 65535 * value = scaled - value. Test the half-step on the
+    // fraction so the large integer part cannot round it away.
+    precise float fraction_minus_half = fraction - 0.5;
+    precise float value_minus_half = value - 0.5;
+    return (uint)scaled + (uint)(fraction_minus_half >= value)
+                        - (uint)(fraction < value_minus_half);
+}
+[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x * 2;
@@ -612,32 +634,102 @@ mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    #[test]
+    fn float_depth_rounds_at_each_u16_threshold() {
+        let Some(host) = host() else {
+            return;
+        };
+        let converter = converter().expect("depth converter");
+        // Five adjacent f32 values at each midpoint, then every depth
+        // code widened by the reciprocal used by the forward converter.
+        let depths: Vec<f32> = (0..65535)
+            .flat_map(|code| {
+                let center = ((f64::from(code) + 0.5) / 65535.0) as f32;
+                (center.to_bits() - 2..=center.to_bits() + 2).map(f32::from_bits)
+            })
+            .chain((0..=65535).map(|code| code as f32 * f32::from_bits(0x37800080)))
+            .chain([0.0, 1.0, f32::NEG_INFINITY, f32::INFINITY, f32::NAN])
+            .collect();
+        const WIDTH: u32 = 512;
+        const HEIGHT: u32 = 768;
+        const PITCH16: u32 = WIDTH * 2;
+        const PITCH32: u32 = WIDTH * 4;
+        const AT32: u32 = PITCH16 * HEIGHT;
+        assert_eq!(depths.len(), (WIDTH * HEIGHT) as usize);
+        let input_bytes = u64::from(PITCH32 * HEIGHT);
+        let scratch = scratch_buffer(u64::from(AT32) + input_bytes).unwrap();
+        let list = host.new_list().unwrap();
+        let (input, data) = list.upload(host, input_bytes).unwrap();
+        let (output, mapped) = list.readback(host, u64::from(AT32)).unwrap();
+        let l = &list.list;
+        let state = |from, to| transition(&scratch, from, to);
+        let constants = [WIDTH, HEIGHT, PITCH16, 0, PITCH32, AT32, 0, 0];
+        // SAFETY: the mapped upload holds every input float. The two
+        // footprints in scratch are disjoint and every dispatched row fits.
+        unsafe {
+            std::ptr::copy_nonoverlapping(depths.as_ptr().cast(), data, input_bytes as usize);
+            l.CopyBufferRegion(&scratch, u64::from(AT32), &input, 0, input_bytes);
+            l.ResourceBarrier(&[state(
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            l.SetComputeRootSignature(&converter.root);
+            l.SetPipelineState(&converter.pso);
+            l.SetComputeRootUnorderedAccessView(1, scratch.GetGPUVirtualAddress());
+            l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+            l.Dispatch(WIDTH / 128, HEIGHT, 1);
+            l.ResourceBarrier(&[state(
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyBufferRegion(&output, 0, &scratch, 0, u64::from(AT32));
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the submission completed and readback remains mapped.
+        let actual = unsafe { std::slice::from_raw_parts(mapped.cast::<u16>(), depths.len()) };
+        let mut mismatches = 0;
+        let mut first = None;
+        for (&depth, &got) in depths.iter().zip(actual) {
+            let want = (f64::from(depth).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+            if got != want {
+                mismatches += 1;
+                first.get_or_insert((depth.to_bits(), want, got));
+            }
+        }
+        assert_eq!(
+            mismatches,
+            0,
+            "{mismatches} of {} depths misrounded, first (bits, expected, actual) {first:x?}",
+            depths.len()
+        );
+    }
 
     /// The material-depth frame of Grand Theft Auto VI: written through
-    /// unordered views, read as a shader resource in the same list, written
-    /// again; read in the next list; tested as depth in a later one; the
-    /// next frame writes it through unordered views again.
-    #[test]
-    fn copies_follow_the_side_each_use_needs() {
-        // List 1: unordered write first (the prelude copies the depth side
-        // over, newer since the last frame), a read (copy back now), a
-        // write again.
-        let mut last = Some(TWIN);
-        assert_eq!(again(TWIN, &mut last, DEPTH, false), Some(true));
-        assert_eq!(last, Some(BOTH));
-        assert_eq!(again(TWIN, &mut last, TWIN, true), None);
-        assert_eq!(submitted(TWIN, last, DEPTH), (Some(false), TWIN));
-        // List 2 only reads: its prelude copies into the depth texture.
-        assert_eq!(submitted(DEPTH, None, TWIN), (Some(true), BOTH));
-        // List 3 renders to it: nothing to copy, the depth side is newer.
-        assert_eq!(submitted(DEPTH, Some(DEPTH), BOTH), (None, DEPTH));
-        // A list that starts reading the depth side, unchanged since, does
-        // not know the twin is current: a use of the twin copies.
-        let mut last = None;
-        assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
-        assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
-        assert_eq!(last, Some(TWIN));
-    }
+/// unordered views, read as a shader resource in the same list, written
+/// again; read in the next list; tested as depth in a later one; the
+/// next frame writes it through unordered views again.
+#[test]
+fn copies_follow_the_side_each_use_needs() {
+    // List 1: unordered write first (the prelude copies the depth side
+    // over, newer since the last frame), a read (copy back now), a
+    // write again.
+    let mut last = Some(TWIN);
+    assert_eq!(again(TWIN, &mut last, DEPTH, false), Some(true));
+    assert_eq!(last, Some(BOTH));
+    assert_eq!(again(TWIN, &mut last, TWIN, true), None);
+    assert_eq!(submitted(TWIN, last, DEPTH), (Some(false), TWIN));
+    // List 2 only reads: its prelude copies into the depth texture.
+    assert_eq!(submitted(DEPTH, None, TWIN), (Some(true), BOTH));
+    // List 3 renders to it: nothing to copy, the depth side is newer.
+    assert_eq!(submitted(DEPTH, Some(DEPTH), BOTH), (None, DEPTH));
+    // A list that starts reading the depth side, unchanged since, does
+    // not know the twin is current: a use of the twin copies.
+    let mut last = None;
+    assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
+    assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
+    assert_eq!(last, Some(TWIN));
+}
 
     #[test]
     fn uav_formats_and_default_words_stay_uav_capable() {
@@ -935,9 +1027,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(route(&list, &depth, twin, UNORDERED_ACCESS));
         const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         assert!(!route(&list, &depth, twin, PIXEL_SHADER_RESOURCE));
-        if let Some(b) = list.move_texture(&depth, PIXEL_SHADER_RESOURCE) {
+        let mut barriers = Vec::new();
+        list.move_texture(&depth, PIXEL_SHADER_RESOURCE, &mut barriers);
+        if !barriers.is_empty() {
             // SAFETY: an open list and a live texture.
-            unsafe { list.list.ResourceBarrier(&[b]) };
+            unsafe { list.list.ResourceBarrier(&barriers) };
         }
         list.close();
         let recorded = issued();
@@ -949,8 +1043,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut states = std::collections::HashMap::from([(key(&depth), DEPTH_WRITE), (key(&twin.planes[0]), 0)]);
         replay(&run, &mut states).unwrap();
         // What the list left is what the next prelude starts from.
-        assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
-        assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));
+        assert_eq!(states[&key(&depth)], depth.state(0));
+        assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state(0));
     }
 
     /// The converter builds with the system's compiler (Wine's too) and

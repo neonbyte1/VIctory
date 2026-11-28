@@ -21,6 +21,7 @@
 //! is lost.
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
@@ -94,10 +95,32 @@ impl Pending {
         &self.shaders
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_mip_test_pipeline(&self, pipeline: HostPipeline) {
+        assert!(self.made.set(Some(pipeline)).is_ok());
+    }
+
     fn make(&self) {
+        self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+    }
+
+    fn make_with(&self, create: impl FnOnce() -> Option<HostPipeline>) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let made = match catch_unwind(AssertUnwindSafe(create)) {
+                Ok(made) => made,
+                Err(payload) => {
+                    #[cfg(feature = "diagnostics")]
+                    super::library::LAST.take();
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown panic payload");
+                    tracing::error!(shaders = ?self.shaders, panic = message, "pipeline creation panicked");
+                    return None;
+                }
+            };
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
@@ -296,16 +319,18 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // Listed for an early start in later runs from its first use, made or
-    // not: one a run never got made is the one it should start early.
-    if !p.used.swap(true, Ordering::Relaxed) {
+    // not. Once listed, a lookup only needs to read the flag. The swap
+    // chooses one recorder when several threads reach the first use.
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
         #[cfg(feature = "diagnostics")]
         log("used", &p.key, String::new);
     }
-    if p.made.get().is_none() {
-        start(p, true);
-        wait(p, crate::frame::current());
+    if let Some(made) = p.made.get() {
+        return made.as_ref();
     }
+    start(p, true);
+    wait(p, crate::frame::current());
     p.made.get()?.as_ref()
 }
 
@@ -547,6 +572,19 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic while making a host pipeline leaves it refused.
+    #[test]
+    fn panicking_pipeline_is_refused() {
+        let p = Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        p.make_with(|| panic!("pipeline creation panicked"));
+        assert!(matches!(p.made.get(), Some(None)));
+    }
 
     #[test]
     fn empty_draws_do_not_request_graphics_pipelines() {
@@ -863,6 +901,22 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
         assert_eq!(zero_demands, [false; 3]);
         assert!(nonempty_demand);
+    }
+    #[test]
+    fn first_use_of_a_finished_pipeline_is_recorded_without_queueing() {
+        let p = Arc::new(Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        assert!(p.made.set(None).is_ok());
+        assert!(!p.used.load(Ordering::Relaxed));
+        for _ in 0..2 {
+            assert!(ready(&p).is_none());
+            assert!(p.used.load(Ordering::Relaxed));
+            assert!(p.queued.is_completed());
+        }
     }
 
     #[cfg(feature = "diagnostics")]
