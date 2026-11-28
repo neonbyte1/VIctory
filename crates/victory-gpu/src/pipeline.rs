@@ -919,6 +919,8 @@ fn read_stream(
     let mut shaders = Vec::new();
     #[allow(unused_mut, clippy::let_unit_value)]
     let mut graphics = Graphics::default();
+    #[cfg(windows)]
+    let mut has_depth_stencil = false;
     let mut at = 0;
     while at + 8 <= stream.len() {
         let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
@@ -940,12 +942,15 @@ fn read_stream(
             shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(kind, stream.as_ptr().add(at))
-        };
+        {
+            // SAFETY: a whole subobject of this kind lies at `at`.
+            unsafe { graphics.read(kind, stream.as_ptr().add(at)) };
+            has_depth_stencil |= matches!(kind, 11 | 21);
+        }
         at += size;
     }
+    #[cfg(windows)]
+    graphics.apply_stream_defaults(has_depth_stencil);
     (shaders, graphics)
 }
 

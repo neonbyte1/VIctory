@@ -232,6 +232,14 @@ impl GraphicsState {
         }
     }
 
+    /// A stream with neither a depth-stencil subobject nor a depth format
+    /// defaults to disabled depth testing.
+    pub(super) fn apply_stream_defaults(&mut self, has_depth_stencil: bool) {
+        if !has_depth_stencil && self.depth_format == DXGI_FORMAT_UNKNOWN {
+            self.depth.DepthEnable = false.into();
+        }
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -946,6 +954,7 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
+    use super::super::read_stream;
     use super::*;
 
     #[test]
@@ -1143,6 +1152,157 @@ mod tests {
             slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
         }
         assert_eq!(actual, [2, 6, 8, 24, 0, 2]);
+    }
+
+    fn read_graphics(words: &[u32]) -> GraphicsState {
+        let stream: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        read_stream(&stream, |_, _| None).1
+    }
+
+    #[test]
+    fn omitted_stream_depth_defaults_to_dsv_format() {
+        let state = read_graphics(&[]);
+        assert_eq!(state.depth_format, DXGI_FORMAT_UNKNOWN);
+        assert!(!state.depth.DepthEnable.as_bool());
+
+        for (format, enabled) in [(DXGI_FORMAT_UNKNOWN, false), (DXGI_FORMAT_D32_FLOAT, true)] {
+            let state = read_graphics(&[16, format.0 as u32]);
+            assert_eq!(state.depth_format, format);
+            assert_eq!(state.depth.DepthEnable.as_bool(), enabled, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_stream_depth_overrides_dsv_default() {
+        for (format, enabled) in [(DXGI_FORMAT_UNKNOWN, true), (DXGI_FORMAT_D32_FLOAT, false)] {
+            for (kind, words, bounds) in [(11, 14, false), (21, 16, true)] {
+                let mut depth = [0; 16];
+                depth[..6].copy_from_slice(&[
+                    kind,
+                    u32::from(enabled),
+                    D3D12_DEPTH_WRITE_MASK_ZERO.0 as u32,
+                    D3D12_COMPARISON_FUNC_GREATER.0 as u32,
+                    1,                                      // StencilEnable
+                    u32::from_le_bytes([0x12, 0x34, 0, 0]), // Stencil masks and padding
+                ]);
+                depth[14] = u32::from(bounds); // DepthBoundsTestEnable in DESC1
+                let dsv = [16, format.0 as u32];
+                let state = read_graphics(&[&depth[..words], &dsv].concat());
+                assert_eq!(state.depth_format, format);
+                assert_eq!(
+                    state.depth.DepthEnable.as_bool(),
+                    enabled,
+                    "{format:?}, kind {kind}"
+                );
+                assert_eq!(state.depth.DepthWriteMask, D3D12_DEPTH_WRITE_MASK_ZERO);
+                assert_eq!(state.depth.DepthFunc, D3D12_COMPARISON_FUNC_GREATER);
+                assert!(state.depth.StencilEnable.as_bool());
+                assert_eq!(state.depth.StencilReadMask, 0x12);
+                assert_eq!(state.depth.StencilWriteMask, 0x34);
+                assert_eq!(state.depth_bounds, bounds);
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_stream_depth_builds_forced_sample_count_pipeline() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let compile = |source: &[u8], profile: PCSTR, stage: &'static str, hw| {
+            let mut blob = None;
+            // SAFETY: constant shader source and profile strings.
+            unsafe {
+                windows::Win32::Graphics::Direct3D::Fxc::D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    PCSTR::null(),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    profile,
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .unwrap();
+            }
+            let blob = blob.unwrap();
+            // SAFETY: `blob` owns the compiled bytecode slice.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+            };
+            let s = super::super::shader(stage, bytes);
+            s.translated.get_or_init(|| {
+                Some(super::super::Translated {
+                    host: victory_shader::emit::HostShader {
+                        stage: hw,
+                        dxil: bytes.to_vec(),
+                        user_data: Vec::new(),
+                        samplers: Vec::new(),
+                        static_samplers: Vec::new(),
+                        root_cbvs: Vec::new(),
+                        root_srvs: Vec::new(),
+                        root_uavs: Vec::new(),
+                        memory: false,
+                        memory_writes: false,
+                        view_addresses: false,
+                        heap: false,
+                        heap_writes: false,
+                        view_marks: false,
+                    },
+                    used: Vec::new(),
+                })
+            });
+            s
+        };
+        let vs = compile(
+            b"float4 main(uint id : SV_VertexID) : SV_Position { return 0; }",
+            windows::core::s!("vs_5_1"),
+            "vertex",
+            victory_shader::HwStage::Vs,
+        );
+        let ps = compile(
+            b"float4 main() : SV_Target { return 1; }",
+            windows::core::s!("ps_5_1"),
+            "pixel",
+            victory_shader::HwStage::Ps,
+        );
+
+        #[repr(C)]
+        struct Stream {
+            raster_kind: u32,
+            raster: D3D12_RASTERIZER_DESC,
+            topology: [u32; 2],
+            rtv_kind: u32,
+            rtvs: D3D12_RT_FORMAT_ARRAY,
+        }
+        let stream = Stream {
+            raster_kind: 10,
+            raster: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                ForcedSampleCount: 1,
+                ..Default::default()
+            },
+            topology: [14, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32],
+            rtv_kind: 15,
+            rtvs: targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]),
+        };
+        // SAFETY: `stream` is a packed sequence of initialized subobjects.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(std::ptr::from_ref(&stream).cast::<u8>(), size_of_val(&stream))
+        };
+        let state = read_stream(bytes, |_, _| None).1;
+        assert_eq!(state.rasterizer.ForcedSampleCount, 1);
+        assert_eq!(state.topology, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        assert_eq!(state.targets.NumRenderTargets, 1);
+        assert!(!state.depth.DepthEnable.as_bool());
+        assert!(HostPipeline::new(&[vs, ps], Some(&state)).is_some());
     }
 
     fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
