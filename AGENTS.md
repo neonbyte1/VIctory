@@ -52,9 +52,12 @@ cargo test --workspace --locked          # includes xtask's asset-policy test
 cargo xtask policy
 ```
 
-These are CI's commands (`.github/workflows/ci.yml`, Windows only). CI does not run rustfmt and
-the tree is not rustfmt-clean: format only the files you changed
-(`rustfmt --edition 2024 --check <files>`), never the workspace. Shader tests need a Shader
+These are CI's commands (`.github/workflows/ci.yml`, Windows only). This fork's `main` is
+rustfmt-clean and `.github/workflows/fmt.yml` checks it: run `cargo fmt --all` before every commit
+on the fork. Upstream `Marvisak/VIctory` is not rustfmt-clean and its CI doesn't run rustfmt, so a
+branch cut from upstream `main` for an upstream PR formats only the lines it changes
+(`rustfmt --edition 2024 --check <files>`, then drop hunks outside your change), never the
+workspace. Shader tests need a Shader
 Model 6.6 `dxil.dll`; if an old SDK validator rejects `ps_6_6`, set `VICTORY_DXIL` (README,
 "Windows shader-test validator"). GPU tests need a device with SM 6.6 (CI has WARP); say in the
 PR when a test was skipped and why.
