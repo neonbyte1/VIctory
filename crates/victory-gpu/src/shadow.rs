@@ -3924,9 +3924,12 @@ mod run_tests {
     /// and the runtime's own (`c`), which copy-back is told to write
     /// through for `a`'s pages.
     fn three_views(pages: usize) -> (usize, usize, usize) {
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
-        static AT: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+        // Per thread: the tests run in parallel, and one test's views would
+        // otherwise answer another's alias question (its pages' `through`).
+        thread_local! {
+            static AT: [std::cell::Cell<usize>; 3] = const { [const { std::cell::Cell::new(0) }; 3] };
+        }
         let len = pages * PAGE;
         // SAFETY: a pagefile section mapped three times; the test keeps them.
         let [a, b, c] = unsafe {
@@ -3938,12 +3941,16 @@ mod run_tests {
         for k in (0..len).step_by(PAGE) {
             crate::watch::title_memory_aliased(b + k, &[a + k]);
         }
-        AT[0].store(a, Relaxed);
-        AT[1].store(len, Relaxed);
-        AT[2].store(c, Relaxed);
+        AT.with(|s| {
+            s[0].set(a);
+            s[1].set(len);
+            s[2].set(c);
+        });
         crate::watch::set_writable_alias(|at| {
-            let (a, len, c) = (AT[0].load(Relaxed), AT[1].load(Relaxed), AT[2].load(Relaxed));
-            (a..a + len).contains(&at).then(|| at - a + c)
+            AT.with(|s| {
+                let (a, len, c) = (s[0].get(), s[1].get(), s[2].get());
+                (a..a + len).contains(&at).then(|| at - a + c)
+            })
         });
         (a, b, c)
     }
@@ -4131,15 +4138,21 @@ mod run_tests {
     /// the same pages) and the runtime's own view `c`, through which pages
     /// at both go back (`VICTORY_OWNER` tests: two copies of one page).
     fn owner_views(pages: usize) -> (usize, usize, usize) {
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-        static AT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
-        let (a, b, c) = three_views(pages);
-        for (slot, v) in AT.iter().zip([a, b, pages * PAGE, c]) {
-            slot.store(v, Relaxed);
+        // Per thread, as [`three_views`]'s.
+        thread_local! {
+            static AT: [std::cell::Cell<usize>; 4] = const { [const { std::cell::Cell::new(0) }; 4] };
         }
+        let (a, b, c) = three_views(pages);
+        AT.with(|s| {
+            for (slot, v) in s.iter().zip([a, b, pages * PAGE, c]) {
+                slot.set(v);
+            }
+        });
         crate::watch::set_writable_alias(|at| {
-            let [a, b, len, c] = [0, 1, 2, 3].map(|k| AT[k].load(Relaxed));
-            [a, b].into_iter().find(|v| (*v..v + len).contains(&at)).map(|v| at - v + c)
+            AT.with(|s| {
+                let [a, b, len, c] = [0, 1, 2, 3].map(|k| s[k].get());
+                [a, b].into_iter().find(|v| (*v..v + len).contains(&at)).map(|v| at - v + c)
+            })
         });
         (a, b, c)
     }

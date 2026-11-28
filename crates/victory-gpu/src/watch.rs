@@ -3180,13 +3180,20 @@ pub(crate) mod tests {
     /// `writable_alias` answers `own` for title memory `[title, title + len)`
     /// (the runtime's own view of the pages a title view shows).
     pub(crate) fn own_alias(title: usize, len: usize, own: usize) {
-        static AT: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
-        AT[0].store(title, Ordering::Relaxed);
-        AT[1].store(len, Ordering::Relaxed);
-        AT[2].store(own, Ordering::Relaxed);
+        // Per thread: tests run in parallel, and each answers for its own views.
+        thread_local! {
+            static AT: [std::cell::Cell<usize>; 3] = const { [const { std::cell::Cell::new(0) }; 3] };
+        }
+        AT.with(|s| {
+            s[0].set(title);
+            s[1].set(len);
+            s[2].set(own);
+        });
         set_writable_alias(|at| {
-            let (title, len, own) = (AT[0].load(Ordering::Relaxed), AT[1].load(Ordering::Relaxed), AT[2].load(Ordering::Relaxed));
-            (title..title + len).contains(&at).then(|| at - title + own)
+            AT.with(|s| {
+                let (title, len, own) = (s[0].get(), s[1].get(), s[2].get());
+                (title..title + len).contains(&at).then(|| at - title + own)
+            })
         });
     }
 
