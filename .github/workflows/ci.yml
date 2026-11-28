@@ -74,13 +74,18 @@ jobs:
         with:
           path: |
             ~/.xwin
+            ~/.xwin-cache
             ~/vkd3d-proton
           key: linux-wine-${{ env.XWIN_VERSION }}-${{ env.VKD3D_PROTON_VERSION }}
       - name: xwin splat
         run: |
           if [ ! -d ~/.xwin/crt ]; then
             cargo install xwin --version "$XWIN_VERSION"
-            xwin --accept-license splat --output ~/.xwin
+            # xwin caches downloads in ./.xwin-cache unless told otherwise;
+            # that put the CRT/SDK's .vsix files in the checkout and the
+            # asset-policy step (correctly) refused them.
+            xwin --accept-license --cache-dir "$HOME/.xwin-cache" \
+              splat --output ~/.xwin
           fi
       - name: vkd3d-proton
         run: |
