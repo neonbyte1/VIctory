@@ -1258,7 +1258,7 @@ impl State {
             slot: 0,
         };
         list.end_hoisted_indirect();
-        readable(list, &written, &view, false);
+        readable(list, &written, view, false);
         self.bind_heaps(list, false);
         list.keep(resource);
         let gpu = visible.gpu(slot);

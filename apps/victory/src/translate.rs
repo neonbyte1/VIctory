@@ -225,6 +225,7 @@ fn thread_count(jobs: Option<usize>) -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
 }
 
+#[allow(clippy::too_many_arguments)] // the CLI's own options
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
