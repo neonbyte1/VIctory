@@ -95,7 +95,7 @@ pub(crate) struct Lowered {
     #[cfg(all(test, windows))]
     pub wave_ballot_calls: usize,
     /// Whether it declares rasterizer-ordered views.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub rovs: bool,
     /// Whether the module declares `dx.op.waveGetLaneIndex`.
     #[cfg(test)]
@@ -1611,7 +1611,7 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(all(test, windows))]
             wave_ballot_calls: self.s.m.written_calls("dx.op.waveActiveBallot").count(),
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             rovs: self.s.m.uses().rovs,
             #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
@@ -5600,6 +5600,9 @@ impl<'a> Lower<'a> {
         let empty = self.s.m.cmp(c, pred::EQ, block, zero);
         self.s.m.select(c, empty, l1, entry)
     }
+
+    /// Sets bit `n` in the title-memory dirty bitmap `bitmap`.
+    /// Called inside the access guard: only lanes that owe a mark participate.
 
     /// The level-2 page-table index, block, and level-1 index of title
     /// address `(hi:lo)` (`block == 0` when the 256 MiB region has no block).

@@ -1178,6 +1178,9 @@ mod tests {
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
+        use super::bitcode::Attr;
+        use super::shader::Shader;
+
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
             name: "SV_Target".into(),
@@ -1462,10 +1465,10 @@ mod tests {
             TRIANGLE | EDGE_FLAGS,
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
-            let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let _ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
-                v.validate(&mut ms.dxil.clone())
+                v.validate(&mut _ms.dxil.clone())
                     .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             }
         }
@@ -2077,25 +2080,163 @@ mod tests {
         emit_pixel(&words, vec![color], 1 << 1, &isg1, &osg1).unwrap();
     }
 
+    /// Write to a title address offset by the local thread id shifted by s2.
+    /// A preceding store to page zero leaves the first bit already set.
+    fn dirty_mark_program() -> HostShader {
+        let words: [u32; 8] = [
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xDC70_8000,
+            0x0000_0001, // global_store_dword v1, v0, s[0:1]
+            0x3404_0002, // v_lshlrev_b32 v2, s2, v0
+            0xDC70_8000,
+            0x0000_0002, // global_store_dword v2, v0, s[0:1]
+            0xBF8C_0000,
+            0xBF81_0000, // s_waitcnt; s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 3,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 3,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        emit(
+            &Container::parse(&bytes).unwrap(),
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+            super::Target::ANY,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn title_page_marks_use_wave_ops_and_guard_the_atomic() {
+        let shader = dirty_mark_program();
+        assert!(shader.memory_writes);
+        let host = Container::parse(&shader.dxil).unwrap();
+        let sfi = host.part(FourCC::SFI0).unwrap().data;
+        assert_ne!(u64::from_le_bytes(sfi.try_into().unwrap()) & 0x4000, 0);
+        if let Some(ir) = dump_dxil(&shader.dxil) {
+            // Four potential marks: the first and last page of each store.
+            let marks: Vec<_> = ir.split("call i1 @dx.op.waveActiveAllEqual.i32").skip(1).collect();
+            assert_eq!(marks.len(), 4);
+            for mark in marks {
+                let mut rest = mark;
+                for op in [
+                    "call i32 @dx.op.waveActiveBit.i32",
+                    "call i1 @dx.op.waveIsFirstLane",
+                    "br i1",
+                    "@dx.op.rawBufferLoad.",
+                    "icmp ne i32",
+                    "br i1",
+                    "call i32 @dx.op.atomicBinOp.i32",
+                ] {
+                    rest = rest
+                        .split_once(op)
+                        .unwrap_or_else(|| panic!("mark lacks {op}: {mark}"))
+                        .1;
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn title_page_marks_keep_every_lanes_bit() {
+        use super::host::{Dispatch, Host, Root, View};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let shader = dirty_mark_program();
+        let host = Host::new(true)
+            .or_else(|_| Host::new(false))
+            .expect("an SM 6.6 device");
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        // Region zero uses block 1. Its first page points to the real copy,
+        // the rest to the null pair. Writes and misses both owe a mark.
+        let mut table = vec![0; 4096 + 2 * 2 * 4096];
+        table[0] = 1;
+        table[4096 + 2 * 4096] = 2;
+        for shift in [2, 16, 21] {
+            let mut constants = vec![0; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                constants[u.index as usize] = [0, 0, shift][u.dword as usize];
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(constants)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: table.clone(),
+                                },
+                            ),
+                            (2, Root::Uav(8192 / 32)),
+                        ],
+                        views: &[View::NullPair, View::Pair, View::Memory(&[0; 32]), View::Pair],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let mut expected = vec![0u32; 8192 / 32];
+            for lane in 0..32 {
+                let page = 4096 + ((lane << shift) >> 16);
+                expected[page / 32] |= 1 << (page % 32);
+            }
+            assert_eq!(out[0], (0..32).collect::<Vec<_>>(), "title data, shift {shift}");
+            assert_eq!(out[1], expected, "dirty pages, shift {shift}");
+        }
+    }
+
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
-    #[cfg(windows)]
     fn dump_dxil(container: &[u8]) -> Option<String> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => std::path::PathBuf::from(p),
+            #[cfg(not(windows))]
+            None => return None,
+            #[cfg(windows)]
             None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
         };
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
-        std::fs::write(&file, container).ok()?;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = std::env::temp_dir().join(format!("victory-{}-{id}.dxil", std::process::id()));
+        std::fs::write(&file, container).expect("write shader for dxc");
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
             .arg(&file)
-            .output()
-            .ok()?;
+            .output();
         let _ = std::fs::remove_file(&file);
+        let out = out.expect("run dxc -dumpbin");
         assert!(
             out.status.success(),
             "dxc -dumpbin failed: {}",
