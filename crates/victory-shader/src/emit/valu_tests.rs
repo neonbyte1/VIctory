@@ -7387,3 +7387,81 @@ fn v_swaprel_b32_swaps_indexed_vgprs_and_respects_exec() {
         );
     });
 }
+
+#[test]
+fn v_perm_b32_matches_rdna2() {
+    // v_perm_b32 v0, v1, v2, v3 (VOP3 opcode 0x344): dynamic selector in v3.
+    let perm_dyn = build_valu_cs(&vop3(0x344, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // Inline constant selector: -1 (0xC1 = 0xFFFF_FFFF -> all bytes >= 13 -> 0xFFFF_FFFF).
+    let perm_const_ff = build_valu_cs(&vop3(0x344, 0, vgpr(1), vgpr(2), 0xC1));
+    // Inline constant selector: 12 (0x8C = 0x0000_000C -> byte 0 = 0x00, bytes 1..3 = byte 0 of src1).
+    let perm_const_12 = build_valu_cs(&vop3(0x344, 0, vgpr(1), vgpr(2), 0x8C));
+
+    let ref_perm = |src0: u32, src1: u32, sel: u32| -> u32 {
+        let mut out = 0u32;
+        for i in 0..4u32 {
+            let pick = (sel >> (8 * i)) & 0xFF;
+            let byte = match pick {
+                0..=3 => (src1 >> (8 * pick)) & 0xFF,
+                4..=7 => (src0 >> (8 * (pick - 4))) & 0xFF,
+                8 => if ((src1 >> 15) & 1) != 0 { 0xFF } else { 0x00 },
+                9 => if ((src1 >> 31) & 1) != 0 { 0xFF } else { 0x00 },
+                10 => if ((src0 >> 15) & 1) != 0 { 0xFF } else { 0x00 },
+                11 => if ((src0 >> 31) & 1) != 0 { 0xFF } else { 0x00 },
+                12 => 0x00,
+                _ => 0xFF,
+            };
+            out |= byte << (8 * i);
+        }
+        out
+    };
+
+    let src0 = 0x8765_4321u32; // bytes 4..7; byte 1 sign=0 (0x43), byte 3 sign=1 (0x87)
+    let src1 = 0x7EAB_CD01u32; // bytes 0..3; byte 1 sign=1 (0xCD), byte 3 sign=0 (0x7E)
+    let dyn_cases: &[[u32; 4]] = &[
+        [src0, src1, 0x0302_0100, 0], // identity src1
+        [src0, src1, 0x0706_0504, 0], // identity src0
+        [src0, src1, 0x0007_0205, 0], // mixed bytes across src0 and src1
+        [src0, src1, 0x0B0A_0908, 0], // sign-extension selectors 8..11
+        [0x1234_8000, 0x8000_7FFF, 0x0B0A_0908, 0], // flipped signs for 8..11
+        [src0, src1, 0xFF0D_0C04, 0], // constants 12 (0x00), 13 (0xFF), 255 (0xFF)
+    ];
+    run_cases(&perm_dyn, dyn_cases, |backend, _, inp, got| {
+        let want = ref_perm(inp[0], inp[1], inp[2]);
+        assert_eq!(
+            got, want,
+            "{backend}: v_perm_b32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    for &[s0, s1, sel, _] in dyn_cases {
+        let mut w = vop3(0x344, 0, vgpr(1), vgpr(2), 0xFF).to_vec();
+        w.push(sel);
+        let perm_lit = build_valu_cs(&w);
+        run_cases(&perm_lit, &[[s0, s1, 0, 0]], |backend, _, inp, got| {
+            let want = ref_perm(inp[0], inp[1], sel);
+            assert_eq!(
+                got, want,
+                "{backend}: v_perm_b32({:#010x}, {:#010x}, lit {sel:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    run_cases(&perm_const_ff, &[[src0, src1, 0, 0]], |backend, _, inp, got| {
+        let want = ref_perm(inp[0], inp[1], 0xFFFF_FFFF);
+        assert_eq!(
+            got, want,
+            "{backend}: v_perm_b32(const -1) = {got:#010x}, want {want:#010x}",
+        );
+    });
+
+    run_cases(&perm_const_12, &[[src0, src1, 0, 0]], |backend, _, inp, got| {
+        let want = ref_perm(inp[0], inp[1], 12);
+        assert_eq!(
+            got, want,
+            "{backend}: v_perm_b32(const 12) = {got:#010x}, want {want:#010x}",
+        );
+    });
+}
