@@ -3226,6 +3226,80 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn transitions_keep_color_target_mips_independent() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let desc = ResourceDesc {
+            flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32,
+            ..texture(8, 8, 28, 2)
+        };
+        let target = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let sampled = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        let mut image = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                target,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image,
+            ),
+            S_OK
+        );
+        let list = host.new_list().unwrap();
+        let changes = |state, mips| {
+            let mut barriers = Vec::new();
+            list.transition(image, state, mips, |_, mip, before, after| {
+                barriers.push((mip, before, after));
+            });
+            barriers
+        };
+        assert!(changes(target, None).is_empty());
+        assert_eq!(changes(sampled, Some(0..1)), [(0, target, sampled)]);
+        assert!(changes(target, Some(1..2)).is_empty());
+        assert!(changes(sampled, Some(0..1)).is_empty());
+        assert_eq!(
+            changes(copy, None),
+            [
+                (0, sampled, target),
+                (D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, target, copy),
+            ]
+        );
+
+        let close_list = host.new_list().unwrap();
+        close_list.transition(image, target, None, |_, _, _, _| {});
+        close_list.transition(image, sampled, Some(0..1), |_, _, _, _| {});
+        let mut restored = Vec::new();
+        close_list.close_transitions(|_, mip, before, after| {
+            restored.push((mip, before, after));
+        });
+        assert_eq!(restored, [(0, sampled, target)]);
+
+        let closing_list = host.new_list().unwrap();
+        closing_list.transition(image, target, None, |_, _, _, _| {});
+        closing_list.transition(image, sampled, Some(0..1), |_, _, _, _| {});
+        closing_list.close();
+        let mut remaining = Vec::new();
+        closing_list.close_transitions(|_, mip, before, after| {
+            remaining.push((mip, before, after));
+        });
+        assert!(remaining.is_empty());
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(image, 0x10)(image),
+            0
+        );
+    }
+
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]

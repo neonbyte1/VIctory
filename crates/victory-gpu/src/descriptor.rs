@@ -562,6 +562,28 @@ fn default_dsv_desc(
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn rtv_mips(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    desc: Option<&windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC>,
+) -> Option<std::ops::Range<u32>> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RTV_DIMENSION_TEXTURE2D;
+    let count = crate::host::color_mip_count(texture)?;
+    let mip = match desc {
+        None => 0,
+        Some(desc) if desc.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the view dimension selects this union member.
+            let view = unsafe { desc.Anonymous.Texture2D };
+            if view.PlaneSlice != 0 {
+                return None;
+            }
+            view.MipSlice
+        }
+        Some(_) => return None,
+    };
+    (mip < count).then(|| mip..mip + 1)
+}
+
 /// Device method: records the view at `handle` (descriptor memory).
 pub(crate) extern "system" fn create_rtv(
     _: This,

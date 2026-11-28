@@ -84,6 +84,11 @@ impl Pending {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_mip_test_pipeline(&self, pipeline: HostPipeline) {
+        assert!(self.made.set(Some(pipeline)).is_ok());
+    }
+
     fn make(&self) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());

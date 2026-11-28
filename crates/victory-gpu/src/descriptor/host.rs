@@ -963,6 +963,22 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
+pub(crate) fn srv_mips(
+    texture: &ID3D12Resource,
+    words: &[u32; 10],
+) -> Option<std::ops::Range<u32>> {
+    let count = crate::host::color_mip_count(texture)?;
+    let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
+        return None;
+    }
+    // SAFETY: the view dimension selects this union member.
+    let view = unsafe { desc.Anonymous.Texture2D };
+    let start = view.MostDetailedMip;
+    let end = start.saturating_add(view.MipLevels).min(count);
+    (view.PlaneSlice == 0 && start < end && (start != 0 || end != count)).then_some(start..end)
+}
+
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);

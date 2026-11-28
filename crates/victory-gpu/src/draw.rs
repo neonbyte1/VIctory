@@ -85,7 +85,7 @@ pub(crate) struct State {
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
-    targets: Vec<usize>,
+    targets: Vec<(usize, Option<std::ops::Range<u32>>)>,
     depth: Option<DepthTarget>,
     /// The current draw also samples its read-only depth target.
     depth_sampled: bool,
@@ -458,10 +458,14 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
-            self.targets.push(record.resource as usize);
+            let desc = record.desc();
+            self.targets.push((
+                record.resource as usize,
+                crate::descriptor::rtv_mips(&texture, desc.as_ref()),
+            ));
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(Some(&texture), record.desc().as_ref()));
+            rtvs.push(host.rtv(Some(&texture), desc.as_ref()));
         }
         self.depth = None;
         self.depth_sampled = false;
@@ -630,8 +634,8 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        for (resource, mips) in &self.targets {
+            crate::list::ensure_mips(list, *resource as This, RENDER_TARGET, mips.clone());
         }
         self.ensure_depth_state(list);
         // A depth copy of ours (`crate::twin`) ran a compute pipeline.
@@ -1265,7 +1269,7 @@ impl State {
         let _ = write!(text, " tables {:?}", self.reads(compute));
         if !compute {
             let mem = |r: usize| crate::resource::texture_memory(r as This).map_or(0, |(p, _)| p as u64);
-            let targets: Vec<String> = self.targets.iter().map(|&t| format!("{t:#x} mem {:#x}", mem(t))).collect();
+            let targets: Vec<String> = self.targets.iter().map(|&(t, _)| format!("{t:#x} mem {:#x}", mem(t))).collect();
             let depth = self.depth.map_or(0, |d| d.resource);
             let _ = write!(
                 text,
@@ -1461,7 +1465,7 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
+            .filter_map(|&(resource, _)| crate::resource::host_resource(resource as This))
             .map(|t| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -2057,7 +2061,7 @@ fn readable_for_draw(
         }
     }
     match (view, u.kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
+        (View::Shader(resource, desc), ResourceType::Srv) => {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
             if let Some(a) = crate::resource::alias_source(*resource as This) {
@@ -2077,7 +2081,11 @@ fn readable_for_draw(
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            let mips = match (&host_tex, desc.as_ref()) {
+                (Some(t), Some(d)) => crate::descriptor::host::srv_mips(t, d),
+                _ => None,
+            };
+            crate::list::ensure_mips(list, *resource as This, state, mips);
             #[cfg(feature = "diagnostics")]
             if let Some(ref t) = host_tex {
                 // SAFETY: a live resource.
@@ -4500,11 +4508,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Uav), &uav1, false);
         let tex1 = crate::resource::texture_at(va1, &tex1_res).unwrap();
-        assert_eq!(
-            list.transition(tex1, 0x8).map(|(_, before)| before),
-            None,
-            "placed UAV moved to UNORDERED_ACCESS"
-        );
+        let mut before_state = None;
+        list.transition(tex1, 0x8, None, |_, _, before, _| before_state = Some(before));
+        assert_eq!(before_state, None, "placed UAV moved to UNORDERED_ACCESS");
         run(&list, &slots, &write, 0, None, (1, 1));
 
         readable(&list, &used(ResourceType::Srv), &srv1, false);
@@ -5078,5 +5084,370 @@ mod depth_tests {
         };
         assert_eq!(release(views), 0);
         assert_eq!(release(depth), 0);
+    }
+}
+
+#[cfg(test)]
+mod mip_state_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::core::s;
+
+    fn read_mip(
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        texture: &ID3D12Resource,
+        mip: u32,
+    ) -> (ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut size = 0;
+        let mut buffer = None;
+        // SAFETY: live textures, output pointers and an open list with this mip in COPY_SOURCE.
+        unsafe {
+            device.GetCopyableFootprints(
+                &texture.GetDesc(),
+                mip,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut size),
+            );
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: size,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .expect("readback buffer");
+            let buffer: ID3D12Resource = buffer.expect("readback buffer");
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: mip,
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            (buffer, footprint)
+        }
+    }
+
+    #[test]
+    fn reads_one_mip_and_renders_to_another() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let device = &host.device;
+        let source = r#"
+            [RootSignature("RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), DescriptorTable(SRV(t0), visibility=SHADER_VISIBILITY_PIXEL)")]
+            float4 vs(uint id : SV_VertexID) : SV_Position {
+                return float4(id == 2 ? 3 : -1, id == 1 ? -3 : 1, 0, 1);
+            }
+            Texture2D<float4> from_mip : register(t0);
+            float4 ps() : SV_Target { return from_mip.Load(int3(0, 0, 0)); }
+        "#;
+        let compile = |entry, target| {
+            let mut code = None;
+            // SAFETY: live shader source and entry names, with a local output pointer.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    s!("mip-state-test"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+                .expect("compile fixture shader");
+            }
+            code.expect("fixture bytecode")
+        };
+        let vs = compile(s!("vs"), s!("vs_5_1"));
+        let ps = compile(s!("ps"), s!("ps_5_1"));
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // SAFETY: compiled fixture shaders and the embedded root signature are live.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let bytecode = |blob: &ID3DBlob| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: blob.GetBufferPointer(),
+                BytecodeLength: blob.GetBufferSize(),
+            };
+            let code = bytecode(&vs);
+            let root = device
+                .CreateRootSignature(
+                    0,
+                    std::slice::from_raw_parts(code.pShaderBytecode.cast(), code.BytecodeLength),
+                )
+                .expect("graphics root signature");
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code,
+                PS: bytecode(&ps),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = format;
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+                D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let pso = device
+                .CreateGraphicsPipelineState(&desc)
+                .expect("mip-test pipeline");
+            (root, pso)
+        };
+
+        let user = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let handle = crate::pipeline::mip_test_pipeline(
+            HostPipeline {
+                compute: false,
+                mesh: false,
+                pso,
+                root,
+                stages: Vec::new(),
+                rectangles: false,
+                slots: 0,
+                inputs: Vec::new(),
+                name: "mip-state-test".into(),
+                marks: None,
+            },
+            user,
+        );
+
+        let null = std::ptr::null();
+        let release = |object: This| {
+            crate::object::slot::<extern "system" fn(This) -> u32>(object, 0x10)(object)
+        };
+        for separate_copy in [false, true] {
+            let mut resource = null;
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 8,
+                Height: 8,
+                DepthOrArraySize: 1,
+                MipLevels: 2,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let iid = ID3D12Resource::IID;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+                    null.cast(),
+                    (&raw const iid).cast(),
+                    &mut resource,
+                ),
+                crate::object::S_OK
+            );
+            let texture = crate::resource::host_resource(resource).expect("two-mip RGBA texture");
+            let list = host.new_list().expect("host list");
+            let l = &list.list;
+            let rtv_desc = |mip| D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_RTV {
+                        MipSlice: mip,
+                        PlaneSlice: 0,
+                    },
+                },
+            };
+            let rt0 = host.rtv(&texture, Some(&rtv_desc(0)));
+            let rt1 = host.rtv(&texture, Some(&rtv_desc(1)));
+            // SAFETY: both subresources start in RENDER_TARGET and the views are live.
+            unsafe {
+                l.ClearRenderTargetView(rt0, &[1.0, 1.0, 0.0, 1.0], None);
+                l.ClearRenderTargetView(rt1, &[1.0, 0.0, 1.0, 1.0], None);
+                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            }
+            let mut state = State::default();
+            state.viewports(
+                &list,
+                &[D3D12_VIEWPORT {
+                    Width: 4.0,
+                    Height: 4.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }],
+            );
+            state.scissors(
+                &list,
+                &[RECT {
+                    right: 4,
+                    bottom: 4,
+                    ..Default::default()
+                }],
+            );
+
+            #[repr(C)]
+            struct ViewHeap {
+                desc: D3D12_DESCRIPTOR_HEAP_DESC,
+                placement: [u64; 2],
+            }
+            let heap_desc = ViewHeap {
+                desc: D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                },
+                placement: [0; 2],
+            };
+            let iid = ID3D12DescriptorHeap::IID;
+            let mut views = null;
+            assert_eq!(
+                crate::descriptor::create_heap(
+                    null,
+                    (&raw const heap_desc).cast(),
+                    (&raw const iid).cast(),
+                    &mut views,
+                ),
+                crate::object::S_OK
+            );
+            let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MipLevels: 1,
+                        ..Default::default()
+                    },
+                },
+            };
+            let srv = crate::descriptor::heap(views).start;
+            crate::descriptor::create_srv(null, resource, (&raw const srv_desc).cast(), srv);
+            let view_heap = &crate::descriptor::heap(views)
+                .host()
+                .expect("host views")
+                .heap;
+
+            crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+            let mut slot = [0u64; 16];
+            let rtv = slot.as_mut_ptr() as u64;
+            let mip1 = rtv_desc(1);
+            crate::descriptor::create_rtv(null, resource, (&raw const mip1).cast(), rtv);
+            state.set_targets(&list, &[rtv], 0);
+            state.set_heaps(&[views]);
+            state.set_table(false, 0, srv);
+            state.set_pipeline(handle);
+            assert!(state.prepare_for(&list, false, false));
+
+            // SAFETY: open list and live descriptor table.
+            unsafe {
+                l.SetGraphicsRootDescriptorTable(0, view_heap.GetGPUDescriptorHandleForHeapStart());
+                l.DrawInstanced(3, 1, 0, 0);
+            }
+            let following = separate_copy.then(|| {
+                list.close();
+                host.new_list().expect("copy list")
+            });
+            let copy_list = following.as_ref().unwrap_or(&list);
+            crate::list::ensure_state(
+                copy_list,
+                resource,
+                D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+            );
+            let readbacks = [
+                read_mip(device, &copy_list.list, &texture, 0),
+                read_mip(device, &copy_list.list, &texture, 1),
+            ];
+            copy_list.close();
+            assert_eq!(host.log_messages(), None);
+            if separate_copy {
+                host.execute(&[&list, copy_list]);
+            } else {
+                host.execute(&[&list]);
+            }
+            assert_eq!(host.log_messages(), None);
+
+            for (mip, (pixels, fp)) in readbacks.into_iter().enumerate() {
+                let mut data = std::ptr::null_mut();
+                // SAFETY: submission has finished and all offsets stay inside the footprint.
+                unsafe {
+                    pixels.Map(0, None, Some(&mut data)).expect("map readback");
+                    let f = fp.Footprint;
+                    for y in 0..f.Height {
+                        for x in 0..f.Width {
+                            let at = fp.Offset as usize + (y * f.RowPitch + x * 4) as usize;
+                            assert_eq!(
+                                std::slice::from_raw_parts(data.cast::<u8>().add(at), 4),
+                                [255, 255, 0, 255],
+                                "separate_copy={separate_copy} mip {mip} at ({x},{y})"
+                            );
+                        }
+                    }
+                    pixels.Unmap(0, None);
+                }
+            }
+            assert_eq!(release(views), 0);
+            assert_eq!(release(resource), 0);
+        }
+        assert_eq!(release(handle), 0);
     }
 }

@@ -514,7 +514,54 @@ pub(crate) fn not_dispatched(this: This, why: &str) {
 #[cfg(windows)]
 pub fn note_title_dll(file: &str, base: usize, size: usize) {
     builder::note_title_dll(file, base, size);
-}
+
+#[cfg(all(windows, test))]
+pub(crate) fn mip_test_pipeline(
+    mut native: host::HostPipeline,
+    used: victory_shader::UsedResource,
+) -> This {
+    let translated = Translated {
+        host: victory_shader::emit::HostShader {
+            stage: victory_shader::HwStage::Ps,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
+            view_marks: false,
+        },
+        used: vec![used],
+    };
+    let shader = Arc::new(Shader {
+        stage: "pixel",
+        hash: "mip-test".into(),
+        container: Vec::new(),
+        translated: OnceLock::from(Some(translated)),
+    });
+    native.stages.push(host::Stage {
+        shader,
+        user_data: None,
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        memory: None,
+        memory_dirty: None,
+        view_addresses: None,
+    });
+    let mut handle = std::ptr::null();
+    assert_eq!(
+        hand_out(Vec::new(), None, &PIPELINE_IIDS[0], &mut handle),
+        crate::object::S_OK
+    );
+    pipeline(handle).host.set_mip_test_pipeline(native);
+    handle}
 
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
