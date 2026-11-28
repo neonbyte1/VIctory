@@ -47,10 +47,16 @@ jobs:
       CARGO_TERM_COLOR: always
       WINEPREFIX: ${{ github.workspace }}/target/wine-prefix
       WINEDEBUG: "-all"
-      WINEDLLOVERRIDES: "d3d12,d3d12core=n;winedbg.exe=d"
-      # Ubuntu 24.04's wine64 package has no `wine` wrapper.
-      WINE: /usr/lib/wine/wine64
-      WINESERVER: /usr/lib/wine/wineserver
+      # mscoree/mshtml: WineHQ's wineboot asks to download Mono and Gecko,
+      # and that dialog hangs a headless runner (seen as a wineboot stuck in
+      # setupapi's InstallHinfSection). The tests need neither.
+      WINEDLLOVERRIDES: "d3d12,d3d12core=n;winedbg.exe=d;mscoree=d;mshtml=d"
+      # WineHQ's official 11.x, not Ubuntu 24.04's wine64 9.0: the newest
+      # watch/shadow guard-page tests fail alone on Wine 9 (docs/linux.md §1
+      # asks for Wine 11.x). `wine-devel` gives /opt/wine-devel/bin/{wine,wineserver}.
+      WINE: /opt/wine-devel/bin/wine
+      WINESERVER: /opt/wine-devel/bin/wineserver
+      WINEHQ_VERSION: "11.23~noble-1"
       # Pinned so a run is the same harness every time (docs/linux.md §1-2).
       XWIN_VERSION: "0.10.0"
       VKD3D_PROTON_VERSION: "3.1"
@@ -60,9 +66,22 @@ jobs:
       - run: rustup toolchain install
       - name: Packages
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang lld llvm wine64 xvfb xauth mesa-vulkan-drivers libvulkan1 zstd
+            clang lld llvm xvfb xauth mesa-vulkan-drivers libvulkan1 zstd \
+            libc6:i386 libstdc++6:i386 libfreetype6:i386
+          # WineHQ's own repository: the distribution's Wine 9 lacks the
+          # guard-page behaviour the watch tests need.
+          sudo mkdir -pm755 /etc/apt/keyrings
+          sudo curl -fsSL -o /etc/apt/keyrings/winehq-archive.key \
+            https://dl.winehq.org/wine-builds/winehq.key
+          . /etc/os-release
+          sudo curl -fsSL -o /etc/apt/sources.list.d/winehq.sources \
+            "https://dl.winehq.org/wine-builds/ubuntu/dists/${UBUNTU_CODENAME}/winehq-${UBUNTU_CODENAME}.sources"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "winehq-devel=$WINEHQ_VERSION"
           # Ubuntu keeps clang-cl under LLVM's own bin and links only clang.
           llvm=$(ls -d /usr/lib/llvm-* | sort -V | tail -1)
           for tool in clang-cl lld-link llvm-lib; do
@@ -123,6 +142,7 @@ jobs:
           mkdir -p "$WINEPREFIX"
           # A prefix of this run's own, as `cargo xtask wine-test` makes one.
           xvfb-run -a "$WINE" wineboot -i
+          "$WINE" --version
           # vkd3d-proton's D3D12 in place of Wine's own (no shader model 6.6).
           cp ~/vkd3d-proton/x64/d3d12.dll ~/vkd3d-proton/x64/d3d12core.dll \
             "$WINEPREFIX/drive_c/windows/system32/"
