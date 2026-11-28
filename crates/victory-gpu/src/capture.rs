@@ -656,7 +656,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
-/// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
+/// Rows of a host format as 8-bit RGBA: unsigned 8-bit color as is, everything else
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
@@ -675,7 +675,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
-        27..=32 => {
+        27..=30 => {
             // The PNG drops alpha: its range and how many texels have each
             // channel zero are logged.
             let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
@@ -692,6 +692,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
             return Some(out);
         }
+        31..=32 => (4, Box::new(|b| [0, 1, 2].map(|i| f32::from(b[i] as i8)))),
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
         87 | 88 | 90..=93 => {
             for y in 0..h {
@@ -737,7 +738,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
         35..=36 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         37..=38 => (4, Box::new(move |b| [f32::from(i16_at(b, 0)), f32::from(i16_at(b, 1)), 0.0])),
-        48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        48..=50 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        51..=52 => (2, Box::new(|b| [f32::from(b[0] as i8), f32::from(b[1] as i8), 0.0])),
         // Single channels (and depth planes): shown as grey.
         39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
@@ -745,7 +747,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
         55..=57 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
         58..=59 => (2, Box::new(move |b| [f32::from(i16_at(b, 0)); 3])),
-        60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        60..=62 | 65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        63..=64 => (1, Box::new(|b| [f32::from(b[0] as i8); 3])),
         _ => return None,
     };
     let values: Vec<[f32; 3]> = (0..h)
@@ -1106,6 +1109,10 @@ mod tests {
         assert_eq!(capture(depth, [0.25, 0.75]), [black, white].concat());
     }
 
+    // These fixtures can share the RGBA8 callsite. Keep its registration
+    // from racing the test that installs a scoped tracing subscriber.
+    static RGBA8_TRACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
@@ -1224,5 +1231,105 @@ mod r32_tests {
         let expected = Some([0, 0, 0, 255].repeat(2));
         assert_eq!(super::to_rgba(42, 2, 1, 8, &[0; 8]), expected);
         assert_eq!(super::to_rgba(43, 2, 1, 8, &[0; 8]), expected);
+    }
+
+    #[test]
+    fn signed_rgba8_clamps_negative_colour_and_keeps_alpha_opaque() {
+        let _trace = RGBA8_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = [0xff, 64, 32, 0];
+        let actual = [31, 32].map(|format| super::to_rgba(format, 1, 1, 4, &rows).unwrap());
+        assert_eq!(actual, [[0, 255, 127, 255]; 2]);
+    }
+
+    #[test]
+    fn signed_rg8_clamps_negative_colour() {
+        let rows = [0xff, 64];
+        let actual = [51, 52].map(|format| super::to_rgba(format, 1, 1, 2, &rows).unwrap());
+        assert_eq!(actual, [[0, 255, 0, 255]; 2]);
+    }
+
+    #[test]
+    fn signed_r8_grayscale_uses_signed_extrema() {
+        let rows = [0x80, 0xff, 0, 0x7f];
+        let actual = [63, 64].map(|format| super::to_rgba(format, 4, 1, 4, &rows).unwrap());
+        let expected = [0, 127, 128, 255].map(|grey| [grey, grey, grey, 255]).concat();
+        assert_eq!(actual, [expected.clone(), expected]);
+    }
+
+    #[test]
+    fn unsigned_srgb_and_alpha_only_keep_their_byte_interpretation() {
+        let _trace = RGBA8_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = [0xff, 64, 32, 0];
+        for format in [27, 28, 29, 30] {
+            assert_eq!(super::to_rgba(format, 1, 1, 4, &rows).unwrap(), [255, 64, 32, 255]);
+        }
+        for format in [48, 49, 50] {
+            assert_eq!(super::to_rgba(format, 1, 1, 2, &rows).unwrap(), [255, 64, 0, 255]);
+        }
+        for format in [60, 61, 62, 65] {
+            assert_eq!(
+                super::to_rgba(format, 2, 1, 2, &rows).unwrap(),
+                [255, 255, 255, 255, 0, 0, 0, 255],
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_rgba8_logs_raw_channel_stats_excluding_row_padding() {
+        use std::collections::BTreeMap;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tracing::{Event, Metadata, Subscriber, field, span};
+
+        #[derive(Default)]
+        struct Fields(BTreeMap<&'static str, String>);
+
+        impl field::Visit for Fields {
+            fn record_debug(&mut self, field: &field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name(), format!("{value:?}"));
+            }
+        }
+
+        struct RgbaStats(Arc<AtomicUsize>);
+
+        impl Subscriber for RgbaStats {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.is_event()
+                    && metadata.target() == "victory_gpu::capture"
+                    && metadata.fields().field("zero").is_some()
+            }
+
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                unreachable!()
+            }
+
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                assert_eq!(fields.0["low"], "[0, 0, 3, 0]");
+                assert_eq!(fields.0["high"], "[250, 7, 11, 255]");
+                assert_eq!(fields.0["zero"], "[1, 2, 0, 3]");
+                assert_eq!(fields.0["texels"], "4");
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let _trace = RGBA8_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = [0, 2, 5, 0, 250, 0, 3, 0, 99, 99, 99, 99, 100, 0, 8, 255, 10, 7, 11, 0];
+        let expected = [0, 2, 5, 255, 250, 0, 3, 255, 100, 0, 8, 255, 10, 7, 11, 255];
+        let events = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::with_default(RgbaStats(events.clone()), || {
+            for format in 27..=30 {
+                assert_eq!(super::to_rgba(format, 2, 2, 12, &rows).unwrap(), expected);
+                assert_eq!(events.load(Ordering::Relaxed), (format - 26) as usize);
+            }
+        });
     }
 }
