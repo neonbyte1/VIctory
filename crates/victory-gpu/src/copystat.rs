@@ -114,8 +114,13 @@ pub(crate) enum C {
     /// Time in copies redone piece by piece after meeting an unmapped page.
     FallbackUs,
     /// Title threads writing a view into a shader-visible heap: time
-    /// waiting for the heaps' lock (held by heap syncs and other writers).
+    /// waiting for the heaps' registry (held by heap syncs and other writers;
+    /// taken shared with `VICTORY_HEAP_LOCKFREE=1`).
     MirrorWaitUs,
+    /// Takes of a host heap's slot lock (`made`: every `mirror` and every
+    /// heap sync's page scan), and the time those takes waited.
+    SlotCalls,
+    SlotWaitUs,
     /// Copies in video memory (#3312), on completion: bytes the list after
     /// a submission read back put into the mirrors, and the time; pages the
     /// views' marks and the lists' page bitmaps named, of them those read
@@ -631,6 +636,28 @@ pub(crate) fn log(frames: f64) {
         })
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    {
+        let registry: Vec<String> = crate::descriptor::heap_registry::take()
+            .iter()
+            .map(|(name, c)| {
+                format!(
+                    "{name} {:.1} ms held in {:.0} (longest {:.1}), {:.1} ms waited in {:.0} (longest {:.1})",
+                    c[1] as f64 / 1e3 / frames,
+                    c[0] as f64 / frames,
+                    c[2] as f64 / 1e3,
+                    c[4] as f64 / 1e3 / frames,
+                    c[3] as f64 / frames,
+                    c[5] as f64 / 1e3,
+                )
+            })
+            .collect();
+        tracing::info!(
+            "  heap registry per frame: {}; a host heap's slot lock {:.0} takes {:.1} ms waited",
+            registry.join(", "),
+            c[C::SlotCalls as usize],
+            ms(c[C::SlotWaitUs as usize]),
+        );
+    }
     tracing::info!(
         "  marked copy-back per frame: {:.0} guard lock rounds, {:.0} protection changes; {:.0} runs of \
          {:.0} pages (the rest page by page); {:.0} byte runs, {:.1} MB written; {:.0} pages a title \

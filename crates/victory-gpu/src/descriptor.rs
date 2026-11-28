@@ -134,10 +134,196 @@ const VIEWS_KIND: u32 = 0;
 const SAMPLERS: u32 = 1;
 const SHADER_VISIBLE: u32 = 1;
 
-/// Shader-visible heaps by address range, for mirroring descriptor writes:
-/// start, end, heap.
+/// Whether the heaps' registry is shared by its readers
+/// (`VICTORY_HEAP_LOCKFREE=1`, off by default); logged once.
+///
+/// The registry is held so a heap cannot be freed while it is looked at
+/// (`Heap::drop`). Sharing it runs a title thread's view write beside the
+/// heap syncs, the slots-to-read making and the evictions instead of behind
+/// them: title threads waited 77.7 ms a frame for it (run 1013d-pipe0, five
+/// second blocks), the sync holding it 18.7 ms of a 33.3 ms frame in 28
+/// holds (`local://ViewWaits.md`). With the switch off every site takes it
+/// alone, as the mutex it was.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) fn lockfree() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = crate::switch::on("VICTORY_HEAP_LOCKFREE");
+        if on {
+            tracing::info!(
+                "view writers, heap syncs and the heaps' other users share the heaps' registry \
+                 (VICTORY_HEAP_LOCKFREE)"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+/// Shader-visible heaps by address range, for mirroring descriptor writes:
+/// start, end, heap. Taken alone only to add or remove a heap
+/// ([`create_heap`], `Heap::drop`), so a heap found under it lives while the
+/// finder holds it; its other users take it through [`registry`].
+#[cfg(windows)]
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// Which site takes the heaps' registry (diagnostics: the hold and wait
+/// table, `copystat::log`'s "heap registry per frame" line).
+#[cfg(windows)]
+mod sites {
+    /// A title thread writing a view (`DescriptorHeap::Create*View`).
+    pub(super) const WRITE: usize = 0;
+    /// A heap sync collecting the pages written since the last submission.
+    pub(super) const COLLECT: usize = 1;
+    /// A heap sync of one chunk of pages.
+    pub(super) const CHUNK: usize = 2;
+    /// Slots to read made again after a submission.
+    pub(super) const READ: usize = 3;
+    /// Every other lookup: textures read, evictions, releases, `with_host`.
+    pub(super) const LOOKUP: usize = 4;
+    /// Making or releasing a heap.
+    pub(super) const CHANGE: usize = 5;
+    #[cfg(feature = "diagnostics")]
+    pub(super) const NAMES: [&str; 6] = [
+        "a title view write",
+        "a heap sync collecting",
+        "a heap sync of a chunk",
+        "slots to read",
+        "other lookups",
+        "heaps made or released",
+    ];
+}
+
+/// The held lock of [`registry`].
+#[cfg(windows)]
+enum Heaps {
+    Shared(std::sync::RwLockReadGuard<'static, Vec<(u64, u64, usize)>>),
+    Alone(std::sync::RwLockWriteGuard<'static, Vec<(u64, u64, usize)>>),
+}
+
+/// A held [`SHADER_HEAPS`]: held until dropped, so the heap found under it
+/// stays alive (diagnostics: its hold is counted when it goes).
+#[cfg(windows)]
+struct Held {
+    heaps: Heaps,
+    #[cfg(feature = "diagnostics")]
+    /// (site, when it was taken): the hold, from [`registry`]'s return.
+    held: (usize, std::time::Instant),
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for Held {
+    type Target = Vec<(u64, u64, usize)>;
+    fn deref(&self) -> &Self::Target {
+        match &self.heaps {
+            Heaps::Shared(h) => h,
+            Heaps::Alone(h) => h,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match &mut self.heaps {
+            Heaps::Alone(h) => h,
+            // Only [`registry_alone`] mutates, and it never shares.
+            Heaps::Shared(_) => unreachable!("a shared registry is not changed"),
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl Drop for Held {
+    fn drop(&mut self) {
+        let (site, since) = self.held;
+        heap_registry::note_hold(site, since.elapsed());
+    }
+}
+
+/// [`SHADER_HEAPS`] for a lookup at `site`: shared under [`lockfree`], else
+/// alone (readers take turns, as with the mutex it was).
+#[cfg(windows)]
+fn registry(site: usize) -> Held {
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = site;
+    #[cfg(feature = "diagnostics")]
+    let since = std::time::Instant::now();
+    let heaps = if lockfree() {
+        Heaps::Shared(SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        Heaps::Alone(SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner()))
+    };
+    #[cfg(feature = "diagnostics")]
+    heap_registry::note_wait(site, since.elapsed());
+    #[cfg(feature = "diagnostics")]
+    let held = Held {
+        heaps,
+        held: (site, std::time::Instant::now()),
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let held = Held { heaps };
+    held
+}
+
+/// [`SHADER_HEAPS`] alone, for adding or removing a heap.
+#[cfg(windows)]
+fn registry_alone(site: usize) -> Held {
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = site;
+    #[cfg(feature = "diagnostics")]
+    let since = std::time::Instant::now();
+    let heaps = Heaps::Alone(SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    heap_registry::note_wait(site, since.elapsed());
+    #[cfg(feature = "diagnostics")]
+    let held = Held {
+        heaps,
+        held: (site, std::time::Instant::now()),
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let held = Held { heaps };
+    held
+}
+
+/// Per-site holds and waits of [`SHADER_HEAPS`], and of a host heap's slot
+/// lock (which every `mirror` meets next), since the last line (diagnostics:
+/// `copystat::log`'s "heap registry per frame").
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod heap_registry {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Per site: holds, held µs, longest hold µs, acquisitions that waited,
+    /// waited µs, longest wait µs.
+    static SITES: [[AtomicU64; 6]; 6] = [const { [const { AtomicU64::new(0) }; 6] }; 6];
+
+    pub(super) fn note_hold(site: usize, held: std::time::Duration) {
+        let us = held.as_micros() as u64;
+        SITES[site][0].fetch_add(1, Relaxed);
+        SITES[site][1].fetch_add(us, Relaxed);
+        SITES[site][2].fetch_max(us, Relaxed);
+    }
+
+    pub(super) fn note_wait(site: usize, waited: std::time::Duration) {
+        let us = waited.as_micros() as u64;
+        SITES[site][3].fetch_add(u64::from(us > 0), Relaxed);
+        SITES[site][4].fetch_add(us, Relaxed);
+        SITES[site][5].fetch_max(us, Relaxed);
+    }
+
+    /// Since the last call, per site of [`super::sites::NAMES`]: holds, held
+    /// µs, longest hold µs, acquisitions that waited, waited µs, longest wait
+    /// µs. Sites nothing took are dropped.
+    pub(crate) fn take() -> Vec<(&'static str, [u64; 6])> {
+        super::sites::NAMES
+            .iter()
+            .zip(SITES.iter())
+            .filter_map(|(&name, s)| {
+                let c = std::array::from_fn(|k| s[k].swap(0, Relaxed));
+                (c[0] > 0 || c[4] > 0).then_some((name, c))
+            })
+            .collect()
+    }
+}
 
 /// The end of the view slots in use (it only grows): the most slots any
 /// shader-visible view heap has had, or past them the dynamic slots a host
@@ -163,13 +349,13 @@ pub(crate) fn view_slots_reach(end: u32) {
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
+/// is in a shader-visible heap. Keeps `SHADER_HEAPS` held for the duration
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
     #[cfg(feature = "diagnostics")]
     let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = registry(sites::WRITE);
     #[cfg(feature = "diagnostics")]
     drop(waited);
     let Some(&(_, _, at)) = heaps
@@ -255,19 +441,21 @@ fn page_jobs(
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 ///
 /// `SHADER_HEAPS` is what a title thread writing a view waits on
-/// (`descriptor.rs`'s `mirror`, `C::MirrorWaitUs`): the sync holds it for a
-/// chunk of pages, not for the whole sync, because title threads queued
-/// behind one 16 ms hold for 74.6 ms a frame (run heapdirty2, 222 pages a
-/// frame); a writer now waits for at most one chunk.
+/// (`descriptor.rs`'s `mirror`, `C::MirrorWaitUs`). With [`lockfree`] the
+/// sync takes it shared, so a writer does not wait for it at all; without
+/// the switch the sync holds it alone for a chunk of pages, not for the
+/// whole sync, because title threads queued behind one 16 ms hold for
+/// 74.6 ms a frame (run heapdirty2, 222 pages a frame). The chunk also
+/// bounds how long `Heap::drop` can wait on the switch's shared side.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     const CHUNK: usize = 16;
-    // The heap and its dirty pages are collected under the lock, the pages
-    // are synced under it a chunk at a time. `written.take` empties the
-    // heap's changed set, so a page is not synced twice.
+    // The heap and its dirty pages are collected under the registry, the
+    // pages are synced under it a chunk at a time. `written.take` empties
+    // the heap's changed set, so a page is not synced twice.
     let mut jobs: Vec<PageJob> = Vec::new();
     {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = registry(sites::COLLECT);
         for &(start, _, at) in heaps.iter() {
             // SAFETY: registered heaps are live (removed when dropped).
             let heap = unsafe { &*(at as *const Heap) };
@@ -281,7 +469,7 @@ pub(crate) fn sync_heaps() {
         }
     }
     for chunk in jobs.chunks(CHUNK) {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = registry(sites::CHUNK);
         for job in chunk {
             // The heap may have been released while the lock was free.
             if !heaps.iter().any(|&(_, _, at)| at == job.heap) {
@@ -315,12 +503,12 @@ pub(crate) fn sync_heaps() {
 #[cfg(windows)]
 pub(crate) fn make_read(slots: &[u32]) {
     // The placed textures those slots view are made first, without the
-    // heaps' lock, which every title thread writing a view waits on (making
+    // heaps' registry, which every title thread writing a view takes (making
     // a texture takes up to milliseconds; title threads waited 1-6 s a frame,
     // runs evict2, noevict1). They are never released, so they outlive it;
-    // the lock is held only to look the slots up and to make the views.
+    // the registry is held only to look the slots up and to make the views.
     let placed: Vec<View> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = registry(sites::READ);
         heaps
             .iter()
             // SAFETY: registered heaps are live (removed when dropped).
@@ -342,19 +530,20 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
-    // The lock is the one title threads writing views wait on: it is taken a
-    // chunk of slots at a time (`SLOTS`), not around every heap's whole list,
-    // because `mirror` can make a host copy of the memory the view names.
+    // The registry is taken a chunk of slots at a time (`SLOTS`), not around
+    // every heap's whole list, because `mirror` can make a host copy of the
+    // memory the view names (and more of it under the switch would hold
+    // `Heap::drop` up).
     const SLOTS: usize = 64;
     let live: Vec<usize> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = registry(sites::READ);
         heaps.iter().map(|&(_, _, at)| at).collect()
     };
     for at in live {
         // The heap's slots to make, and where its records are, under one
         // short hold: the making happens below, a chunk at a time.
         let Some((start, step, mine)) = ({
-            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let heaps = registry(sites::READ);
             let Some(&(start, _, _)) = heaps.iter().find(|&&(_, _, h)| h == at) else {
                 continue;
             };
@@ -375,7 +564,7 @@ pub(crate) fn make_read(slots: &[u32]) {
             continue;
         };
         for chunk in mine.chunks(SLOTS) {
-            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let heaps = registry(sites::READ);
             if !heaps.iter().any(|&(_, _, h)| h == at) {
                 break;
             }
@@ -397,7 +586,7 @@ pub(crate) fn make_read(slots: &[u32]) {
 /// shader-visible view heaps view.
 #[cfg(windows)]
 pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = registry(sites::LOOKUP);
     let mut textures = std::collections::HashSet::new();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -414,7 +603,7 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
 /// (`crate::resource::evict` gives those textures up).
 #[cfg(windows)]
 pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = registry(sites::LOOKUP);
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -428,7 +617,7 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = registry(sites::LOOKUP);
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -441,7 +630,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 /// heap cannot be released; None if it is gone or has no host heap.
 #[cfg(windows)]
 pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = registry(sites::LOOKUP);
     if !heaps.iter().any(|&(_, _, h)| h == heap) {
         return None;
     }
@@ -455,7 +644,7 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = registry_alone(sites::CHANGE);
         heaps.retain(|&(_, _, h)| h != at);
         // Nothing can find the heap by now. The table's lock is taken
         // inside the heaps' lock (`memory::bind`), never the other way
@@ -1186,7 +1375,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = registry_alone(sites::CHANGE);
         if desc.kind == VIEWS_KIND {
             VIEW_SLOTS.fetch_max(desc.count, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1698,5 +1887,123 @@ pub(crate) mod tests {
 
         let dsv_1d = default_dsv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1, 1), dfmt);
         assert_eq!(dsv_1d.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE1D);
+    }
+
+    /// A heap sync of 16 copied pages and title view writes of the same
+    /// slots run at once (the registry shared with `VICTORY_HEAP_LOCKFREE=1`,
+    /// else taken alone): every copied record's slot is made, no other. A
+    /// host GPU needed.
+    #[cfg(windows)]
+    #[test]
+    fn a_heap_sync_and_view_writes_share_the_registry() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const PAGES: usize = 16;
+        const STEP: usize = 32;
+        let slots = (PAGES * crate::watch::PAGE / STEP) as u32;
+        let memory = crate::watch::tests::pool(PAGES);
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: slots,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: u64::from(slots) * STEP as u64,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let host = heap(h).host().expect("a host view heap");
+        sync_heaps(); // takes the heap's first changes (all of it)
+        // A null constant buffer view's record, written where no heap sees
+        // it, then copied into every third slot as bytes.
+        let mut elsewhere = [0u64; 4];
+        create_cbv(
+            std::ptr::null(),
+            &[0, 0, 256, 0],
+            elsewhere.as_mut_ptr() as u64,
+        );
+        let copied: Vec<u32> = (0..slots).step_by(3).collect();
+        for &k in &copied {
+            // SAFETY: a slot of the heap's memory, ours.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    elsewhere.as_ptr(),
+                    (memory + STEP * k as usize) as *mut u64,
+                    4,
+                )
+            };
+        }
+        assert!(!host.made(0), "not before the sync");
+        let group = copied.len().div_ceil(4);
+        std::thread::scope(|s| {
+            for slots in copied.chunks(group) {
+                s.spawn(move || {
+                    for &k in slots {
+                        mirror(memory as u64 + STEP as u64 * u64::from(k));
+                    }
+                });
+            }
+            sync_heaps();
+        });
+        for k in 0..slots.min(host.count()) {
+            assert_eq!(host.made(k), k % 3 == 0, "slot {k}");
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        crate::watch::tests::free(memory);
+    }
+
+    /// A heap released while a lookup holds the registry waits for the
+    /// lookup: what it found stays alive until it lets go (shared with
+    /// `VICTORY_HEAP_LOCKFREE=1`, else alone). A host GPU needed.
+    #[cfg(windows)]
+    #[test]
+    fn a_heap_release_waits_for_a_lookup_that_holds_the_registry() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const STEP: usize = 32;
+        let slots = (crate::watch::PAGE / STEP) as u32;
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: slots,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: u64::from(slots) * STEP as u64,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let at = h as usize;
+        heap(h).host().expect("a host view heap");
+        let (entered, holding) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                with_host(at, |_| {
+                    entered.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    done.send(()).unwrap();
+                });
+            });
+            holding.recv().unwrap();
+            let start = std::time::Instant::now();
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+            let waited = start.elapsed();
+            assert!(
+                finished.try_recv().is_ok(),
+                "the release did not wait for the lookup"
+            );
+            assert!(
+                waited >= std::time::Duration::from_millis(150),
+                "waited {waited:?}"
+            );
+        });
+        crate::watch::tests::free(memory);
     }
 }

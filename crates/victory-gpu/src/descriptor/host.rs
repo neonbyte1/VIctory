@@ -841,7 +841,7 @@ impl HostHeap {
         }
         // Held until the table is published: `mirror` (which holds it while
         // it notes an address) neither slips in between nor is lost.
-        let slots = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = self.made_lock();
         let made = self.addresses.get_or_init(|| {
             // The view is a root view, which has no bounds: an entry for
             // every slot a table can lie in, the dynamic ones too (a table
@@ -968,6 +968,20 @@ impl HostHeap {
         }
     }
 
+    /// The heap's slot lock (`made`), taken: the one lock every `mirror`
+    /// takes, and the sync's page scans (`diagnostics`: counted and timed,
+    /// the "heap registry per frame" line's slot lock).
+    fn made_lock(&self) -> std::sync::MutexGuard<'_, Vec<u64>> {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SlotCalls, 1);
+        #[cfg(feature = "diagnostics")]
+        let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SlotWaitUs);
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        drop(waited);
+        made
+    }
+
     /// A heap sync of slots `first..last`, whose records are at `start` +
     /// index × `step`: [`HostHeap::mirror`] of each slot whose record
     /// differs from what the slot holds, the rest passed by as `mirror`
@@ -1005,7 +1019,7 @@ impl HostHeap {
         let page = ((u64::from(first) * step) / crate::watch::PAGE as u64) as usize;
         let earlier = self.pages.get(page).map_or(u64::MAX, |p| p.load(Relaxed));
         let stale: Vec<u32> = {
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let made = self.made_lock();
             if deaths == earlier {
                 stale_slots(&made, first, last, at, None)
             } else {
@@ -1052,7 +1066,7 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut made = self.made_lock();
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -1133,7 +1147,7 @@ impl HostHeap {
             // binding and writing views wait on (run evict5).
             drop(made);
             prepare(&view);
-            made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            made = self.made_lock();
             // The title may have written another record there meanwhile (and
             // another thread made it): that one is the slot's.
             // SAFETY: as above.
@@ -1232,7 +1246,7 @@ impl HostHeap {
         // live dynamic slots belong to recorded lists and keep their views.
         // (Such a slot keeps the texture until it is next made, not until its
         // list is reset: the dynamic range comes round quickly.)
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = self.made_lock();
         let taken = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
