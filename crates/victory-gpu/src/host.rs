@@ -5278,3 +5278,6 @@ mod fills {
         list.reset();
     }
 }
+
+#[cfg(test)]
+mod frame_bench;
