@@ -1893,7 +1893,11 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-        if let (Op::AddF, Some(inclusive)) = (op, prefix) {
+        // (In the console flow's halves the host wave's sum is only the
+        // half's: it goes on to the carry below.)
+        if let (Op::AddF, Some(inclusive)) = (op, prefix)
+            && !(self.console_cf && self.split)
+        {
             let r = self.float_prefix_sum(x, id, inclusive);
             return Ok(self.as_int(r));
         }
@@ -1901,6 +1905,7 @@ impl<'a> Lower<'a> {
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
+            (Op::AddF, Some(inclusive)) => self.float_prefix_sum(x, id, inclusive),
             (Op::AddU, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
