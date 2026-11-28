@@ -578,7 +578,7 @@ pub(crate) struct Barrier {
 /// The barrier on host resources, or `None` if it names a resource the host
 /// GPU does not have (buffers so far).
 #[cfg(windows)]
-fn host_barrier(b: &Barrier) -> Option<Barrier> {
+fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
     // The list names the resource until it is reset: the title may release it
     // before the list runs.
@@ -657,7 +657,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                         },
                     );
                 }
-            } else if let Some(b) = host_barrier(b) {
+            } else if let Some(b) = host_barrier(list, b) {
                 host.push(b);
             }
         }
@@ -2166,25 +2166,26 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const Barrier
                     let mut emitted_transition = false;
                     if whole
                         && let Some(wanted) = wanted
-                        && let Some((texture, before)) = list.transition(b.resource, wanted)
                     {
-                        let after = crate::host::legal_state(&texture, wanted);
-                        if before != after {
-                            let tex_key = texture.as_raw() as usize;
-                            if seen_transitions.contains(&tex_key) {
-                                // SAFETY: an open list and live resources.
-                                unsafe { list.list.ResourceBarrier(&out) };
-                                out.clear();
-                                seen_transitions.clear();
+                        list.transition(b.resource, wanted, None, |texture, mip, before, after| {
+                            if before != after {
+                                let tex_key = texture.as_raw() as usize;
+                                if seen_transitions.contains(&tex_key) {
+                                    // SAFETY: an open list and live resources.
+                                    unsafe { list.list.ResourceBarrier(&out) };
+                                    out.clear();
+                                    seen_transitions.clear();
+                                }
+                                seen_transitions.push(tex_key);
+                                out.push(crate::host::transition_subresource(
+                                    texture,
+                                    mip,
+                                    State(before as i32),
+                                    State(after as i32),
+                                ));
+                                emitted_transition = true;
                             }
-                            seen_transitions.push(tex_key);
-                            out.push(crate::host::transition(
-                                &texture,
-                                State(before as i32),
-                                State(after as i32),
-                            ));
-                            emitted_transition = true;
-                        }
+                        });
                     }
                     if ((b.access_before | b.access_after) & ACCESS_UAV != 0)
                         || (wanted == Some(STATE_UAV) && !emitted_transition)
@@ -3894,8 +3895,12 @@ mod tests {
             call_barrier(list, 1, &group);
 
             // Must still be in RENDER_TARGET (0x4) so a subsequent mip-0 clear does not fail.
+            let mut recorded = false;
+            host_list(list)
+                .unwrap()
+                .transition(tex, 0x4, None, |_, _, _, _| recorded = true);
             assert!(
-                host_list(list).unwrap().transition(tex, 0x4).is_none(),
+                !recorded,
                 "partial mip-1 barrier clobbered whole-resource RENDER_TARGET state"
             );
             clear_rtv(list, rtv, &unorm([0, 128, 255, 255]), 0, null.cast());
@@ -4114,8 +4119,10 @@ void main() {
                 hlist.list.SetPipelineState(&pso);
                 hlist.list.Dispatch(1, 1, 1);
             }
+            let mut recorded = false;
+            hlist.transition(tex, 0x40 | 0x80, None, |_, _, _, _| recorded = true);
             assert!(
-                hlist.transition(tex, 0x40 | 0x80).is_none(),
+                !recorded,
                 "texture stayed in RENDER_TARGET instead of transitioning to SHADER_RESOURCE"
             );
 

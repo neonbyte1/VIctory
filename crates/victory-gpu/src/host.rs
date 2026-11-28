@@ -935,9 +935,12 @@ pub(crate) mod tests {
         );
         let list = host.new_list().unwrap();
         // Record RENDER_TARGET (0x4) -> COPY_SOURCE (0x800) inside `list`.
-        assert!(list.transition(tex, 0x4).is_none());
-        let (host_tex, before) = list.transition(tex, 0x800).unwrap();
-        assert_eq!(before, 0x4);
+        let mut moved = None;
+        list.transition(tex, 0x4, None, |_, _, before, after| moved = Some((before, after)));
+        assert!(moved.is_none());
+        list.transition(tex, 0x800, None, |_, _, before, after| moved = Some((before, after)));
+        assert_eq!(moved, Some((0x4, 0x800)));
+        let host_tex = crate::resource::host_resource(tex).unwrap();
         // SAFETY: open list and live texture.
         unsafe {
             list.list.ResourceBarrier(&[transition(

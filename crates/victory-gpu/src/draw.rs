@@ -5062,20 +5062,17 @@ mod depth_tests {
             state.set_table(false, 0, srv);
             crate::list::ensure_state(&list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
             state.ensure_depth_state(&list);
-            assert!(
-                list.transition(depth, unsampled_state).is_none(),
-                "unsampled depth state for {flags:?}"
-            );
+            let mut recorded = false;
+            list.transition(depth, unsampled_state, None, |_, _, _, _| recorded = true);
+            assert!(!recorded, "unsampled depth state for {flags:?}");
             state.tables(&list, &[used], false);
-            assert!(
-                list.transition(depth, shader_state).is_none(),
-                "shader-table state for {flags:?}"
-            );
+            let mut recorded = false;
+            list.transition(depth, shader_state, None, |_, _, _, _| recorded = true);
+            assert!(!recorded, "shader-table state for {flags:?}");
             state.ensure_depth_state(&list);
-            assert!(
-                list.transition(depth, draw_state).is_none(),
-                "depth state for {flags:?}"
-            );
+            let mut recorded = false;
+            list.transition(depth, draw_state, None, |_, _, _, _| recorded = true);
+            assert!(!recorded, "depth state for {flags:?}");
             list.close();
             host.execute(&[&list]);
         }
@@ -5262,6 +5259,7 @@ mod mip_state_tests {
                 inputs: Vec::new(),
                 name: "mip-state-test".into(),
                 marks: None,
+                in_library: false,
             },
             user,
         );
@@ -5317,8 +5315,8 @@ mod mip_state_tests {
                     },
                 },
             };
-            let rt0 = host.rtv(&texture, Some(&rtv_desc(0)));
-            let rt1 = host.rtv(&texture, Some(&rtv_desc(1)));
+            let rt0 = host.rtv(Some(&texture), Some(&rtv_desc(0)));
+            let rt1 = host.rtv(Some(&texture), Some(&rtv_desc(1)));
             // SAFETY: both subresources start in RENDER_TARGET and the views are live.
             unsafe {
                 l.ClearRenderTargetView(rt0, &[1.0, 1.0, 0.0, 1.0], None);

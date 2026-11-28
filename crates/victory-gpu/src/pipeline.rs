@@ -514,6 +514,7 @@ pub(crate) fn not_dispatched(this: This, why: &str) {
 #[cfg(windows)]
 pub fn note_title_dll(file: &str, base: usize, size: usize) {
     builder::note_title_dll(file, base, size);
+}
 
 #[cfg(all(windows, test))]
 pub(crate) fn mip_test_pipeline(
@@ -557,11 +558,12 @@ pub(crate) fn mip_test_pipeline(
     });
     let mut handle = std::ptr::null();
     assert_eq!(
-        hand_out(Vec::new(), None, &PIPELINE_IIDS[0], &mut handle),
+        hand_out(Vec::new(), None, &[], &PIPELINE_IIDS[0], &mut handle),
         crate::object::S_OK
     );
     pipeline(handle).host.set_mip_test_pipeline(native);
-    handle}
+    handle
+}
 
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
