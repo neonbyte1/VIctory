@@ -1836,13 +1836,18 @@ pub(crate) fn copy_back_marks(
             }
         }
     }
+    let mut dropped: Vec<(Arc<Shadow>, usize)> = Vec::new();
     let pages: Vec<(Arc<Shadow>, usize)> = pages
         .into_iter()
         .filter(|(copy, page)| {
             let page = *page;
-            !withheld
+            let out = withheld
                 .iter()
-                .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
+                .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n);
+            if out {
+                dropped.push((copy.clone(), page));
+            }
+            !out
         })
         .collect();
     #[cfg(feature = "diagnostics")]
@@ -1897,6 +1902,17 @@ pub(crate) fn copy_back_marks(
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = back;
+    }
+    // Dropped after the marked copy-backs, as #3099 has it: the page leaves the
+    // copy, so its next refresh re-reads title memory instead of keeping the
+    // copy's bytes, and a page another, non-withheld submission wrote in the
+    // same range still reaches title memory. Before the copy-backs, an
+    // immediate retake on a shared page would mark another copy's page changed
+    // before its own copy-back runs.
+    dropped.sort_unstable_by_key(|(copy, page)| (Arc::as_ptr(copy) as usize, *page));
+    dropped.dedup_by_key(|(copy, page)| (Arc::as_ptr(copy) as usize, *page));
+    for (_, page) in dropped {
+        crate::memory::drop_withheld(page, PAGE);
     }
     #[cfg(feature = "diagnostics")]
     {
