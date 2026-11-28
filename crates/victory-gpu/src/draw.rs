@@ -2327,7 +2327,7 @@ mod tests {
         let entry = |root, dword| victory_shader::emit::UserData { index: 0, slot: 0, root, dword };
         assert!(is_root_view_offset(&entry(RootType::Descriptor, victory_shader::emit::ROOT_VIEW_OFFSET)));
         assert!(!is_root_view_offset(&entry(RootType::Constants, victory_shader::emit::ROOT_VIEW_OFFSET)));
-        assert!(!is_view_offset(&entry(RootType::Descriptor, 0)));
+        assert!(!is_root_view_offset(&entry(RootType::Descriptor, 0)));
     }
     /// Rectangles expand from title memory at submission; vertices the
     /// title unmapped since the draw was recorded leave the scratch alone.
