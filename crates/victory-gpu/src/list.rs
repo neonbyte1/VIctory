@@ -1092,7 +1092,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
             return;
         }};
     }
-    let (Some(host), Some(copy)) = (crate::host::host(), crate::resource::host_copy(src.resource)) else {
+    let Some(copy) = crate::resource::host_copy(src.resource) else {
         refused!("no host texture");
     };
     let texture = &copy.texture;
@@ -1121,7 +1121,10 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (Some(rows), Some(len)) = (dst.footprint.rows(at, size), dst.footprint.bytes()) else {
         refused!("a region outside its footprint");
     };
-    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
+    let (Some(title), Some((buffer, offset, data))) = (
+        buffer_range(dst.resource, dst.footprint.offset, len),
+        list.readback_space(len),
+    ) else {
         return;
     };
     if crate::texture::title_written(texture) {
@@ -1130,7 +1133,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     ensure_copy_state(list, &copy, src.subresource(), COPY_SOURCE);
     let (mut to, mut from) = (*dst, *src);
     to.resource = buffer.as_raw().cast_const().cast();
-    to.footprint.offset = 0;
+    to.footprint.offset = offset;
     from.resource = texture.as_raw().cast_const().cast();
     #[cfg(feature = "diagnostics")]
     {

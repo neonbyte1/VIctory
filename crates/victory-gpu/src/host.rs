@@ -869,6 +869,152 @@ pub(crate) mod tests {
         eprintln!("PresentX compositor initialized");
     }
 
+    /// Read backs of one list share 512-byte-aligned chunks instead of
+    /// taking a readback buffer each, and the chunks are reused after a
+    /// reset.
+    #[test]
+    fn readback_spaces_share_chunks_and_are_reused() {
+        use windows::core::Interface;
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let (first, at, ptr) = list.readback_space(4 << 10).unwrap();
+        let (second, at2, ptr2) = list.readback_space(4 << 10).unwrap();
+        assert_eq!(first.as_raw(), second.as_raw(), "one chunk for the list's read backs");
+        assert_eq!(at % 512, 0);
+        assert_eq!(at2, at + (4 << 10));
+        assert_eq!(ptr2 as usize - ptr as usize, 4 << 10);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        let (again, at3, _) = list.readback_space(4 << 10).unwrap();
+        assert_eq!((again.as_raw(), at3), (first.as_raw(), at), "reused after reset");
+        list.close();
+    }
+
+    /// A texture read back through the shared chunk: the texels put in the
+    /// texture come back at the chunk's 512-byte-aligned offset. D3D12
+    /// requires that alignment for a placed texture footprint.
+    #[test]
+    fn texture_readback_through_shared_chunks_round_trips_texels() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation into our out pointer.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut texture,
+            )
+        }
+        .expect("texture");
+        let texture = texture.expect("texture");
+        let mut footprint = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 1];
+        let mut rows = [0u32; 1];
+        let mut total = 0u64;
+        // SAFETY: arrays for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(&desc, 0, 1, 0, Some(footprint.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
+        }
+        let f = footprint[0];
+        let (pitch, at) = (f.Footprint.RowPitch as usize, 0usize);
+        let (upload, udata) = host.upload_buffer(total).expect("upload buffer");
+        let mut pattern = [0u8; 64];
+        for y in 0..4 {
+            for x in 0..16 {
+                let v = (1 + y * 16 + x) as u8;
+                pattern[y * 16 + x] = v;
+                // SAFETY: inside the upload buffer.
+                unsafe { *udata.add(at + y * pitch + x) = v };
+            }
+        }
+        let list = host.new_list().unwrap();
+        let sub = |r: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
+        };
+        let placed = |r: &ID3D12Resource, mut p: D3D12_PLACED_SUBRESOURCE_FOOTPRINT, offset: u64| {
+            p.Offset = offset;
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(r) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: p },
+            }
+        };
+        // SAFETY: an open list; the texture is COPY_DEST, the upload buffer
+        // is read-only upload memory.
+        unsafe {
+            list.list.CopyTextureRegion(&sub(&texture, 0), 0, 0, 0, &placed(&upload, f, 0), None);
+            list.list.ResourceBarrier(&[transition(
+                &texture,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        let (readback, rat, rdata) = list.readback_space(total).expect("readback space");
+        let rat = rat as usize;
+        assert_eq!(rat % 512, 0);
+        // SAFETY: the texture is COPY_SOURCE; the readback chunk is
+        // COPY_DEST memory.
+        unsafe {
+            list.list.CopyTextureRegion(&placed(&readback, f, rat as u64), 0, 0, 0, &sub(&texture, 0), None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        for y in 0..4 {
+            for x in 0..16 {
+                // SAFETY: inside the readback chunk, GPU done.
+                let got = unsafe { *rdata.add(rat + y * pitch + x) };
+                assert_eq!(got, pattern[y * 16 + x], "texel row {y} byte {x}");
+            }
+        }
+        list.reset();
+    }
+
+    /// `cargo test --release -p victory-gpu benchmark_readback_spaces -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark: a readback buffer per copy against the shared chunks"]
+    fn benchmark_readback_spaces() {
+        let Some(host) = host() else { return };
+        const N: u32 = 2_000;
+        const BYTES: u64 = 4 << 10;
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = host.mapped_buffer(BYTES, true).unwrap();
+        }
+        let one_each = started.elapsed();
+        let list = host.new_list().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = list.readback_space(BYTES).unwrap();
+        }
+        let shared = started.elapsed();
+        println!(
+            "{N} x {BYTES} B readback spaces: one buffer each {one_each:?}, shared chunks {shared:?}"
+        );
+        list.close();
+        host.execute(&[&list]);
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -1159,10 +1305,13 @@ pub(crate) struct HostList {
     /// Read-back memory for what the list's query resolves write, reused
     /// after a reset.
     readback: Mutex<Readback>,
+    /// Readback memory for texture-to-buffer copies: 512-byte-aligned
+    /// chunks shared by the list's read backs, reused after a reset.
+    readbacks: Mutex<Readbacks>,
     /// Initial and final states of the host subresources this list uses.
-    /// Lists are recorded on many threads and run in submission order,
-    /// so `prelude` reconciles the states at submission. These entries
-    /// also keep the textures alive until the list is reset.
+/// Lists are recorded on many threads and run in submission order,
+/// so `prelude` reconciles the states at submission. These entries
+/// also keep the textures alive until the list is reset.
     states: Mutex<States>,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
@@ -1357,6 +1506,53 @@ struct Readback {
 
 /// 8,192 occlusion results, or 744 of pipeline statistics.
 const READBACK_CHUNK: u64 = 64 << 10;
+
+/// Readback chunks for texture-to-buffer copies, front to back: the
+/// chunks, the one in use and the bytes used in it. A list's read backs
+/// share them, and they are reused after a reset.
+#[derive(Default)]
+struct Readbacks {
+    chunks: Vec<ReadbackChunk>,
+    current: usize,
+    used: u64,
+}
+
+// SAFETY: the chunk pointers are persistent mappings of readback buffers.
+unsafe impl Send for Readbacks {}
+
+struct ReadbackChunk {
+    buffer: ID3D12Resource,
+    mapped: usize,
+    capacity: u64,
+}
+
+impl Readbacks {
+    /// `len` bytes (512-byte aligned, at most one chunk) in a readback
+    /// chunk, made on demand: the chunk and the offset in it.
+    fn allocate(&mut self, host: &Host, len: u64) -> Option<(usize, u64)> {
+        let len = len.max(1).checked_next_multiple_of(512)?;
+        if len > SCRATCH_CHUNK {
+            return None;
+        }
+        while let Some(chunk) = self.chunks.get(self.current) {
+            if len <= chunk.capacity - self.used {
+                break;
+            }
+            (self.current, self.used) = (self.current + 1, 0);
+        }
+        if self.current == self.chunks.len() {
+            let next = self.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
+            let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
+            let (buffer, data) = host.mapped_buffer(capacity, true)?;
+            name(&buffer, || format!("list readback chunk {capacity:#x}"));
+            self.chunks.push(ReadbackChunk { buffer, mapped: data as usize, capacity });
+            self.used = 0;
+        }
+        let at = self.used;
+        self.used += len;
+        Some((self.current, at))
+    }
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -1575,6 +1771,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 readback: Mutex::default(),
+                readbacks: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
@@ -2457,6 +2654,10 @@ impl HostList {
             let mut readback = self.readback.lock().unwrap_or_else(|e| e.into_inner());
             (readback.current, readback.used) = (0, 0);
         }
+        {
+            let mut readbacks = self.readbacks.lock().unwrap_or_else(|e| e.into_inner());
+            (readbacks.current, readbacks.used) = (0, 0);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -2920,15 +3121,6 @@ impl HostList {
         Some((buffer, data))
     }
 
-    /// A mapped readback buffer of `size` bytes, alive until the list is
-    /// reset.
-    pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.mapped_buffer(size, true)?;
-        name(&buffer, || format!("list readback {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
-        Some((buffer, data))
-    }
-
     /// `len` bytes of read-back memory (8-byte aligned) until the list is
     /// reset, for what its query resolves write: the buffer, the offset in
     /// it and the CPU pointer, read once the list has run. The buffers are
@@ -2957,6 +3149,31 @@ impl HostList {
         let result = (buffer.clone(), r.used, (mapped + r.used as usize) as *const u8);
         r.used += len;
         Some(result)
+    }
+
+    /// `len` bytes of 512-byte-aligned readback memory for a
+    /// texture-to-buffer copy: the buffer, its offset in it and the CPU
+    /// pointer there. Read backs of one list share the chunks, and the
+    /// chunks are reused after a reset.
+    pub(crate) fn readback_space(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let host = host()?;
+        let len = len.max(1).checked_next_multiple_of(512)?;
+        if len > SCRATCH_CHUNK {
+            let (buffer, data) = host.mapped_buffer(len, true)?;
+            name(&buffer, || format!("list readback {len:#x}"));
+            // A copy larger than a chunk gets a buffer of its own, alive
+            // until the list is reset.
+            self.deferred().uploads.push(buffer.clone());
+            return Some((buffer, 0, data));
+        }
+        let mut s = self.readbacks.lock().unwrap_or_else(|e| e.into_inner());
+        let (chunk, at) = s.allocate(host, len)?;
+        let chunk = &s.chunks[chunk];
+        Some((
+            chunk.buffer.clone(),
+            at,
+            (chunk.mapped + at as usize) as *mut u8,
+        ))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
