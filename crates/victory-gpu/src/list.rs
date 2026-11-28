@@ -843,7 +843,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(&to.texture, &from.texture) };
+            list.crumbed(crate::host::Crumb::Copy, Some("copy resource"), || unsafe {
+                list.list.CopyResource(&to.texture, &from.texture)
+            });
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -1049,7 +1051,7 @@ extern "system" fn copy_texture_region(
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
-        unsafe {
+        list.crumbed(crate::host::Crumb::Copy, Some("texture copy"), || unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
                 x,
@@ -1058,7 +1060,7 @@ extern "system" fn copy_texture_region(
                 (&raw const from).cast(),
                 host_box,
             )
-        };
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -1219,7 +1221,8 @@ extern "system" fn resolve(
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
-        unsafe {            let format = DXGI_FORMAT(format as i32);
+        list.crumbed(crate::host::Crumb::Resolve, Some("resolve"), || unsafe {
+            let format = DXGI_FORMAT(format as i32);
             if let Some(rect) = resolve_region(to.texture.GetDesc(), dst_sub, from.texture.GetDesc(), src_sub) {
                 if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                     // The console clips a larger source to the destination.
@@ -1237,8 +1240,9 @@ extern "system" fn resolve(
                 }
             } else {
                 list.list
-                    .ResolveSubresource(&to.texture, dst_sub, &from.texture, src_sub, format);            }
-        }
+                    .ResolveSubresource(&to.texture, dst_sub, &from.texture, src_sub, format);
+            }
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
@@ -1315,9 +1319,9 @@ extern "system" fn clear_rtv(
         ensure_copy_state(list, &copy, subresource, RENDER_TARGET);
         let rtv = host.rtv(Some(&copy.texture), desc.as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
-            list.list.ClearRenderTargetView(rtv, color, rects);
-        }
+        list.crumbed(crate::host::Crumb::Clear, Some("render target clear"), || unsafe {
+            list.list.ClearRenderTargetView(rtv, color, rects)
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
@@ -1355,10 +1359,10 @@ extern "system" fn clear_dsv(
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
+        list.crumbed(crate::host::Crumb::Clear, Some("depth clear"), || unsafe {
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
-        };
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
