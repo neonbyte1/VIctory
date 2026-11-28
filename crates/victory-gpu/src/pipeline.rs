@@ -628,7 +628,7 @@ pub(crate) fn take_waited_ms() -> f64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(feature = "diagnostics", any(windows, test)))]
+#[cfg(any(windows, test))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -648,7 +648,17 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The hashes the user asked to drop (`VICTORY_SKIP_PIPELINES`, a
+/// comma-separated list of shader hashes), read once.
+///
+/// The switch answers one question - "is the device removal (or the wrong
+/// picture) this shader?" - and that question is asked of the build that
+/// removes it, which is a release build without the diagnostics feature: a
+/// diagnostics build takes the removal away on the machines seen so far (a
+/// slower frame never reaches the TDR). So this and `skipped_shader` are
+/// here in every build; only the reporting around them (`note_drop`,
+/// `dropped`, `shaders_of`) is diagnostics.
+#[cfg(windows)]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
@@ -657,7 +667,7 @@ fn skip_hashes() -> &'static [String] {
     })
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
@@ -668,9 +678,8 @@ fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && pipeline(this).host.skipped_shader.is_some()
+    !this.is_null() && skipped_shader(&pipeline(this).shaders, skip_hashes()).is_some()
 }
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).
