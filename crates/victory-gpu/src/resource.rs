@@ -1474,7 +1474,10 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let host = crate::host::host()?;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // The console allows a clear value on any texture; the host only on
+    // render targets and depth buffers, and refuses creation otherwise
+    // (E_INVALIDARG): drop it there.
+    let clear_value = (!clear.is_null() && d.flags & (USES & !UNORDERED) != 0).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -5428,6 +5431,38 @@ pub(crate) mod tests {
             let host = host_desc(&texture(28)).unwrap();
             assert_eq!(host.flags & UNORDERED, UNORDERED, "28 keeps the flag");
         }
+    }
+
+    /// The console lets a title set a clear value on any texture; PC D3D12
+    /// refuses one when the host flags name neither render target nor depth
+    /// (`CreateCommittedResource` answers E_INVALIDARG). The host copy drops
+    /// the clear value there instead of failing.
+    #[cfg(windows)]
+    #[test]
+    fn a_clear_value_on_a_plain_texture_does_not_break_creation() {
+        if crate::host::host().is_none() {
+            eprintln!("skipping: no D3D12 device");
+            return;
+        }
+        let d = ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        // The format word first, then the colour.
+        let clear = [28u32, 0, 0, 0, 0];
+        assert!(
+            make_texture(&d, 0, clear.as_ptr().cast()).is_some(),
+            "a plain texture with a clear value has no host texture"
+        );
     }
 }
 
