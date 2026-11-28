@@ -825,7 +825,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if is_view_offset(u) => {
+                        None if is_root_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
                                 Some(&Root::View(address)) => crate::shadow::find(address, 1)
@@ -2192,17 +2192,15 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
-/// A user-data entry that takes where a root view's address lies in the
-/// copy its view shows (not a dword of a root constants parameter).
-fn is_view_offset(u: &victory_shader::emit::UserData) -> bool {
-    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
-}
-/// The host address of `heap`'s view-address table, which the list keeps
-/// until it is reset: the title may release the heap while the GPU still
-/// reads it.
 /// A user-data entry that takes the heap index of a root view's view.
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
+}
+
+/// Whether `u` is a root view's offset in the copy its view shows: a root
+/// descriptor's dword 4. A root constant's dword 4 is a value.
+fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
 }
 
 /// Whether a shader reads root views through views the host makes.
@@ -2393,6 +2391,21 @@ mod tests {
             ..view
         };
         assert_eq!(rectangle_vertex_bounds(wide, 3, 0), None);
+    }
+    /// A root constant's dword 4 is a value: only a root descriptor's dword
+    /// 4 names its view's offset.
+    #[test]
+    fn only_a_root_descriptors_dword_four_is_a_view_offset() {
+        let u = |root, dword| victory_shader::emit::UserData {
+            index: 0,
+            slot: 0,
+            root,
+            dword,
+        };
+        let offset = victory_shader::emit::ROOT_VIEW_OFFSET;
+        assert!(is_root_view_offset(&u(RootType::Descriptor, offset)));
+        assert!(!is_root_view_offset(&u(RootType::Constants, offset)));
+        assert!(!is_root_view_offset(&u(RootType::Table, offset)));
     }
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
