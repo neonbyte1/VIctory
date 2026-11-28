@@ -1988,7 +1988,8 @@ pub(crate) fn evict_unused() {
     if EVICTED_AT.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+    let memory = crate::host::video_memory();
+    let over = memory.map_or(0, |[(used, budget), _]| {
         // The copies' room in video memory for the frame (`crate::vram_fit`).
         crate::vram_fit::frame(used, budget);
         // Free space in the heaps of textures takes the card's memory but
@@ -2001,6 +2002,37 @@ pub(crate) fn evict_unused() {
         }
     });
     evict(frame, now_ms(), over);
+    if let Some([(_, budget), _]) = memory
+        && let Some(heaps) = crate::placement::drain_heaps(budget)
+    {
+        drain(&heaps, frame);
+    }
+}
+
+/// `VICTORY_HEAP_DRAIN`: gives up, least recently used first, up to
+/// [`crate::vram_fit::DRAIN_PER_FRAME`] bytes of the textures that may be
+/// given up ([`evictable`]) in the heaps of textures `heaps`
+/// (`crate::placement::drain_heaps`), but none the title used this frame.
+/// The next use makes each again, in a fuller heap.
+#[cfg(windows)]
+fn drain(heaps: &std::collections::HashSet<u64>, frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut chosen: Vec<Owned> = candidates()
+        .into_iter()
+        .filter(|(t, _)| {
+            t.placement.is_some_and(|p| heaps.contains(&p.heap_id()))
+                && t.last[0].load(Relaxed) != frame
+        })
+        .collect();
+    chosen.sort_by_key(|(t, _)| t.last[1].load(Relaxed));
+    let mut bytes = 0;
+    chosen.retain(|(t, _)| {
+        bytes += t.bytes;
+        bytes <= crate::vram_fit::DRAIN_PER_FRAME
+    });
+    let (n, given) = give_up(&chosen, frame);
+    crate::placement::DRAINED[0].fetch_add(n, Relaxed);
+    crate::placement::DRAINED[1].fetch_add(given, Relaxed);
 }
 
 /// A host texture and the title textures (resource objects) holding it.

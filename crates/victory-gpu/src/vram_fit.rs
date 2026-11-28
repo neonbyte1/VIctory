@@ -32,6 +32,27 @@ pub(crate) fn on() -> bool {
     *ON
 }
 
+/// `VICTORY_HEAP_DRAIN=1` (read once): while the heaps of textures hold
+/// more free space than 2 % of the card's budget, the textures in heaps
+/// under a quarter full are given up, up to [`DRAIN_PER_FRAME`] bytes a
+/// presented frame (`crate::resource::evict_unused`), and made again at
+/// their next use in fuller heaps: the load's textures go at the world's
+/// start and leave a few each in every heap (fork issue #15, Vram.md §6).
+pub(crate) fn drain() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        let on = crate::switch::on("VICTORY_HEAP_DRAIN");
+        tracing::info!(
+            on,
+            "heaps of textures drained when sparse (VICTORY_HEAP_DRAIN)"
+        );
+        on
+    });
+    *ON
+}
+
+/// Bytes of textures given up a presented frame to drain heaps.
+pub(crate) const DRAIN_PER_FRAME: u64 = 32 << 20;
+
 /// Share of the card's budget host copies may fill it up to.
 pub(crate) const TARGET: f64 = 0.85;
 

@@ -36,12 +36,29 @@ pub(crate) struct Placement {
     size: u64,
 }
 
-/// A heap and its free ranges (offset → bytes).
+/// A heap, its free ranges (offset → bytes) and the ranges handed out
+/// (offset → bytes and the presented frame they were placed in, freed or
+/// not: given back only once nothing holds their texture).
 struct Heap {
     heap: ID3D12Heap,
     id: u64,
     free: BTreeMap<u64, u64>,
+    placed: BTreeMap<u64, (u64, u64)>,
+    /// Under a quarter full while the heaps hold too much free space
+    /// ([`drain_heaps`]): new textures go elsewhere if they can, and the
+    /// ones in it are given up.
+    draining: bool,
 }
+
+impl Heap {
+    fn used(&self) -> u64 {
+        heap_bytes() - self.free.values().sum::<u64>()
+    }
+}
+
+/// Heaps made and released (diagnostics, [`log`]).
+static HEAPS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HEAPS_RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Default)]
 struct Heaps {
@@ -112,6 +129,7 @@ impl Heaps {
                 let (_, p) = self.pending.swap_remove(i);
                 if let Some(h) = self.heaps.iter_mut().find(|h| h.id == p.heap) {
                     give(&mut h.free, p.offset, p.size);
+                    h.placed.remove(&p.offset);
                 }
             } else {
                 i += 1;
@@ -124,7 +142,11 @@ impl Heaps {
                 return true;
             }
             spare += 1;
-            spare <= SPARE
+            let keep = spare <= SPARE;
+            if !keep {
+                HEAPS_RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            keep
         });
     }
 
@@ -135,16 +157,28 @@ impl Heaps {
         size: u64,
         align: u64,
     ) -> Option<(ID3D12Heap, Placement)> {
-        // With the switch, the fullest heap that fits first: a long-lived
-        // texture then keeps a heap that is full anyway, and sparse heaps
-        // empty out and are released.
+        // With `VICTORY_VRAM_FIT`, the fullest heap that fits first: a
+        // long-lived texture then keeps a heap that is full anyway, and
+        // sparse heaps empty out and are released. Heaps being drained
+        // last ([`drain_heaps`]).
         let mut order: Vec<usize> = (0..self.heaps.len()).collect();
-        if crate::vram_fit::on() {
-            order.sort_by_key(|&i| self.heaps[i].free.values().sum::<u64>());
-        }
+        let fullest = crate::vram_fit::on();
+        order.sort_by_key(|&i| {
+            let h = &self.heaps[i];
+            (
+                h.draining,
+                if fullest {
+                    h.free.values().sum::<u64>()
+                } else {
+                    0
+                },
+            )
+        });
+        let frame = crate::queue::presented();
         for i in order {
             let h = &mut self.heaps[i];
             if let Some(offset) = take(&mut h.free, size, align) {
+                h.placed.insert(offset, (size, frame));
                 return Some((
                     h.heap.clone(),
                     Placement {
@@ -174,10 +208,13 @@ impl Heaps {
         let mut free = BTreeMap::new();
         free.insert(0, heap_bytes());
         let offset = take(&mut free, size, align)?;
+        HEAPS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.heaps.push(Heap {
             heap: heap.clone(),
             id,
             free,
+            placed: BTreeMap::from([(offset, (size, frame))]),
+            draining: false,
         });
         Some((
             heap,
@@ -231,6 +268,7 @@ pub(crate) fn unplace(p: Placement) {
         .and_then(|hs| hs.heaps.iter_mut().find(|h| h.id == p.heap))
     {
         give(&mut h.free, p.offset, p.size);
+        h.placed.remove(&p.offset);
     }
 }
 
@@ -269,10 +307,122 @@ pub(crate) fn stats() -> (usize, u64, u64) {
     )
 }
 
+/// Share of the card's budget the heaps may hold free before sparse heaps
+/// drain ([`drain_heaps`]).
+const DRAIN_FREE: f64 = 0.02;
+
+/// With `VICTORY_HEAP_DRAIN=1` and more free space in the heaps than
+/// [`DRAIN_FREE`] of the card's budget (`budget_mb`): the heaps under a
+/// quarter full are marked draining, and their ids returned (their
+/// textures are given up, `crate::resource`). Otherwise none drains.
+pub(crate) fn drain_heaps(budget_mb: f64) -> Option<std::collections::HashSet<u64>> {
+    let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let h = heaps.as_mut()?;
+    h.reap();
+    let free: u64 = h.heaps.iter().flat_map(|h| h.free.values()).sum();
+    let over = crate::vram_fit::drain() && free as f64 > budget_mb * 1e6 * DRAIN_FREE;
+    let ids = h.mark_draining(over);
+    (!ids.is_empty()).then_some(ids)
+}
+
+impl Heaps {
+    /// With `over`, the heaps holding something but under a quarter full
+    /// drain (their ids); without, none does.
+    fn mark_draining(&mut self, over: bool) -> std::collections::HashSet<u64> {
+        let mut ids = std::collections::HashSet::new();
+        for heap in &mut self.heaps {
+            let used = heap.used();
+            heap.draining = over && used > 0 && used * 4 < heap_bytes();
+            if heap.draining {
+                ids.insert(heap.id);
+            }
+        }
+        ids
+    }
+}
+
+/// Textures given up to drain heaps, and their bytes (diagnostics).
+pub(crate) static DRAINED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The heaps line, with the frame-rate statistics: heaps by how full they
+/// are and the free space in each class; what pins the heaps under a
+/// quarter full (textures still ours, by how many frames ago they were
+/// placed; ranges let go of but held elsewhere); heaps made and released,
+/// and textures drained, per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let frame = crate::queue::presented();
+    let mut fill = [(0usize, 0u64); 4];
+    let (mut ages, mut live_bytes, mut held, mut held_bytes) = (Vec::new(), 0u64, 0usize, 0u64);
+    {
+        let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(h) = heaps.as_mut() else { return };
+        h.reap();
+        let pending: std::collections::HashSet<(u64, u64)> =
+            h.pending.iter().map(|(_, p)| (p.heap, p.offset)).collect();
+        for heap in &h.heaps {
+            let used = heap.used();
+            let class = ((used * 4) / heap_bytes()).min(3) as usize;
+            fill[class].0 += 1;
+            fill[class].1 += heap_bytes() - used;
+            if class > 0 {
+                continue;
+            }
+            for (offset, &(size, made)) in &heap.placed {
+                if pending.contains(&(heap.id, *offset)) {
+                    held += 1;
+                    held_bytes += size;
+                } else {
+                    ages.push(frame.saturating_sub(made));
+                    live_bytes += size;
+                }
+            }
+        }
+    }
+    ages.sort_unstable();
+    let at = |q: usize| ages.get(ages.len() * q / 100).copied().unwrap_or(0);
+    let per = |n: u64| n as f64 / frames.max(1.0);
+    let mb = |b: u64| b as f64 / 1e6;
+    let (made, released) = (HEAPS_MADE.swap(0, Relaxed), HEAPS_RELEASED.swap(0, Relaxed));
+    let drained = [DRAINED[0].swap(0, Relaxed), DRAINED[1].swap(0, Relaxed)];
+    tracing::info!(
+        "heaps of textures by fill: under 25 % {} ({:.0} MB free), 25-50 % {} ({:.0} MB), 50-75 % {} ({:.0} MB), \
+         75 % and over {} ({:.0} MB); pinning those under 25 %: {} textures of ours ({:.0} MB, placed {} / {} frames ago, \
+         median / 90th percentile), {} let go of and held elsewhere ({:.0} MB); heaps made {:.2}, released {:.2} per frame; \
+         drained (VICTORY_HEAP_DRAIN={}) {:.1} textures ({:.1} MB) per frame",
+        fill[0].0,
+        mb(fill[0].1),
+        fill[1].0,
+        mb(fill[1].1),
+        fill[2].0,
+        mb(fill[2].1),
+        fill[3].0,
+        mb(fill[3].1),
+        ages.len(),
+        mb(live_bytes),
+        at(50),
+        at(90),
+        held,
+        mb(held_bytes),
+        per(made),
+        per(released),
+        u8::from(crate::vram_fit::drain()),
+        per(drained[0]),
+        mb(drained[1]) / frames.max(1.0),
+    );
+}
+
 impl Placement {
     /// Its offset in its heap.
     pub(crate) fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Its heap's id ([`drain_heaps`]).
+    pub(crate) fn heap_id(&self) -> u64 {
+        self.heap
     }
 }
 
@@ -327,6 +477,29 @@ mod tests {
         heaps.reap();
         let (_, c) = heaps.allocate(&host.device, ALIGN, ALIGN).unwrap();
         assert_eq!(c, a, "nothing holds it: free again");
+    }
+
+    /// A heap holding little drains while there is too much free space:
+    /// it is marked, and new ranges go to a heap that does not drain while
+    /// one has room; without too much free space nothing drains.
+    #[test]
+    fn sparse_heaps_drain_and_new_ranges_avoid_them() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let mut heaps = Heaps::default();
+        // A whole heap, then two fifths of it given back: 60 % full.
+        let (_, big) = heaps.allocate(&host.device, heap_bytes(), ALIGN).unwrap();
+        give(&mut heaps.heaps[0].free, 0, heap_bytes() / 5 * 2);
+        // A little in a second heap.
+        let (_, small) = heaps.allocate(&host.device, ALIGN, ALIGN).unwrap();
+        assert_ne!(small.heap, big.heap);
+        let ids = heaps.mark_draining(true);
+        assert_eq!(ids, [small.heap].into(), "under a quarter full: drains");
+        let (_, next) = heaps.allocate(&host.device, ALIGN, ALIGN).unwrap();
+        assert_eq!(next.heap, big.heap, "new ranges avoid the heap draining");
+        assert!(heaps.mark_draining(false).is_empty());
+        assert!(heaps.heaps.iter().all(|h| !h.draining));
     }
 
     #[test]
