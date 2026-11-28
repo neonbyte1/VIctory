@@ -201,6 +201,10 @@ pub(crate) enum C {
     ClampIndirectDispatchesAlone,
     IndirectPlain,
     IndirectSpreadSignature,
+    /// Spreading programs' indirect dispatches run lean instead
+    /// (`VICTORY_INDIRECT_PLAIN=lean`: the plain signature, then the spread
+    /// one under the clamp's predicate).
+    IndirectLean,
     /// Copying back marked pages (`crate::shadow::copy_back_marks`): rounds
     /// of the guard lock and protection changes the copy-back made; runs
     /// gone back in one lease and their pages; byte runs and bytes written;
@@ -625,7 +629,7 @@ pub(crate) fn log(frames: f64) {
         c[C::ClampDispatchWindows as usize],
     );
     tracing::info!(
-        "  indirect dispatches per frame (VICTORY_INDIRECT_PLAIN): {in_windows:.0} clamped in {dispatch_windows:.0} windows ({:.1} a window), {:.0} of them with spread groups; {:.0} alone; {:.0} with the plain signature, {:.0} with the spread one",
+        "  indirect dispatches per frame (VICTORY_INDIRECT_PLAIN): {in_windows:.0} clamped in {dispatch_windows:.0} windows ({:.1} a window), {:.0} of them with spread groups; {:.0} alone; {:.0} with the plain signature, {:.0} with the spread one, {:.0} lean (plain, then spread under a predicate)",
         if dispatch_windows > 0.0 {
             in_windows / dispatch_windows
         } else {
@@ -635,6 +639,7 @@ pub(crate) fn log(frames: f64) {
         c[C::ClampIndirectDispatchesAlone as usize],
         c[C::IndirectPlain as usize],
         c[C::IndirectSpreadSignature as usize],
+        c[C::IndirectLean as usize],
     );
     let snapshots = crate::shadow::idle_snapshot_bytes();
     let textures = crate::texture::cached_staging_bytes();

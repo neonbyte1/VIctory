@@ -432,16 +432,91 @@ fn groups_run([x, y, z]: [u32; 3]) -> (usize, usize, u32) {
     }
 }
 
+/// How a spread indirect dispatch runs in [`check_spread_modes`]: name,
+/// whether the program reads the dispatch record, clamp windows,
+/// `VICTORY_INDIRECT_PLAIN`, and whether a plain `DISPATCH` signature runs
+/// (`1`, `lean`).
+type SpreadMode = (&'static str, bool, bool, crate::indirect::Plain, bool);
+
 /// An indirect dispatch of a program that spreads its groups sees the same
 /// spread words and runs the same groups with `VICTORY_INDIRECT_PLAIN` off,
-/// `window` and `1`, with and without clamp windows: the spread signature's
-/// root constants and the plain signature's dispatch record are the same
-/// two words of the same clamped record. Zero and oversized group counts
-/// included: past 65,535 in x (spread over z), past 65,535 in y or z
-/// (bounded), past 2^20 groups (none run).
+/// `window`, `1` and `lean`, with and without clamp windows: the spread
+/// signature's root constants and the plain signature's dispatch record
+/// are the same two words of the same clamped record, and lean runs each
+/// record through exactly one of its two executions. Zero and oversized
+/// group counts included: past 65,535 in x (spread over z), past 65,535 in
+/// y or z (bounded), past 2^20 groups (none run).
 #[test]
 fn indirect_dispatch_runs_the_same_groups_in_every_plain_mode() {
-    use crate::indirect::{Plain, TEST_SWITCHES};
+    use crate::indirect::Plain;
+    let modes = [
+        ("off", false, false, Plain::Off, false),
+        ("off, windows", false, true, Plain::Off, false),
+        ("window, windows", false, true, Plain::Window, false),
+        ("1", true, false, Plain::Signature, true),
+        ("1, windows", true, true, Plain::Signature, true),
+        (
+            "record program, spread signature",
+            true,
+            true,
+            Plain::Window,
+            false,
+        ),
+        ("record program, off", true, false, Plain::Off, false),
+        ("lean", false, false, Plain::Lean, true),
+        ("lean, windows", false, true, Plain::Lean, true),
+    ];
+    let cases = [
+        [3, 2, 1],
+        [2, 3, 2],
+        [0, 1, 1],
+        [5, 0, 1],
+        [5, 1, 0],
+        [65_535, 1, 1],
+        [65_536, 1, 1],
+        [65_537, 1, 1],
+        [70_000, 2, 1],
+        [65_537, 0, 1],
+        [65_537, 1, 2],
+        [7, 70_000, 1],
+        [65_535, 16, 1],
+        [65_535, 17, 1],
+        [70_000, 131_072, 1],
+        [(1 << 20) + 1, 1, 1],
+        [u32::MAX, 1, 1],
+    ];
+    check_spread_modes(&cases, &modes);
+}
+
+/// The lean form's boundary (andrewpozdnakov7-jpg's probe on
+/// fxceless/victory-fork#1352, here on the host GPU): every group ID once
+/// at 65,535, 65,536 and 65,537 groups in x, where lean switches from the
+/// plain execution to the predicated spread one, and with two z slices
+/// (`65,537 x 1 x 2`: not spread, bounded to 65,535 per slice), against
+/// the spread signature for every record.
+#[test]
+fn lean_runs_each_group_once_at_the_65535_boundary() {
+    use crate::indirect::Plain;
+    let modes = [
+        ("off", false, false, Plain::Off, false),
+        ("lean", false, false, Plain::Lean, true),
+    ];
+    let cases = [
+        [65_535, 1, 1],
+        [65_536, 1, 1],
+        [65_537, 1, 1],
+        [65_535, 1, 2],
+        [65_536, 1, 2],
+        [65_537, 1, 2],
+    ];
+    check_spread_modes(&cases, &modes);
+}
+
+/// Runs each record of `cases` as one indirect dispatch of [`group_writer`]
+/// in each of `modes`, through `crate::draw` end to end, and checks every
+/// group slot against [`groups_run`].
+fn check_spread_modes(cases: &[[u32; 3]], modes: &[SpreadMode]) {
+    use crate::indirect::TEST_SWITCHES;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
 
     let Some(host) = crate::host::host() else {
@@ -489,45 +564,9 @@ fn indirect_dispatch_runs_the_same_groups_in_every_plain_mode() {
         .unwrap()
         .0
         .cast::<[u32; 3]>();
-    // (name, the program reads the dispatch record, windows, mode, the
-    // plain signature runs).
-    let modes = [
-        ("off", false, false, Plain::Off, false),
-        ("off, windows", false, true, Plain::Off, false),
-        ("window, windows", false, true, Plain::Window, false),
-        ("1", true, false, Plain::Signature, true),
-        ("1, windows", true, true, Plain::Signature, true),
-        (
-            "record program, spread signature",
-            true,
-            true,
-            Plain::Window,
-            false,
-        ),
-        ("record program, off", true, false, Plain::Off, false),
-    ];
-    let cases = [
-        [3, 2, 1],
-        [2, 3, 2],
-        [0, 1, 1],
-        [5, 0, 1],
-        [5, 1, 0],
-        [65_535, 1, 1],
-        [65_536, 1, 1],
-        [65_537, 1, 1],
-        [70_000, 2, 1],
-        [65_537, 0, 1],
-        [65_537, 1, 2],
-        [7, 70_000, 1],
-        [65_535, 16, 1],
-        [65_535, 17, 1],
-        [70_000, 131_072, 1],
-        [(1 << 20) + 1, 1, 1],
-        [u32::MAX, 1, 1],
-    ];
-    for requested in cases {
+    for &requested in cases {
         let (xs, zs, count) = groups_run(requested);
-        for (name, record, windows, mode, plain) in modes {
+        for &(name, record, windows, mode, plain) in modes {
             // Direct too, for the program reading the record (its root
             // view names our buffer then), where a direct dispatch runs
             // the indirect one's groups (no 2^20 bound there).

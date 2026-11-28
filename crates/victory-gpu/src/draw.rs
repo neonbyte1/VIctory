@@ -2270,6 +2270,18 @@ impl State {
             None
         };
         let is_spread = spread.is_some();
+        // Lean (`VICTORY_INDIRECT_PLAIN=lean`, grosterr's form): one record
+        // of a spreading program runs through the plain `DISPATCH`
+        // signature at the groups the clamp leaves it (none past 65,535 in
+        // x; its spread words are 0 from `bind`), then through the spread
+        // signature under the clamp's predicate (set only past 65,535).
+        let lean = (kind == DISPATCH
+            && is_spread
+            && !plain
+            && max == 1
+            && crate::indirect::plain() == crate::indirect::Plain::Lean)
+            .then(|| host_signature(DISPATCH, 12))
+            .flatten();
         let Some(signature) = spread.or_else(|| {
             matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
                 .then(|| host_signature(kind, stride))
@@ -2360,7 +2372,11 @@ impl State {
                 crate::indirect::gaps_on(),
                 kind == DISPATCH,
                 stores,
-                is_spread && crate::indirect::plain() == crate::indirect::Plain::Off,
+                is_spread
+                    && matches!(
+                        crate::indirect::plain(),
+                        crate::indirect::Plain::Off | crate::indirect::Plain::Lean
+                    ),
             );
             let joins = alone.is_none();
             let window = joins
@@ -2405,8 +2421,12 @@ impl State {
                         }
                     }
                     // Bounded first: the clamp binds a compute pipeline of its own.
-                    let Some(clamped) = crate::indirect::bound(list, args_gpu, spec, is_spread)
-                    else {
+                    let clamped = if lean.is_some() {
+                        crate::indirect::bound_lean(list, args_gpu, spec)
+                    } else {
+                        crate::indirect::bound(list, args_gpu, spec, is_spread)
+                    };
+                    let Some(clamped) = clamped else {
                         why("not bounded (no clamp, or arguments not 4-byte aligned)");
                         return false;
                     };
@@ -2475,26 +2495,53 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if plain {
             crate::copystat::add(crate::copystat::C::IndirectPlain, 1);
+        } else if lean.is_some() {
+            crate::copystat::add(crate::copystat::C::IndirectLean, 1);
         } else if is_spread {
             crate::copystat::add(crate::copystat::C::IndirectSpreadSignature, 1);
         }
         // The plain signature reads the groups after the spread words.
         let groups_at = clamped_at + if plain { 8 } else { 0 };
         #[cfg(test)]
-        if plain {
+        if plain || lean.is_some() {
             PLAIN_DISPATCHES.set(PLAIN_DISPATCHES.get() + 1);
         }
+        let count_buffer = counter.as_ref().map(|(s, _)| &s.buffer);
+        let count_at = counter.as_ref().map_or(0, |(s, at)| s.offset(*at));
         // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // copies the list keeps alive (refresh), the signatures are cached.
+        // Lean: the clamp left the record in `INDIRECT_ARGUMENT`, which is
+        // also the predication state; predication is off again before
+        // anything else is recorded (no title predication reaches the host).
         list.crumbed(Crumb::Indirect, None, || unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &clamped,
-                groups_at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            if let Some(lean) = &lean {
+                use crate::indirect::{LEAN_PREDICATE, LEAN_SPREAD};
+                let l = &list.list;
+                l.ExecuteIndirect(lean, max, &clamped, clamped_at, count_buffer, count_at);
+                l.SetPredication(
+                    &clamped,
+                    clamped_at + LEAN_PREDICATE,
+                    D3D12_PREDICATION_OP_EQUAL_ZERO,
+                );
+                l.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &clamped,
+                    clamped_at + LEAN_SPREAD,
+                    count_buffer,
+                    count_at,
+                );
+                l.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            } else {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &clamped,
+                    groups_at,
+                    count_buffer,
+                    count_at,
+                )
+            }
         });
         // A listed frame, or any frame for a traced shader: what the records
         // held (after the clamp).
@@ -2505,7 +2552,13 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                let (record_stride, prefix) = if is_spread { (20, 8) } else { (stride, 0) };
+                let (record_stride, prefix) = if lean.is_some() {
+                    (crate::indirect::LEAN_RECORD, 0)
+                } else if is_spread {
+                    (20, 8)
+                } else {
+                    (stride, 0)
+                };
                 crate::capture::read_indirect(
                     list,
                     (&clamped, clamped_at),

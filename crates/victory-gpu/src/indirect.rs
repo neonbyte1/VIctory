@@ -101,7 +101,28 @@ uint clamped(uint at, uint record) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        if (spread != 0) {
+        if (spread == 2) {
+            // Lean (`bound_lean`), 12 words a record: the groups for the
+            // plain signature (none if spread), a 64-bit predicate (1 if
+            // spread), then the spread record (empty if not spread).
+            uint base = record * 12;
+            if (row != 0) {
+                store3(base, uint3(0, 0, 0));
+                dest[base + 4] = 1;
+                dest[base + 6] = row;
+                dest[base + 7] = asked;
+                store3(base + 8, g);
+            } else {
+                store3(base, g);
+                dest[base + 4] = 0;
+                dest[base + 6] = 0;
+                dest[base + 7] = 0;
+                store3(base + 8, uint3(0, 0, 0));
+            }
+            dest[base + 3] = 0;
+            dest[base + 5] = 0;
+            dest[base + 11] = 0;
+        } else if (spread != 0) {
             dest[record * 5] = row;
             dest[record * 5 + 1] = asked;
             store3(record * 5 + 2, g);
@@ -152,7 +173,10 @@ void main(uint lane : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
-            if (spread != 0 && record < records) {
+            if (spread == 2 && record < records) {
+                store3(record * 12, uint3(0, 0, 0));
+                store3(record * 12 + 8, uint3(0, 0, 0));
+            } else if (spread != 0 && record < records) {
                 store3(record * 5 + 2, uint3(0, 0, 0));
             } else {
                 dest[at] = 0;
@@ -745,8 +769,45 @@ pub(crate) fn hoist(
 pub(crate) fn bound(
     list: &HostList,
     gpu: u64,
-    (kind, stride, records): (u32, u32, u32),
+    spec: (u32, u32, u32),
     spread: bool,
+) -> Option<ID3D12Resource> {
+    bound_as(list, gpu, spec, u32::from(spread))
+}
+
+/// Bytes of a lean record ([`bound_lean`]): the groups for the plain
+/// signature (12 and 4 empty), the 64-bit predicate (at [`LEAN_PREDICATE`]),
+/// the spread record (at [`LEAN_SPREAD`], 20) and 4 empty.
+pub(crate) const LEAN_RECORD: u32 = 48;
+/// Where in a lean record its predicate lies.
+pub(crate) const LEAN_PREDICATE: u64 = 16;
+/// Where in a lean record its spread record lies.
+pub(crate) const LEAN_SPREAD: u64 = 24;
+
+/// [`bound`] for one spread dispatch record, lean
+/// (`VICTORY_INDIRECT_PLAIN=lean`; grosterr's form, fxceless/victory-fork
+/// cd10ed9): a record within 65,535 groups in x gets its groups for the
+/// plain `DISPATCH` signature and an empty spread record; a record past it
+/// none for the plain signature, its spread record, and a predicate of 1,
+/// under which the caller runs the spread signature. So exactly one of the
+/// two executions runs groups. [`LEAN_RECORD`] bytes a record; the caller
+/// takes it for executions of one record only, so the two executions keep
+/// the records' order.
+pub(crate) fn bound_lean(
+    list: &HostList,
+    gpu: u64,
+    spec: (u32, u32, u32),
+) -> Option<ID3D12Resource> {
+    bound_as(list, gpu, spec, 2)
+}
+
+/// [`bound`] into `layout`: 0 the records' own, 1 the spread layout, 2
+/// lean ([`bound_lean`]).
+fn bound_as(
+    list: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    layout: u32,
 ) -> Option<ID3D12Resource> {
     #[cfg(feature = "diagnostics")]
     note_clamp(list, "clamp", crate::passes::Class::Clamp);
@@ -758,12 +819,16 @@ pub(crate) fn bound(
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
-    let out_stride = if spread { 20 } else { stride };
+    let out_stride = match layout {
+        0 => stride,
+        1 => 20,
+        _ => LEAN_RECORD,
+    };
     let out = list.arguments(u64::from(out_stride) * u64::from(records.max(1)))?;
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::ClampSingle, 1);
     let l = &list.list;
-    let constants = [kind, stride, records, u32::from(spread)];
+    let constants = [kind, stride, records, layout];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
@@ -911,6 +976,15 @@ pub(crate) enum Plain {
     /// spread signature would have set. The list's clamped records are then
     /// shader-readable as well as arguments ([`read_state`]).
     Signature,
+    /// `VICTORY_INDIRECT_PLAIN=lean` (grosterr's form,
+    /// fxceless/victory-fork#1352 `cd10ed9`): no translation change and no
+    /// windows for spread dispatches; an execution of one record is clamped
+    /// alone into [`bound_lean`]'s layout and recorded twice: the plain
+    /// `DISPATCH` signature at its groups (empty past 65,535 in x; the
+    /// program's spread words are 0 from its bind, so it runs unspread),
+    /// then the spread signature under a predicate the clamp sets only for
+    /// a record past 65,535. More records keep the spread signature.
+    Lean,
 }
 
 /// This process's [`Plain`].
@@ -924,6 +998,7 @@ pub(crate) fn plain() -> Plain {
         let mode = match value.as_deref().and_then(std::ffi::OsStr::to_str) {
             None | Some("0") => Plain::Off,
             Some("window") => Plain::Window,
+            Some("lean") => Plain::Lean,
             Some(_) => Plain::Signature,
         };
         if mode != Plain::Off {
@@ -943,7 +1018,7 @@ pub(crate) fn read_state() -> D3D12_RESOURCE_STATES {
         Plain::Signature => {
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
         }
-        Plain::Off | Plain::Window => D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        Plain::Off | Plain::Window | Plain::Lean => D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
     }
 }
 
@@ -2385,6 +2460,55 @@ void main() { title.Store(at, value); }
             return; // no host GPU here
         };
         assert!(twice.iter().all(|r| r[0] == 0));
+    }
+    /// The lean clamp (grosterr's routing test on fxceless/victory-fork,
+    /// `warp_spread_lean_routes_small_and_large_records_and_counts_them`,
+    /// for this clamp's layout): a record within 65,535 groups in x goes to
+    /// the plain groups with a zero predicate and an empty spread record,
+    /// one past it to the spread record (the single clamp's words) with a
+    /// predicate of 1 and no plain groups; one over 2^20 groups runs
+    /// neither.
+    #[test]
+    fn lean_records_route_by_65535() {
+        let Some(host) = super::host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let cases: [([u32; 3], [u32; 12]); 5] = [
+            ([100, 2, 1], [100, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            ([65_535, 1, 1], [65_535, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (
+                [100_000, 1, 1],
+                [0, 0, 0, 0, 1, 0, 50_000, 100_000, 50_000, 1, 2, 0],
+            ),
+            (
+                [65_536, 1, 1],
+                [0, 0, 0, 0, 1, 0, 32_768, 65_536, 32_768, 1, 2, 0],
+            ),
+            ([(1 << 20) + 1, 1, 1], [0; 12]),
+        ];
+        for (input, expected) in cases {
+            let (title, data) = host.shared_buffer(12).unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: the mapping covers one record; a live buffer.
+            let address = unsafe {
+                data.cast::<[u32; 3]>().write(input);
+                title.GetGPUVirtualAddress()
+            };
+            let out = super::bound_lean(&list, address, (2, 12, 1)).unwrap();
+            super::done(&list, &out);
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the output mapping covers one lean record; the list ran.
+            let got = unsafe {
+                let mut mapped = std::ptr::null_mut();
+                out.Map(0, None, Some(&mut mapped)).unwrap();
+                let got = mapped.cast::<[u32; 12]>().read();
+                out.Unmap(0, None);
+                got
+            };
+            assert_eq!(got, expected, "lean record for {input:?}");
+        }
     }
 
     #[test]
