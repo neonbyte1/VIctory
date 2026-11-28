@@ -525,7 +525,7 @@ fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) 
     // SAFETY: an open list; live resources in the states named.
     unsafe {
         for i in 0..plan.n {
-            l.CopyTextureRegion(&place(&buffer, plan.fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
+            l.CopyTextureRegion(&place(&buffer, plan.fa[i as usize]), 0, 0, 0, &sub(a, i), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
@@ -533,7 +533,7 @@ fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) 
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
         for i in 0..plan.n {
-            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, plan.fb[i as usize]), None);
+            l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, plan.fb[i as usize]), None);
         }
     }
     static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
