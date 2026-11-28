@@ -6370,3 +6370,179 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+
+#[test]
+fn valu16_min3_max3_med3_and_mad32_16_match_rdna2() {
+    let vop3_mod =
+        |op: u16, opsel: u32, clamp: bool, vdst: u8, s0: u16, s1: u16, s2: u16| -> [u32; 2] {
+            let mut inst = vop3(op, vdst, s0, s1, s2);
+            inst[0] |= (opsel & 0xF) << 11;
+            if clamp {
+                inst[0] |= 1 << 15;
+            }
+            inst
+        };
+
+    // Pre-seed v0 with 0xCAFE_BEEF so high/low half preservation on 16-bit writes is checked.
+    let seeded = |op: u16, opsel: u32| {
+        let mut code = vec![vop1(0x001, 0, 255), 0xCAFE_BEEF];
+        code.extend_from_slice(&vop3_mod(op, opsel, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+        build_valu_cs(&code)
+    };
+
+    // 16-bit signed & unsigned min3/max3/med3 (low dst, plus high dst + op_sel[0..2]).
+    let min3_i16 = seeded(0x352, 0);
+    let min3_u16 = seeded(0x353, 0);
+    let max3_i16 = seeded(0x355, 0);
+    let max3_u16 = seeded(0x356, 0);
+    let med3_i16 = seeded(0x358, 0);
+    let med3_u16 = seeded(0x359, 0);
+    // op_sel = 0b1101 => src0=hi, src1=lo, src2=hi, dst=hi (preserves low 0xBEEF).
+    let med3_i16_hi = seeded(0x358, 0b1101);
+
+    let cases16: &[([u32; 4], [u32; 6])] = &[
+        // (a, b, c) low halves: (-10 = 0xFFF6, 5 = 0x0005, -2 = 0xFFFE)
+        // signed:   min=-10 (0xFFF6), max=5 (0x0005), med=-2 (0xFFFE)
+        // unsigned: min=5 (0x0005), max=0xFFFE, med=0xFFF6
+        (
+            [0x0000_FFF6, 0x0000_0005, 0x0000_FFFE, 0],
+            [
+                0xCAFE_FFF6,
+                0xCAFE_0005,
+                0xCAFE_0005,
+                0xCAFE_FFFE,
+                0xCAFE_FFFE,
+                0xCAFE_FFF6,
+            ],
+        ),
+        // (0x8000 = -32768 / 32768, 0x7FFF = 32767, 0x0000 = 0)
+        (
+            [0x1234_8000, 0x5678_7FFF, 0x9ABC_0000, 0],
+            [
+                0xCAFE_8000,
+                0xCAFE_0000,
+                0xCAFE_7FFF,
+                0xCAFE_8000,
+                0xCAFE_0000,
+                0xCAFE_7FFF,
+            ],
+        ),
+    ];
+    let in16: Vec<[u32; 4]> = cases16.iter().map(|c| c.0).collect();
+    run_cases(&min3_i16, &in16, |b, i, _, g| {
+        assert_eq!(g, cases16[i].1[0], "{b}: v_min3_i16 case {i}");
+    });
+    run_cases(&min3_u16, &in16, |b, i, _, g| {
+        assert_eq!(g, cases16[i].1[1], "{b}: v_min3_u16 case {i}");
+    });
+    run_cases(&max3_i16, &in16, |b, i, _, g| {
+        assert_eq!(g, cases16[i].1[2], "{b}: v_max3_i16 case {i}");
+    });
+    run_cases(&max3_u16, &in16, |b, i, _, g| {
+        assert_eq!(g, cases16[i].1[3], "{b}: v_max3_u16 case {i}");
+    });
+    run_cases(&med3_i16, &in16, |b, i, _, g| {
+        assert_eq!(g, cases16[i].1[4], "{b}: v_med3_i16 case {i}");
+    });
+    run_cases(&med3_u16, &in16, |b, i, _, g| {
+        assert_eq!(g, cases16[i].1[5], "{b}: v_med3_u16 case {i}");
+    });
+
+    // High-half op_sel test: src0.hi = -5 (0xFFFB), src1.lo = 10, src2.hi = -1 (0xFFFF) => med = -1 -> 0xFFFF_BEEF.
+    let hi_in = [[0xFFFB_1234, 0x9999_000A, 0xFFFF_5678, 0]];
+    run_cases(&med3_i16_hi, &hi_in, |b, _, _, g| {
+        assert_eq!(g, 0xFFFF_BEEF, "{b}: v_med3_i16 opsel=0b1101");
+    });
+
+    // v_mad_u32_u16 (0x373) & v_mad_i32_i16 (0x375), wrapping + clamped + op_sel.
+    let mad_u32 = build_valu_cs(&vop3_mod(0x373, 0, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mad_u32_clamp = build_valu_cs(&vop3_mod(0x373, 0, true, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // op_sel = 0b0010 => src0=lo, src1=hi
+    let mad_u32_hi1 = build_valu_cs(&vop3_mod(
+        0x373,
+        0b0010,
+        false,
+        0,
+        vgpr(1),
+        vgpr(2),
+        vgpr(3),
+    ));
+    let mad_i32 = build_valu_cs(&vop3_mod(0x375, 0, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mad_i32_clamp = build_valu_cs(&vop3_mod(0x375, 0, true, 0, vgpr(1), vgpr(2), vgpr(3)));
+
+    let u32_cases: &[([u32; 4], u32, u32)] = &[
+        // 300 * 400 + 50 = 120050
+        ([0xDEAD_012C, 0xBEEF_0190, 50, 0], 120_050, 120_050),
+        // 65535 * 65535 + 0x0002_0000 overflows u32 -> wraps to 1, clamps to u32::MAX
+        (
+            [0x0000_FFFF, 0x0000_FFFF, 0x0002_0000, 0],
+            (65535u32 * 65535).wrapping_add(0x0002_0000),
+            u32::MAX,
+        ),
+    ];
+    let u32_in: Vec<[u32; 4]> = u32_cases.iter().map(|c| c.0).collect();
+    run_cases(&mad_u32, &u32_in, |b, i, _, g| {
+        assert_eq!(g, u32_cases[i].1, "{b}: v_mad_u32_u16 case {i}");
+    });
+    run_cases(&mad_u32_clamp, &u32_in, |b, i, _, g| {
+        assert_eq!(g, u32_cases[i].2, "{b}: v_mad_u32_u16 clamp case {i}");
+    });
+    // src0.lo = 10, src1.hi = 20, acc = 3 => 203.
+    run_cases(
+        &mad_u32_hi1,
+        &[[0x9999_000A, 0x0014_8888, 3, 0]],
+        |b, _, _, g| {
+            assert_eq!(g, 203, "{b}: v_mad_u32_u16 opsel=0b0010");
+        },
+    );
+
+    let i32_cases: &[([u32; 4], u32, u32)] = &[
+        // (-100) * 50 + 20 = -4980
+        (
+            [0x0000_FF9C, 0x0000_0032, 20, 0],
+            (-4980i32) as u32,
+            (-4980i32) as u32,
+        ),
+        // (-32768) * (-32768) + i32::MAX => +2^30 + (2^31 - 1), positive overflow -> i32::MAX
+        (
+            [0x0000_8000, 0x0000_8000, i32::MAX as u32, 0],
+            (1i32 << 30).wrapping_add(i32::MAX) as u32,
+            i32::MAX as u32,
+        ),
+        // (-32768) * 32767 + i32::MIN => negative overflow -> i32::MIN
+        (
+            [0x0000_8000, 0x0000_7FFF, i32::MIN as u32, 0],
+            (-32768i32 * 32767).wrapping_add(i32::MIN) as u32,
+            i32::MIN as u32,
+        ),
+    ];
+    let i32_in: Vec<[u32; 4]> = i32_cases.iter().map(|c| c.0).collect();
+    run_cases(&mad_i32, &i32_in, |b, i, _, g| {
+        assert_eq!(g, i32_cases[i].1, "{b}: v_mad_i32_i16 case {i}");
+    });
+    run_cases(&mad_i32_clamp, &i32_in, |b, i, _, g| {
+        assert_eq!(g, i32_cases[i].2, "{b}: v_mad_i32_i16 clamp case {i}");
+    });
+
+    // Inline float constant 242 (1.0f = 0x3F80_0000) on 16-bit integer ops:
+    // op_sel=0 selects low half 0x0000 (not f16 0x3C00); op_sel=1 selects 0x3F80.
+    let mad_u32_fconst_lo = build_valu_cs(&vop3_mod(0x373, 0, false, 0, 242, vgpr(2), vgpr(3)));
+    let mad_u32_fconst_hi =
+        build_valu_cs(&vop3_mod(0x373, 0b0001, false, 0, 242, vgpr(2), vgpr(3)));
+    run_cases(&mad_u32_fconst_lo, &[[0, 7, 11, 0]], |b, _, _, g| {
+        assert_eq!(g, 11, "{b}: v_mad_u32_u16 inline 1.0 op_sel=0");
+    });
+    run_cases(&mad_u32_fconst_hi, &[[0, 2, 11, 0]], |b, _, _, g| {
+        assert_eq!(g, 0x3F80 * 2 + 11, "{b}: v_mad_u32_u16 inline 1.0 op_sel=1");
+    });
+    let max3_u16_fconst_lo = build_valu_cs(&vop3_mod(0x356, 0, false, 0, 242, vgpr(2), vgpr(3)));
+    let max3_u16_fconst_hi =
+        build_valu_cs(&vop3_mod(0x356, 0b0001, false, 0, 242, vgpr(2), vgpr(3)));
+    run_cases(&max3_u16_fconst_lo, &[[0, 10, 20, 0]], |b, _, _, g| {
+        assert_eq!(g & 0xFFFF, 20, "{b}: v_max3_u16 inline 1.0 op_sel=0");
+    });
+    run_cases(&max3_u16_fconst_hi, &[[0, 10, 20, 0]], |b, _, _, g| {
+        assert_eq!(g & 0xFFFF, 0x3F80, "{b}: v_max3_u16 inline 1.0 op_sel=1");
+    });
+}

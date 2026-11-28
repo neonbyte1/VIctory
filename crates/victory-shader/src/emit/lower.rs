@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 mod bvh;
 mod dot2;
 mod phi;
+mod valu16;
 
 type Why = &'static str;
 
@@ -7123,6 +7124,7 @@ impl<'a> Lower<'a> {
                 let rf = self.as_float(r);
                 float(self, rf)
             }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => self.mad_32_16(inst, name, guard),
             "v_fmac_f32" | "v_mac_f32" | "v_mac_legacy_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -7879,6 +7881,12 @@ impl<'a> Lower<'a> {
             "v_max_i16",
             "v_min_u16",
             "v_min_i16",
+            "v_min3_i16",
+            "v_min3_u16",
+            "v_max3_i16",
+            "v_max3_u16",
+            "v_med3_i16",
+            "v_med3_u16",
             "v_cvt_u16_f16",
             "v_cvt_i16_f16",
             "v_cvt_norm_i16_f16",
@@ -8106,6 +8114,8 @@ impl<'a> Lower<'a> {
                 let z = self.s.m.i32(0);
                 self.s.m.select(c, nan, z, r)
             }
+            "v_min3_i16" | "v_min3_u16" | "v_max3_i16" | "v_max3_u16" | "v_med3_i16"
+            | "v_med3_u16" => self.min_max_med3_16(inst, name)?,
             _ => {
                 let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
                 let k16 = self.s.m.i32(16);
