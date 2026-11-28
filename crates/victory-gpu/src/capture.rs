@@ -22,6 +22,10 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// lists frames counted from the first one that ran 500 draws (the world's
 /// first, whose number depends on how fast the title loaded).
 pub(crate) fn listed(n: u64) -> bool {
+    #[cfg(test)]
+    if with_test_state(|_| ()).is_some() {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
         || WORLD
@@ -80,7 +84,16 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    let Some(folder) = folder() else { return };
+    #[cfg(test)]
+    let test_folder = with_test_state(|capture| capture.folder.clone());
+    #[cfg(test)]
+    let folder = match &test_folder {
+        Some(folder) => Some(folder),
+        None => folder(),
+    };
+    #[cfg(not(test))]
+    let folder = folder();
+    let Some(folder) = folder else { return };
     // Keep the last sample when the input width or height is odd.
     let (w, h) = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
@@ -300,10 +313,54 @@ pub(crate) fn save_read_back(
 /// (`-by-<pipeline>` in the name; `-black` when its colour is all zeros).
 /// `VICTORY_DUMP_WRITERS` (shader hashes) adds, in any frame, the textures
 /// a pipeline with one of them writes, the first frame it runs.
-#[allow(clippy::type_complexity)]
-static TARGETS: std::sync::Mutex<
-    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>,
-> = std::sync::Mutex::new(Vec::new());
+type Targets = Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>;
+static TARGETS: std::sync::Mutex<Targets> = std::sync::Mutex::new(Vec::new());
+
+fn with_targets<R, F: FnOnce(&mut Targets) -> R>(f: F) -> R {
+    let global = |f: F| f(&mut TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(test)]
+    return TEST_CAPTURE.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(capture) => f(&mut capture.targets),
+        None => global(f),
+    });
+    #[cfg(not(test))]
+    global(f)
+}
+
+#[cfg(test)]
+struct TestCapture {
+    folder: PathBuf,
+    targets: Targets,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CAPTURE: std::cell::RefCell<Option<TestCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_test_state<R>(f: impl FnOnce(&mut TestCapture) -> R) -> Option<R> {
+    TEST_CAPTURE.with(|slot| slot.borrow_mut().as_mut().map(f))
+}
+
+/// Records and submits a synthetic capture on this test's thread.
+#[cfg(test)]
+pub(crate) fn with_test_capture(folder: &std::path::Path, test: impl FnOnce()) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CAPTURE.with(|slot| slot.take());
+            WRITER.with(|writer| writer.borrow_mut().clear());
+        }
+    }
+    TEST_CAPTURE.with(|slot| {
+        assert!(slot.borrow().is_none(), "nested capture test");
+        slot.replace(Some(TestCapture { folder: folder.into(), targets: Vec::new() }));
+    });
+    binding("");
+    let _reset = Reset;
+    test();
+}
 
 thread_local! {
     /// The pipeline whose draw or dispatch this thread is binding.
@@ -318,6 +375,10 @@ pub(crate) fn binding(pipeline: &str) {
 }
 
 pub(crate) fn dump_on() -> bool {
+    #[cfg(test)]
+    if with_test_state(|_| ()).is_some() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
@@ -335,10 +396,19 @@ static BUFFERS: std::sync::Mutex<Vec<(usize, Vec<u8>, String)>> = std::sync::Mut
 /// command of `list`, whose submission dumps it again when the frame is
 /// listed).
 pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object::This) {
+    note_write(list, resource, true);
+}
+
+/// Clears write a texture directly, without the bound pipeline.
+pub(crate) fn note_clear(list: &crate::host::HostList, resource: crate::object::This) {
+    note_write(list, resource, false);
+}
+
+fn note_write(list: &crate::host::HostList, resource: crate::object::This, by_pipeline: bool) {
     if resource.is_null() || !dump_on() {
         return;
     }
-    let by = WRITER.with(|w| w.borrow().clone());
+    let by = if by_pipeline { WRITER.with(|w| w.borrow().clone()) } else { String::new() };
     // Lists are recorded ahead of the frame that submits them.
     list.note_target(resource as usize, &by);
     if !listed(crate::queue::presented() + 1) {
@@ -361,12 +431,15 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
             return;
         }
     }
-    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
-    {
-        targets.push((resource as usize, copy, by));
-    }
+    with_targets(|targets| {
+        if let Some((_, _, writer)) = targets.iter_mut().find(|(r, _, _)| *r == resource as usize) {
+            if writer.is_empty() {
+                *writer = by;
+            }
+        } else if let Some(copy) = crate::resource::host_copy(resource) {
+            targets.push((resource as usize, copy, by));
+        }
+    });
 }
 
 /// Whether textures wait to be dumped at this present.
@@ -377,7 +450,12 @@ pub(crate) fn has_targets() -> bool {
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
-    let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let targets = with_targets(std::mem::take);
+    #[cfg(test)]
+    if with_test_state(|_| ()).is_some() {
+        dump_target_images(frame, &targets);
+        return;
+    }
     let buffers = std::mem::take(&mut *BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
     // Writers dumped once.
     if let Some(writers) = WRITERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -407,6 +485,11 @@ pub(crate) fn dump_targets(frame: u64) {
             "a buffer the named pipeline writes, at the present"
         );
     }
+    dump_target_images(frame, &targets);
+}
+
+fn dump_target_images(frame: u64, targets: &Targets) {
+    use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;

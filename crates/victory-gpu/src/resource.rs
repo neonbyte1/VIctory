@@ -2767,6 +2767,106 @@ pub(crate) mod tests {
             assert_eq!(out.alignment, KIB_64, "requested alignment {requested}");
         }
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn clear_only_targets_are_captured_without_a_pipeline_name() {
+        use crate::object::IUNKNOWN;
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM};
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU for clear-only capture; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        crate::capture::with_test_capture(dir.path(), || {
+            let null = std::ptr::null();
+            let make = |format, flags| {
+                let desc = ResourceDesc { flags, ..texture(4, 4, format, 1) };
+                let mut resource = null;
+                assert_eq!(
+                    create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut resource),
+                    S_OK,
+                );
+                assert!(host_copy(resource).is_some(), "the clear needs a host target");
+                resource
+            };
+            let color = make(DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32);
+            let depth = make(DXGI_FORMAT_D32_FLOAT.0 as u32, DEPTH | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 as u32);
+            let named = make(DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32);
+            let mut descriptors = [[0u64; 14]; 3];
+            let [rtv, dsv, named_rtv] = descriptors.each_mut().map(|slot| slot.as_mut_ptr() as u64);
+            crate::descriptor::create_rtv(null, color, null.cast(), rtv);
+            crate::descriptor::create_dsv(null, depth, null.cast(), dsv);
+            crate::descriptor::create_rtv(null, named, null.cast(), named_rtv);
+
+            let mut allocator = null;
+            let mut guest = null;
+            assert_eq!(crate::list::create_allocator(null, 0, &IUNKNOWN, &mut allocator), S_OK);
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &IUNKNOWN, &mut guest), S_OK);
+            let list = crate::list::host_list(guest).expect("a host list for the guest clear calls");
+            // A clear has its own value and does not run the last bound shader.
+            crate::capture::binding("stale-pipeline");
+            let clear_color = slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const RECT)>(guest, 0x1a0);
+            let clear_depth = slot::<extern "system" fn(This, u64, u32, f32, u8, u32, *const RECT)>(guest, 0x198);
+            clear_color(guest, rtv, &[1.0, 0.0, 0.0, 1.0], 0, null.cast());
+            clear_depth(guest, dsv, 1, 0.25, 0, 0, null.cast());
+            let right_half = RECT { left: 2, top: 0, right: 4, bottom: 4 };
+            clear_depth(guest, dsv, 1, 0.75, 0, 1, &right_half);
+
+            clear_color(guest, named_rtv, &[0.0, 0.0, 1.0, 1.0], 0, null.cast());
+
+            // A later list in the submission gives this target a named binding.
+            let mut next_guest = null;
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &IUNKNOWN, &mut next_guest), S_OK);
+            let next = crate::list::host_list(next_guest).unwrap();
+            let bind = slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(next_guest, 0x190);
+            crate::capture::binding("named-pipeline");
+            bind(next_guest, 1, &named_rtv, 0, null.cast());
+
+            list.close();
+            next.close();
+            host.execute(&[list, next]);
+            crate::capture::dump_targets(crate::queue::presented() + 1);
+            for o in [guest, next_guest, allocator, color, depth, named] {
+                assert_eq!(slot::<Release>(o, 0x10)(o), 0);
+            }
+        });
+
+        let mut actual = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "png") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(!name.contains("stalepipeline"), "{name} claims a pipeline wrote the clear");
+            let png = std::fs::read(&path).unwrap();
+            let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+            assert_eq!([word(16), word(20)], [2, 2]);
+            let rgb = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
+            assert_eq!(rgb.len(), 14);
+            actual.push((name.split('-').nth(2).unwrap().starts_with('s'), name.contains("-by-namedpipeline"), rgb));
+        }
+        let red = [0, 255, 0, 0, 255, 0, 0].repeat(2);
+        let two_depths = [0, 0, 0, 0, 255, 255, 255].repeat(2);
+        let blue = [0, 0, 0, 255, 0, 0, 255].repeat(2);
+        let mut expected = vec![
+            (false, false, red.clone()),
+            (true, false, red),
+            (false, false, two_depths.clone()),
+            (true, false, two_depths),
+            (false, true, blue.clone()),
+            (true, true, blue),
+        ];
+        actual.sort_unstable();
+        expected.sort_unstable();
+        println!("clear-only capture produced {} PNGs", actual.len());
+        assert_eq!(actual, expected, "color and depth PNGs at submission and at present");
+    }
 
     fn heap(size: u64) -> This {
         let desc = HeapDesc {

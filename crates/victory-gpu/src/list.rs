@@ -1322,6 +1322,8 @@ extern "system" fn clear_rtv(
         list.crumbed(crate::host::Crumb::Clear, Some("render target clear"), || unsafe {
             list.list.ClearRenderTargetView(rtv, color, rects)
         });
+        #[cfg(feature = "diagnostics")]
+        crate::capture::note_clear(list, record.resource);
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
@@ -1363,6 +1365,10 @@ extern "system" fn clear_dsv(
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         });
+        #[cfg(feature = "diagnostics")]
+        if flags & 3 != 0 {
+            crate::capture::note_clear(list, record.resource);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
