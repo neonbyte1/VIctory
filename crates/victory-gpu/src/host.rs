@@ -1309,6 +1309,8 @@ pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
+    /// Whether the host command list is open for recording.
+    recording: std::sync::atomic::AtomicBool,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1780,6 +1782,7 @@ impl Host {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
+                recording: true.into(),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 readback: Mutex::default(),
@@ -2611,6 +2614,9 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        if !self.recording.load(Ordering::Relaxed) {
+            return;
+        }
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
         for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
@@ -2618,25 +2624,29 @@ impl HostList {
             unsafe { self.list.EndQuery(&heap, kind, index) };
         }
         #[cfg(feature = "diagnostics")]
-        if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
-            }
+    if let Some((heap, back)) = self.stamps() {
+        let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+        // SAFETY: an open list, our heap and read-back buffer.
+        unsafe {
+            self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+            self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
         }
+    }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        self.recording.store(false, Ordering::Relaxed);
     }
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        // VIctory lets a guest discard an open recording. D3D12 needs
+        // the host list closed before resetting its allocator.
+        self.close();
         #[cfg(feature = "diagnostics")]
         crate::library_timing::list_reset(self);
         let mut deferred = self.deferred();
@@ -2679,6 +2689,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.recording.store(true, Ordering::Relaxed);
     }
 
     /// Moves host subresources to `wanted` in this list, emitting inline

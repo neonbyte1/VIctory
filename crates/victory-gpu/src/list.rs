@@ -2784,6 +2784,55 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
+    #[test]
+    fn command_list_can_discard_an_open_recording() {
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Reset = extern "system" fn(This, This, This) -> HRESULT;
+        type Release = extern "system" fn(This) -> u32;
+
+        let null = std::ptr::null();
+        for kind in [0, 3] {
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, kind, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, kind, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            let close = slot::<Close>(list, 0x48);
+            let reset = slot::<Reset>(list, 0x50);
+            let release_list = slot::<Release>(list, 16);
+            let release_allocator = slot::<Release>(allocator, 16);
+
+            #[cfg(windows)]
+            if let Some(active) = host_list(list) {
+                active.defer_after(|| panic!("the discarded recording ran"));
+            }
+            assert_eq!(reset(list, allocator, null), S_OK);
+            #[cfg(windows)]
+            if let Some(active) = host_list(list) {
+                assert!(active.is_empty());
+                active.defer_after(|| panic!("the extended reset did not discard the recording"));
+            }
+            assert_eq!(reset_x(list, allocator, null, 0), S_OK);
+            assert_eq!(close(list), S_OK);
+            assert_eq!(close(list), S_OK);
+            assert_eq!(reset(list, null, null), E_INVALIDARG);
+            assert_eq!(reset(list, allocator, null), S_OK);
+            assert_eq!(close(list), S_OK);
+            #[cfg(windows)]
+            if let (Some(active), Some(host)) = (host_list(list), crate::host::host()) {
+                assert!(active.is_empty());
+                host.execute(&[active]);
+            }
+            assert_eq!(release_list(list), 0);
+            assert_eq!(release_allocator(allocator), 0);
+        }
+    }
+
     /// ClearUnorderedAccessViewUint/Float and DiscardResource come before
     /// the methods newer lists insert: the AMD upscaler calls them there.
     #[test]
