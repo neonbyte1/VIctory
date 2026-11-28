@@ -19,11 +19,18 @@
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
+//!
+//! shortcut: the budget is the *frame's*, so a compile that outlives one
+//! frame makes the title pay it again in every later frame, for the same
+//! pipeline (run 1013d: 350.3 + 21.8 ms/frame for four compute pipelines
+//! that took 4-5 s each). `VICTORY_PIPELINE_WAIT=once` gives each pipeline
+//! one budget over its life instead; the draws are dropped at once after
+//! it, as they were dropped anyway once the frame's budget was spent.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -47,6 +54,9 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// What the title has waited for it so far, in microseconds
+    /// ([`Mode::Once`]).
+    waited: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -87,7 +97,19 @@ impl Pending {
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
+            waited: AtomicU64::new(0),
         }
+    }
+
+    /// What the title has waited for this pipeline so far.
+    fn waited(&self) -> Duration {
+        Duration::from_micros(self.waited.load(Ordering::Relaxed))
+    }
+
+    /// The title waited `spent` for this pipeline.
+    fn note_waited(&self, spent: Duration) {
+        self.waited
+            .fetch_add(spent.as_micros() as u64, Ordering::Relaxed);
     }
 
     /// The shader containers it is made from.
@@ -224,6 +246,46 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 /// Waiting allowed per title frame, over all threads: the time in which
 /// at least one thread waits ([`Waits`]).
 const BUDGET: Duration = Duration::from_millis(500);
+
+/// How the budget is charged (`VICTORY_PIPELINE_WAIT`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The frame's: every frame may wait `BUDGET` for any pipeline. The
+    /// default, and what every run before the switch did.
+    Frame,
+    /// The pipeline's: one is waited for `BUDGET` over its whole life, so
+    /// a compile that outlives a frame no longer makes every later frame
+    /// pay again.
+    Once,
+}
+
+/// Whether waits are charged to the frame (default) or to the pipeline:
+/// `VICTORY_PIPELINE_WAIT=once` or `frame`.
+fn mode() -> Mode {
+    static MODE: LazyLock<Mode> = LazyLock::new(|| match std::env::var("VICTORY_PIPELINE_WAIT") {
+        Err(_) => Mode::Frame,
+        Ok(value) => match value.as_str() {
+            "" | "frame" => Mode::Frame,
+            "once" => {
+                tracing::info!("a pipeline is waited for once, not every frame");
+                Mode::Once
+            }
+            value => {
+                tracing::warn!(value, "VICTORY_PIPELINE_WAIT expects `frame` or `once`");
+                Mode::Frame
+            }
+        },
+    });
+    *MODE
+}
+
+/// What `p` may be waited for now.
+fn budget(p: &Pending, mode: Mode) -> Duration {
+    match mode {
+        Mode::Frame => BUDGET,
+        Mode::Once => BUDGET.saturating_sub(p.waited()),
+    }
+}
 
 /// The waiting of a title frame, over all threads. The title records its
 /// lists on several threads, and a thread may begin to wait while another
@@ -430,9 +492,19 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` has budget left ([`mode`]).
 fn wait(p: &Pending, frame: u64) {
-    wait_within(&WAITS, BUDGET, p, frame);
+    let mode = mode();
+    let allowed = budget(p, mode);
+    if allowed.is_zero() {
+        return;
+    }
+    let started = Instant::now();
+    wait_within(&WAITS, allowed, p, frame);
+    if mode == Mode::Once {
+        // What it used of the budget, not how long it took to be scheduled.
+        p.note_waited(started.elapsed().min(allowed));
+    }
 }
 
 /// Waits for `p` until it is made or the waiting `waits` allows frame
@@ -633,6 +705,30 @@ mod tests {
         );
         p.make_with(|| panic!("pipeline creation panicked"));
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn a_pipeline_waited_for_once_gets_no_second_budget() {
+        let pending = || {
+            Pending::new(
+                Vec::new(),
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            )
+        };
+        let p = pending();
+        assert_eq!(budget(&p, Mode::Frame), BUDGET);
+        assert_eq!(budget(&p, Mode::Once), BUDGET);
+        p.note_waited(BUDGET / 2);
+        // The frame's budget is the frame's: what this pipeline took of it
+        // does not change what a later frame may wait for it.
+        assert_eq!(budget(&p, Mode::Frame), BUDGET);
+        assert_eq!(budget(&p, Mode::Once), BUDGET - BUDGET / 2);
+        p.note_waited(BUDGET);
+        assert!(budget(&p, Mode::Once).is_zero());
+        // Another pipeline's budget is its own.
+        assert_eq!(budget(&pending(), Mode::Once), BUDGET);
     }
 
     #[test]
