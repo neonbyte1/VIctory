@@ -6287,28 +6287,23 @@ impl<'a> Lower<'a> {
         let bitmap = self.s.view_writes_handle();
         let outer = self.begin_guarded(Some(active));
         for (i, &n) in bits.iter().enumerate() {
-            let c = self.cur;
-            let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
-            let word = self.s.m.bin(c, Bin::LShr, n, k5);
-            let word = self.s.m.bin(c, Bin::Shl, word, k2);
-            let bit = self.s.m.bin(c, Bin::And, n, k31);
-            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            // Wave operations first (uniform control flow), then the page:
+            // the lane's first in the wave marks its page for the lanes
+            // that read the same bit.
             let lead = self.mark_lead(n);
             let led = self.begin_guarded(lead);
-            let c = self.cur;
-            // Most writes find their page marked: a load, not an atomic.
-            let old = self.raw_dword(bitmap, word);
-            let set = self.s.m.bin(c, Bin::And, old, bit);
-            let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
-            if i == 1 {
-                let other = self.s.m.cmp(c, pred::NE, n, bits[0]);
-                clear = self.s.m.bin(c, Bin::And, clear, other);
-            }
-            let inner = self.begin_guarded(Some(clear));
-            let iu = self.s.m.undef(self.s.t.i32);
-            // Operation 2 is OR.
-            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
-            self.end_guarded(inner, &[]);
+            // A multi-byte write ends in its first page for most writes:
+            // where the two bits are equal, the second mark (and its load)
+            // is skipped whole (#2167).
+            let other = if i == 1 {
+                let c = self.cur;
+                let diff = self.s.m.cmp(c, pred::NE, n, bits[0]);
+                self.begin_guarded(Some(diff))
+            } else {
+                None
+            };
+            self.mark_dirty_bit(bitmap, n);
+            self.end_guarded(other, &[]);
             self.end_guarded(led, &[]);
         }
         self.end_guarded(outer, &[]);

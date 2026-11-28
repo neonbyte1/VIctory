@@ -122,8 +122,30 @@ fn user_data_cbv_rows_and_dwords_are_cached_in_entry_block() {
             sgprs: 8,
             ..root(RootType::Constants, user_data, 0)
         }];
+        // Where our stack's compute prologue reads the dispatch pair from:
+        // the dword above the layout's last (module notes, "group spread").
+        let dispatch_at = layout.iter().map(|p| u32::from(p.user_data) + p.sgprs).max().unwrap();
         let emitted = lower_with(words, layout, vec![]).unwrap();
-        assert_eq!(emitted.user_data.len(), 8, "{label}: 8 distinct dwords");
+        // Every compute program we lower also reads the dispatch pair (the
+        // row the host spreads groups with, and how many it asked for) at
+        // `dispatch_at`, slot [`super::super::DISPATCH_SLOT`]: #2207's
+        // counts are the program's own dwords; the pair is checked apart.
+        let dispatch: Vec<u32> = emitted
+            .user_data
+            .iter()
+            .filter(|u| u.slot == super::super::DISPATCH_SLOT)
+            .map(|u| u.index)
+            .collect();
+        assert_eq!(
+            dispatch,
+            vec![dispatch_at, dispatch_at + 1],
+            "{label}: the dispatch pair above the layout"
+        );
+        assert_eq!(
+            emitted.user_data.len() - dispatch.len(),
+            8,
+            "{label}: 8 distinct dwords of the program's own"
+        );
 
         let stats = emitted.cbuf_stats;
         assert!(
@@ -131,15 +153,18 @@ fn user_data_cbv_rows_and_dwords_are_cached_in_entry_block() {
             "{label}: expected multi-block shader, got {} blocks",
             stats.blocks
         );
+        // The pair is a row of its own, loaded in the entry block as the
+        // program's are.
+        let dispatch_row = dispatch_at / 4;
         assert_eq!(
             stats.loads,
-            vec![(0, expected_rows[0]), (0, expected_rows[1])],
-            "{label}: expected 2 entry-block cbufferLoadLegacy.i32 calls"
+            vec![(0, dispatch_row), (0, expected_rows[0]), (0, expected_rows[1])],
+            "{label}: expected 3 entry-block cbufferLoadLegacy.i32 calls (the dispatch row, then the program's 2)"
         );
         assert_eq!(
             stats.extracts.len(),
-            8,
-            "{label}: expected 8 cached extractvalue ops, got {:?}",
+            8 + dispatch.len(),
+            "{label}: expected 10 cached extractvalue ops, got {:?}",
             stats.extracts
         );
         assert!(
