@@ -12,6 +12,11 @@ use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
+/// Sources allowed past `MAX_FILE_SIZE`, each with its own cap. Fork only:
+/// upstream keeps `lower.rs` just under 512 KiB; the fork's integration of
+/// many shader PRs pushes it over, and splitting it here would conflict with
+/// every upstream PR that touches it.
+const LARGE_SOURCES: &[(&str, usize)] = &[("crates/victory-shader/src/emit/lower.rs", 1024 * 1024)];
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
@@ -155,9 +160,13 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
-    if content.len() > MAX_FILE_SIZE {
+    let max = LARGE_SOURCES
+        .iter()
+        .find(|(p, _)| *p == path)
+        .map_or(MAX_FILE_SIZE, |&(_, cap)| cap);
+    if content.len() > max {
         problems.push(format!(
-            "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
+            "{} bytes exceeds the {max}-byte limit",
             content.len()
         ));
     }
@@ -310,6 +319,20 @@ mod tests {
         assert!(
             !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
             "too big"
+        );
+    }
+
+    #[test]
+    fn a_large_source_gets_its_own_cap_and_only_its_own() {
+        let big = vec![b'a'; 600 * 1024];
+        assert!(check("crates/victory-shader/src/emit/lower.rs", &big).is_empty());
+        assert!(!check("crates/victory-shader/src/emit/other.rs", &big).is_empty());
+        assert!(
+            !check(
+                "crates/victory-shader/src/emit/lower.rs",
+                &vec![b'a'; 1100 * 1024]
+            )
+            .is_empty()
         );
     }
 
