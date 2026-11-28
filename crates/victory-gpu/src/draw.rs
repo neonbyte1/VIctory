@@ -2366,10 +2366,10 @@ mod tests {
         };
         let list = host.new_list().unwrap();
         let before = list.kept_count();
-        let (_, _, gpu) = heap.view_addresses().expect("a table");
+        let (table, _, gpu) = heap.view_addresses().expect("a table");
         assert_eq!(list.kept_count(), before + 1);
         // SAFETY: a live buffer.
-        assert_eq!(gpu, unsafe { heap.view_addresses_buffer().unwrap().GetGPUVirtualAddress() });
+        assert_eq!(gpu, unsafe { table.GetGPUVirtualAddress() });
         list.close();
     }
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
