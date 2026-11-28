@@ -1281,6 +1281,10 @@ mod tests {
     // from racing the test that installs a scoped tracing subscriber.
     static RGBA8_TRACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // These fixtures can share the RGBA8 callsite. Keep its registration
+    // from racing the test that installs a scoped tracing subscriber.
+    static RGBA8_TRACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
