@@ -9,7 +9,6 @@ use super::{Bool, Bools, Map, MAX_MEET, MAX_MEMO, TERMINAL};
 use std::collections::HashSet;
 
 type Triple = (Bool, Bool, Bool);
-type Conditions = Vec<(Bool, bool)>;
 
 enum IteTask {
     Evaluate(Triple),
@@ -26,11 +25,6 @@ enum RewriteTask {
     Evaluate(Bool),
     Combine(Bool, u32),
     Decided(Bool),
-}
-
-enum MeetTask {
-    Evaluate(Conditions),
-    Refute(Conditions),
 }
 
 impl Bools {
@@ -168,60 +162,69 @@ impl Bools {
         results.pop().expect("rewrite result")
     }
 
+    /// [`meet`](Self::meet) with a caller-chosen budget (tests).
+    #[cfg(test)]
+    fn meet_with_budget(&self, all: &[(Bool, bool)], budget: usize) -> bool {
+        let mut budget = budget;
+        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::default())
+    }
+
     /// Whether any lane satisfies all conditions. A budget exhaustion is
     /// still a conservative yes, never a proof that no lane can satisfy them.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
-        self.meet_with_budget(all, MAX_MEET)
+        let mut budget = MAX_MEET;
+        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::default())
     }
 
-    fn meet_with_budget(&self, all: &[(Bool, bool)], mut budget: usize) -> bool {
-        let mut refuted = HashSet::new();
-        let mut tasks = vec![MeetTask::Evaluate(all.to_vec())];
-        while let Some(task) = tasks.pop() {
-            let mut all = match task {
-                MeetTask::Refute(all) => {
-                    // Both children have been exhausted; any successful or
-                    // unknown child would have returned from the whole search.
-                    refuted.insert(all);
-                    continue;
-                }
-                MeetTask::Evaluate(all) => all,
-            };
-            if all.iter().any(|&(b, holds)| {
-                b == if holds { Bool::FALSE } else { Bool::TRUE }
-            }) {
-                continue;
-            }
-            all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-            all.sort_unstable();
-            all.dedup();
-            if refuted.contains(&all) {
-                continue;
-            }
-            if all.is_empty() || budget == 0 {
-                return true;
-            }
-            budget -= 1;
-            let v = all
-                .iter()
-                .map(|&(b, _)| self.nodes[b.0 as usize].0)
-                .min()
-                .expect("nonempty conditions");
-            let branch = |high: bool| {
-                all.iter()
-                    .map(|&(b, holds)| {
-                        let (lo, hi) = self.split(b, v);
-                        (if high { hi } else { lo }, holds)
-                    })
-                    .collect()
-            };
-            let lo = branch(false);
-            let hi = branch(true);
-            tasks.push(MeetTask::Refute(all));
-            tasks.push(MeetTask::Evaluate(hi));
-            tasks.push(MeetTask::Evaluate(lo));
+    /// `refuted`: conditions no lane meets, so a split reaching them again
+    /// stops at once (diagrams sharing most atoms reach the same ones often).
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        refuted: &mut HashSet<Vec<(Bool, bool)>>,
+    ) -> bool {
+        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
+        if all.iter().any(fails) {
+            return false;
         }
-        false
+        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        all.sort_unstable();
+        all.dedup();
+        // Equal functions are equal nodes, so a node held both ways is a
+        // contradiction; without this the search splits the node's whole
+        // diagram, or gives up past the budget and answers yes.
+        if all.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return false;
+        }
+        // A node of a reduced diagram is no constant: some lane takes it
+        // each way, so one condition alone is always met.
+        if all.len() <= 1 {
+            return true;
+        }
+        if refuted.contains(&all) {
+            return false;
+        }
+        if *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        let top = |b: Bool| self.nodes[b.0 as usize].0;
+        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
+        let met = [false, true].into_iter().any(|value| {
+            let next = all
+                .iter()
+                .map(|&(b, holds)| {
+                    let (lo, hi) = self.split(b, v);
+                    (if value { hi } else { lo }, holds)
+                })
+                .collect();
+            self.meet_in(next, budget, refuted)
+        });
+        if !met {
+            refuted.insert(all);
+        }
+        met
     }
 }
 
@@ -331,8 +334,12 @@ mod tests {
     fn exhausted_search_is_conservative() {
         let mut b = Bools::new();
         let a = b.atom(Atom::Lane(Value(0)), 0);
-        assert!(b.meet_with_budget(&[(a, true), (a, false)], 0));
+        let c = b.atom(Atom::Lane(Value(1)), 0);
+        // A node held both ways is a contradiction, whatever the budget.
+        assert!(!b.meet_with_budget(&[(a, true), (a, false)], 0));
         assert!(!b.meet_with_budget(&[(a, true), (a, false)], 1));
+        // Budget exhaustion answers yes: the search did not finish.
+        assert!(b.meet_with_budget(&[(a, true), (c, true)], 0));
         assert!(!b.meet_with_budget(&[(Bool::FALSE, true)], 0));
     }
 }

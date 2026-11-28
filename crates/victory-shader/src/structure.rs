@@ -1862,6 +1862,35 @@ mod tests {
     }
 
     #[test]
+    fn meet_rejects_opposite_facts_about_the_same_function() {
+        // Fifteen pairs: splitting the diagram runs past `MAX_MEET`, where
+        // the search gives up and answers that some lane meets both.
+        let (mut b, xs) = atoms(30);
+        let f = pairs_equal(&mut b, &xs, 15);
+        assert!(!b.meet(&[(f, true), (f, false)]));
+        // Two functions that only become the same one after a split: where
+        // `x` holds, both are `g`, held both ways.
+        let (mut b, xs) = atoms(31);
+        let g = pairs_equal(&mut b, &xs[1..], 15);
+        let h = b.and(xs[0], g);
+        let nx = b.not(xs[0]);
+        let k = b.or(nx, g);
+        assert!(!b.meet(&[(h, true), (k, false)]));
+    }
+
+    /// One condition other than a constant is met either way, also when it
+    /// is too large to split within the budget.
+    #[test]
+    fn meet_takes_one_condition_as_met() {
+        let (mut b, xs) = atoms(30);
+        let f = pairs_equal(&mut b, &xs, 15);
+        assert!(b.meet(&[(f, true)]));
+        assert!(b.meet(&[(f, false)]));
+        assert!(b.meet(&[(f, true), (f, true)]));
+        assert!(!b.meet(&[(f, true), (Bool::FALSE, true)]));
+    }
+
+    #[test]
     #[ignore = "benchmark: cargo test --release -p victory-shader bench_bools -- --ignored --nocapture"]
     fn bench_bools() {
         // Microseconds per call, over at least 3 calls and 50 ms.
@@ -1905,6 +1934,63 @@ mod tests {
                 vars_old / vars_new,
                 given_old / given_new
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p victory-shader bench_meet -- --ignored --nocapture"]
+    fn bench_meet() {
+        // Meet is queried during structurisation and resource tracking. Keep
+        // each BDD fixed so this measures the constraint search, not building
+        // the test expressions.
+        let time = |b: &Bools, facts: &[(Bool, bool)]| {
+            let start = std::time::Instant::now();
+            let result = b.meet(facts);
+            let mut calls = 1;
+            while calls < 3 || start.elapsed().as_millis() < 50 {
+                std::hint::black_box(b.meet(std::hint::black_box(facts)));
+                calls += 1;
+            }
+            (
+                start.elapsed().as_secs_f64() * 1e6 / f64::from(calls),
+                result,
+            )
+        };
+
+        for n in [8usize, 10, 12] {
+            let (mut b, xs) = atoms(2 * n as u64);
+            let f = pairs_equal(&mut b, &xs, n);
+            let constraints: Vec<_> = (0..8)
+                .map(|i| mixed(&mut b, &xs, 0x51ed + i, 12 * n))
+                .collect();
+            let cases = [
+                ("one", vec![(f, true)]),
+                (
+                    "four",
+                    constraints
+                        .iter()
+                        .take(4)
+                        .enumerate()
+                        .map(|(i, &condition)| (condition, i % 2 == 0))
+                        .collect(),
+                ),
+                (
+                    "eight",
+                    constraints
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &condition)| (condition, i % 2 == 0))
+                        .collect(),
+                ),
+                ("contradiction", vec![(f, true), (f, false)]),
+            ];
+            for (name, facts) in cases {
+                let (us, result) = time(&b, &facts);
+                println!(
+                    "n={n} case={name} facts={} result={result} {us:.2} us/call",
+                    facts.len()
+                );
+            }
         }
     }
 
