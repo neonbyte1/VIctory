@@ -681,13 +681,7 @@ fn dump_one(
         // Tiny targets (exposure, averages): their values as they are.
         if f.Width * f.Height <= 16 {
             let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
-            let words: Vec<String> = (0..f.Height as usize)
-                .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
-                .map(|c| {
-                    let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
-                    format!("{w:#x}={}", f32::from_bits(w))
-                })
-                .collect();
+            let words = tiny_words(rows, pitch, f.Width as usize * texel, f.Height as usize);
             tracing::info!(?resource, format = f.Format.0, "tiny target {prefix}-{i:02}: {}", words.join(" "));
         }
         // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
@@ -714,6 +708,22 @@ fn dump_one(
         }
         buffer.Unmap(0, None);
     }
+}
+
+fn tiny_words(rows: &[u8], pitch: usize, row_bytes: usize, height: usize) -> Vec<String> {
+    (0..height)
+        .flat_map(|y| rows[y * pitch..][..row_bytes].chunks(4))
+        .map(|c| {
+            let mut bytes = [0; 4];
+            bytes[..c.len()].copy_from_slice(c);
+            let w = u32::from_le_bytes(bytes);
+            if c.len() == 4 {
+                format!("{w:#x}={}", f32::from_bits(w))
+            } else {
+                format!("{w:#0width$x}", width = 2 + 2 * c.len())
+            }
+        })
+        .collect()
 }
 
 fn half(h: u16) -> f32 {
@@ -1210,6 +1220,27 @@ mod tests {
                 "format {format}"
             );
         }
+    }
+
+    #[test]
+    fn tiny_capture_keeps_short_words_on_each_row() {
+        // A complete float word retains its existing description.
+        assert_eq!(
+            super::tiny_words(&1.0f32.to_le_bytes(), 4, 4, 1),
+            ["0x3f800000=1"]
+        );
+
+        // Two three-texel R16 rows with different padding after each row.
+        let rows = [0, 0, 128, 63, 0, 60, 222, 173, 0, 0, 0, 64, 1, 0, 190, 239];
+        assert_eq!(
+            super::tiny_words(&rows, 8, 6, 2),
+            ["0x3f800000=1", "0x3c00", "0x40000000=2", "0x0001"]
+        );
+
+        // A one-texel R8 row and a three-texel R8 row.
+        let row = [0x7f, 0x34, 0x12, 0xee];
+        assert_eq!(super::tiny_words(&row, 4, 1, 1), ["0x7f"]);
+        assert_eq!(super::tiny_words(&row, 4, 3, 1), ["0x12347f"]);
     }
 
     #[test]
