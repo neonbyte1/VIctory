@@ -1339,13 +1339,27 @@ fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
     assert_eq!(out, want);
 }
 
+/// How a console wave64 runs on a host without 64-lane waves: each form
+/// runs it as two 32-lane host waves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Halves {
+    /// The console flow (a lane read of the other half asks for it).
+    ConsoleFlow,
+    /// The per-lane form: no lane reads, no wave size declared.
+    PerLane,
+    /// Plain split halves: lane reads inside each half only (DPP).
+    Split,
+}
+
 /// Lane `writer` of each console wave stores 1 + a dword only it loads
 /// (0) to its console wave's slot, and lane `reader` then loads the slot
 /// into its output; every other lane outputs 0. The console runs both in
 /// one wave, in program order: `reader` reads 1. Groups of `threads` (a
-/// multiple of 64), `groups` of them. The buffer holds the outputs, then a
-/// slot per console wave, then 64 dwords per console wave for the loads.
+/// multiple of 64), `groups` of them, in the form `form` says. The buffer
+/// holds the outputs, then a slot per console wave, then 64 dwords per
+/// console wave for the loads.
 fn uav_write_then_read(
+    form: Halves,
     writer: u32,
     reader: u32,
     threads: u32,
@@ -1355,7 +1369,14 @@ fn uav_write_then_read(
     let waves = n / 64;
     let (slots, far) = (4 * n, 4 * (n + waves));
     let lane = |k: u32| 128 + k;
-    let words = [
+    let form_words: &[u32] = match form {
+        // v_readlane_b32 s9, v0, 40
+        Halves::ConsoleFlow => &[0xD760_0009, 0x0001_5100],
+        Halves::PerLane => &[],
+        // v_mov_b32_dpp v8, v0 row_mirror row_mask:0xf bank_mask:0xf
+        Halves::Split => &[0x7E10_02FA, 0xFF01_4000],
+    };
+    let head = [
         0xBE82_0300, // s_mov_b32 s2, s0
         0xBE83_0380, // s_mov_b32 s3, 0
         0xF408_0101,
@@ -1363,8 +1384,8 @@ fn uav_write_then_read(
         0x9308_FF01,
         threads,     // s_mul_i32 s8, s1, threads
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0xD760_0009,
-        0x0001_5100, // v_readlane_b32 s9, v0, 40 (takes the console flow)
+    ];
+    let body = [
         0x7E04_0280, // v_mov_b32 v2, 0
         0x4A08_0008, // v_add_nc_u32 v4, s8, v0 (flat id in the dispatch)
         0x2C0A_0886, // v_lshrrev_b32 v5, 6, v4 (console wave)
@@ -1396,7 +1417,11 @@ fn uav_write_then_read(
         S_ENDPGM,
     ];
     let mut p = program(&[], threads);
-    p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    p.code = [&head[..], form_words, &body]
+        .concat()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
     // (loaded and stored: the table's buffer is a UAV)
     p.used = vec![crate::native::UsedResource {
         kind: crate::native::ResourceType::Uav,
@@ -1419,6 +1444,27 @@ fn uav_write_then_read(
 /// console's one wave does. Repeated dispatches of many groups.
 #[test]
 fn uav_writes_are_seen_by_the_other_half_in_program_order() {
+    uav_order_case(Halves::ConsoleFlow);
+}
+
+/// [`uav_writes_are_seen_by_the_other_half_in_program_order`] for a
+/// program without lane reads, which would run in the per-lane form: two
+/// host waves for each console wave there too, so it takes the console
+/// flow for its conflicting UAV accesses.
+#[test]
+fn uav_writes_are_seen_by_the_other_half_per_lane() {
+    uav_order_case(Halves::PerLane);
+}
+
+/// [`uav_writes_are_seen_by_the_other_half_in_program_order`] for a
+/// program whose lanes read their own half only, which would run as plain
+/// split halves.
+#[test]
+fn uav_writes_are_seen_by_the_other_half_split() {
+    uav_order_case(Halves::Split);
+}
+
+fn uav_order_case(form: Halves) {
     let host = match Host::new(false) {
         Ok(h) if !h.target().runs(64) && h.target().runs(32) => h,
         Ok(_) => {
@@ -1437,14 +1483,14 @@ fn uav_writes_are_seen_by_the_other_half_in_program_order() {
     let mut bad = Vec::new();
     for (writer, reader) in [(5, 40), (40, 5)] {
         for threads in [64, 128, 256] {
-            let (p, dwords) = uav_write_then_read(writer, reader, threads, groups);
+            let (p, dwords) = uav_write_then_read(form, writer, reader, threads, groups);
             let cs =
                 emit_for(&p, host.target()).unwrap_or_else(|e| panic!("{threads} threads: {e}"));
-            assert_eq!(
-                wave_size(&cs.dxil),
-                Some(32),
-                "{threads} threads: in halves"
-            );
+            let wave = wave_size(&cs.dxil);
+            let summary = super::last_module_summary();
+            // (the console flow in halves: wave size 32, meetings)
+            assert_eq!(wave, Some(32), "{threads} threads: in halves");
+            assert!(summary.contains("barrier"), "{threads} threads: {summary}");
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
             let views = [View::RawUav(dwords)];
@@ -1479,8 +1525,12 @@ fn uav_writes_are_seen_by_the_other_half_in_program_order() {
                     "a slot not written"
                 );
             }
-            let label = format!("lane {writer} writes, lane {reader} reads, {threads} threads");
-            eprintln!("{label}: {stale} of {} reads stale", runs * n / 64);
+            let label =
+                format!("{form:?}: lane {writer} writes, lane {reader} reads, {threads} threads");
+            eprintln!(
+                "{label}: {stale} of {} reads stale (wave size {wave:?}; {summary})",
+                runs * n / 64
+            );
             if stale > 0 {
                 bad.push(format!("{label}: {stale} stale"));
             }

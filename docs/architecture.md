@@ -109,11 +109,15 @@ lists what they cannot handle yet.
 On a 32-lane host, eligible wave64 compute programs run in two 32-lane
 halves. In a single-wave thread group, the console's control flow uses
 group barriers for cross-half exchanges and shared LDS accesses. A UAV
-access that conflicts with an earlier one (either of them writing), with no
-title barrier between them, gets its own meeting of the halves with a UAV
-fence: a group barrier, or a pair meeting where a group holds several
-console waves (`emit/lower/uav_order.rs`). `VICTORY_UAV_ORDER=raw` keeps
-only those before reads after writes (for A/B runs).
+access that conflicts with an earlier one (either of them writing, from
+different lanes: accesses through the same descriptor at addresses that
+keep each lane's bytes apart, such as `base + 4 * thread id`, do not), with
+no title barrier between them, gets its own meeting of the halves with a
+UAV fence: a group barrier, or a pair meeting where a group holds several
+console waves (`emit/lower/uav_order.rs`). Every form runs a console wave
+as two host waves there, so a program in another form with such an access
+takes the console flow where that can lower it. `VICTORY_UAV_ORDER=raw`
+keeps only those before reads after writes, `off` none (for A/B runs).
 `ds_permute_b32`, which is not translated yet, and whole-wave sections in
 partial groups can prevent splitting (`ds_bpermute_b32` does not: it
 gathers within each 32-lane half).
