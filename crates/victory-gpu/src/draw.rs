@@ -97,7 +97,9 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
-    host_heaps: [usize; 2],
+    /// `None` once the heaps the host list has cannot be told: `wanted`'s
+    /// `Some` pairs never equal it, so the next bind rebinds.
+    host_heaps: Option<[usize; 2]>,
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
@@ -390,8 +392,10 @@ impl State {
     /// root signatures and pipeline are set again before the next draw or
     /// dispatch.
     pub(crate) fn host_state_lost(&mut self) {
-        // No title heaps (0) differ from what the host list has, too.
-        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        // A `None` pair differs from every `wanted`, too (`wanted` can make
+        // `[MEMORY_HEAP, SAMPLERS_OURS]` — the marker `[usize::MAX; 2]` —
+        // for a list that binds no heaps and reads title memory, #2881).
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], None);
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -1065,7 +1069,6 @@ impl State {
         Some((index, offset))
     }
 
-    /// Gives the host list the title's heaps if it has others.
     /// The heaps a list must have bound before a root signature that indexes
     /// them directly is set: the title's of each kind, and ours for a kind it
     /// binds none of — D3D12 requires a heap of both kinds to be bound before
@@ -1091,7 +1094,7 @@ impl State {
     /// Gives the host list the title's heaps if it has others.
     fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
         let want = Self::wanted(self.heaps, memory_heap);
-        if self.host_heaps != want {
+        if self.host_heaps != Some(want) {
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
@@ -1118,7 +1121,7 @@ impl State {
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { list.list.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = want;
+            self.host_heaps = Some(want);
             self.host_roots = [0; 2];
         }
     }
@@ -2356,6 +2359,26 @@ mod tests {
         );
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
+    }
+
+    /// `host_state_lost` records a pair `wanted` can never make, so the next
+    /// `bind_heaps` binds the heaps again even for a list wanting
+    /// `[MEMORY_HEAP, SAMPLERS_OURS]` — equal to the `[usize::MAX; 2]`
+    /// marker the state used to leave, which bound nothing (#2881).
+    #[test]
+    fn a_lost_host_state_matches_no_wanted_heaps() {
+        let mut state = State::default();
+        state.host_state_lost();
+        for views in [0, 0x10] {
+            for samplers in [0, 0x20] {
+                for memory_heap in [false, true] {
+                    assert_ne!(
+                        state.host_heaps,
+                        Some(State::wanted([views, samplers], memory_heap))
+                    );
+                }
+            }
+        }
     }
 
     /// Once the host list's state is lost (a cut into a new host list, which
