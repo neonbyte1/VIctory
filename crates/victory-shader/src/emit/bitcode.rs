@@ -610,9 +610,32 @@ impl Module {
                 let name = self.funcs[*f as usize].name.as_str();
                 if name.starts_with("dx.op.createHandleFromHeap") {
                     // Arguments: opcode, index, sampler heap, non-uniform.
-                    let sampler = args.get(2).and_then(|&a| self.int_value(a)).is_some_and(|x| x != 0);
+                    let sampler = args
+                        .get(2)
+                        .and_then(|&a| self.int_value(a))
+                        .is_some_and(|x| x != 0);
                     u.heap |= !sampler;
                     u.sampler_heap |= sampler;
+                }
+                if name == "dx.op.annotateHandle" {
+                    let (props0, _) = self.handle_props(V::Inst(i));
+                    u.rovs |= props0 & 0x2000 != 0;
+                }
+                if (name.starts_with("dx.op.textureLoad.") || name.starts_with("dx.op.bufferLoad."))
+                    && let Some(&handle) = args.get(1)
+                {
+                    let (props0, _) = self.handle_props(handle);
+                    let kind = props0 & 0xFF;
+                    u.typed_uav_loads |= props0 & 0x1000 != 0 && (1..=10).contains(&kind);
+                }
+                if matches!(
+                    name,
+                    "dx.op.atomicBinOp.i64" | "dx.op.atomicCompareExchange.i64"
+                ) && let Some(&handle) = args.get(1)
+                {
+                    let (props0, from_heap) = self.handle_props(handle);
+                    u.atomic64_typed |= (1..=10).contains(&(props0 & 0xFF));
+                    u.atomic64_heap |= from_heap;
                 }
                 u.wave |= name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad");
                 if name == "dx.op.annotateHandle" {
@@ -730,13 +753,48 @@ impl Module {
         count
     }
 
-    /// Which instructions are written: those [`Module::rooted`], the
-    /// branch conditions, and whatever they read, transitively (a phi or a
-    /// value nothing reads is dropped: lowering makes size queries for
+    /// Resource properties (`props0`, whether from the descriptor heap) of a
+    /// handle value, read from its `dx.op.annotateHandle` and underlying
+    /// handle-creation call.
+    fn handle_props(&self, handle: V) -> (u32, bool) {
+        let name = |v: V| match v {
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Call(f, _) => self.funcs[*f as usize].name.as_str(),
+                _ => "",
+            },
+            _ => "",
+        };
+        let (mut props0, mut source) = (0u32, handle);
+        if name(handle) == "dx.op.annotateHandle"
+            && let V::Inst(i) = handle
+            && let Op::Call(_, args) = &self.insts[i as usize].op
+        {
+            // Arguments: opcode, handle, properties.
+            if let Some(&V::Const(props)) = args.get(2)
+                && let Const::Aggregate(fields) = &self.consts[props as usize].1
+                && let Some(&first) = fields.first()
+                && let Some(p0) = self.int_value(V::Const(first))
+            {
+                props0 = p0 as u32;
+            }
+            if let Some(&raw) = args.get(1) {
+                source = raw;
+            }
+        }
+        (
+            props0,
+            name(source).starts_with("dx.op.createHandleFromHeap"),
+        )
+    }
+
+    /// Which instructions are written: those [`Module::rooted`] in reachable
+    /// blocks, reachable non-constant branch conditions, and whatever they
+    /// read through live edges, transitively (a phi or a value nothing in the
+    /// reachable program reads is dropped: lowering makes size queries for
     /// descriptor words no path reads, 556 of ActivateRays' 587). A worklist
     /// visits each instruction once, so a long chain of merges costs one
     /// pass, not one pass per merge.
-    fn live(&self) -> Vec<bool> {
+    fn live(&self, post: &[usize], seen: &[bool]) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
@@ -747,20 +805,39 @@ impl Module {
                 work.push(i);
             }
         };
-        for b in &self.blocks {
-            for &i in b.body.iter().filter(|&&i| self.rooted(i)) {
+        let mut phi_owner = vec![usize::MAX; self.insts.len()];
+        for &b in post {
+            let blk = &self.blocks[b];
+            for &i in &blk.phis {
+                phi_owner[i as usize] = b;
+            }
+            for &i in blk.body.iter().filter(|&&i| self.rooted(i)) {
                 mark(&mut live, &mut work, V::Inst(i));
             }
-            if let Some(Term::CondBr(c, ..)) = b.term {
+            if let Some(Term::CondBr(c, ..)) = self.term(b) {
                 mark(&mut live, &mut work, c);
             }
         }
         while let Some(i) = work.pop() {
-            for_each_operand(&self.insts[i as usize].op, |v| {
-                mark(&mut live, &mut work, v)
-            });
+            match &self.insts[i as usize].op {
+                Op::Phi(inc) => {
+                    let owner = phi_owner[i as usize];
+                    for &(v, pred) in inc {
+                        if owner != usize::MAX && self.has_edge(seen, pred, owner) {
+                            mark(&mut live, &mut work, v);
+                        }
+                    }
+                }
+                op => for_each_operand(op, |v| mark(&mut live, &mut work, v)),
+            }
         }
         live
+    }
+
+    /// Whether block `from` is reachable and its simplified terminator
+    /// directly targets `to` (an untaken constant branch's edge is not one).
+    fn has_edge(&self, seen: &[bool], from: usize, to: usize) -> bool {
+        seen[from] && successors(self.term(from)).contains(&to)
     }
 
     /// Block `b`'s terminator, a branch on a constant taking its one edge
@@ -802,17 +879,29 @@ impl Module {
                 read[*g as usize] = true;
             }
         }
-        for b in plan.layout.iter().map(|&b| &self.blocks[b]) {
+        for &x in &plan.layout {
+            let b = &self.blocks[x];
             for &i in b.phis.iter().chain(&b.body).filter(|&&i| plan.live[i as usize]) {
                 let op = &self.insts[i as usize].op;
                 if let Op::Call(f, _) = *op {
                     called[f as usize] = true;
                 }
-                for_each_operand(op, |v| {
+                let mut note = |v: V| {
                     if let V::Global(g) = v {
                         read[g as usize] = true;
                     }
-                });
+                };
+                match op {
+                    // Only the entries the writer keeps read anything.
+                    Op::Phi(inc) => {
+                        for &(v, pred) in inc {
+                            if plan.edge(self, pred, x) {
+                                note(v);
+                            }
+                        }
+                    }
+                    _ => for_each_operand(op, note),
+                }
             }
         }
         let number = |keep: &mut dyn Iterator<Item = bool>| {
@@ -845,7 +934,6 @@ impl Module {
     /// preheaders, as DXC emits them), or its predecessor would reach the
     /// target twice (the target's phis have one entry per predecessor).
     fn plan(&self) -> Plan {
-        let live = self.live();
         let succs = |b: usize| successors(self.term(b));
         let mut seen = vec![false; self.blocks.len()];
         let mut post = Vec::new();
@@ -867,6 +955,7 @@ impl Module {
             }
         }
         post.reverse();
+        let live = self.live(&post, &seen);
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
@@ -1227,6 +1316,10 @@ pub struct Uses {
     pub typed_uav_loads: bool,
     /// Rasterizer-ordered view annotations.
     pub rovs: bool,
+    /// 64-bit integer atomics on typed resources.
+    pub atomic64_typed: bool,
+    /// 64-bit integer atomics on resources from the descriptor heap.
+    pub atomic64_heap: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).
@@ -1264,7 +1357,7 @@ impl Plan {
     /// is still there (not a constant branch's other edge, not from a block
     /// left out).
     fn edge(&self, m: &Module, b: usize, x: usize) -> bool {
-        self.seen[b] && successors(m.term(b)).contains(&x)
+        m.has_edge(&self.seen, b, x)
     }
 }
 
@@ -1772,15 +1865,37 @@ mod tests {
         })
     }
 
-    /// Liveness as `write` computed it before the worklist: whole passes over
-    /// the instructions until one changes nothing.
+    /// Liveness by whole passes until one changes nothing, to check the
+    /// worklist against: the blocks reached from the entry by the edges
+    /// branches on constants leave, what is rooted in them and their branch
+    /// conditions, and what those read (a phi: only along an edge that is
+    /// still there).
     fn live_by_passes(m: &Module) -> Vec<bool> {
+        let mut reached = vec![false; m.blocks.len()];
+        reached[0] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let now: Vec<usize> = (0..m.blocks.len()).filter(|&b| reached[b]).collect();
+            for b in now {
+                for &s in successors(m.term(b)).iter() {
+                    if !reached[s] {
+                        reached[s] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
         let mut live = vec![false; m.insts.len()];
-        for b in &m.blocks {
-            for &i in b.body.iter().filter(|&&i| m.rooted(i)) {
+        let mut owner = vec![usize::MAX; m.insts.len()];
+        for (b, blk) in m.blocks.iter().enumerate().filter(|&(b, _)| reached[b]) {
+            for &i in &blk.phis {
+                owner[i as usize] = b;
+            }
+            for &i in blk.body.iter().filter(|&&i| m.rooted(i)) {
                 live[i as usize] = true;
             }
-            if let Some(Term::CondBr(V::Inst(c), ..)) = b.term {
+            if let Some(Term::CondBr(V::Inst(c), ..)) = m.term(b) {
                 live[c as usize] = true;
             }
         }
@@ -1788,15 +1903,26 @@ mod tests {
         while changed {
             changed = false;
             for (i, inst) in m.insts.iter().enumerate() {
-                if live[i] {
-                    for_each_operand(&inst.op, |v| {
-                        if let V::Inst(j) = v
-                            && !live[j as usize]
-                        {
-                            live[j as usize] = true;
-                            changed = true;
+                if !live[i] {
+                    continue;
+                }
+                let mut read = |v: V| {
+                    if let V::Inst(j) = v
+                        && !live[j as usize]
+                    {
+                        live[j as usize] = true;
+                        changed = true;
+                    }
+                };
+                match &inst.op {
+                    Op::Phi(inc) => {
+                        for &(v, pred) in inc {
+                            if reached[pred] && successors(m.term(pred)).contains(&owner[i]) {
+                                read(v);
+                            }
                         }
-                    });
+                    }
+                    op => for_each_operand(op, read),
                 }
             }
         }
@@ -1807,7 +1933,7 @@ mod tests {
     fn worklist_liveness_matches_passes() {
         for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
             let m = synthetic(regs, stages, read);
-            let live = m.live();
+            let live = m.plan().live;
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
     }
@@ -1839,7 +1965,7 @@ mod tests {
             V::Inst(i) => i as usize,
             _ => unreachable!(),
         };
-        let live = m.live();
+        let live = m.plan().live;
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
@@ -2057,7 +2183,7 @@ mod tests {
         m.store(entry, cell, one);
         let old = m.atomic(entry, Rmw::Add, cell, two);
         m.terminate(entry, Term::Ret);
-        let live = m.live();
+        let live = m.plan().live;
         let at = |v: V| match v {
             V::Inst(i) => live[i as usize],
             _ => unreachable!(),
@@ -2131,6 +2257,290 @@ mod tests {
         let _ = (m.call(live, sink, vec![t]), h);
         let u = m.uses();
         assert!(u.int64 && !u.heap && !u.sampler_heap, "{u:?}");
+    }
+
+    /// Values defined in reachable blocks whose only users lie behind an
+    /// untaken constant branch are dropped together with their flags and
+    /// constant globals.
+    #[test]
+    fn dead_branch_users_do_not_keep_reachable_values_or_flags_alive() {
+        let (mut m, b, sink) = module(3);
+        let [entry, live, dead] = b[..] else {
+            unreachable!()
+        };
+        let (i32t, i64t, handle_t, i1t) = (m.int(32), m.int(64), m.int(8), m.int(1));
+        let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+        let heap = m.function(
+            "dx.op.createHandleFromHeap",
+            heap_ty,
+            Some(Attr::ReadNone),
+            false,
+        );
+        let (op, zero, one, no, yes) =
+            (m.i32(218), m.i32(0), m.i32(1), m.bool(false), m.bool(true));
+        let five = m.int_const(i64t, 5);
+        let arr = m.array(2, i32t);
+        let init = m.aggregate(arr, &[zero, one]);
+        let dead_tbl = m.constant_global("dead_tbl", init);
+
+        // Defined in the reachable entry block, but consumed only in `dead`.
+        let h = m.call(entry, heap, vec![op, zero, no, no]);
+        let wide = m.bin(entry, Bin::Add, five, five);
+        let p = m.element(entry, dead_tbl, zero);
+        let loaded = m.load(entry, p);
+        m.terminate(entry, Term::CondBr(yes, live, dead));
+
+        let _ = m.call(live, sink, vec![one]);
+        m.terminate(live, Term::Ret);
+
+        let h32 = m.cast(dead, Cast::ZExt, h, i32t);
+        let w32 = m.cast(dead, Cast::Trunc, wide, i32t);
+        let _ = m.call(dead, sink, vec![h32]);
+        let _ = m.call(dead, sink, vec![w32]);
+        let _ = m.call(dead, sink, vec![loaded]);
+        m.terminate(dead, Term::Ret);
+
+        let plan = m.plan();
+        let at = |v: V| match v {
+            V::Inst(i) => plan.live[i as usize],
+            _ => unreachable!(),
+        };
+        assert!(!at(h) && !at(wide) && !at(p) && !at(loaded));
+        assert_eq!(plan.live, live_by_passes(&m));
+        assert_eq!(m.uses(), Uses::default());
+        let ((globals, g_n), _) = m.kept(&plan);
+        let V::Global(g) = dead_tbl else {
+            unreachable!()
+        };
+        assert_eq!((globals[g as usize], g_n), (u32::MAX, 0));
+        let _ = m.write();
+    }
+
+    /// Values defined in reachable blocks that only feed a phi's incoming edge
+    /// from an unreachable predecessor are dropped along with that edge.
+    #[test]
+    fn unreachable_phi_edge_does_not_keep_reachable_value_alive() {
+        let (mut m, b, sink) = module(4);
+        let [entry, live, dead, join] = b[..] else {
+            unreachable!()
+        };
+        let (i32t, handle_t, i1t) = (m.int(32), m.int(8), m.int(1));
+        let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+        let heap = m.function(
+            "dx.op.createHandleFromHeap",
+            heap_ty,
+            Some(Attr::ReadNone),
+            false,
+        );
+        let (op, zero, one, two, no, yes) = (
+            m.i32(218),
+            m.i32(0),
+            m.i32(1),
+            m.i32(2),
+            m.bool(false),
+            m.bool(true),
+        );
+
+        let dead_sum = m.bin(entry, Bin::Add, one, two);
+        let dead_h = m.call(entry, heap, vec![op, zero, no, no]);
+        let dead_h32 = m.cast(entry, Cast::ZExt, dead_h, i32t);
+        m.terminate(entry, Term::CondBr(yes, live, dead));
+
+        m.terminate(live, Term::Br(join));
+        m.terminate(dead, Term::Br(join));
+
+        let p_val = m.phi(join, i32t);
+        m.set_phi(p_val, vec![(one, live), (dead_sum, dead)]);
+        let p_h = m.phi(join, i32t);
+        m.set_phi(p_h, vec![(zero, live), (dead_h32, dead)]);
+        let out = m.bin(join, Bin::Add, p_val, p_h);
+        let _ = m.call(join, sink, vec![out]);
+        m.terminate(join, Term::Ret);
+
+        let plan = m.plan();
+        let at = |v: V| match v {
+            V::Inst(i) => plan.live[i as usize],
+            _ => unreachable!(),
+        };
+        assert!(!at(dead_sum) && !at(dead_h) && !at(dead_h32));
+        assert!(at(p_val) && at(p_h) && at(out));
+        assert_eq!(plan.live, live_by_passes(&m));
+        assert_eq!(m.uses(), Uses::default());
+        let _ = m.write();
+    }
+
+    /// A phi entry from a reachable predecessor whose edge to the phi's block
+    /// a constant branch removed (directly, or through an empty block that
+    /// folds away) keeps nothing alive: liveness and the writer agree on
+    /// which entries exist.
+    #[test]
+    fn dropped_direct_phi_edge_from_reachable_pred_does_not_keep_value_alive() {
+        for folded in [false, true] {
+            let (mut m, b, sink) = module(3);
+            let [entry, mid, join] = b[..] else {
+                unreachable!()
+            };
+            let (i32t, handle_t, i1t) = (m.int(32), m.int(8), m.int(1));
+            let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+            let heap = m.function(
+                "dx.op.createHandleFromHeap",
+                heap_ty,
+                Some(Attr::ReadNone),
+                false,
+            );
+            let (op, zero, one, two, no, yes) = (
+                m.i32(218),
+                m.i32(0),
+                m.i32(1),
+                m.i32(2),
+                m.bool(false),
+                m.bool(true),
+            );
+
+            // Pure values defined in the reachable entry block, read only by
+            // the phi entry along the removed direct edge entry -> join.
+            let dead_sum = m.bin(entry, Bin::Add, one, two);
+            let dead_h = m.call(entry, heap, vec![op, zero, no, no]);
+            let dead_h32 = m.cast(entry, Cast::ZExt, dead_h, i32t);
+            m.terminate(entry, Term::CondBr(yes, mid, join));
+            if !folded {
+                // A non-empty middle block: it stays.
+                let _ = m.call(mid, sink, vec![one]);
+            }
+            m.terminate(mid, Term::Br(join));
+            let p_val = m.phi(join, i32t);
+            m.set_phi(p_val, vec![(one, mid), (dead_sum, entry)]);
+            let p_h = m.phi(join, i32t);
+            m.set_phi(p_h, vec![(zero, mid), (dead_h32, entry)]);
+            let out = m.bin(join, Bin::Add, p_val, p_h);
+            let _ = m.call(join, sink, vec![out]);
+            m.terminate(join, Term::Ret);
+
+            let plan = m.plan();
+            let at = |v: V| match v {
+                V::Inst(i) => plan.live[i as usize],
+                _ => unreachable!(),
+            };
+            assert_eq!(plan.fold[mid].is_some(), folded, "folded={folded}");
+            if folded {
+                assert_eq!(plan.fold[mid], Some((entry, join)));
+            }
+            assert!(
+                !at(dead_sum) && !at(dead_h) && !at(dead_h32),
+                "folded={folded}"
+            );
+            assert!(at(p_val) && at(p_h) && at(out), "folded={folded}");
+            assert!(
+                !plan.edge(&m, entry, join),
+                "the removed direct edge, folded={folded}"
+            );
+            assert!(plan.edge(&m, mid, join), "the taken edge, folded={folded}");
+            assert_eq!(plan.live, live_by_passes(&m), "folded={folded}");
+            assert_eq!(m.uses(), Uses::default(), "folded={folded}");
+            let _ = m.write();
+        }
+    }
+
+    /// A reachable block whose only instructions fed an unreachable branch
+    /// becomes empty once those instructions are dropped, and folds away.
+    #[test]
+    fn block_emptied_by_dropping_dead_branch_uses_folds() {
+        let (mut m, b, sink) = module(4);
+        let [entry, mid, live, dead] = b[..] else {
+            unreachable!()
+        };
+        let (one, two, yes) = (m.i32(1), m.i32(2), m.bool(true));
+
+        m.terminate(entry, Term::Br(mid));
+        let only_for_dead = m.bin(mid, Bin::Add, one, two);
+        m.terminate(mid, Term::CondBr(yes, live, dead));
+        let _ = m.call(live, sink, vec![one]);
+        m.terminate(live, Term::Ret);
+        let _ = m.call(dead, sink, vec![only_for_dead]);
+        m.terminate(dead, Term::Ret);
+
+        let plan = m.plan();
+        let V::Inst(i) = only_for_dead else {
+            unreachable!()
+        };
+        assert!(!plan.live[i as usize]);
+        assert_eq!(plan.fold[mid], Some((entry, live)));
+        assert!(!plan.layout.contains(&mid));
+        assert_eq!(plan.live, live_by_passes(&m));
+        let _ = m.write();
+    }
+
+    /// Pruned `ReadOnly` typed UAV loads and unreachable ROV / 64-bit atomic
+    /// uses do not leak into [`Module::uses`], while live uses set them.
+    #[test]
+    fn uses_tracks_typed_uav_loads_rovs_and_atomic64() {
+        const HEAP: &str = "dx.op.createHandleFromHeap";
+        const BINDING: &str = "dx.op.createHandleFromBinding";
+        let build = |props0: u32, source: &str, op_name: &str, live_use: bool| {
+            let (mut m, b, sink) = module(3);
+            let [entry, live, dead] = b[..] else {
+                unreachable!()
+            };
+            let (i32t, i64t, handle_t, i1t) = (m.int(32), m.int(64), m.int(8), m.int(1));
+            let props_ty = m.named_struct("props", vec![i32t, i32t]);
+            let ann_ty = m.func_ty(handle_t, vec![i32t, handle_t, props_ty]);
+            let ann = m.function("dx.op.annotateHandle", ann_ty, Some(Attr::ReadNone), false);
+            let make_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+            let make = m.function(source, make_ty, Some(Attr::ReadNone), false);
+            let res_ty = m.named_struct("res_ret", vec![i32t, i32t, i32t, i32t, i32t]);
+            let load_ty = m.func_ty(res_ty, vec![i32t, handle_t, i32t, i32t]);
+            let atomic_ty = m.func_ty(i64t, vec![i32t, handle_t, i32t, i32t, i32t, i32t, i64t]);
+            let (zero, one, two, yes, no) =
+                (m.i32(0), m.i32(1), m.i32(2), m.bool(true), m.bool(false));
+            let iu = m.undef(i32t);
+            let make_op = m.i32(if source == HEAP { 218 } else { 217 });
+            let raw = m.call(entry, make, vec![make_op, zero, no, no]);
+            let p0 = m.i32(props0);
+            let p = m.aggregate(props_ty, &[p0, zero]);
+            let ann_op = m.i32(216);
+            let h = m.call(entry, ann, vec![ann_op, raw, p]);
+            let val = if op_name.starts_with("dx.op.bufferLoad.")
+                || op_name.starts_with("dx.op.textureLoad.")
+            {
+                let f = m.function(op_name, load_ty, Some(Attr::ReadOnly), false);
+                let ld_op = m.i32(68);
+                let r = m.call(entry, f, vec![ld_op, h, zero, iu]);
+                m.extract(entry, r, 0)
+            } else {
+                let f = m.function(op_name, atomic_ty, Some(Attr::NoUnwind), false);
+                let blk = if live_use { live } else { dead };
+                let at_op = m.i32(78);
+                let one64 = m.int_const(i64t, 1);
+                let r = m.call(blk, f, vec![at_op, h, two, zero, iu, iu, one64]);
+                let r32 = m.cast(blk, Cast::Trunc, r, i32t);
+                let _ = m.call(blk, sink, vec![r32]);
+                m.terminate(entry, Term::CondBr(yes, live, dead));
+                if !live_use {
+                    let _ = m.call(live, sink, vec![one]);
+                }
+                m.terminate(live, Term::Ret);
+                m.terminate(dead, Term::Ret);
+                return m.uses();
+            };
+            m.terminate(entry, Term::CondBr(yes, live, dead));
+            let dst = if live_use { live } else { dead };
+            let other = if live_use { dead } else { live };
+            let _ = m.call(dst, sink, vec![val]);
+            let _ = m.call(other, sink, vec![one]);
+            m.terminate(live, Term::Ret);
+            m.terminate(dead, Term::Ret);
+            m.uses()
+        };
+        let pruned_load = build(10 | 0x1000, BINDING, "dx.op.bufferLoad.f32", false);
+        assert!(!pruned_load.typed_uav_loads);
+        let live_load = build(10 | 0x1000 | 0x2000, HEAP, "dx.op.textureLoad.f32", true);
+        assert!(live_load.typed_uav_loads && live_load.rovs && live_load.heap);
+        let srv_load = build(10, BINDING, "dx.op.bufferLoad.f32", true);
+        assert!(!srv_load.typed_uav_loads && !srv_load.rovs);
+        let pruned_a64 = build(2 | 0x1000 | 0x2000, HEAP, "dx.op.atomicBinOp.i64", false);
+        assert!(!pruned_a64.atomic64_typed && !pruned_a64.atomic64_heap && !pruned_a64.rovs);
+        let live_a64 = build(2 | 0x1000, HEAP, "dx.op.atomicCompareExchange.i64", true);
+        assert!(live_a64.atomic64_typed && live_a64.atomic64_heap);
     }
 
     #[test]

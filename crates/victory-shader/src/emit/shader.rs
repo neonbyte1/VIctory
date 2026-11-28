@@ -725,8 +725,14 @@ impl Shader {
             (flags::INT64, uses.int64),
             (flags::TYPED_UAV_LOADS, uses.typed_uav_loads),
             (flags::ROVS, uses.rovs),
+            (flags::ATOMIC64_TYPED, uses.atomic64_typed),
+            (flags::ATOMIC64_HEAP, uses.atomic64_heap),
         ] {
-            self.flags = if used { self.flags | flag } else { self.flags & !flag };
+            self.flags = if used {
+                self.flags | flag
+            } else {
+                self.flags & !flag
+            };
         }
         // UAVs outside pixel and compute programs (the write and read marks
         // of vertex, geometry and mesh programs), as DXC counts them: UAV
@@ -1331,6 +1337,49 @@ mod tests {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
+        }
+    }
+
+    /// A pruned `ReadOnly` typed UAV load clears `TYPED_UAV_LOADS` so SFI0
+    /// and the DXIL entry flags match the emitted bitcode under `dxil.dll`.
+    #[test]
+    fn pruned_typed_uav_load_clears_flag_and_validates() {
+        let mut s = Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        let entry = s.entry;
+        let b_live = s.m.new_block();
+        let b_dead = s.m.new_block();
+        let zero = s.m.i32(0);
+        let yes = s.m.bool(true);
+        let iu = s.m.undef(s.t.i32);
+        let h = s.heap_handle(entry, zero, false, false, (10 | 0x1000, 0x409));
+        s.flags |= flags::TYPED_UAV_LOADS;
+        let loaded = s.op(
+            entry,
+            "bufferLoad.f32",
+            Attr::ReadOnly,
+            s.t.res_ret,
+            68,
+            &[h, zero, iu],
+        );
+        let x = s.m.extract(entry, loaded, 0);
+        let mask = s.m.i8(1);
+        let _sink = s.op(
+            b_dead,
+            "bufferStore.f32",
+            Attr::NoUnwind,
+            s.t.void,
+            69,
+            &[h, zero, iu, x, x, x, x, mask],
+        );
+        s.m.terminate(entry, Term::CondBr(yes, b_live, b_dead));
+        s.m.terminate(b_live, Term::Ret);
+        s.m.terminate(b_dead, Term::Ret);
+        assert!(!s.m.uses().typed_uav_loads);
+        let mut dxil = s.finish();
+        let path = super::super::validator::Validator::default_path();
+        if let Ok(mut v) = super::super::validator::Validator::load(path.as_deref()) {
+            v.validate(&mut dxil).unwrap();
         }
     }
 }
