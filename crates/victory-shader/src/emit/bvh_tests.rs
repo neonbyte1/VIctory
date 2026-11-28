@@ -648,6 +648,7 @@ fn build(cfg: Config) -> HostShader {
     })
     .expect("lower");
     let shader = HostShader {
+        wave_size: lowered.wave_size,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

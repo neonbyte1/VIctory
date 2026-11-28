@@ -78,6 +78,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,

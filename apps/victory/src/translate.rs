@@ -69,6 +69,7 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    wave_sizes: BTreeMap<Option<u32>, usize>,
     /// Reason → programs stopped by it, and the smallest recorded label.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -77,6 +78,20 @@ struct Tally {
 }
 
 impl Tally {
+    fn record_wave_size(&mut self, size: Option<u32>) {
+        *self.wave_sizes.entry(size).or_default() += 1;
+    }
+
+    fn wave_summary(&self) -> String {
+        let mut counts = BTreeMap::from([(None, 0), (Some(32), 0), (Some(64), 0)]);
+        counts.extend(self.wave_sizes.iter().map(|(&size, &count)| (size, count)));
+        counts
+            .into_iter()
+            .map(|(size, count)| format!("{count} {}", wave_label(size)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
         let example = example();
         if self.list {
@@ -133,6 +148,9 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        for (size, count) in other.wave_sizes {
+            *self.wave_sizes.entry(size).or_default() += count;
+        }
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -141,6 +159,10 @@ impl Tally {
             self.record_failure(reason, n, example);
         }
     }
+}
+
+fn wave_label(size: Option<u32>) -> String {
+    size.map_or_else(|| "unrestricted".into(), |n| format!("wave{n}"))
 }
 
 /// Emitted shaders by label, shared between threads.
@@ -321,6 +343,7 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    println!("wave sizes   {}", t.wave_summary());
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -628,13 +651,14 @@ fn translate(
     }
 }
 
-/// Validates an emitted shader if asked to.
+/// Records an emitted shader and runs the requested checks.
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
+    t.record_wave_size(shader.wave_size);
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
@@ -670,7 +694,11 @@ fn check(
     }
     let Some(v) = checks.validator.as_mut() else {
         if t.list && checks.host.is_none() {
-            t.lines.push(format!("{}  emitted", label()));
+            t.lines.push(format!(
+                "{}  emitted, {}",
+                label(),
+                wave_label(shader.wave_size)
+            ));
         }
         return;
     };
@@ -708,6 +736,24 @@ fn check(
             t.fail(format!("validator: {first}"), label);
         }
     }
+}
+
+#[test]
+fn counts_emitted_wave_sizes() {
+    let mut total = Tally::default();
+    assert_eq!(total.wave_summary(), "0 unrestricted, 0 wave32, 0 wave64");
+    for sizes in [[None, Some(32), Some(64)], [Some(64); 3]] {
+        let mut worker = Tally::default();
+        for size in sizes {
+            worker.record_wave_size(size);
+        }
+        total.merge(worker);
+    }
+    assert_eq!(total.wave_summary(), "1 unrestricted, 1 wave32, 4 wave64");
+    assert_eq!(
+        [None, Some(32), Some(64)].map(wave_label),
+        ["unrestricted", "wave32", "wave64"]
+    );
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,

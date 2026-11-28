@@ -39,6 +39,7 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    pub wave_size: Option<u32>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -1522,6 +1523,7 @@ impl<'a> Lower<'a> {
             wave_ballots: self.s.m.written_calls("dx.op.waveActiveBallot").count() as u32,
             #[cfg(test)]
             heap_props: self.s.heap_props.clone(),
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,

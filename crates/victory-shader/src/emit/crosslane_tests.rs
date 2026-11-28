@@ -425,6 +425,7 @@ fn build_wave32_cs_with_ballots(
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,

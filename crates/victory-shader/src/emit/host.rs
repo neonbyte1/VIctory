@@ -1154,6 +1154,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         view_marks: false,
     })?;
     Ok(HostShader {
+        wave_size: lowered.wave_size,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -1254,6 +1255,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         } else {
             crate::native::HwStage::Vs
         },
+        wave_size: s.wave_size,
         dxil: s.finish(),
         user_data: Vec::new(),
         samplers: Vec::new(),

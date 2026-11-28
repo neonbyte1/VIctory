@@ -427,6 +427,7 @@ fn build_prefix_cs(wave64: bool, float: bool, inclusive: bool, mode: Mode) -> Ho
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -786,6 +787,7 @@ fn wave_prefix_sum_f32_pixel_quad_all_backends() {
     .expect("vs lower");
     let vs = HostShader {
         stage: HwStage::Vs,
+        wave_size: vlow.wave_size,
         dxil: vlow.dxil,
         user_data: vlow.user_data,
         samplers: Vec::new(),
@@ -899,6 +901,7 @@ fn wave_prefix_sum_f32_pixel_quad_all_backends() {
     .expect("ps lower");
     let ps = HostShader {
         stage: HwStage::Ps,
+        wave_size: plow.wave_size,
         dxil: plow.dxil,
         user_data: plow.user_data,
         samplers: Vec::new(),

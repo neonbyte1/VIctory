@@ -188,6 +188,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -1392,6 +1393,7 @@ fn three_xor_swap_tracks_table_through_vcc_and_64bit_pair() {
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -2469,6 +2471,7 @@ fn try_lower_cs32(
         view_marks: false,
     })?;
     Ok(HostShader {
+        wave_size: lowered.wave_size,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -4048,6 +4051,7 @@ fn packed_fmac_dpp_reads_the_swizzled_lane() {
     s.m.terminate(b, Term::Ret);
     let vs = HostShader {
         stage: HwStage::Vs,
+        wave_size: None,
         dxil: s.finish(),
         user_data: Vec::new(),
         samplers: Vec::new(),
@@ -4675,6 +4679,7 @@ fn build_wave32_cs(body: &[u32]) -> HostShader {
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -5203,6 +5208,7 @@ fn compute_group_info_and_waveid_in_workgroup_match_the_group() {
         }
         HostShader {
             stage: HwStage::Cs,
+            wave_size: lowered.wave_size,
             dxil: lowered.dxil,
             user_data: lowered.user_data,
             samplers: lowered.samplers,
@@ -5876,6 +5882,7 @@ fn build_cube_cs(body: &[u32], uav_dwords: u8) -> HostShader {
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -6293,6 +6300,7 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -6710,6 +6718,7 @@ fn build_wave_cs(wave64: bool, body: &[u32]) -> HostShader {
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -7065,6 +7074,7 @@ fn v_readlane_b32_host_lane_runs_on_all_backends_including_warp() {
     .unwrap();
     let vs = HostShader {
         stage: HwStage::Vs,
+        wave_size: vlow.wave_size,
         dxil: vlow.dxil,
         user_data: Vec::new(),
         samplers: Vec::new(),
@@ -7150,6 +7160,7 @@ fn v_readlane_b32_host_lane_runs_on_all_backends_including_warp() {
     .unwrap();
     let ps = HostShader {
         stage: HwStage::Ps,
+        wave_size: plow.wave_size,
         dxil: plow.dxil,
         user_data: plow.user_data,
         samplers: Vec::new(),

@@ -109,6 +109,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
 fn build_native(native: &NativeProgram) -> Result<HostShader, crate::ShaderError> {
     let lowered = lowered(native)?;
     Ok(HostShader {
+        wave_size: lowered.wave_size,
         stage: native.stage,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -1002,6 +1003,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
         }
         HostShader {
             stage: native.stage,
+            wave_size: l.wave_size,
             dxil: l.dxil,
             user_data: l.user_data,
             samplers: l.samplers,
@@ -1140,6 +1142,7 @@ fn empty_root_constants_bind_zero_in_draw_and_dispatch() {
     cs.m.terminate(cs.entry, super::bitcode::Term::Ret);
     let cs = HostShader {
         stage: HwStage::Cs,
+        wave_size: None,
         dxil: cs.finish(),
         user_data: Vec::new(),
         samplers: Vec::new(),

@@ -297,6 +297,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
     })
     .map_err(e)?;
     Ok(HostShader {
+        wave_size: lowered.wave_size,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

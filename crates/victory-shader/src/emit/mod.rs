@@ -303,6 +303,8 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
+    /// The fixed wave size declared by the emitter, if any.
+    pub wave_size: Option<u32>,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -590,6 +592,7 @@ pub fn emit_with(
     };
     Ok(HostShader {
         stage: native.stage,
+        wave_size: l.wave_size,
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -1133,6 +1136,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_shader_reports_the_emitted_wave_size() {
+        let bytes = crate::dxbc::build(&[]);
+        let container = Container::parse(&bytes).unwrap();
+        for (wave64, lds, expected) in [
+            (true, false, None),
+            (false, true, Some(32)),
+            (true, true, Some(64)),
+        ] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    // A single wave with LDS requires the console wave size.
+                    rsrc2: u32::from(lds) << 15,
+                    threads: [if wave64 { 64 } else { 32 }, 1, 1],
+                }),
+                code: 0xBF81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+            };
+            let p = ir::build(&native.patched_code(), wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let shader = emit(&container, &native, &p, &st, &io, &res, super::Target::ANY).unwrap();
+            assert_eq!(shader.wave_size, expected);
+
+            let dxil = Container::parse(&shader.dxil).unwrap();
+            let psv = dxil.part(FourCC::PSV0).unwrap().data;
+            let min = crate::dxbc::u32_at(psv, 4 + 16).unwrap();
+            let max = crate::dxbc::u32_at(psv, 4 + 20).unwrap();
+            assert_eq!((min, max), expected.map_or((0, u32::MAX), |n| (n, n)));
+        }
+    }
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
@@ -1178,6 +1218,7 @@ mod tests {
         };
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,
+            wave_size: None,
             dxil: constant_color(),
             user_data: Vec::new(),
             samplers: Vec::new(),
@@ -1195,6 +1236,7 @@ mod tests {
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
                 stage,
+                wave_size: None,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
                 samplers: Vec::new(),
@@ -2417,6 +2459,7 @@ mod tests {
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
+                wave_size: None,
                 dxil,
                 user_data: l.user_data,
                 samplers: Vec::new(),
@@ -2577,6 +2620,7 @@ mod tests {
             assert_eq!(lowered.cmp_samplers, if cmp_first { 0b01 } else { 0b10 });
             let mut host = super::HostShader {
                 stage: native.stage,
+                wave_size: lowered.wave_size,
                 dxil: lowered.dxil,
                 user_data: lowered.user_data,
                 static_samplers: lowered
@@ -2902,6 +2946,7 @@ mod tests {
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
+                wave_size: None,
                 dxil,
                 user_data: l.user_data,
                 samplers: Vec::new(),
@@ -3053,6 +3098,7 @@ mod tests {
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
+                wave_size: None,
                 dxil,
                 user_data: l.user_data,
                 samplers: Vec::new(),
