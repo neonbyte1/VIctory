@@ -59,12 +59,27 @@ fn opened(page: usize) -> &'static AtomicU32 {
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty),
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks),
-/// and where its copy keeps its bytes when that is CPU memory our GPU work
-/// does not write (a copy in video memory's mirror): `(bytes of title
-/// address 0, start, end)` ([`Tracked::own_bytes`]).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool, std::sync::OnceLock<(usize, usize, usize)>);
+/// where its copy keeps its bytes when that is CPU memory our GPU work does
+/// not write (a copy in video memory's mirror): `(bytes of title address 0,
+/// start, end)` ([`Tracked::own_bytes`]), and how many of the copy's
+/// submissions may have written its bytes ([`Tracked::note_gpu_writes`],
+/// [`LazyPage::writes`]).
+struct Changed(
+    Mutex<BTreeSet<usize>>,
+    Mutex<Saved>,
+    Option<u32>,
+    bool,
+    std::sync::OnceLock<(usize, usize, usize)>,
+    AtomicU64,
+);
 
 impl Changed {
+    /// How many of the copy's submissions may have written its bytes
+    /// ([`Tracked::note_gpu_writes`]).
+    fn writes(&self) -> u64 {
+        self.5.load(Ordering::Relaxed)
+    }
+
     /// The copy's 64 KiB of whole page `page` (a page number), if known.
     fn own_page(&self, page: usize) -> Option<&[u8]> {
         let &(base, start, end) = self.4.get()?;
@@ -557,6 +572,7 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
         bit,
         copy,
         std::sync::OnceLock::new(),
+        AtomicU64::new(0),
     ));
     let mut g = guards();
     for &page in &pages {
@@ -968,6 +984,14 @@ impl Tracked {
         let _ = self.changed.4.set(((data as usize).wrapping_sub(self.start), self.start, self.end));
     }
 
+    /// Shaders of a submission may write the copy's bytes now (`crate::shadow`'s
+    /// declaring `crate::shadow::Shadow::writing`): a lazy page of the copy
+    /// records the count this makes, so that one a later submission wrote
+    /// over does not go back ([`LazyPage::writes`], [`withheld`]).
+    pub(crate) fn note_gpu_writes(&self) {
+        self.changed.5.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// [`Tracked::arm`], and with [`owner`] the copy's bytes of armed whole
     /// pages that are lazy and that it holds as current (not changed: given
     /// the lazy copy's bytes, or its own) are kept now as their bytes before
@@ -981,6 +1005,10 @@ impl Tracked {
     /// bytes when nothing is lazy.
     pub(crate) fn arm_keeping<'b>(&self, from: usize, to: usize, bytes: impl Fn(usize) -> Option<&'b [u8]>) {
         self.arm(from, to);
+        // Its shaders may write the copy's bytes from here on
+        // ([`Tracked::note_gpu_writes`]): a lazy page of it records that, so
+        // that one they write over does not go back ([`withheld`]).
+        self.note_gpu_writes();
         if self.changed.4.get().is_some() {
             return;
         }
@@ -1376,6 +1404,7 @@ impl Lease<'_> {
             src: v.src,
             alias: v.alias,
             owner: owner.clone(),
+            writes: owner.writes(),
             #[cfg(any(test, feature = "diagnostics"))]
             print: print(v.alias),
         };
@@ -1456,6 +1485,18 @@ impl Lease<'_> {
     /// made them (their next read is given the new bytes, [`serve`]).
     pub(crate) fn again(&mut self, page: usize) {
         self.tracked.changed.taken(page);
+        // The copy wrote the page over its own bytes: what `src` holds is the
+        // page's again, until a later submission's shaders may write it.
+        let writes = self.tracked.changed.writes();
+        let alias = self.g.lazy.get(&page).map(|l| l.alias);
+        if let Some(alias) = alias {
+            let showing = self.g.alias_of.get(&page).cloned().unwrap_or_default();
+            for q in std::iter::once(page).chain(showing) {
+                if let Some(l) = self.g.lazy.get_mut(&q).filter(|l| l.alias == alias) {
+                    l.writes = writes;
+                }
+            }
+        }
         if owner() {
             let me = self.tracked.changed.clone();
             mark_others(&mut self.g, page, &me);
@@ -1480,6 +1521,7 @@ impl Lease<'_> {
             if let Some(l) = g.lazy.get_mut(&q).filter(|l| l.alias == alias) {
                 l.src = src;
                 l.owner = me.clone();
+                l.writes = me.writes();
             }
         }
         me.taken(page);
@@ -1904,7 +1946,8 @@ pub(crate) fn writable_alias(page: usize) -> Option<usize> {
 // - the runtime mapping or unmapping a page ([`title_memory_aliased`],
 //   [`title_memory_remapped`], reported before an unmap);
 // - the copy going (`crate::shadow`'s drop: [`Tracked::resolve_all`]); what
-//   it wrote being withheld ([`forget_lazy`]: title memory keeps its bytes).
+//   it wrote being withheld ([`withheld`]: the page goes back unless its
+//   copy may have written it over, and title memory keeps its bytes then).
 //
 // shortcut: a system call reading title memory on the title's behalf (a file
 // write from a lazy page) fails as a kernel write into a guarded page does;
@@ -1921,6 +1964,11 @@ struct LazyPage {
     /// ([`writable_alias`]), which the title does not see.
     alias: usize,
     owner: Arc<Changed>,
+    /// The owner's write count ([`Changed::writes`]) when the bytes at
+    /// `src` were the page's: a later one means the copy's shaders may have
+    /// written `src` since, and it is not the page's bytes any more (those
+    /// stay in title memory: [`withheld`] forgets it, [`forget`]).
+    writes: u64,
     /// [`print`] of the title bytes left there (checked at the first touch
     /// and by [`verify_lazy`]).
     #[cfg(any(test, feature = "diagnostics"))]
@@ -2282,13 +2330,23 @@ fn forget(g: &mut Guards, page: usize) {
 }
 
 /// What shaders wrote into host copies of `[at, at + len)` stays out of
-/// title memory (`crate::memory::drop_withheld`, [`retake`]): lazy pages
-/// there do not go back either ([`forget`]).
-// shortcut: a lazy page shaders write again in a submission whose writes are
-// withheld loses the earlier submission's bytes too (they were only in the
-// copy); copy-back makes no page lazy while writes are withheld, so this
-// takes a miss right after a lazy copy-back.
-pub(crate) fn forget_lazy(at: usize, len: usize) {
+/// title memory (`crate::memory::drop_withheld`, [`retake`]): a lazy page
+/// there whose copy has not written it since it went lazy goes back now
+/// ([`resolve`]: its bytes come from a submission nothing withheld, and are
+/// the ones title memory would hold had they gone back then), and one the
+/// copy's shaders may have written over does not ([`forget`]: `src` holds
+/// their bytes now, and title memory keeps its own).
+///
+/// [`crate::watch::writing_over`] gives the pages of a declared range their
+/// bytes back before the shaders that may write it run, so a submission
+/// whose writes are withheld drops only its own: the count here catches
+/// the pages whose copies were written through ranges and views nobody
+/// declared (`crate::memory`'s page tables, `crate::shadow`'s marks).
+// shortcut: a lazy page the copy's shaders write again in a submission
+// whose writes are withheld loses the earlier submission's bytes with it:
+// only the copy held them (copy-back makes no page lazy while writes are
+// withheld, so a miss does not meet a page a withheld submission made).
+pub(crate) fn withheld(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     if !any_lazy(first, last) {
         return;
@@ -2296,8 +2354,28 @@ pub(crate) fn forget_lazy(at: usize, len: usize) {
     let mut g = guards();
     let pages: Vec<usize> = g.lazy.range(first..last).map(|(&p, _)| p).collect();
     for page in pages {
-        forget(&mut g, page);
+        let lazy = g.lazy.get(&page);
+        let written = lazy.is_some_and(|l| l.writes != l.owner.writes());
+        if written {
+            forget(&mut g, page);
+        } else {
+            resolve(&mut g, page, Touch::Host);
+        }
     }
+}
+
+/// Before a submission's shaders may write `[at, at + len)` of a copy whose
+/// writes stay out of title memory when a list of it misses memory
+/// (`crate::memory::withholding`; `crate::host`'s declaring the step): its
+/// lazy pages get their copies' bytes now, so that what [`withheld`] drops
+/// later is only the submission's own bytes, not an earlier copy's.
+pub(crate) fn writing_over(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    if !any_lazy(first, last) {
+        return;
+    }
+    let mut g = guards();
+    resolve_range(&mut g, first, last, Touch::Host);
 }
 
 /// Before our host reads title memory `[at, at + len)` through the kernel
@@ -2544,7 +2622,7 @@ fn readable(at: usize) -> bool {
 /// were uploaded again for nothing: 19 % of the uploads, run evict3).
 pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    forget_lazy(at, len);
+    withheld(at, len);
     let g = guards();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     mark(&g, first, last);
@@ -3721,24 +3799,34 @@ pub(crate) mod tests {
     }
 
     /// What shaders wrote and the submission withheld stays out of title
-    /// memory: a lazy page there is guarded again with the title's bytes,
-    /// and the copy takes them again.
+    /// memory (`crate::watch::withheld`): a lazy page there whose copy has
+    /// not written it since it went lazy goes back, the copy's bytes in title
+    /// memory; one the copy may have written over keeps the title's bytes and
+    /// the copy takes them again.
     #[test]
-    fn a_withheld_lazy_view_page_keeps_the_titles_bytes() {
+    fn a_withheld_lazy_view_page_goes_back_unless_its_copy_wrote_it() {
         let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::PAGE_READONLY;
         let _on = LazyOn::set();
-        let (v, own) = section_views(1, 1);
-        let a = v[0];
-        let t = track_copy(a, PAGE, true).expect("views are tracked");
-        t.take(a, a + PAGE);
-        let copy = vec![3u8; PAGE];
-        assert_eq!(t.lease().lazify(&[offer(a, 0, &copy, own)]).len(), 1);
-        retake(a, PAGE);
-        assert_eq!(protection(a), Some(PAGE_READONLY));
-        assert_eq!(raw(a), Some(0), "the title's bytes");
-        assert!(t.changed(a / PAGE), "the copy takes them again");
-        drop(t);
+        for written in [false, true] {
+            let (v, own) = section_views(1, 1);
+            let a = v[0];
+            let t = track_copy(a, PAGE, true).expect("views are tracked");
+            t.take(a, a + PAGE);
+            let copy = vec![3u8; PAGE];
+            assert_eq!(t.lease().lazify(&[offer(a, 0, &copy, own)]).len(), 1);
+            if written {
+                // Its shaders may write the copy's bytes: the page's are not
+                // there any more.
+                t.note_gpu_writes();
+            }
+            withheld(a, PAGE);
+            assert_eq!(protection(a), Some(PAGE_READONLY), "{written}");
+            let title = if written { 0 } else { 3 };
+            assert_eq!(raw(a), Some(title), "{written}: the title's bytes");
+            assert_eq!(t.changed(a / PAGE), written, "who holds them: {written}");
+            drop(t);
+        }
     }
 
     /// Measurement, not a check (`--ignored`): per 64 KiB page under this

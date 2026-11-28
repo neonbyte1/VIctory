@@ -4875,7 +4875,16 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len, marked, _) => {
+                Step::GpuWrite(shadow, address, len, marked, memory) => {
+                    // A range of a program using title memory: its writes
+                    // stay out of title memory if a list of the submission
+                    // missed (`crate::memory::withholding`). Pages an earlier
+                    // copy left lazy there go back before these shaders may
+                    // write the copy over, so that what is withheld is only
+                    // this submission's (`crate::watch::withheld`).
+                    if *memory {
+                        crate::watch::writing_over(*address, *len);
+                    }
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
                     if !marked {
@@ -4887,11 +4896,20 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l, clean| batch.add_reached(s, a, l, clean));
+                    // Shaders taking views from the heap itself may write them
+                    // without declaring a range: every copy the heap reaches
+                    // counts as possibly written (`crate::watch::withheld`).
+                    crate::bindless::refresh(viewed, |s, a, l, clean| {
+                        s.wrote_over();
+                        batch.add_reached(s, a, l, clean);
+                    });
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l, clean| batch.add_reached(s, a, l, clean));
+                    crate::memory::prepare(heap, |s, a, l, clean| {
+                        s.wrote_over();
+                        batch.add_reached(s, a, l, clean);
+                    });
                     continue;
                 }
             };
