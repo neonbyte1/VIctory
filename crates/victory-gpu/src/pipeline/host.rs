@@ -1494,4 +1494,118 @@ mod tests {
             }
         }
     }
+
+    /// A title's graphics state blending (MAX, which the console allows on
+    /// integer formats) into three targets, the last `R8_UINT`; with
+    /// `independent` false, target 0's description stands for all three and
+    /// the others keep their defaults (unblended), as a title's need not match.
+    fn blending_into_an_integer_target(independent: bool) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = independent.into();
+        let described = if independent { 8 } else { 1 };
+        for t in &mut g.blend.RenderTarget[..described] {
+            t.BlendEnable = true.into();
+            t.BlendOp = D3D12_BLEND_OP_MAX;
+            t.BlendOpAlpha = D3D12_BLEND_OP_MAX;
+        }
+        g.depth.DepthEnable = false.into();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        g
+    }
+
+    /// With one description for every target, the others are copied from
+    /// target 0, not taken from entries the title left at their defaults:
+    /// a float target keeps the blending target 0 describes.
+    /// (`integer_targets_do_not_blend` gives every entry the same blend, so
+    /// it would pass without the copy.)
+    #[test]
+    fn a_shared_blend_description_is_copied_to_every_target() {
+        let g = blending_into_an_integer_target(false);
+        let blend = host_blend(&g.blend, &g.targets);
+        assert!(blend.IndependentBlendEnable.as_bool());
+        assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(blend.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(blend.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
+        assert!(!blend.RenderTarget[2].BlendEnable.as_bool());
+    }
+
+    /// The host takes such a pipeline (it was refused with E_INVALIDARG).
+    #[test]
+    fn the_host_takes_a_pipeline_blending_into_an_integer_target() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        const SOURCE: &str = r#"
+#define RS "RootFlags(0)"
+struct Out { float4 a : SV_Target0; float4 b : SV_Target1; uint c : SV_Target2; };
+[RootSignature(RS)]
+float4 vs(uint v : SV_VertexID) : SV_Position { return float4(v & 1, v >> 1, 0, 1); }
+Out ps() { Out o; o.a = 1; o.b = 1; o.c = 1; return o; }
+"#;
+        let blob = |entry: PCSTR, target: PCSTR| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names outlive the call.
+            unsafe {
+                D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    s!("blend"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+            }
+            .unwrap();
+            code.unwrap()
+        };
+        let (vs, ps) = (blob(s!("vs"), s!("vs_5_1")), blob(s!("ps"), s!("ps_5_1")));
+        // SAFETY: the blobs' own bytes.
+        let bytes = |b: &ID3DBlob| unsafe {
+            D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.GetBufferPointer(),
+                BytecodeLength: b.GetBufferSize(),
+            }
+        };
+        // SAFETY: a compiled shader with its root signature inside.
+        let root: ID3D12RootSignature = unsafe {
+            host.device.CreateRootSignature(
+                0,
+                std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize()),
+            )
+        }
+        .unwrap();
+        for independent in [true, false] {
+            let g = blending_into_an_integer_target(independent);
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed for the call.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                VS: bytes(&vs),
+                PS: bytes(&ps),
+                BlendState: host_blend(&g.blend, &g.targets),
+                SampleMask: g.sample_mask,
+                RasterizerState: g.rasterizer,
+                DepthStencilState: g.depth,
+                PrimitiveTopologyType: host_topology(&g),
+                NumRenderTargets: g.targets.NumRenderTargets,
+                RTVFormats: g.targets.RTFormats,
+                SampleDesc: g.samples,
+                ..Default::default()
+            };
+            // SAFETY: a complete description.
+            let made: windows::core::Result<ID3D12PipelineState> =
+                unsafe { host.device.CreateGraphicsPipelineState(&desc) };
+            assert!(made.is_ok(), "independent: {independent}: {:?}", made.err());
+        }
+    }
 }
