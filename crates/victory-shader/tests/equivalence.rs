@@ -410,7 +410,7 @@ fn false_observer_guard_preserves_the_defined_old_value() {
 
 #[test]
 fn bounded_execution_and_compiler_refusal() {
-    use source::Op::{End, Jump, Mov, Observe};
+    use source::Op::{End, Mov, Observe};
     let i = fixture();
     // Reachable self-loop after a preheader, with an observer on the untaken
     // exit. Both compiler representations have a valid loop header.
@@ -426,10 +426,13 @@ fn bounded_execution_and_compiler_refusal() {
     assert_eq!(ssa::execute(&p, &i), Err(Stop::Limit));
     let s = structure::structure(&p).unwrap();
     assert_eq!(structured::execute(&p, &s, &i), Err(Stop::Limit));
-    // The builder explicitly refuses a branch to the program entry.
-    let error = ir::build(&source::encode(&[Jump(0), End]).unwrap(), false, 3).unwrap_err();
-    assert!(matches!(
-        failure("build", error),
-        Outcome::Refused("build", 0, _)
-    ));
+    // The same loop with its header at the program entry: a branch to the
+    // first instruction is accepted. s2 enters as 0, so it is always taken and
+    // the observer sits on the untaken exit.
+    let ops = [source::Op::Less(2, 1), source::Op::Scc1(0), Observe, End];
+    assert_eq!(source::direct(&ops, &i), Err(Stop::Limit));
+    let p = ir::build(&source::encode(&ops).unwrap(), false, 3).unwrap();
+    assert_eq!(ssa::execute(&p, &i), Err(Stop::Limit));
+    let s = structure::structure(&p).unwrap();
+    assert_eq!(structured::execute(&p, &s, &i), Err(Stop::Limit));
 }

@@ -555,9 +555,11 @@ impl Module {
                     Op::Call(f, args)
                         if self.funcs[*f as usize].name == "dx.op.cbufferLoadLegacy.i32" =>
                     {
-                        let row = self.int_value(args[2]).unwrap() as u32;
+                        let Some(row) = self.int_value(args[2]) else {
+                            continue;
+                        };
                         load_ids.insert(i);
-                        loads.push((pos, row));
+                        loads.push((pos, row as u32));
                     }
                     Op::Extract(V::Inst(src), lane) if load_ids.contains(src) => {
                         extracts.push((pos, *lane));
