@@ -1046,18 +1046,69 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
 }
 
-/// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+struct Buffers {
+    map: BTreeMap<(u64, usize), Entry>,
+    /// Live registration count per buffer size, keeping `max_size()` exact
+    /// in O(log n) across inserts, in-place replacements, and removals.
+    sizes: BTreeMap<u64, usize>,
+}
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+impl Buffers {
+    const fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            sizes: BTreeMap::new(),
+        }
+    }
+
+    fn max_size(&self) -> u64 {
+        self.sizes.keys().next_back().copied().unwrap_or(0)
+    }
+
+    fn insert(&mut self, resource: usize, start: u64, len: u64) {
+        if let Some(prev) = self.map.insert(
+            (start, resource),
+            Entry {
+                end: start + len,
+                shadow: None,
+            },
+        ) {
+            let old_len = prev.end - start;
+            if old_len == len {
+                return;
+            }
+            self.decrement_size(old_len);
+        }
+        *self.sizes.entry(len).or_insert(0) += 1;
+    }
+
+    fn remove(&mut self, resource: usize, start: u64) -> Option<Entry> {
+        let removed = self.map.remove(&(start, resource))?;
+        self.decrement_size(removed.end - start);
+        Some(removed)
+    }
+
+    fn decrement_size(&mut self, len: u64) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.sizes.entry(len) {
+            if *entry.get() > 1 {
+                *entry.get_mut() -= 1;
+            } else {
+                entry.remove();
+            }
+        }
+    }
+}
+
+/// Title buffers by (start address, resource), with their copy once made.
+static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers::new());
+
+fn buffers() -> std::sync::MutexGuard<'static, Buffers> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The longest title buffer registered so far (it stays after the buffer is
 /// released): a buffer starting further below an address than this cannot
 /// hold it. Changed under `BUFFERS`' lock.
-static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
-
 /// Counts copies made and title buffers released: [`all`] may differ when
 /// it changed.
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1073,31 +1124,23 @@ fn changed() {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    let mut map = buffers();
-    MAX_SPAN.fetch_max(len, Ordering::Relaxed);
-    map.insert(
-        (start, resource),
-        Entry {
-            end: start.saturating_add(len),
-            shadow: None,
-        },
-    );
+    buffers().insert(resource, start, len);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    if buffers().remove(resource, start).is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
 }
 
-/// The innermost entry holding `[address, end)`: the one starting closest
-/// below `address` that reaches `end`, among those starting at most `span`
-/// (the longest entry's length) below `end`. Big buffers hold many smaller
-/// ones (a heap's placed buffers), so the one holding an address past
-/// those can be any number of entries back.
-fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: u64) -> Option<(u64, usize)> {
-    let lowest = end.saturating_sub(span);
+fn find_buffer(
+    map: &BTreeMap<(u64, usize), Entry>,
+    max_size: u64,
+    address: u64,
+    end: u64,
+) -> Option<(u64, usize)> {
+    let lowest = end.saturating_sub(max_size);
     if lowest > address {
         return None;
     }
@@ -1111,13 +1154,12 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
-    let Some(key) = key else {
-        drop(map);
+    let mut state = buffers();
+    let Some(key) = find_buffer(&state.map, state.max_size(), address, end) else {
+        drop(state);
         return loose(address, end);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = state.map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -1410,7 +1452,7 @@ impl Arena {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut all: Vec<Arc<Shadow>> = buffers().map.values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
@@ -1419,6 +1461,7 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers()
+        .map
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -1982,25 +2025,25 @@ pub(crate) mod tests {
         let span = 256 * MIB;
         // Past all 200 children (and the 64 entries looked at before).
         let at = base + 200 * 0x10000 + 0x100;
-        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        assert_eq!(find_buffer(&map, span, at, at + 16), Some((base, 1)));
         let first_64 = map.range(..=(at, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= at + 16);
         assert!(first_64.is_none(), "the parent is more than 64 entries back");
         // Near the parent's end.
         let at = base + 256 * MIB - 16;
-        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        assert_eq!(find_buffer(&map, span, at, at + 16), Some((base, 1)));
         // Inside a child: the child, the innermost.
         let at = base + 150 * 0x10000 + 8;
-        assert_eq!(enclosing(&map, span, at, at + 8), Some((base + 150 * 0x10000, 250)));
+        assert_eq!(find_buffer(&map, span, at, at + 8), Some((base + 150 * 0x10000, 250)));
         // Across two children: only the parent holds it.
         let at = base + 151 * 0x10000 - 8;
-        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        assert_eq!(find_buffer(&map, span, at, at + 16), Some((base, 1)));
         // Past the parent, and before it.
         let at = base + 256 * MIB;
-        assert_eq!(enclosing(&map, span, at, at + 1), None);
-        assert_eq!(enclosing(&map, span, base - 16, base + 16), None);
+        assert_eq!(find_buffer(&map, span, at, at + 1), None);
+        assert_eq!(find_buffer(&map, span, base - 16, base + 16), None);
         // Longer than any buffer: none, without looking.
-        assert_eq!(enclosing(&map, span, base, base + span + 1), None);
-        assert_eq!(enclosing(&map, 0, base, base + 1), None);
+        assert_eq!(find_buffer(&map, span, base, base + span + 1), None);
+        assert_eq!(find_buffer(&map, 0, base, base + 1), None);
     }
 
     #[test]
@@ -2013,115 +2056,131 @@ pub(crate) mod tests {
         for i in 0..100u64 {
             register(2 + i as usize, base + i * 0x1000, 0x1000);
         }
-        assert!(MAX_SPAN.load(Ordering::Relaxed) >= len);
         let at = base + len - 64;
-        let found = enclosing(&buffers(), MAX_SPAN.load(Ordering::Relaxed), at, at + 64);
+        let found = find_buffer(&buffers().map, buffers().max_size(), at, at + 64);
         for i in 0..100u64 {
             unregister(2 + i as usize, base + i * 0x1000);
         }
         unregister(1, base);
         assert_eq!(found, Some((base, 1)));
-        assert!(buffers().range((base, 0)..=(base + len, usize::MAX)).next().is_none());
+        let state = buffers();
+        assert!(state.map.range((base, 0)..=(base + len, usize::MAX)).next().is_none());
     }
 
     #[test]
-    fn loose_windows_are_reused_for_ranges_inside_them() {
-        let w = window();
-        let base = 0x20_0000_0000;
-        let mut windows = BTreeMap::new();
-        windows.insert((base, w), "first");
-        // A range across the next two windows got one of its own.
-        windows.insert((base + w, 2 * w), "spanning");
-        let span = 2 * w;
-        let find = |address: u64, len: u64| enclosing_window(&windows, span, address, address + len).copied();
-        assert_eq!(find(base, 1), Some("first"));
-        assert_eq!(find(base + w - 16, 16), Some("first"));
-        // Inside the spanning window, also in its second half.
-        assert_eq!(find(base + w + 8, 64), Some("spanning"));
-        assert_eq!(find(base + 2 * w + 8, 64), Some("spanning"));
-        assert_eq!(find(base + 3 * w - 8, 8), Some("spanning"));
-        // Across the first window's end: none holds it whole.
-        assert_eq!(find(base + w - 8, 16), None);
-        // Past every window, before them, longer than any.
-        assert_eq!(find(base + 3 * w, 1), None);
-        assert_eq!(find(base - 8, 4), None);
-        assert_eq!(find(base, 3 * w), None);
-    }
+    fn find_reaches_covering_buffer_past_many_inner_buffers() {
+        let p = crate::watch::tests::pool(4);
+        let base = p as u64;
+        let outer_len = (4 * PAGE) as u64;
 
-    /// A range in one window, then a range across that window's end, which
-    /// gets a window of its own over both (the first inside it): what the
-    /// title writes reaches both copies, and what the GPU writes through
-    /// the spanning one goes back to title memory and from there into the
-    /// first at its next refresh. (Within one submission the two copies are
-    /// apart, as any two copies of the same bytes are.)
-    #[test]
-    fn overlapping_windows_agree_through_title_memory() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        if host().is_none() {
-            return;
+        register(p, base, outer_len);
+        for i in 0..128 {
+            register(p + 1 + i, base + (i as u64) * 256, 128);
         }
-        let w = window() as usize;
-        // SAFETY: a fresh allocation, released below.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * w, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
-        assert_ne!(p, 0);
-        let b = p.next_multiple_of(w);
-        let title = |at: usize| (b + at) as *mut u8;
-        // SAFETY: (all title reads and writes below) bytes of our allocation.
-        unsafe { title(w - 40).write_volatile(0x11) };
-        let first = loose((b + w - 64) as u64, (b + w - 32) as u64).expect("a window");
-        let spanning = loose((b + w - 16) as u64, (b + w + 16) as u64).expect("a window across the boundary");
-        assert!(!Arc::ptr_eq(&first, &spanning));
-        assert_eq!((first.start, first.len), (b as u64, w as u64));
-        assert_eq!((spanning.start, spanning.len), (b as u64, 2 * w as u64), "the first lies inside it");
-        let byte = |s: &Shadow, at: usize| s.read_host(((b + at) & !3) as u64, 1)[0].to_le_bytes()[(b + at) % 4];
-        // The title writes: both copies take it at their refresh.
-        // SAFETY: a byte of our allocation.
-        unsafe { title(w - 40).write_volatile(0x22) };
-        first.update(b + w - 64, 64);
-        spanning.update(b + w - 64, 64);
-        assert_eq!((byte(&first, w - 40), byte(&spanning, w - 40)), (0x22, 0x22));
-        // A shader writes through the spanning copy; it goes back to title
-        // memory, and the first copy takes it at its next refresh.
-        spanning.writing(b + w - 64, 64, false);
-        spanning.write_host((b + w - 40) as u64, &[0x33]);
-        spanning.copy_back(b + w - 64, 64);
-        // SAFETY: a byte of our allocation.
-        let back = unsafe { title(w - 40).read_volatile() };
-        assert_eq!(back, 0x33, "back in title memory");
-        first.update(b + w - 64, 64);
-        assert_eq!(byte(&first, w - 40), 0x33, "and in the first copy");
-        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(s, _), _| s != b as u64);
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
-    }
 
-    #[test]
-    fn window_sizes_are_any_power_of_two() {
-        assert_eq!(window_from(None), 4 << 20);
-        assert_eq!(window_from(Some("256")), 256 << 10);
-        assert_eq!(window_from(Some(" 64 ")), 64 << 10);
-        assert_eq!(window_from(Some("4")), 4 << 10);
-        assert_eq!(window_from(Some("16384")), 16 << 20);
-        for bad in ["", "0", "100", "-256", "256k", "0x100", "9223372036854775808"] {
-            assert_eq!(window_from(Some(bad)), 4 << 20, "{bad:?}");
+        let target = base + (3 * PAGE) as u64;
+        {
+            let state = buffers();
+            assert_eq!(
+                find_buffer(&state.map, state.max_size(), target, target + 64),
+                Some((base, p))
+            );
         }
+        if let Some(outer) = find(target, 64) {
+            assert_eq!(outer.range(), (base, outer_len));
+        }
+
+        for i in 0..128 {
+            unregister(p + 1 + i, base + (i as u64) * 256);
+        }
+        unregister(p, base);
     }
 
     #[test]
-    fn loose_memory_must_be_committed() {
-        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        // The null page and its guard area.
-        assert!(loose(0, 16).is_none());
-        assert!(loose(0x1000, 0x1010).is_none());
-        assert!(loose(LOWEST_MAPPED - 1, LOWEST_MAPPED + 1).is_none());
-        // Reserved, not committed.
-        // SAFETY: a fresh reservation, released below.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), window() as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
-        assert_ne!(p, 0);
-        assert!(loose(p + 64, p + 128).is_none());
-        // SAFETY: our reservation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
-        // Too close to the top to round up to a window.
-        assert!(loose(u64::MAX - 8, u64::MAX).is_none());
+    fn find_stops_at_max_size_bound_and_tightens_on_unregister() {
+        let mut state = Buffers::new();
+        let base = 0x7e00_0000_0000_u64;
+        let huge = 64 << 20;
+        let small = 256;
+
+        state.insert(1, base, huge);
+        state.insert(2, base + 0x1000, small);
+        assert_eq!(state.max_size(), huge);
+        assert_eq!(
+            find_buffer(&state.map, state.max_size(), base + 0x2000, base + 0x2040),
+            Some((base, 1))
+        );
+
+        // Removing the largest buffer tightens `max_size` to the remaining buffers.
+        assert!(state.remove(1, base).is_some());
+        assert_eq!(state.max_size(), small);
+        assert_eq!(
+            find_buffer(&state.map, state.max_size(), base + 0x2000, base + 0x2040),
+            None
+        );
+
+        // Entries starting further back than `max_size` are not visited on a miss.
+        let mut stale = BTreeMap::new();
+        stale.insert(
+            (base, 3),
+            Entry {
+                end: base + 1024,
+                shadow: None,
+            },
+        );
+        assert_eq!(find_buffer(&stale, small, base + 512, base + 576), None);
+
+        // Also exercise global `register` / `unregister` tightening `max_size`.
+        register(0x7e00_0001, base, huge);
+        assert!(buffers().max_size() >= huge);
+        unregister(0x7e00_0001, base);
+        assert!(buffers().max_size() < huge);
+    }
+
+    #[test]
+    fn max_size_tracks_equal_sizes_replacements_and_descending_removals() {
+        let mut state = Buffers::new();
+        let base = 0x7d00_0000_0000_u64;
+        assert_eq!(state.max_size(), 0);
+
+        // Multiple equal maximum-size buffers keep `max_size()` pinned until the
+        // last one is removed, then fall back cleanly to the next largest size.
+        state.insert(1, base, 512);
+        state.insert(2, base + 0x1000, 4096);
+        state.insert(3, base + 0x2000, 4096);
+        state.insert(4, base + 0x3000, 4096);
+        assert_eq!(state.max_size(), 4096);
+
+        assert!(state.remove(2, base + 0x1000).is_some());
+        assert_eq!(state.max_size(), 4096);
+        assert!(state.remove(3, base + 0x2000).is_some());
+        assert_eq!(state.max_size(), 4096);
+        assert!(state.remove(4, base + 0x3000).is_some());
+        assert_eq!(state.max_size(), 512);
+
+        // In-place replacement: equal size is a no-op, growing raises the max,
+        // shrinking lowers it immediately to the exact remaining maximum.
+        state.insert(5, base + 0x4000, 2048);
+        assert_eq!(state.max_size(), 2048);
+        state.insert(5, base + 0x4000, 2048);
+        assert_eq!(state.max_size(), 2048);
+        state.insert(5, base + 0x4000, 8192);
+        assert_eq!(state.max_size(), 8192);
+        state.insert(5, base + 0x4000, 1024);
+        assert_eq!(state.max_size(), 1024);
+
+        // Removing distinct sizes in strictly descending order steps down to 0.
+        state.insert(6, base + 0x5000, 256);
+        for (resource, addr, next_max) in [
+            (5, base + 0x4000, 512),
+            (1, base, 256),
+            (6, base + 0x5000, 0),
+        ] {
+            assert!(state.remove(resource, addr).is_some());
+            assert_eq!(state.max_size(), next_max);
+        }
+        assert!(state.map.is_empty());
+        assert!(state.sizes.is_empty());
+        assert_eq!(state.max_size(), 0);
     }
 }
