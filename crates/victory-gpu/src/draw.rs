@@ -277,6 +277,23 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Clears bindings within a segment, retaining what its recorded work uses.
+    pub(crate) fn clear_state(&mut self, pipeline: This) {
+        self.set_pipeline(pipeline);
+        self.heaps = [0; 2];
+        self.graphics.clear();
+        self.compute.clear();
+        self.vertex = [VertexView::default(); 32];
+        self.index = IndexView::default();
+        self.targets.clear();
+        self.depth = None;
+        self.depth_bounds = None;
+        self.topology = 0;
+        self.host_state_lost();
+        self.table_failed = false;
+        self.fixed = Fixed::default();
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -2366,7 +2383,6 @@ mod tests {
         // A title view heap stays.
         assert_eq!(State::wanted([0x10, 0x20], false), [0x10, 0x20]);
     }
-    use crate::object::{HRESULT, S_OK};
 
     /// The fifth dword of a root constants parameter is a constant, not the
     /// offset of a root view.
@@ -2419,6 +2435,7 @@ mod tests {
         assert_eq!(gpu, unsafe { table.GetGPUVirtualAddress() });
         list.close();
     }
+    use crate::object::{HRESULT, IUNKNOWN, S_OK, slot};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
@@ -2635,6 +2652,235 @@ void main() {
             (0x2222_2222, 0x3333_3333),
             "CBV shadow after a copy and after partial first use"
         );
+    }
+
+
+    fn title_list(kind: u32, pipeline: This) -> This {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(null, kind, &IUNKNOWN, &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            crate::list::create_list(null, 0, kind, allocator, pipeline, &IUNKNOWN, &mut list),
+            S_OK
+        );
+        release(allocator);
+        list
+    }
+
+    fn release(object: This) {
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
+    }
+
+    /// A Wave32 compute shader that stores a literal to the buffer UAV at table slot 0.
+    fn store_pipeline(value: u32) -> This {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E00_02FF, value, // v_mov_b32 v0, literal
+            0xE070_0000, 0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let packet = [0u32, 0, 0, 0x0001_0001, 0x0010_0001, 0, 5 << 1];
+        let meta = [
+            0x403, 36, code.len() as u32, 0, 0, 0x0001_0440,
+            // Resource record: a 4-dword UAV in the table passed in s4.
+            0x41, 0x0303, 0, 0, 1, 0x0404, u32::MAX, 0,
+        ];
+        let code_offset = 64 + size_of_val(&packet) as u32;
+        let meta_offset = code_offset + size_of_val(&code) as u32;
+        let directory = [
+            u32::from_le_bytes(*b"FSPX"), 1, 3, meta_offset + size_of_val(&meta) as u32,
+            0, 64, size_of_val(&packet) as u32, 0,
+            6, code_offset, size_of_val(&code) as u32, 0,
+            7, meta_offset, size_of_val(&meta) as u32, 0,
+        ];
+        let part_size = directory[3];
+        // DXBC header and the single ACCC part header.
+        let header = [
+            u32::from_le_bytes(*b"DXBC"), 0, 0, 0, 0, 1, 44 + part_size, 1, 36,
+            u32::from_le_bytes(*b"ACCC"), part_size,
+        ];
+        let bytes: Vec<_> = header
+            .into_iter()
+            .chain(directory)
+            .chain(packet)
+            .chain(code)
+            .chain(meta)
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        #[repr(C)]
+        struct ComputeDesc {
+            root: This,
+            code: *const u8,
+            size: usize,
+        }
+        let null = std::ptr::null();
+        let desc = ComputeDesc {
+            root: null,
+            code: bytes.as_ptr(),
+            size: bytes.len(),
+        };
+        let mut pipeline = null;
+        assert_eq!(
+            crate::pipeline::create_compute(
+                null,
+                std::ptr::from_ref(&desc).cast(),
+                &IUNKNOWN,
+                &mut pipeline
+            ),
+            S_OK
+        );
+        // The normal pipeline workers share a per-frame wait budget with other tests.
+        let started = std::time::Instant::now();
+        while crate::pipeline::host_pipeline(pipeline).is_none() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the host did not make the compute pipeline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        pipeline
+    }
+
+    #[test]
+    fn clear_state_switches_compute_pipeline_without_losing_recorded_work() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped ClearState compute test: no host D3D12 device");
+            return;
+        };
+        let expected = [0x1357_9bdf, 0x2468_ace0];
+        let [a, b] = expected.map(store_pipeline);
+        let list = title_list(2, a);
+        let (heap, title_heap, _) = view_heap(8);
+        let base = crate::watch::tests::pool(2);
+        let addresses = [base, base + crate::watch::PAGE];
+        let buffers = addresses.map(|at| buffer_at_address(at as u64, crate::watch::PAGE as u64));
+        let handles = [title_heap.start, title_heap.start + 32];
+        let uav = [39, 1, 0, 0, 1, 0, 0, 0, 1, 0];
+        let heaps = slot::<extern "system" fn(This, u32, *const This)>(list, 0x100);
+        let table = slot::<extern "system" fn(This, u32, u64)>(list, 0x118);
+        let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(list, 0x70);
+        let record = |buffer, handle| {
+            let null = std::ptr::null();
+            crate::descriptor::create_uav(null, buffer, null, &uav, handle);
+            heaps(list, 1, &heap);
+            table(list, 0, handle);
+            dispatch(list, 1, 1, 1);
+        };
+        record(buffers[0], handles[0]);
+        slot::<extern "system" fn(This, This)>(list, 0x58)(list, b);
+        record(buffers[1], handles[1]);
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        release(a);
+        release(b);
+        assert_eq!(crate::list::segments(list).len(), 1);
+        host.execute(&[crate::list::host_list(list).unwrap()]);
+
+        // SAFETY: both addresses are in mapped title memory and the GPU has finished.
+        let results = addresses.map(|at| unsafe { (at as *const u32).read_volatile() });
+        assert_eq!(results, expected);
+        for object in [list, heap, buffers[0], buffers[1]] {
+            release(object);
+        }
+        crate::watch::tests::free(base);
+    }
+
+    #[test]
+    fn clear_state_clears_graphics_bindings_before_a_segment_cut() {
+        let Some(device) = crate::host::host() else {
+            eprintln!("skipped ClearState graphics test: no host D3D12 device");
+            return;
+        };
+        let null = std::ptr::null();
+        let list = title_list(0, null);
+        let (heap, _, heap_host) = view_heap(8);
+        let dynamic = (heap as usize, heap_host.dynamic(1).unwrap(), 1);
+        let (mut copied, source) = (0u8, 1u8);
+        let mut memory = None;
+        crate::list::with_state(list, |host, state| {
+            state.pipeline = 1;
+            state.set_heaps(&[heap]);
+            state.set_constants(false, 0, &[5], 0);
+            state.set_view(true, 0, 7);
+            state.vertex[0].address = 8;
+            state.index.address = 16;
+            state.targets.push((1, None));
+            state.depth = None;
+            state.depth_bounds = Some((0.25, 0.75));
+            state.set_topology(host, 4);
+            state.viewports(
+                host,
+                &[D3D12_VIEWPORT {
+                    Width: 1.0,
+                    Height: 1.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }],
+            );
+            state.scissors(
+                host,
+                &[RECT { right: 1, bottom: 1, ..Default::default() }],
+            );
+            state.blend_factor(host, Some(&[0.5; 4]));
+            state.stencil_ref(host, 1);
+            state.fixed.targets = Some((vec![1], 1));
+            state.host_pipeline = 1;
+            state.host_roots = [1; 2];
+            state.host_heaps = [1; 2];
+            state.table_failed = true;
+            state.fresh_tables.insert((1, 2), 3);
+            state.root_slots.insert((1, 2, true), 3);
+            state.root_run = (1, 4, 5);
+            state.dynamic.push(dynamic);
+            memory = Some(state.memory_map(host).expect("title-memory map"));
+            host.defer_copy(&mut copied, &source, 1);
+        });
+        slot::<extern "system" fn(This, This)>(list, 0x58)(list, null);
+        crate::list::with_state(list, |_, state| {
+            assert_eq!(state.pipeline, 0);
+            assert_eq!(state.heaps, [0; 2]);
+            assert!(state.graphics.is_empty() && state.compute.is_empty());
+            assert!(state.vertex.iter().all(|view| view.address == 0));
+            assert_eq!(state.index.address, 0);
+            assert!(state.targets.is_empty());
+            assert!(state.depth.is_none());
+            assert_eq!(state.depth_bounds, None);
+            assert_eq!(state.topology, 0);
+            assert_eq!(state.host_pipeline, 0);
+            assert_eq!(state.host_roots, [0; 2]);
+            assert_eq!(state.host_heaps, [usize::MAX; 2]);
+            assert!(!state.table_failed);
+            assert_eq!(state.fresh_tables.get(&(1, 2)), Some(&3));
+            assert_eq!(state.root_slots.get(&(1, 2, true)), Some(&3));
+            assert_eq!(state.root_run, (1, 4, 5));
+            assert_eq!(state.dynamic, [dynamic]);
+            assert_eq!(
+                state.memory.as_ref().map(|(_, map)| (map.table, map.dirty)),
+                memory
+            );
+        });
+        let ready = 1u64;
+        crate::list::wait64(list, std::ptr::from_ref(&ready) as u64, 3, ready, 0);
+        let segments = crate::list::segments(list);
+        assert_eq!(segments.len(), 2);
+        crate::list::with_state(list, |_, state| {
+            let fixed = &state.fixed;
+            assert!(!fixed.topology);
+            assert!(fixed.viewports.is_none() && fixed.scissors.is_none());
+            assert!(fixed.blend_factor.is_none() && fixed.stencil_ref.is_none());
+            assert!(fixed.targets.is_none());
+        });
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        device.execute(&[&segments[0]]);
+        assert_eq!(copied, source);
+        drop(segments);
+        release(list);
+        release(heap);
     }
 
     fn dispatch_marked_uav(
