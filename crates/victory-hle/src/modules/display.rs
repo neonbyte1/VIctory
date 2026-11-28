@@ -190,8 +190,10 @@ mod tests {
                 assert!(!handle.is_null());
                 method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
             }
-            // Windows can reject display power requests on some hosts.
-            NOT_SUPPORTED => assert!(handle.is_null()),
+            // Windows can reject display power requests on some hosts
+            // (ERROR_NOT_SUPPORTED); Wine has no power request at all
+            // (ERROR_CALL_NOT_IMPLEMENTED). Either refusal hands nothing out.
+            hr if (hr as u32) >> 16 == 0x8007 => assert!(handle.is_null()),
             hr => panic!("unexpected display deferral HRESULT {:#010x}", hr as u32),
         }
     }

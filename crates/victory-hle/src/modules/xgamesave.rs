@@ -1335,12 +1335,25 @@ mod tests {
             update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
             S_OK
         );
-        const NTFS: &str = "the temp folder must be on NTFS, which allows 1024 links to a file";
+        const NTFS: &str =
+            "the temp folder is not a filesystem with NTFS's 1024-link limit, which this needs";
         let old_b = container_dir(root, "Slot").join("v1").join("1");
+        // The title's saves live on NTFS, which stops at 1024 links to a
+        // file. A host filesystem that allows more never reaches the copy
+        // (ext4 allows 65,000 through Wine): skip, saying so.
         for i in 0..1023 {
-            std::fs::hard_link(&old_b, links.path().join(i.to_string())).expect(NTFS);
+            if let Err(e) = std::fs::hard_link(&old_b, links.path().join(i.to_string())) {
+                eprintln!("skipped a_kept_blob_past_the_link_limit_is_copied: {NTFS}: {e}");
+                return;
+            }
         }
-        let full = std::fs::hard_link(&old_b, links.path().join("full")).expect_err(NTFS);
+        let full = match std::fs::hard_link(&old_b, links.path().join("full")) {
+            Err(e) if e.kind() == std::io::ErrorKind::TooManyLinks => e,
+            other => {
+                eprintln!("skipped a_kept_blob_past_the_link_limit_is_copied: {NTFS}: {other:?}");
+                return;
+            }
+        };
         assert_eq!(full.kind(), std::io::ErrorKind::TooManyLinks, "{NTFS}");
 
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);

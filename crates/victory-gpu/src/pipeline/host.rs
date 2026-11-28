@@ -1452,6 +1452,12 @@ mod tests {
     }
     #[test]
     fn a_host_pipeline_refused_by_the_library_is_not_listed_as_prebuilt() {
+        if crate::host::skip_on_software_adapter(
+            "pipeline::host::tests::a_host_pipeline_refused_by_the_library_is_not_listed_as_prebuilt",
+            "WARP refuses CreatePipelineLibrary (E_INVALIDARG, HRESULT 0x80070057)",
+        ) {
+            return;
+        }
         use super::super::{Prebuild, library, prebuilt, save_pipeline_cache, use_pipeline_cache};
         use victory_shader::native::{ComputeIo, NativeProgram, StageIo};
         use victory_shader::{Container, HwStage, emit, io, range, resource};

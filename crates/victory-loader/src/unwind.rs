@@ -592,6 +592,19 @@ mod tests {
         }
     }
 
+    /// Whether the host is Wine: it does not deliver a stack overflow to
+    /// the crash report, and the child that overflows never returns.
+    fn wine_host() -> bool {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        let ntdll: Vec<u16> = "ntdll.dll".encode_utf16().chain([0]).collect();
+        // SAFETY: NUL-terminated names; ntdll is loaded in every process.
+        unsafe {
+            let module = GetModuleHandleW(ntdll.as_ptr());
+            !module.is_null()
+                && GetProcAddress(module, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    }
+
     /// An address in the reserved, never committed part of this thread's
     /// stack.
     fn reserved_stack_address() -> usize {
@@ -625,6 +638,15 @@ mod tests {
 
     #[test]
     fn a_stack_pointer_in_the_uncommitted_stack_ends_the_walk() {
+        // Wine commits the thread's whole stack reserve, so there is no
+        // uncommitted part of the stack to walk there (`reserved_stack_address`).
+        if wine_host() {
+            eprintln!(
+                "skipped a_stack_pointer_in_the_uncommitted_stack_ends_the_walk: Wine commits \
+                 the thread's stack reserve"
+            );
+            return;
+        }
         let (code, text) = Child {
             test: "unwind::tests::stack_pointer_child",
             variable: "VICTORY_STACK_POINTER_CHILD",
@@ -836,6 +858,15 @@ mod tests {
 
     #[test]
     fn a_frame_register_in_the_uncommitted_stack_ends_the_walk() {
+        // As above: Wine has no uncommitted stack reserve to place the frame
+        // register in.
+        if wine_host() {
+            eprintln!(
+                "skipped a_frame_register_in_the_uncommitted_stack_ends_the_walk: Wine commits \
+                 the thread's stack reserve"
+            );
+            return;
+        }
         assert_one_frame_walked("uncommitted");
     }
 
@@ -1010,6 +1041,13 @@ mod tests {
 
     #[test]
     fn a_stack_overflow_is_still_reported() {
+        if wine_host() {
+            eprintln!(
+                "skipped a_stack_overflow_is_still_reported: Wine does not deliver the stack \
+                 overflow to the crash report, and the child that overflows never returns"
+            );
+            return;
+        }
         let (code, text) = Child {
             test: "unwind::tests::stack_overflow_child",
             variable: "VICTORY_STACK_OVERFLOW_CHILD",
@@ -1110,6 +1148,15 @@ mod tests {
 
     #[test]
     fn unwind_info_in_a_no_access_page_ends_the_walk() {
+        // Wine reports the faulting address two bytes into the no-access
+        // page, Windows the first byte the walk read.
+        if wine_host() {
+            eprintln!(
+                "skipped unwind_info_in_a_no_access_page_ends_the_walk: Wine reports another \
+                 faulting address for the page"
+            );
+            return;
+        }
         let function = Synthetic {
             code: &FRAMED_BODY,
             unwind_info: &FRAMED_INFO,
@@ -1145,6 +1192,15 @@ mod tests {
 
     #[test]
     fn a_frame_in_a_guard_page_ends_the_walk_and_keeps_the_guard() {
+        // Wine raises an access violation for a read of a guard page where
+        // Windows raises the guard-page fault the walk reports.
+        if wine_host() {
+            eprintln!(
+                "skipped a_frame_in_a_guard_page_ends_the_walk_and_keeps_the_guard: Wine \
+                 reports a guard page's read as an access violation"
+            );
+            return;
+        }
         // SAFETY: reserves and commits a fresh guard page of ours.
         let guard = unsafe {
             VirtualAlloc(
