@@ -2927,10 +2927,6 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
-                        #[cfg(feature = "diagnostics")]
-                        {
-                            started = std::time::Instant::now();
-                        }
                     }
                     #[cfg(feature = "diagnostics")]
                     let run = std::time::Instant::now();
@@ -5041,7 +5037,8 @@ mod present_plane_tests {
                 list.close();
                 host.execute(&[&list]);
                 let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
-                observed.push(host.present(&[(&texture, state)], 1));
+                let copy = crate::resource::HostTexture::new(texture.clone(), state, Vec::new());
+                observed.push(host.present(&[&copy], 1));
             }
         }
         assert_eq!(observed, [Some(true), Some(true), Some(false), Some(false)].repeat(4));
