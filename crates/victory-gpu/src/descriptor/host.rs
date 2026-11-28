@@ -25,6 +25,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The count of title buffers made and released ([`crate::shadow::owners`])
+    /// when each buffer view slot was last found showing the copy its view
+    /// reads.
+    owners_seen: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -195,6 +199,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            owners_seen: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -820,7 +825,31 @@ impl HostHeap {
                     })
                 })
         };
-        if made[index as usize] == key && !needs_remake() {
+        // A buffer view shows the copy of the innermost title buffer holding
+        // its bytes (`crate::shadow::for_view`), which a buffer the title
+        // makes or releases over them changes. Draws refresh the copy the
+        // view reads now (`view_copy`): the slot must show that one. Looked
+        // at again only when buffers came or went since the slot last was.
+        let owners = crate::shadow::owners();
+        let owner_moved = || {
+            if buffer_range(&view).is_none() && !matches!(view, View::Constant(..)) {
+                return false;
+            }
+            let mut seen = self.owners_seen.lock().unwrap_or_else(|e| e.into_inner());
+            if seen[index as usize] == owners {
+                return false;
+            }
+            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
+                .as_ref()
+                .map(|(res, _)| windows::core::Interface::as_raw(res));
+            let current = shown_copy(&view).map(|s| windows::core::Interface::as_raw(&s.buffer));
+            let shown = held == current;
+            if shown {
+                seen[index as usize] = owners;
+            }
+            !shown
+        };
+        if made[index as usize] == key && !needs_remake() && !owner_moved() {
             return Some(view);
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -844,7 +873,7 @@ impl HostHeap {
                 drop(made);
                 return self.mirror(index, handle, for_draw);
             }
-            if made[index as usize] == key && !needs_remake() {
+            if made[index as usize] == key && !needs_remake() && !owner_moved() {
                 return Some(view);
             }
         }
@@ -869,6 +898,7 @@ impl HostHeap {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             self.keep(index, kept.flatten());
+            self.owners_seen.lock().unwrap_or_else(|e| e.into_inner())[index as usize] = owners;
         }
         Some(view)
     }
@@ -1360,6 +1390,18 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
     let (address, len) = buffer_range(view)?;
     let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
     Some((shadow, address, len))
+}
+
+/// The copy a slot made from buffer view `view` now would show: as
+/// [`view_copy`], and for a constant view (made a raw view of the copy
+/// holding its bytes, [`make`]) that copy's.
+fn shown_copy(view: &View) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    if let &View::Constant(address, size) = view {
+        let shadow = crate::shadow::find(address, u64::from(size))?;
+        let bytes = u64::from(size).min(shadow.left(address));
+        return crate::shadow::for_view(address, bytes, 4).map(|(s, _)| s);
+    }
+    view_copy(view).map(|(s, ..)| s)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -2377,6 +2419,63 @@ mod tests {
         ] {
             assert_eq!(host(format, 0, false), None, "{format:?}");
         }
+    }
+
+    /// A buffer view slot shows the copy of the innermost title buffer
+    /// holding the view's bytes as buffers come and go over them: the outer
+    /// buffer's, a buffer then placed inside it, the outer's again once
+    /// that one is released (shader, unordered and constant views alike),
+    /// the copy draws refresh for the view.
+    #[test]
+    fn buffer_view_slots_follow_new_and_released_owners() {
+        let Some(_) = host() else { return };
+        #[repr(align(256))]
+        struct Aligned([u8; 512]);
+        static DATA: Aligned = Aligned([0; 512]);
+        let start = DATA.0.as_ptr() as u64;
+        let address = start + 256;
+        let heap = HostHeap::new(false, 3).unwrap();
+        let mut records = [0u64; 12];
+        let handle = records.as_mut_ptr() as u64;
+        let mut resource = [0; 14];
+        (resource[0], resource[4]) = (1, 64); // a 64-byte buffer
+        let mut desc = [0; 16];
+        // R32_UINT, a buffer, the default component mapping, 16 elements,
+        // at `address`.
+        (desc[0], desc[1], desc[2]) = (DXGI_FORMAT_R32_UINT.0 as u32, 1, 0x1688);
+        desc[6] = 16;
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, handle);
+        let mut unordered = [0; 16];
+        (unordered[0], unordered[1], unordered[4]) = (desc[0], 1, 16);
+        (unordered[10], unordered[11]) = (desc[10], desc[11]);
+        crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &unordered, handle + 32);
+        let constant = [address as u32, (address >> 32) as u32, 64, 0];
+        crate::descriptor::create_cbv(std::ptr::null(), &constant, handle + 64);
+        let shows = |shadow: &crate::shadow::Shadow| {
+            for slot in 0..3 {
+                let view = heap
+                    .mirror(slot, handle + 32 * u64::from(slot), true)
+                    .unwrap();
+                let held = heap.kept.lock().unwrap()[slot as usize]
+                    .as_ref()
+                    .map(|(res, _)| windows::core::Interface::as_raw(res));
+                let raw = windows::core::Interface::as_raw(&shadow.buffer);
+                assert_eq!(held, Some(raw), "slot {slot}");
+                let read = shown_copy(&view).unwrap();
+                assert_eq!(windows::core::Interface::as_raw(&read.buffer), raw);
+            }
+        };
+        crate::shadow::register(1, start, 512);
+        let outer = crate::shadow::find(address, 64).unwrap();
+        shows(&outer);
+        crate::shadow::register(2, address, 64);
+        let inner = crate::shadow::find(address, 64).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&outer, &inner));
+        shows(&inner);
+        crate::shadow::unregister(2, address);
+        shows(&outer);
+        crate::shadow::unregister(1, start);
     }
 
     /// Typed buffer views of integer formats carry their kind in the
