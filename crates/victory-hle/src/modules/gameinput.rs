@@ -131,8 +131,26 @@ trait Source: Send {
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Motor levels for the pad in host slot `slot`.
+    fn rumble(&mut self, slot: usize, motors: Motors);
+}
+
+/// Rumble levels, 0 to 1, in the order the title passes them: the body's
+/// low (left) and high (right) frequency motors, then the trigger motors.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Motors {
+    low: f32,
+    high: f32,
+    left_trigger: f32,
+    right_trigger: f32,
+}
+
+impl Motors {
+    /// A body motor level as an XInput speed.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn speed(level: f32) -> u16 {
+        (level * f32::from(u16::MAX)) as u16
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -765,7 +783,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: Motors) {}
     }
     Box::new(Nothing)
 }
@@ -1196,10 +1214,9 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+/// Four motor levels: low and high frequency, left and right trigger. Grand
+/// Theft Auto VI sends trigger levels here; the host drives them where it can
+/// (`host::Host::rumble`).
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     called!("IGameInputDevice::SetRumbleState");
     // SAFETY: one of our devices.
@@ -1207,14 +1224,21 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let [low, high, left_trigger, right_trigger] = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
+    }
+    // NaN and below zero are off.
+    .map(|level| if level > 0.0 { level.min(1.0) } else { 0.0 });
+    let motors = Motors {
+        low,
+        high,
+        left_trigger,
+        right_trigger,
     };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    lock(&device.hub().source).rumble(device.index, motors);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1387,6 +1411,7 @@ fn press_order(previous: &[u8], down: &[u8]) -> Vec<u8> {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows::Gaming::Input::{Gamepad, GamepadVibration};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1446,6 +1471,29 @@ mod host {
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
         held_keys: Vec<u8>,
+        /// The Windows.Gaming.Input pad each slot's rumble last went to, so
+        /// it can be stopped if the slot goes back to XInput.
+        driven: [Option<Gamepad>; PADS],
+    }
+
+    impl Host {
+        /// The Windows.Gaming.Input pad that is XInput slot `slot`, when
+        /// that is certain: this is the only XInput slot connected and there
+        /// is one Windows.Gaming.Input pad.
+        // shortcut: the two APIs share no pad identity, so with several pads
+        // connected the triggers stay still. Its pad list also fills in a
+        // moment after first use, so the first rumble goes through XInput.
+        fn gaming_input_pad(&self, slot: usize) -> Option<Gamepad> {
+            let connected = |s: usize| self.empty_until[s].is_none();
+            if !connected(slot) || (0..PADS).any(|s| s != slot && connected(s)) {
+                return None;
+            }
+            let pads = Gamepad::Gamepads().ok()?;
+            if pads.Size().ok()? != 1 {
+                return None;
+            }
+            pads.GetAt(0).ok()
+        }
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1505,10 +1553,32 @@ mod host {
             }
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        /// All four motors through Windows.Gaming.Input when the slot's pad
+        /// is known there (`gaming_input_pad`); otherwise the body motors
+        /// through XInput, which has no trigger motors.
+        fn rumble(&mut self, slot: usize, motors: Motors) {
+            let pad = self.gaming_input_pad(slot);
+            if let Some(previous) = self.driven[slot].take()
+                && pad.as_ref() != Some(&previous)
+            {
+                // Its levels would otherwise stay on.
+                let _ = previous.SetVibration(GamepadVibration::default());
+            }
+            if let Some(pad) = pad {
+                let vibration = GamepadVibration {
+                    LeftMotor: f64::from(motors.low),
+                    RightMotor: f64::from(motors.high),
+                    LeftTrigger: f64::from(motors.left_trigger),
+                    RightTrigger: f64::from(motors.right_trigger),
+                };
+                if pad.SetVibration(vibration).is_ok() {
+                    self.driven[slot] = Some(pad);
+                    return;
+                }
+            }
             let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
+                wLeftMotorSpeed: Motors::speed(motors.low),
+                wRightMotorSpeed: Motors::speed(motors.high),
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
@@ -1602,7 +1672,7 @@ mod tests {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, Motors)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1617,8 +1687,8 @@ mod tests {
         fn scripted_keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().scripted.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, motors: Motors) {
+            self.0.lock().unwrap().rumble.push((slot, motors));
         }
     }
 
@@ -2050,10 +2120,26 @@ mod tests {
 
         type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
         let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
+        rumble(device, &[0.5, 1.0, 0.25, 0.75]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        // Out of range and NaN are clamped; NaN is off.
+        rumble(device, &[2.0, -1.0, f32::NAN, 1.5]);
+        let motors = |low, high, left_trigger, right_trigger| Motors {
+            low,
+            high,
+            left_trigger,
+            right_trigger,
+        };
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [
+                (2, motors(0.5, 1.0, 0.25, 0.75)),
+                (2, Motors::default()),
+                (2, motors(1.0, 0.0, 0.0, 1.0)),
+            ]
+        );
+        assert_eq!((Motors::speed(0.5), Motors::speed(1.0)), (32767, 65535));
     }
 
     #[test]

@@ -36,8 +36,10 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 # The host's D3D12 objects handed to a host library (`modules::fidelityfx`);
+# trigger rumble through Windows.Gaming.Input (`modules::gameinput`);
 # diagnostics: recording our own audio (`modules::audio::capture`).
 windows = { workspace = true, features = [
+    "Gaming_Input",
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Media_Audio",
