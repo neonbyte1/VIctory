@@ -877,6 +877,66 @@ impl CopyLocation {
     }
 }
 
+/// Whether a `CopyTextureRegion` into `to` leaves any texel of any subresource
+/// untouched, so initial title memory must be uploaded before the copy if no
+/// earlier submission has written `to` on the GPU.
+#[cfg(windows)]
+fn is_partial_copy(
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    x: u32,
+    y: u32,
+    z: u32,
+    src: &CopyLocation,
+    src_texture: Option<&windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    source_box: Option<windows::Win32::Graphics::Direct3D12::D3D12_BOX>,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    // SAFETY: `to` is a live D3D12 resource.
+    let d = unsafe { to.GetDesc() };
+    let is_3d = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let subresources = if is_3d {
+        u32::from(d.MipLevels)
+    } else {
+        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize).max(1)
+    };
+    if subresources != 1 || x != 0 || y != 0 || z != 0 {
+        return true;
+    }
+    let dst_depth = if is_3d {
+        u32::from(d.DepthOrArraySize)
+    } else {
+        1
+    };
+    let (w, h, depth) = if let Some(b) = source_box {
+        (
+            u64::from(b.right.saturating_sub(b.left)),
+            b.bottom.saturating_sub(b.top),
+            b.back.saturating_sub(b.front),
+        )
+    } else if src.kind == 1 {
+        (
+            u64::from(src.footprint.width),
+            src.footprint.height,
+            src.footprint.depth.max(1),
+        )
+    } else if let Some(st) = src_texture {
+        // SAFETY: `st` is a live D3D12 resource.
+        let sd = unsafe { st.GetDesc() };
+        if sd.MipLevels != 1 {
+            return true;
+        }
+        let s_depth = if sd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            u32::from(sd.DepthOrArraySize)
+        } else {
+            1
+        };
+        (sd.Width, sd.Height, s_depth)
+    } else {
+        return true;
+    };
+    w < d.Width || h < d.Height || depth < dst_depth
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission; texture to buffer through readback memory
 /// ([`read_back`]).
@@ -910,6 +970,7 @@ extern "system" fn copy_texture_region(
         };
         let mut from = src;
         let _upload; // keeps the staging buffer alive while this call records it
+        let mut src_texture = None;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
@@ -947,12 +1008,21 @@ extern "system" fn copy_texture_region(
             }
             ensure_copy_state(list, &source, src.subresource(), COPY_SOURCE);
             from.resource = source.texture.as_raw().cast_const().cast();
+            src_texture = Some(source.texture.clone());
+        }
+        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        // SAFETY: `source_box` is the title's D3D12_BOX (same layout) or null.
+        let box_copy = host_box.map(|b| unsafe { *b });
+        // A copy that leaves texels of `to` alone needs the title's texels there.
+        if crate::texture::title_written(&to.texture)
+            && is_partial_copy(&to.texture, x, y, z, &src, src_texture.as_ref(), box_copy)
+        {
+            crate::texture::upload(list, dst.resource, &to);
         }
         ensure_copy_state(list, &to, dst.subresource(), COPY_DEST);
         crate::texture::host_writes(list, &to);
         let mut to_location = dst;
         to_location.resource = to.texture.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {

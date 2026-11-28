@@ -4440,4 +4440,433 @@ pub(crate) mod tests {
         );
         assert_eq!((layout, rows, size, total), sentinel);
     }
+
+
+    /// Issue #1891: initial title-memory uploads and `host_written` transitions
+    /// must follow queue submission order, not command-list recording order.
+    #[cfg(windows)]
+    #[test]
+    fn texture_uploads_follow_submission_order_not_recording_order() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type CopyBuf = extern "system" fn(This, This, u64, This, u64, u64);
+        type CopyRegion =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        type CopyRes = extern "system" fn(This, This, This);
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+
+        let mut queue = null;
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+
+        let make_list = || -> (This, This) {
+            let (mut alloc, mut list) = (null, null);
+            assert_eq!(
+                crate::list::create_allocator(null, 0, &allocator_iid, &mut alloc),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list),
+                S_OK
+            );
+            (alloc, list)
+        };
+
+        let make_tex = |w: u64, h: u32, fill: [u8; 4]| -> This {
+            let mut desc = texture(w, h, 28, 1);
+            desc.layout = 1; // linear
+            let mut r = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut r,
+                ),
+                S_OK
+            );
+            let layout = texture_layout(&desc).unwrap();
+            let (ptr, _) = texture_memory(r).unwrap();
+            let len = layout.planes[0].layout.size as usize;
+            // SAFETY: committed backing memory of `r` is at least `len` bytes.
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast_mut(), len) };
+            for px in slice.as_chunks_mut::<4>().0 {
+                *px = fill;
+            }
+            r
+        };
+
+        let make_buf = |fill: [u8; 4]| -> This {
+            let mut r = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &buffer(1024),
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut r,
+                ),
+                S_OK
+            );
+            let (ptr, _) = buffer_bytes(r).unwrap();
+            // SAFETY: committed buffer of 1024 bytes.
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, 1024) };
+            for px in slice.as_chunks_mut::<4>().0 {
+                *px = fill;
+            }
+            r
+        };
+
+        let read_4x4 = |tex: This| -> [[u8; 4]; 16] {
+            let readback_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let readback_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1024,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut readback: Option<ID3D12Resource> = None;
+            // SAFETY: plain readback buffer creation.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &readback_heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &readback_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut readback,
+                    )
+                    .unwrap();
+            }
+            let readback = readback.unwrap();
+            let host_image = host_resource(tex).unwrap();
+            let back = host.new_list().unwrap();
+            let copy = crate::resource::host_copy(tex).unwrap();
+            crate::list::ensure_copy_state(
+                &back,
+                &copy,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                0x800,
+            );
+            let rows = PlacedFootprint {
+                offset: 0,
+                format: 28,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 256,
+            };
+            let out_to = Location {
+                resource: readback.as_raw().cast_const().cast(),
+                kind: 1,
+                footprint: rows,
+            };
+            let out_from = Location {
+                resource: host_image.as_raw().cast_const().cast(),
+                kind: 0,
+                footprint: PlacedFootprint { offset: 0, ..rows },
+            };
+            // SAFETY: open list, live resources, matching state transition.
+            unsafe {
+                back.list.CopyTextureRegion(
+                    (&raw const out_to).cast(),
+                    0,
+                    0,
+                    0,
+                    (&raw const out_from).cast(),
+                    None,
+                );
+            }
+            back.close();
+            host.execute(&[&back]);
+            let mut mapped = std::ptr::null_mut();
+            let mut pixels = [[0u8; 4]; 16];
+            // SAFETY: copy finished (execute waits); buffer holds 1024 bytes.
+            unsafe {
+                readback
+                    .Map(
+                        0,
+                        Some(&D3D12_RANGE { Begin: 0, End: 1024 }),
+                        Some(&mut mapped),
+                    )
+                    .unwrap();
+                let read = std::slice::from_raw_parts(mapped.cast::<u8>(), 1024);
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let off = y * 256 + x * 4;
+                        pixels[y * 4 + x].copy_from_slice(&read[off..off + 4]);
+                    }
+                }
+                readback.Unmap(0, None);
+            }
+            pixels
+        };
+
+        const BG: [u8; 4] = [0x10, 0x20, 0x30, 0xFF];
+        const A: [u8; 4] = [0xAA, 0x11, 0x22, 0xFF];
+        const B: [u8; 4] = [0xBB, 0x33, 0x44, 0xFF];
+
+        let mut expected = [BG; 16];
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            expected[y * 4 + x] = A;
+        }
+        for (x, y) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+            expected[y * 4 + x] = B;
+        }
+
+        // Release resources at the end so the allocator cannot reuse an address
+        // while its previous `HostTexture` is still retiring on the async release thread.
+        let mut keep: Vec<This> = Vec::new();
+
+        // 1. Overlapping partial 2x2 copies (buffer and texture sources),
+        // recorded A-then-B and B-then-A, always submitted A-then-B.
+        for use_texture_src in [false, true] {
+            for record_b_first in [false, true] {
+                let dst = make_tex(4, 4, BG);
+                let (src_a, src_b) = if use_texture_src {
+                    (make_tex(2, 2, A), make_tex(2, 2, B))
+                } else {
+                    (make_buf(A), make_buf(B))
+                };
+                let (alloc_a, list_a) = make_list();
+                let (alloc_b, list_b) = make_list();
+
+                let record_copy = |list: This, src: This, dx: u32, dy: u32| {
+                    let fp = PlacedFootprint {
+                        offset: 0,
+                        format: 28,
+                        width: 2,
+                        height: 2,
+                        depth: 1,
+                        row_pitch: 256,
+                    };
+                    let to = Location {
+                        resource: dst,
+                        kind: 0,
+                        footprint: PlacedFootprint { offset: 0, ..fp },
+                    };
+                    let from = Location {
+                        resource: src,
+                        kind: u32::from(!use_texture_src),
+                        footprint: if use_texture_src {
+                            PlacedFootprint { offset: 0, ..fp }
+                        } else {
+                            fp
+                        },
+                    };
+                    slot::<CopyRegion>(list, 0x80)(list, &to, dx, dy, 0, &from, null.cast());
+                    assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
+                };
+
+                if record_b_first {
+                    record_copy(list_b, src_b, 1, 1);
+                    record_copy(list_a, src_a, 0, 0);
+                } else {
+                    record_copy(list_a, src_a, 0, 0);
+                    record_copy(list_b, src_b, 1, 1);
+                }
+
+                // Submit A then B in separate submissions (and check pixels after B).
+                slot::<Execute>(queue, 0x50)(queue, 1, &list_a);
+                slot::<Execute>(queue, 0x50)(queue, 1, &list_b);
+
+                let got = read_4x4(dst);
+                assert_eq!(
+                    got, expected,
+                    "partial copy mismatch (texture_src={use_texture_src}, record_b_first={record_b_first})"
+                );
+
+                keep.extend([list_a, list_b, alloc_a, alloc_b, src_a, src_b, dst]);
+            }
+        }
+
+        // 2. Reverse-recorded read-after-write: record B (read dst -> out) before
+        // A (write full A -> dst), submit A then B. B must observe A, not stale BG.
+        {
+            let dst = make_tex(4, 4, BG);
+            let src_a = make_tex(4, 4, A);
+            let out = make_tex(4, 4, [0; 4]);
+            let (alloc_a, list_a) = make_list();
+            let (alloc_b, list_b) = make_list();
+
+            slot::<CopyRes>(list_b, 0x88)(list_b, out, dst);
+            assert_eq!(slot::<Close>(list_b, 0x48)(list_b), S_OK);
+            slot::<CopyRes>(list_a, 0x88)(list_a, dst, src_a);
+            assert_eq!(slot::<Close>(list_a, 0x48)(list_a), S_OK);
+
+            let pair = [list_a, list_b];
+            slot::<Execute>(queue, 0x50)(queue, 2, pair.as_ptr());
+            assert_eq!(read_4x4(out), [A; 16], "reverse-recorded read must see A's GPU write");
+
+            keep.extend([list_a, list_b, alloc_a, alloc_b, src_a, dst, out]);
+        }
+
+        // 3. Reverse-recorded write-after-read: record A (write dst) before B
+        // (read dst -> out), submit B first. B must still upload and observe BG.
+        {
+            let dst = make_tex(4, 4, BG);
+            let src_a = make_tex(4, 4, A);
+            let out = make_tex(4, 4, [0; 4]);
+            let (alloc_a, list_a) = make_list();
+            let (alloc_b, list_b) = make_list();
+
+            slot::<CopyRes>(list_a, 0x88)(list_a, dst, src_a);
+            assert_eq!(slot::<Close>(list_a, 0x48)(list_a), S_OK);
+            slot::<CopyRes>(list_b, 0x88)(list_b, out, dst);
+            assert_eq!(slot::<Close>(list_b, 0x48)(list_b), S_OK);
+
+            slot::<Execute>(queue, 0x50)(queue, 1, &list_b);
+            assert_eq!(
+                read_4x4(out),
+                [BG; 16],
+                "unsubmitted writer must not suppress an earlier reader's upload"
+            );
+
+            keep.extend([list_a, list_b, alloc_a, alloc_b, src_a, dst, out]);
+        }
+
+        // 4. Same-list read before buffer copy into the texture's title memory:
+        // `Step::Texture` must refresh before the later `Step::Copy` overwrites
+        // the backing memory, so list 1 observes pre-copy bytes A and a later
+        // submission observes post-copy bytes B.
+        {
+            let h = heap(KIB_64);
+            let mut desc = texture(4, 4, 28, 1);
+            desc.layout = 1; // linear
+            let layout_len = texture_layout(&desc).unwrap().planes[0].layout.size as usize;
+
+            let (mut tex, mut tex_mem, mut src_b) = (null, null, null);
+            assert_eq!(
+                create_placed(null, h, 0, &desc, 0, null.cast(), iid, &mut tex),
+                S_OK
+            );
+            assert_eq!(
+                create_placed(
+                    null,
+                    h,
+                    0,
+                    &buffer(layout_len as u64),
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut tex_mem,
+                ),
+                S_OK
+            );
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &buffer(layout_len as u64),
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut src_b,
+                ),
+                S_OK
+            );
+
+            let (tex_ptr, _) = texture_memory(tex).unwrap();
+            let (src_ptr, _) = buffer_bytes(src_b).unwrap();
+            // SAFETY: both buffers are at least `layout_len` bytes of committed memory.
+            unsafe {
+                for px in std::slice::from_raw_parts_mut(tex_ptr.cast_mut(), layout_len)
+                    .as_chunks_mut::<4>()
+                    .0
+                {
+                    *px = A;
+                }
+                for px in std::slice::from_raw_parts_mut(src_ptr, layout_len)
+                    .as_chunks_mut::<4>()
+                    .0
+                {
+                    *px = B;
+                }
+            }
+
+            let out_1 = make_tex(4, 4, [0; 4]);
+            let out_2 = make_tex(4, 4, [0; 4]);
+            let (alloc_1, list_1) = make_list();
+            let (alloc_2, list_2) = make_list();
+
+            slot::<CopyRes>(list_1, 0x88)(list_1, out_1, tex);
+            slot::<CopyBuf>(list_1, 0x78)(list_1, tex_mem, 0, src_b, 0, layout_len as u64);
+            assert_eq!(slot::<Close>(list_1, 0x48)(list_1), S_OK);
+
+            slot::<Execute>(queue, 0x50)(queue, 1, &list_1);
+            assert_eq!(
+                read_4x4(out_1),
+                [A; 16],
+                "texture read before a same-list CopyBufferRegion into its memory must see pre-copy bytes"
+            );
+
+            slot::<CopyRes>(list_2, 0x88)(list_2, out_2, tex);
+            assert_eq!(slot::<Close>(list_2, 0x48)(list_2), S_OK);
+            slot::<Execute>(queue, 0x50)(queue, 1, &list_2);
+            assert_eq!(
+                read_4x4(out_2),
+                [B; 16],
+                "subsequent read after the CopyBufferRegion must see post-copy bytes"
+            );
+
+            keep.extend([list_1, list_2, alloc_1, alloc_2, out_1, out_2, src_b, tex_mem, tex, h]);
+        }
+
+        for r in keep {
+            slot::<Release>(r, 0x10)(r);
+        }
+        slot::<Release>(queue, 0x10)(queue);
+    }
 }
