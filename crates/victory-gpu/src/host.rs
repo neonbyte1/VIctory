@@ -2056,7 +2056,7 @@ impl Host {
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&no_breadcrumbs(dred_on(), &e));
                     return text;
                 }
             };
@@ -4620,6 +4620,48 @@ fn removed_during(runs: &[&HostList], list: Option<usize>) -> String {
     }
     let _ = (runs, list);
     String::new()
+}
+
+/// What a removal report says when the runtime gives no breadcrumbs. With
+/// device-removed data off (`VICTORY_D3D12_DRED` unset) the runtime answers
+/// `DXGI_ERROR_UNSUPPORTED` ("not supported on this system"), which reads
+/// like the removal's cause; the report names the switch instead. Any other
+/// error is passed on as it is.
+fn no_breadcrumbs(dred: bool, e: &windows::core::Error) -> String {
+    if !dred && e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_UNSUPPORTED {
+        "; no breadcrumbs (device-removed data is off: VICTORY_D3D12_DRED=1 in a diagnostics build)"
+            .to_owned()
+    } else {
+        format!("; no breadcrumbs ({e})")
+    }
+}
+
+#[cfg(test)]
+mod removal_report {
+    use super::no_breadcrumbs;
+    use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_INVALID_CALL, DXGI_ERROR_UNSUPPORTED};
+
+    /// With device-removed data off, the runtime's "unsupported" answer is
+    /// not passed on as if it were why the device went.
+    #[test]
+    fn breadcrumbs_off_names_the_switch_not_the_runtime_error() {
+        let e = windows::core::Error::from(DXGI_ERROR_UNSUPPORTED);
+        let off = no_breadcrumbs(false, &e);
+        assert!(off.contains("VICTORY_D3D12_DRED=1"), "{off}");
+        assert!(!off.contains("0x887A0004"), "{off}");
+        let on = no_breadcrumbs(true, &e);
+        assert!(on.contains("0x887A0004"), "{on}");
+    }
+
+    /// Only the "unsupported" answer is replaced: another error is still
+    /// reported, even with device-removed data off.
+    #[test]
+    fn breadcrumbs_off_keeps_other_errors() {
+        let e = windows::core::Error::from(DXGI_ERROR_INVALID_CALL);
+        let off = no_breadcrumbs(false, &e);
+        assert!(off.contains("0x887A0001"), "{off}");
+        assert!(!off.contains("VICTORY_D3D12_DRED"), "{off}");
+    }
 }
 
 /// Logs where each list of submission `submission` (`runs`) is, by its
