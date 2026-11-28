@@ -558,9 +558,13 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 /// In words: footprint offsets and row pitches are multiples of 4, and
 /// each thread takes an even pixel and the next.
 ///
-/// Wine's compiler has no methods on byte address buffers and ignores a
-/// `RootSignature` attribute, so the buffer is one of `uint`, indexed in
-/// words, and the root signature is made beside the shader.
+/// Wine's compiler has no methods on byte address buffers, and a
+/// `RootSignature` attribute is at best ignored there: one naming a
+/// macro the source does not define fails the build (E5005: Identifier
+/// "RS" is not declared), no converter is made, and 16-bit depth
+/// written through unordered views stays clear. The buffer is one of
+/// `uint`, indexed in words, the source names no root signature, and
+/// one is made beside the shader.
 const SOURCE: &str = r#"
 cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
 // Offsets and pitches are in bytes, all multiples of 4 (placed footprints).
@@ -571,13 +575,15 @@ uint u16(uint d) {
     float scaled = value * 65536.0;
     float fraction = frac(scaled);
     // 65535 * value = scaled - value. Test the half-step on the
-    // fraction so the large integer part cannot round it away.
+    // fraction so the large integer part cannot round it away; the
+    // steps are exact in single precision (a power-of-two product, a
+    // `frac` of it, a difference of halves), so the decision does not
+    // depend on either compiler's reassociation.
     precise float fraction_minus_half = fraction - 0.5;
     precise float value_minus_half = value - 0.5;
     return (uint)scaled + (uint)(fraction_minus_half >= value)
                         - (uint)(fraction < value_minus_half);
 }
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x * 2;
@@ -634,6 +640,35 @@ mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    /// The converter's source builds with the system's compiler, Wine's
+    /// included, with no device: its root signature is made beside it.
+    /// Wine's took neither a byte address buffer's methods nor an
+    /// attribute naming an undefined macro (`E5005`); with either, no
+    /// converter was made and 16-bit depth stayed clear.
+    #[test]
+    fn the_depth_converter_compiles_without_a_root_signature_attribute() {
+        assert!(!SOURCE.contains("RootSignature"));
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: the source lives through the call; out pointers ours.
+        let compiled = unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                windows::core::s!("depth conversion"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        let text = errors.as_ref().map(|e| String::from_utf8_lossy(crate::compute::bytes(e)).into_owned());
+        assert!(compiled.is_ok() && code.is_some(), "depth conversion: {text:?}");
+    }
+
     #[test]
     fn float_depth_rounds_at_each_u16_threshold() {
         let Some(host) = host() else {
