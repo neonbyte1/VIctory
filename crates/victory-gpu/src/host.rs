@@ -3214,11 +3214,13 @@ impl Batch {
             let _ = started;
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
+            // Kept: the union with what was current if they meet across a
+            // page boundary (merging two halves of one page would hide a
+            // later whole-page refresh without guarding the page), else the
+            // larger.
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let (_, a, b) = self.current.entry(key).or_insert_with(|| (shadow.clone(), from, to));
-            if from <= *b && *a <= to {
+            if (*a).max(from).div_ceil(crate::watch::PAGE) <= (*b).min(to) / crate::watch::PAGE {
                 (*a, *b) = ((*a).min(from), (*b).max(to));
             } else if to - from > *b - *a {
                 (*a, *b) = (from, to);
@@ -5001,6 +5003,43 @@ mod batch {   // `mod tests` is already taken at the top of this file
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Two partial flushes covering one page in pieces must not merge in
+    /// `Batch::current`: neither took the page whole, so a later whole-page
+    /// refresh still guards it and marked writes go back to title memory.
+    #[test]
+    fn partial_flushes_do_not_hide_a_whole_page_refresh() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, 0x1000);
+        assert_eq!(batch.flush(), 0x1000);
+        batch.add(&copy, p + 0x1000, PAGE - 0x1000);
+        assert_eq!(batch.flush(), PAGE - 0x1000);
+        batch.add(&copy, p, PAGE);
+        batch.flush();
+        copy.writing(p, PAGE, true);
+        copy.write_host((p + 16) as u64, &[0xaa]);
+        assert_eq!(copy.copy_back_marked(p), PAGE, "marked write goes back");
+        // SAFETY: a byte of our pool.
+        assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0xaa);
+        copy.copy_back(p, PAGE);
+        // Whole pages meeting at a page boundary still merge.
+        batch.add(&copy, p + PAGE, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 0);
+        crate::shadow::unregister(p, p as u64);
+        drop(batch);
         drop(copy);
         crate::watch::tests::free(p);
     }
