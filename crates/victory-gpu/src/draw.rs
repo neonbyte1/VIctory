@@ -2391,7 +2391,7 @@ mod tests {
         for title in [[0, 0], [0x10, 0], [0, 0x20], [0x10, 0x20]] {
             for memory_heap in [false, true] {
                 let want = State::wanted(title, memory_heap);
-                assert_ne!(want, state.host_heaps, "{title:x?}, memory heap {memory_heap}");
+                assert_ne!(Some(want), state.host_heaps, "{title:x?}, memory heap {memory_heap}");
             }
         }
     }
@@ -2854,7 +2854,7 @@ void main() {
             state.fixed.targets = Some((vec![1], 1));
             state.host_pipeline = 1;
             state.host_roots = [1; 2];
-            state.host_heaps = [1; 2];
+            state.host_heaps = Some([1; 2]);
             state.table_failed = true;
             state.fresh_tables.insert((1, 2), 3);
             state.root_slots.insert((1, 2, true), 3);
@@ -2876,7 +2876,7 @@ void main() {
             assert_eq!(state.topology, 0);
             assert_eq!(state.host_pipeline, 0);
             assert_eq!(state.host_roots, [0; 2]);
-            assert_eq!(state.host_heaps, [usize::MAX; 2]);
+            assert_eq!(state.host_heaps, Some([usize::MAX; 2]));
             assert!(!state.table_failed);
             assert_eq!(state.fresh_tables.get(&(1, 2)), Some(&3));
             assert_eq!(state.root_slots.get(&(1, 2, true)), Some(&3));

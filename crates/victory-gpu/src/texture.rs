@@ -1032,8 +1032,9 @@ impl Staging {
             let touched: Vec<_> = (0..n)
                 .filter_map(|i| {
                     let (a, b) = span(i);
-                    let mut changed = ranges.iter().chain(&loose);
-                    changed.any(|&(f, e)| f - start < b && a < e - start)
+                    let overlaps = |&(f, e): &(usize, usize)| f - start < b && a < e - start;
+                    let has_untracked = loose.iter().any(overlaps);
+                    (has_untracked || ranges.iter().any(overlaps)).then_some((i, has_untracked))
                 })
                 .collect();
             // Read through the copy, which stands unmapped pages: memory of
@@ -1042,7 +1043,7 @@ impl Staging {
             // are written, and only they are hashed and detiled.
             let mut scratch = Scratch::take(size);
             let read = &mut scratch.0[..size];
-            let mut spans: Vec<(usize, usize)> = touched.iter().map(|&i| span(i)).collect();
+            let mut spans: Vec<(usize, usize)> = touched.iter().map(|&(i, _)| span(i)).collect();
             merge_spans(&mut spans);
             let mut bytes = 0;
             for (a, b) in spans {
