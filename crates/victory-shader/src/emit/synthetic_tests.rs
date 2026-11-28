@@ -336,12 +336,22 @@ fn gathers_at_a_level_match_the_hardware() {
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.root_srvs.contains(&super::VIEW_STRIDES) {
+            roots.push((
+                1,
+                Root::View {
+                    srv: true,
+                    data: super::host::view_strides(&views),
+                },
+            ));
+        }
         let out = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -461,12 +471,22 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.root_srvs.contains(&super::VIEW_STRIDES) {
+            roots.push((
+                1,
+                Root::View {
+                    srv: true,
+                    data: super::host::view_strides(&views),
+                },
+            ));
+        }
         let out = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -525,12 +545,22 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
             continue;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.root_srvs.contains(&super::VIEW_STRIDES) {
+            roots.push((
+                1,
+                Root::View {
+                    srv: true,
+                    data: super::host::view_strides(&views),
+                },
+            ));
+        }
         let out = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -694,12 +724,22 @@ fn a_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
             continue;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.root_srvs.contains(&super::VIEW_STRIDES) {
+            roots.push((
+                1,
+                Root::View {
+                    srv: true,
+                    data: super::host::view_strides(&views),
+                },
+            ));
+        }
         let out = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -873,12 +913,22 @@ fn relative_moves_in_waterfall_loops_reach_each_lane_s_element() {
             continue;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.root_srvs.contains(&super::VIEW_STRIDES) {
+            roots.push((
+                1,
+                Root::View {
+                    srv: true,
+                    data: super::host::view_strides(&views),
+                },
+            ));
+        }
         let out = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
