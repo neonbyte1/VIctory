@@ -136,7 +136,10 @@ console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+title's window has focus. `VICTORY_MOUSE_LOOK=<sensitivity>` (for example
+`0.05`: 20 pixels of movement per 8 ms poll is full tilt) also moves that pad's
+right stick with the mouse; the cursor is held at the window's centre while the
+window has focus. Unset, it is off:
 
 | Keys | Pad |
 |------|-----|
