@@ -19,6 +19,7 @@
 //! is lost.
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
@@ -90,9 +91,26 @@ impl Pending {
     }
 
     fn make(&self) {
+        self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+    }
+
+    fn make_with(&self, create: impl FnOnce() -> Option<HostPipeline>) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let made = match catch_unwind(AssertUnwindSafe(create)) {
+                Ok(made) => made,
+                Err(payload) => {
+                    #[cfg(feature = "diagnostics")]
+                    super::library::LAST.take();
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown panic payload");
+                    tracing::error!(shaders = ?self.shaders, panic = message, "pipeline creation panicked");
+                    return None;
+                }
+            };
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
@@ -480,6 +498,19 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic while making a host pipeline leaves it refused.
+    #[test]
+    fn panicking_pipeline_is_refused() {
+        let p = Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        p.make_with(|| panic!("pipeline creation panicked"));
+        assert!(matches!(p.made.get(), Some(None)));
+    }
 
     #[test]
     fn empty_draws_do_not_request_graphics_pipelines() {
