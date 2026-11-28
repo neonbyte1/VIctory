@@ -12,7 +12,6 @@
 //! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
 //! crash log too.
 
-use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
@@ -20,18 +19,16 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, SetUnhandledExceptionFilter,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+
+use crate::unwind::{locate_unwinder, recover_unwind_fault, unwind};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
-/// Frames listed per report.
-pub(crate) const MAX_FRAMES: usize = 40;
 
 /// Memory saved to files when a crash is reported: (address, length, file).
 #[cfg(feature = "diagnostics")]
@@ -43,6 +40,70 @@ static SAVE: std::sync::OnceLock<Vec<(usize, usize, std::path::PathBuf)>> =
 #[cfg(feature = "diagnostics")]
 pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
     let _ = SAVE.set(ranges);
+}
+
+/// Writes `byte` at `address`, which may be a read-only or execute-only
+/// page of the title image (`VICTORY_POKE` on code, e.g. nopping a site's
+/// `int3`): the page is made writable for the write and its protection
+/// restored, and executable pages have the instruction cache flushed.
+/// False if the address is not committed memory the host can write.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn write_title_byte(address: usize, byte: u8) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtect, VirtualQuery,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: our own process's address space, into a sized struct.
+    let queried = unsafe {
+        VirtualQuery(
+            address as *const _,
+            &mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 || info.State != MEM_COMMIT {
+        return false;
+    }
+    // Page protection without the modifier bits (`PAGE_GUARD` and the
+    // caching flags) so the comparison below names a base protection.
+    let base_protect = info.Protect & 0xFF;
+    let writable = matches!(
+        base_protect,
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    );
+    if !writable {
+        // Executability keeps execute; data gets plain read-write.
+        let new_protect = if info.Protect & 0xF0 != 0 {
+            PAGE_EXECUTE_READWRITE
+        } else {
+            PAGE_READWRITE
+        };
+        let page = address & !0xFFF;
+        let mut old = 0u32;
+        // SAFETY: one page of our own address space.
+        if unsafe { VirtualProtect(page as *mut _, 0x1000, new_protect, &mut old) } == 0 {
+            return false;
+        }
+        // SAFETY: `address` is committed memory we just made writable.
+        unsafe { (address as *mut u8).write_volatile(byte) };
+        let mut restored = 0u32;
+        // SAFETY: restoring what the page had.
+        unsafe { VirtualProtect(page as *mut _, 0x1000, old, &mut restored) };
+        if info.Protect & 0xF0 != 0 {
+            // SAFETY: a page of our own process that may hold code.
+            unsafe {
+                FlushInstructionCache(GetCurrentProcess(), page as *const _, 0x1000);
+            }
+        }
+        return true;
+    }
+    // SAFETY: `address` is committed writable memory.
+    unsafe { (address as *mut u8).write_volatile(byte) };
+    true
 }
 
 /// The file crash reports are appended to, besides being printed.
@@ -82,6 +143,29 @@ fn append_to_log(text: &str) {
     let _ = append_record(file, text);
 }
 
+/// `WriteFile` only promises atomicity for a single sector, and a record
+/// spans many: another reporter can write between our bytes even with
+/// `FILE_APPEND_DATA`. Keep each record whole with a process-local lock.
+/// Never wait on it for long: an exception handler may belong to the thread
+/// that held it.
+static APPENDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn append_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+    use std::sync::TryLockError;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
+    loop {
+        match APPENDING.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            Err(TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
 fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind, Write};
 
@@ -89,9 +173,12 @@ fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let record = format!("unix time {now}, process {}\n{text}\n", std::process::id());
+    let _guard = append_guard();
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
     // Formatting directly into the file can append fragments separately.
-    // Use one append, with no lock to acquire from an exception handler.
+    // Use one append per record; the guard keeps other reporters out of it.
+    // A handler that cannot take the guard still writes: a rare interleaving
+    // in a crash log is better than losing the report.
     if file.write(record.as_bytes())? == record.len() {
         Ok(())
     } else {
@@ -189,8 +276,11 @@ pub fn report_crashes() {
             && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
-    // SAFETY: registers handlers that only read the exception they are
-    // given; the title's own filter, once it sets one, takes the place of
+    locate_unwinder();
+    // SAFETY: registers handlers that read the exception they are given and,
+    // for an instruction emulated or a fault inside a guarded unwind,
+    // rewrite that thread's context, which belongs to the dispatch for its
+    // duration; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
     unsafe {
         AddVectoredExceptionHandler(0, Some(handler));
@@ -226,11 +316,18 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             return false;
         }
         let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => return clzero(context),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
-            [0x0f, 0x01, 0xfd] => {
+        // Only bytes inside the faulting instruction's page are read: the next
+        // page may not be mapped or readable.
+        let room = 0x1000 - (context.Rip as usize & 0xfff);
+        let mut bytes = [0u8; 32];
+        let n = room.min(bytes.len());
+        std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
+        let slice = &bytes[..n];
+        match slice {
+            [0x0f, 0x01, 0xfc, ..] => return clzero(context),
+            [0x0f, 0x01, 0xfa, ..] => {}
+            [0x0f, 0x01, 0xfb, ..] => std::thread::yield_now(),
+            [0x0f, 0x01, 0xfd, ..] => {
                 // Flags are left as they are: a Zen 3 changes none, for
                 // known counters or not (measured in user mode).
                 let known = context.Rcx as u32 <= 1;
@@ -239,13 +336,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 context.Rdx = cycles >> 32;
             }
             _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
-                let mut bytes = [0u8; 32];
-                let n = room.min(bytes.len());
-                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n])
+                if let Some(pass) = clwb_loop(slice)
                     && let Some(end) =
                         clwb_loop_end(*gpr(context, pass.base), *gpr(context, pass.limit))
                 {
@@ -257,12 +348,12 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += pass.len as u64;
                     return true;
                 }
-                if let Some(len) = clwb_len(&bytes[..n]) {
+                if let Some(len) = clwb_len(slice) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
                     return true;
                 }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
+                let Some(len) = sse4a(slice, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
                 context.Rip += len as u64;
@@ -497,27 +588,23 @@ const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
+fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
+    let prefix = *code.first()?;
+    let b1 = *code.get(1)?;
+    let (rex, at) = if b1 & 0xf0 == 0x40 { (b1, 2) } else { (0, 1) };
+    let op = *code.get(at + 1)?;
+    if !matches!(prefix, 0x66 | 0xf2) || *code.get(at)? != 0x0f || !matches!(op, 0x78 | 0x79) {
         return None;
     }
-    let modrm = b(at + 2);
+    let modrm = *code.get(at + 2)?;
     if modrm >> 6 != 3 {
         return None;
     }
     let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
     let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
+    let immediate = op == 0x78;
     let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
+        ((*code.get(at + 3)?, *code.get(at + 4)?), at + 5)
     } else {
         // extrq reads its fields from src's low half, insertq from its high.
         let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
@@ -541,8 +628,8 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
-    // SAFETY: the system passes valid exception pointers.
-    if unsafe { emulate_amd_only(info) } {
+    // SAFETY: the system passes valid exception pointers, for this thread.
+    if unsafe { recover_unwind_fault(info) || emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
@@ -684,8 +771,12 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
-    for (i, pc) in unwind(*context).into_iter().enumerate() {
+    let (frames, walked) = unwind(*context);
+    for (i, pc) in frames.into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    if let Err(fault) = walked {
+        line(format!("  walk ended: {fault}"));
     }
     if to_file {
         let end = report_end();
@@ -702,69 +793,6 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
             "  saved {address:#x}+{len:#x} to {} ({saved:?})",
             file.display()
         );
-    }
-}
-
-/// Return addresses of the faulting thread's frames, from the faulting
-/// instruction up, by the unwind data of each image (the Windows loader
-/// registered it for title images too). Code without unwind data (our
-/// thunks, leaf functions) is taken to have its return address at `rsp`.
-fn unwind(context: CONTEXT) -> Vec<u64> {
-    let (mut low, mut high) = (0, 0);
-    // SAFETY: writes the current thread's stack bounds.
-    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
-    let mut frames = Vec::with_capacity(MAX_FRAMES);
-    unwind_into(context, low, high, &mut frames);
-    frames
-}
-
-/// A `CONTEXT` at the 16-byte alignment the unwind and capture functions need.
-#[repr(C, align(16))]
-pub(crate) struct Aligned16(pub(crate) CONTEXT);
-
-/// [`unwind`] for any thread of the process, its stack being `low..high`;
-/// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
-/// has that capacity (another thread may be suspended holding the heap).
-pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
-    // `RtlVirtualUnwind` writes the context with 16-byte aligned stores, and
-    // windows-sys declares `CONTEXT` without that alignment: a by-value copy on
-    // the stack can land 8 bytes off and fault (seen in a debug build).
-    let mut aligned = Aligned16(context);
-    let context = &mut aligned.0;
-    frames.push(context.Rip);
-    while frames.len() < MAX_FRAMES {
-        // Stop where reading the stack would fault inside this handler.
-        let rsp = context.Rsp as usize;
-        if rsp < low || rsp + 8 > high {
-            break;
-        }
-        let mut image = 0;
-        // SAFETY: looks up the function table entry covering `Rip`, if any.
-        let entry = unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) };
-        if entry.is_null() {
-            // SAFETY: `rsp` is inside this thread's stack.
-            context.Rip = unsafe { (rsp as *const u64).read() };
-            context.Rsp += 8;
-        } else {
-            let (mut data, mut frame) = (null_mut(), 0);
-            // SAFETY: `entry` belongs to `image`; the context is our copy.
-            unsafe {
-                RtlVirtualUnwind(
-                    UNW_FLAG_NHANDLER,
-                    image,
-                    context.Rip,
-                    entry,
-                    context,
-                    &mut data,
-                    &mut frame,
-                    null_mut(),
-                )
-            };
-        }
-        if context.Rip == 0 {
-            break;
-        }
-        frames.push(context.Rip);
     }
 }
 
@@ -799,7 +827,7 @@ fn module_of(address: usize) -> Option<String> {
 /// broke (with the module, for an image's pages). Each points at a different
 /// cause: a wild pointer, an allocation whose commit failed, a stack
 /// overrun, a write to code or constants.
-fn memory_at(address: usize) -> String {
+pub(crate) fn memory_at(address: usize) -> String {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
         PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
@@ -839,9 +867,7 @@ fn memory_at(address: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
-    };
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD;
 
     #[test]
     fn concurrent_crash_records_stay_together() {
@@ -884,117 +910,6 @@ mod tests {
             }
         }
         assert!(seen.is_empty());
-    }
-
-    /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
-    type Captured = (Vec<u64>, Vec<usize>);
-
-    /// A frame we expect [`unwind`] to report: the helper it is in, and the
-    /// helper's name for the message.
-    type Expected = (&'static str, fn() -> Captured);
-
-    /// The runtime function entry start covering `at`: the image base the
-    /// lookup writes, plus the entry's `BeginAddress`. Asking the system for
-    /// both sides of the comparison means a thunk or an incremental-link jump
-    /// is not mistaken for a different function.
-    fn entry_start_at(at: u64) -> Option<u64> {
-        let mut image = 0;
-        // SAFETY: looks up the function table entry covering `at`; nothing
-        // keeps a reference to the entry past this call.
-        let entry = unsafe { RtlLookupFunctionEntry(at, &mut image, null_mut()) };
-        if entry.is_null() {
-            return None;
-        }
-        // SAFETY: a non-null entry belongs to `image`, which the lookup wrote,
-        // and `BeginAddress` is an offset into that image.
-        Some(image + u64::from(unsafe { (*entry).BeginAddress }))
-    }
-
-    #[test]
-    fn unwinds_like_the_system_walk() {
-        // Asking the system's own walk whether the stack looks right is not
-        // reliable: on Windows 10 x64 debug builds `RtlCaptureStackBackTrace`
-        // returns no frames about half the time. The frames above us are
-        // known instead (see `level_a`), so check those first.
-        let (frames, walked) = level_a();
-        // Frame 0 is in `capture_frames`, which took the context; then its
-        // callers in call order, each named by its runtime function entry.
-        let helpers: [Expected; 4] = [
-            ("capture_frames", capture_frames),
-            ("level_c", level_c),
-            ("level_b", level_b),
-            ("level_a", level_a),
-        ];
-        assert!(frames.len() >= helpers.len(), "{frames:?}");
-        for (i, (name, helper)) in helpers.iter().enumerate() {
-            let want = entry_start_at(*helper as usize as u64)
-                .unwrap_or_else(|| panic!("no unwind data for {name}"));
-            let got = entry_start_at(frames[i])
-                .unwrap_or_else(|| panic!("no unwind data for frame {i} at {:#x}", frames[i]));
-            assert_eq!(got, want, "frame {i} should be {name}: {frames:?}");
-        }
-        // A walk that repeats an address is not a walk.
-        let mut distinct = frames[..helpers.len()].to_vec();
-        distinct.sort_unstable();
-        distinct.dedup();
-        assert_eq!(distinct.len(), helpers.len(), "repeated: {frames:?}");
-        // Where the system's walk does return frames, it must still agree with
-        // ours: frame 0 differs (both are in `capture_frames`, at different
-        // call sites), and the callers above are the same.
-        if walked.len() >= helpers.len() {
-            assert!(frames.len() >= walked.len(), "{frames:?} vs {walked:?}");
-            let ours: Vec<usize> = frames[1..walked.len()]
-                .iter()
-                .map(|&f| f as usize)
-                .collect();
-            assert_eq!(ours.as_slice(), &walked[1..]);
-        }
-    }
-
-    /// The frames of this call, both ways: our [`unwind`], and the system's
-    /// walk, which Windows 10 can come up empty on.
-    #[inline(never)]
-    fn capture_frames() -> Captured {
-        // SAFETY: a zeroed CONTEXT is valid and both calls write buffers of
-        // ours; `RtlCaptureContext` wants the context 16-byte aligned too.
-        unsafe {
-            let mut context = Aligned16(std::mem::zeroed());
-            RtlCaptureContext(&mut context.0);
-            let mut walked = [null_mut(); 8];
-            let n = RtlCaptureStackBackTrace(0, 8, walked.as_mut_ptr(), null_mut());
-            let frames = unwind(context.0);
-            let walked = walked[..usize::from(n)]
-                .iter()
-                .map(|&f| f as usize)
-                .collect();
-            (frames, walked)
-        }
-    }
-
-    /// `level_a` → `level_b` → `level_c` → [`capture_frames`]: three known
-    /// callers above the capture. `black_box` after each call keeps it from
-    /// becoming a tail call, which would erase the caller's frame.
-    #[inline(never)]
-    fn level_a() -> Captured {
-        let captured = level_b();
-        std::hint::black_box(&captured);
-        captured
-    }
-
-    /// See [`level_a`].
-    #[inline(never)]
-    fn level_b() -> Captured {
-        let captured = level_c();
-        std::hint::black_box(&captured);
-        captured
-    }
-
-    /// See [`level_a`].
-    #[inline(never)]
-    fn level_c() -> Captured {
-        let captured = capture_frames();
-        std::hint::black_box(&captured);
-        captured
     }
 
     #[test]
@@ -1170,6 +1085,73 @@ mod tests {
                 assert!(emulate_amd_only(&mut pointers));
                 assert_eq!(context.Rip, end as u64 + insn.len() as u64);
             }
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// Non-emulated `#UD` instructions (e.g. `ud2` at page offset `0xffe`, a
+    /// 1-byte `#UD` at `0xfff`, or a truncated SSE4a prefix at `0xffc`) must
+    /// not read into a following unreadable page inside the VEH, while a
+    /// complete SSE4a instruction ending right at the page boundary still
+    /// emulates cleanly.
+    #[test]
+    fn ud_instructions_at_page_end_do_not_read_past_page() {
+        let mut xmm = [M128A { Low: 0, High: 0 }; 16];
+        assert_eq!(sse4a(&[], &mut xmm), None);
+        assert_eq!(sse4a(&[0x66], &mut xmm), None);
+        assert_eq!(sse4a(&[0x66, 0x0f, 0x78, 0xc0], &mut xmm), None);
+
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // SAFETY: two pages of ours, the second unreadable so reading past the first faults.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let mut old = 0;
+            let guard = page.add(0x1000).cast();
+            assert_ne!(VirtualProtect(guard, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            for insn in [
+                &[0xfe][..],                   // 1 byte at 0xfff
+                &[0x0f, 0x0b][..],             // ud2 (2 bytes at 0xffe)
+                &[0x66, 0x0f, 0x78, 0xc0][..], // truncated extrq imm (4 bytes at 0xffc)
+            ] {
+                let end = page.add(0x1000 - insn.len());
+                end.copy_from_nonoverlapping(insn.as_ptr(), insn.len());
+                let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = end as u64;
+                let mut pointers = EXCEPTION_POINTERS {
+                    ExceptionRecord: &mut record,
+                    ContextRecord: &mut context,
+                };
+                assert!(!emulate_amd_only(&mut pointers));
+                assert_eq!(context.Rip, end as u64);
+            }
+            // Complete 6-byte extrq xmm0, 8, 4 ending right at 0x1000 still emulates.
+            let extrq = [0x66, 0x0f, 0x78, 0xc0, 0x08, 0x04];
+            let end = page.add(0x1000 - extrq.len());
+            end.copy_from_nonoverlapping(extrq.as_ptr(), extrq.len());
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = end as u64;
+            context.Anonymous.FltSave.XmmRegisters[0].Low = 0x1234;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            assert!(emulate_amd_only(&mut pointers));
+            assert_eq!(context.Rip, end as u64 + extrq.len() as u64);
+            assert_eq!(context.Anonymous.FltSave.XmmRegisters[0].Low, 0x23);
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
     }

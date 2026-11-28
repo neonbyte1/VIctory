@@ -4,8 +4,14 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours ([`crate::compute`],
-//! which Wine's compiler builds too: without the clamp every indirect
-//! execution is dropped).
+//! which Wine's compiler builds too).
+//!
+//! The source keeps to what Wine's compiler takes as well as Microsoft's:
+//! Wine's has no methods on byte address buffers (`Load`, `Store`) and
+//! ignores a `RootSignature` attribute, and without the clamp every indirect
+//! execution is dropped. So the buffers are structured buffers of `uint`,
+//! which a root descriptor can be, and records are indexed in words: the
+//! caller already refuses addresses and strides that are not multiples of 4.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -1384,11 +1390,11 @@ mod tests {
     }
 
     /// Clamps `records` records of `kind`, filled by repeating `words`,
-    /// `calls` times in one list: each record's first word in the list's
-    /// argument buffer after (zero when it runs empty). The title's copy,
+    /// `calls` times in one list: each record's words in the list's argument
+    /// buffer after (the first zero when it runs empty). The title's copy,
     /// one record more included, stays as written. `None` without a host
     /// GPU.
-    fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
+    fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<Vec<u32>>> {
         let host = super::host()?;
         // Words in a record of `kind`.
         let per = match kind {
@@ -1421,9 +1427,22 @@ mod tests {
             }
             let mut out_data = std::ptr::null_mut();
             out?.Map(0, None, Some(&mut out_data)).unwrap();
-            let first = |i: usize| out_data.cast::<u32>().add(i * per).read_volatile();
-            Some((0..records as usize).map(first).collect())
+            let word = |at: usize| out_data.cast::<u32>().add(at).read_volatile();
+            Some((0..records as usize).map(|i| (i * per..(i + 1) * per).map(word).collect()).collect())
         }
+    }
+
+    /// Every word of a record reaches the list's buffer, the second record's
+    /// too: the clamped counts and, for draws, the rest as it was.
+    #[test]
+    fn records_arrive_whole() {
+        let Some(draws) = clamped(0, &[1 << 25, 2, 7, 9], 2, 1) else {
+            return; // no host GPU here
+        };
+        assert_eq!(draws, [[1 << 24, 2, 7, 9]; 2]);
+        assert_eq!(clamped(1, &[5, 3, 7, 9, 11], 2, 1).unwrap(), [[5, 3, 7, 9, 11]; 2]);
+        assert_eq!(clamped(2, &[70_000, 2, 1], 2, 1).unwrap(), [[65_535, 2, 1]; 2]);
+        assert_eq!(clamped(10, &[70_000, 2, 3], 2, 1).unwrap(), [[65_535, 1, 1]; 2]);
     }
 
     /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
@@ -1434,9 +1453,9 @@ mod tests {
         let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
             return; // no host GPU here
         };
-        assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
+        assert_eq!(draws.iter().filter(|r| r[0] != 0).count(), 2);
         let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
-        assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
+        assert_eq!(meshes.iter().filter(|r| r[0] != 0).count(), 16);
     }
 
     /// The budget goes to the first records, in order: of 200 draws of
@@ -1447,10 +1466,10 @@ mod tests {
         let Some(draws) = clamped(0, &[3 << 18, 1, 0, 0], 200, 1) else {
             return; // no host GPU here
         };
-        assert!(draws[..170].iter().all(|&count| count != 0));
-        assert!(draws[170..].iter().all(|&count| count == 0));
+        assert!(draws[..170].iter().all(|r| r[0] != 0));
+        assert!(draws[170..].iter().all(|r| r[0] == 0));
         let small = clamped(0, &[1], 1 << 16, 1).unwrap();
-        assert!(small.iter().all(|&count| count == 1));
+        assert!(small.iter().all(|r| r[0] == 1));
     }
 
     /// A record that does not fit ends the budget: after two draws of
@@ -1463,7 +1482,7 @@ mod tests {
         let Some(draws) = clamped(0, &words, 8, 1) else {
             return; // no host GPU here
         };
-        let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
+        let ran: Vec<bool> = draws.iter().map(|r| r[0] != 0).collect();
         assert_eq!(ran, [true, true, false, false, false, false, false, false]);
     }
 
@@ -1935,7 +1954,7 @@ void main() { title.Store(at, value); }
         let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
             return; // no host GPU here
         };
-        assert!(twice.iter().all(|&count| count == 0));
+        assert!(twice.iter().all(|r| r[0] == 0));
     }
 
     #[test]

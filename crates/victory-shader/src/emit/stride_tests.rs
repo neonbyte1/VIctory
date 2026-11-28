@@ -1,7 +1,8 @@
 //! End-to-end tests of descriptors whose emission needs more than one
 //! binding: a buffer read by element through the resource heap (no
-//! used-resource entry, so no stride; the view-stride table gives it), and
-//! one of two immediate samplers chosen by uniform control flow. Synthetic
+//! used-resource entry, so no stride; the view-stride table gives it), one
+//! of two immediate samplers chosen by uniform control flow, and a buffer
+//! sized and read through one descriptor load (a handle each). Synthetic
 //! GFX10 programs lowered to DXIL, validated by `dxil.dll` when present,
 //! and run on the host GPU and WARP.
 
@@ -127,6 +128,32 @@ const HALF_LOAD_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// User data: s0 a table with a raw SRV, s2 a table with a raw UAV. Each
+/// lane loads dword `lane` and stores it to dword `lane`, and stores the
+/// SRV's record count (its descriptor's dword 2, read as a number) to dword
+/// `32 + lane`: one descriptor load serves the loads and the size.
+const RAW_SIZE_AND_LOAD_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE030_1000,
+    0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x7E06_020A, // v_mov_b32 v3, s10
+    0xE070_1000,
+    0x8004_0201, // buffer_store_dword v2, v1, s[16:19], 0 offen
+    0xE070_1080,
+    0x8004_0301, // buffer_store_dword v3, v1, s[16:19], 0 offen offset:128
+    0xBF81_0000, // s_endpgm
+];
+
 /// User data: s2 a table with a raw UAV. Each lane stores its index as the
 /// half at byte `2 × lane` (two lanes share each dword).
 const HALF_STORE_WAVE32: &[u32] = &[
@@ -138,6 +165,31 @@ const HALF_STORE_WAVE32: &[u32] = &[
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
     0xE068_1000,
     0x8004_0001, // buffer_store_short v0, v1, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s2 a table with a raw UAV. Each lane stores the high half of
+/// a VGPR whose low half is junk: its index as the half at byte `2 × lane`
+/// (`buffer_store_short_d16_hi`), and `0x40 + lane` as the byte at
+/// `64 + lane` (`buffer_store_byte_d16_hi`).
+const HIGH_HALF_STORES_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3402_0081, // v_lshlrev_b32 v1, 1, v0
+    0x3404_0090, // v_lshlrev_b32 v2, 16, v0
+    0x3804_04FF,
+    0x0000_5A5A, // v_or_b32 v2, 0x5a5a, v2
+    0x4A06_00C0, // v_add_nc_u32 v3, 64, v0
+    0x3406_0690, // v_lshlrev_b32 v3, 16, v3
+    0x3806_06FF,
+    0x0000_A5A5, // v_or_b32 v3, 0xa5a5, v3
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE06C_1000,
+    0x8004_0201, // buffer_store_short_d16_hi v2, v1, s[16:19], 0 offen
+    0xE064_1040,
+    0x8004_0300, // buffer_store_byte_d16_hi v3, v0, s[16:19], 0 offen offset:64
     0xBF81_0000, // s_endpgm
 ];
 
@@ -304,7 +356,9 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// A buffer read at a heap index from data whose slot holds no buffer view
@@ -364,7 +418,9 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         assert_eq!(words[0], [0; 32], "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// Constant data through the resource heap itself is read from a raw view
@@ -430,7 +486,9 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
         assert_eq!(words[0], vec![9; 32], "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// `buffer_load_ushort`: the half at its byte address, zero-extended (the
@@ -490,6 +548,67 @@ fn a_half_buffer_load_reads_the_half_at_its_address() {
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
+}
+
+/// A raw buffer's size read from the descriptor load its loads go through:
+/// the size in bytes, beside what the loads read. AMD's RDNA 4 driver ends
+/// the process at the pipeline's creation when both share one handle.
+#[test]
+fn a_raw_buffers_size_beside_its_loads_reads_its_byte_count() {
+    let shader = build(
+        RAW_SIZE_AND_LOAD_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![
+            entry(ResourceType::Srv, 4, 0),
+            entry(ResourceType::Uav, 4, 2),
+        ],
+        32,
+    );
+    let data: Vec<u32> = (0..40).map(|k| 0x1000 + 7 * k).collect();
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(64),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            // The SRV's table at heap index 0, the UAV's at 1.
+            ud[u.index as usize] = if u.slot == 0 { 0 } else { 32 };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        // 40 dwords: 160 bytes.
+        let want: Vec<u32> = (0..32).map(|l| 0x1000 + 7 * l).chain([160; 32]).collect();
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
@@ -530,6 +649,54 @@ fn half_buffer_stores_leave_the_other_half_alone() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..16).map(|k| (2 * k) | ((2 * k + 1) << 16)).collect();
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
+}
+
+/// `buffer_store_short_d16_hi` and `buffer_store_byte_d16_hi` store the
+/// high half of their VGPR, each lane's field at its byte address, leaving
+/// the rest of the dword alone.
+#[test]
+fn high_half_buffer_stores_take_the_vgprs_high_half() {
+    let shader = build(
+        HIGH_HALF_STORES_WAVE32,
+        vec![param(RootType::Table, 2)],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let views = [View::RawUav(32)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut want: Vec<u32> = (0..16).map(|k| (2 * k) | ((2 * k + 1) << 16)).collect();
+    want.extend((0..8u8).map(|k| u32::from_le_bytes([0, 1, 2, 3].map(|b| 0x40 + 4 * k + b))));
+    want.resize(32, 0);
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
@@ -596,7 +763,9 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 /// User data: s0 a table with a typed buffer UAV, s1 a table with a raw
 /// buffer of 2 dwords a lane, s2 a table with a raw UAV. Each lane stores

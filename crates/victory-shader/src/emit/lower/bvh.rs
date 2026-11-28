@@ -9,12 +9,14 @@
 //!
 //! * Address VGPRs, f32 unless named: node pointer (two dwords, low first, in
 //!   the 64-bit form), ray extent, origin xyz, direction xyz, inverse
-//!   direction xyz. (`a16` packs both directions as f16: refused.)
+//!   direction xyz. With `a16`, direction xyz and inverse direction xyz are
+//!   packed as six f16 values in three dwords (`dir.x|dir.y`, `dir.z|inv.x`,
+//!   `inv.y|inv.z`) and widened to f32 before intersection.
 //! * Descriptor, 128 bits: base address over 256 in bits 0-39, box growth in
 //!   ULPs 55-62, box sorting 63, node count minus 1 (a bound) 64-105, the
 //!   triangle return mode 120 (1: barycentrics, 0: triangle id and hit
 //!   status), a page-size hint 123, type 8 in 124-127. Programs build it in
-//!   code; `resource` accepts box sorting, no growth, no bound and
+//!   code; `resource` accepts box sorting on or off, no growth, no bound and
 //!   barycentrics (the page-size hint either way), what is emulated here.
 //! * The node is at `base * 256 + (pointer & !7) * 8`; the pointer's low
 //!   three bits are its type: 0-3 triangle, 4 box16, 5 box32, 6 instance, 7
@@ -70,6 +72,16 @@ struct Ray {
     inv: [V; 3],
 }
 
+/// Whether box child pointers are sorted by distance (descriptor bit 63).
+#[derive(Clone, Copy)]
+enum BoxSort {
+    /// Known statically from a traced descriptor (skips the sort network when
+    /// false).
+    Static(bool),
+    /// Runtime `i1` from bit 31 of descriptor dword 1 (`Nodes::Raw`).
+    Dynamic(V),
+}
+
 impl Lower<'_> {
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
@@ -77,13 +89,14 @@ impl Lower<'_> {
             addr,
             rsrc,
             a16,
+            d16,
             ..
         } = &inst.fields
         else {
             unreachable!()
         };
-        if *a16 {
-            return Err("a BVH intersection with 16-bit directions");
+        if *d16 {
+            return Err("a 16-bit BVH intersection result");
         }
         let wide = inst.name() == "image_bvh64_intersect_ray";
         let mut regs = Vec::new();
@@ -99,19 +112,63 @@ impl Lower<'_> {
                 .ok_or("a BVH intersection operand")?;
             l.i32_of(v)
         };
+        let fword = |l: &mut Self, k: usize| -> Result<V, Why> {
+            let w = word(l, k)?;
+            Ok(l.as_float(w))
+        };
         let node = word(self, 0)?;
         let node_hi = if wide { Some(word(self, 1)?) } else { None };
         let first = 1 + usize::from(wide);
-        let mut f = [self.s.m.f32(0); 10];
-        for (k, x) in f.iter_mut().enumerate() {
-            let w = word(self, first + k)?;
-            *x = self.as_float(w);
-        }
+        let extent = fword(self, first)?;
+        let origin = [
+            fword(self, first + 1)?,
+            fword(self, first + 2)?,
+            fword(self, first + 3)?,
+        ];
+        let (dir, inv) = if *a16 {
+            // A16 packs direction xyz and inverse direction xyz as six f16
+            // values in three dwords: dir.x|dir.y, dir.z|inv.x, inv.y|inv.z.
+            let packed = [
+                word(self, first + 4)?,
+                word(self, first + 5)?,
+                word(self, first + 6)?,
+            ];
+            let c = self.cur;
+            let f32t = self.s.t.f32;
+            let k16 = self.s.m.i32(16);
+            let low = self.s.m.i32(0xFFFF);
+            let mut v = [self.s.m.f32(0); 6];
+            for (k, out) in v.iter_mut().enumerate() {
+                let w = packed[k / 2];
+                let half = if k % 2 == 1 {
+                    self.s.m.bin(c, Bin::LShr, w, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, w, low)
+                };
+                *out = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[half]);
+            }
+            ([v[0], v[1], v[2]], [v[3], v[4], v[5]])
+        } else {
+            (
+                [
+                    fword(self, first + 4)?,
+                    fword(self, first + 5)?,
+                    fword(self, first + 6)?,
+                ],
+                [
+                    fword(self, first + 7)?,
+                    fword(self, first + 8)?,
+                    fword(self, first + 9)?,
+                ],
+            )
+        };
         let ray = Ray {
-            extent: f[0],
-            origin: [f[1], f[2], f[3]],
-            dir: [f[4], f[5], f[6]],
-            inv: [f[7], f[8], f[9]],
+            extent,
+            origin,
+            dir,
+            inv,
         };
         let Operand::Vector { reg: out, .. } = *data else {
             return Err("a BVH intersection result");
@@ -122,8 +179,8 @@ impl Lower<'_> {
         // The node's byte offset from the BVH's base: (pointer & !7) * 8.
         let not7 = self.s.m.i32(!7);
         let lo = self.s.m.bin(c, Bin::And, node, not7);
-        let nodes = match self.descriptors.get(&((b, i), false)).copied() {
-            Some(src) if matches!(src, Source::Built { .. }) => {
+        let (nodes, box_sort) = match self.descriptors.get(&((b, i), false)).copied() {
+            Some(src @ Source::Built { bits, .. }) => {
                 // shortcut: the root address is taken to be 256-byte aligned
                 // (the descriptor drops its low byte, not known here).
                 let (k, dynamic) = self.built_offset(src)?;
@@ -135,7 +192,7 @@ impl Lower<'_> {
                     at = self.s.m.bin(c, Bin::Add, at, d);
                 }
                 // A root view is title memory there (bounds-checked).
-                match self.root_address(src) {
+                let nodes = match self.root_address(src) {
                     Some((root_lo, root_hi)) => {
                         self.s.flags |= super::flags::INT64;
                         let base = wide64(self, root_lo, root_hi);
@@ -144,7 +201,8 @@ impl Lower<'_> {
                         Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
                     }
                     None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
-                }
+                };
+                (nodes, BoxSort::Static(bits & 0x8000_0000 != 0))
             }
             Some(_) => return Err("a BVH descriptor"),
             None => {
@@ -167,12 +225,18 @@ impl Lower<'_> {
                 let ptr = wide64(self, lo, node_hi.unwrap_or(zero));
                 let k3 = self.s.m.int_const(i64t, 3);
                 let off = self.s.m.bin(c, Bin::Shl, ptr, k3);
-                Nodes::Raw(self.s.m.bin(c, Bin::Add, base, off))
+                let sort_bit = self.s.m.i32(0x8000_0000);
+                let masked = self.s.m.bin(c, Bin::And, d[1], sort_bit);
+                let sort_en = self.s.m.cmp(c, pred::NE, masked, zero);
+                (
+                    Nodes::Raw(self.s.m.bin(c, Bin::Add, base, off)),
+                    BoxSort::Dynamic(sort_en),
+                )
             }
         };
         // Inactive lanes may hold any pointer: they read nothing.
         let at = self.begin_guarded(guard);
-        let r = self.bvh_lanes(&nodes, node, &ray);
+        let r = self.bvh_lanes(&nodes, node, &ray, box_sort);
         let r = match r {
             Ok(r) => r,
             Err(why) => {
@@ -189,7 +253,13 @@ impl Lower<'_> {
     }
 
     /// The four result dwords of `ray` against the node `node` points to.
-    fn bvh_lanes(&mut self, nodes: &Nodes, node: V, ray: &Ray) -> Result<[V; 4], Why> {
+    fn bvh_lanes(
+        &mut self,
+        nodes: &Nodes,
+        node: V,
+        ray: &Ray,
+        box_sort: BoxSort,
+    ) -> Result<[V; 4], Why> {
         let w = self.node_dwords(nodes, 0, 16)?;
         let c = self.cur;
         let seven = self.s.m.i32(7);
@@ -209,7 +279,7 @@ impl Lower<'_> {
         let pairs: Vec<(V, V)> = tail.iter().map(|&t| (t, zero)).collect();
         let tail = self.end_guarded(at, &pairs);
         let w: Vec<V> = w.into_iter().chain(tail).collect();
-        let boxes = self.bvh_box(&w, ty, ray);
+        let boxes = self.bvh_box(&w, ty, ray, box_sort);
         let tri = self.bvh_triangle(&w, ty, ray);
         let c = self.cur;
         let four = self.s.m.i32(4);
@@ -295,8 +365,8 @@ impl Lower<'_> {
     }
 
     /// The child pointers of a box node (`w`: its 28 dwords, past 16 zero
-    /// unless box32), sorted by distance.
-    fn bvh_box(&mut self, w: &[V], ty: V, ray: &Ray) -> [V; 4] {
+    /// unless box32), sorted by distance when `box_sort` is enabled.
+    fn bvh_box(&mut self, w: &[V], ty: V, ray: &Ray, box_sort: BoxSort) -> [V; 4] {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let is16 = self.s.m.cmp(c, pred::EQ, ty, four);
@@ -364,6 +434,12 @@ impl Lower<'_> {
             child[i] = self.s.m.select(c, hit, w[i], none);
             key[i] = near;
         }
+        let unsorted = child;
+        let sort_en = match box_sort {
+            BoxSort::Static(false) => return unsorted,
+            BoxSort::Static(true) => None,
+            BoxSort::Dynamic(en) => Some(en),
+        };
         // GPURT's network: a valid child moves before a farther or invalid one.
         for (a, b) in [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)] {
             let valid_b = self.s.m.cmp(c, pred::NE, child[b], none);
@@ -378,7 +454,10 @@ impl Lower<'_> {
             key[a] = self.s.m.select(c, swap, kb, ka);
             key[b] = self.s.m.select(c, swap, ka, kb);
         }
-        child
+        match sort_en {
+            Some(en) => std::array::from_fn(|k| self.s.m.select(c, en, child[k], unsorted[k])),
+            None => child,
+        }
     }
 
     /// The triangle result of a triangle node (`w`: its 16 dwords).

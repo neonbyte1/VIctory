@@ -554,11 +554,18 @@ fn defective(probes: Vec<Probe>, defect: &str) -> Vec<Probe> {
 /// (each with its first differing inputs).
 fn check(probes: &[Probe]) -> Vec<String> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut hosts: Vec<(&str, bool, Host)> = [("hardware", false), ("warp", true)]
-        .into_iter()
-        .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, warp, h)))
-        .collect();
-    assert!(!hosts.is_empty(), "no SM 6.6 device");
+    let mut hosts: Vec<(&str, bool, Host)> = Vec::new();
+    let mut errors = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        match Host::new(warp) {
+            Ok(h) => hosts.push((label, warp, h)),
+            Err(e) => errors.push(format!("{label}: {e}")),
+        }
+    }
+    if hosts.is_empty() {
+        crate::emit::host::no_device("no SM 6.6 device", &errors);
+        return Vec::new();
+    }
     let report = std::env::var("VICTORY_SEMANTICS_REPORT").ok();
     let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref());
     let mut failures = Vec::new();
@@ -1071,8 +1078,7 @@ const SCC_MIN_MAX: &str = "s_min and s_max set SCC from the result";
 const FLOOR_CVT: &str = "v_cvt_flr and v_cvt_rpi: NaN and the half";
 const MED3_ZERO: &str = "v_med3_f32 orders -0 and +0 as the host does";
 const CONSTANT_CMP: &str = "a constant compare removes the WARP device";
-/// A fused f16 result (`v_fma_f16`, `v_pk_fma_f16`, `v_fma_mix{lo,hi}_f16`)
-/// whose single rounding the lowering's f32 intermediate changes: the f32
+/// A fused f16 result whose single rounding the f32 intermediate changes: the f32
 /// value lands on an f16 tie the exact one is not on (1 f16 ULP; the
 /// exact result needs more than f32 between the multiply-add and the
 /// narrowing).
@@ -2305,37 +2311,71 @@ fn sixteen_bit_probes() -> Vec<Probe> {
         };
         p.push(pk(0x0F, |a, b, _| a + b));
         p.push(pk(0x10, |a, b, _| a * b));
-        p.push(
-            pk(0x0E, |a, b, c| a.mul_add(b, c)).shows(F16_DOUBLE, move |i| {
-                [false, true].iter().any(|&hi| {
-                    twice(h(pick(i[0], 0, hi)).mul_add(h(pick(i[1], 1, hi)), h(pick(i[2], 2, hi))))
-                })
-            }),
-        );
+        p.push(pk(0x0E, |a, b, c| a.mul_add(b, c)));
     }
     // v_pk_fmac_f16: both halves accumulate into v5 = c.
     let m = |i: [u32; 4], rtz: bool| {
         let r = |s: u32| to_f16(h(i[0] >> s).mul_add(h(i[1] >> s), h(i[2] >> s)), rtz);
         vec![r(0) | r(16) << 16]
     };
-    p.push(
-        f16_tags(
-            probe(
-                [vop1(0x01, 5, v(3)), vop2(0x3C, 5, v(1), 2)],
-                half_pairs(),
-                Kind::Halves { ulps: 0 },
-                move |i| m(i, false),
-            ),
-            m,
-            |i| i[..3].iter().flat_map(|&x| [x, x >> 16]).collect(),
-        )
-        .shows(F16_DOUBLE, |i| {
-            [0, 16]
-                .iter()
-                .any(|&s| twice(h(i[0] >> s).mul_add(h(i[1] >> s), h(i[2] >> s))))
-        }),
-    );
+    p.push(f16_tags(
+        probe(
+            [vop1(0x01, 5, v(3)), vop2(0x3C, 5, v(1), 2)],
+            half_pairs(),
+            Kind::Halves { ulps: 0 },
+            move |i| m(i, false),
+        ),
+        m,
+        |i| i[..3].iter().flat_map(|&x| [x, x >> 16]).collect(),
+    ));
     p
+}
+
+#[test]
+fn packed_fused_f16_rounds_each_half_once() {
+    let inputs = vec![
+        // In each half the exact result is just above or below an f16 midpoint.
+        [0x3C03_3C01, 0x3E00_3E00, 0x0001_8001, 0],
+        [0xBC03_BC01, 0x3E00_3E00, 0x8001_0001, 0],
+        // A subnormal tie in the high half and cancellation in the low half.
+        [0x0001_3C01, 0x3800_3E00, 0x0001_BE00, 0],
+        [0x3C00_4000, 0x4000_3C00, 0, 0],
+    ];
+    let expected = |i: [u32; 4], select: [u8; 2], neg: [u8; 2], clamp: bool| {
+        let result = |half: usize| {
+            let operand = |source: usize| {
+                let shift = 16 * (select[half] >> source & 1);
+                let sign = u32::from(neg[half] >> source & 1) << 15;
+                h((i[source] >> shift) ^ sign)
+            };
+            let fused = operand(0).mul_add(operand(1), operand(2));
+            to_f16(if clamp { fused.clamp(0.0, 1.0) } else { fused }, false)
+        };
+        vec![result(0) | result(1) << 16]
+    };
+    let mut probes = Vec::new();
+    for (select, neg, clamp) in [
+        ([0, 7], [0, 0], false),
+        ([7, 0], [0, 0], false),
+        ([0, 7], [0, 1], true),
+    ] {
+        let mut words = vop3p(0x0E, 5, [v(1), v(2), v(3)], select[0], select[1], neg);
+        words[0] |= u32::from(clamp) << 15;
+        probes.push(probe(words, inputs.clone(), Kind::Halves { ulps: 0 }, move |i| {
+            expected(i, select, neg, clamp)
+        }));
+    }
+    let copy_addend = vop1(0x01, 5, v(3));
+    let fmac = vop3(0x13C, 5, [v(1), v(2), 0], NONE);
+    for words in [
+        vec![copy_addend, vop2(0x3C, 5, v(1), 2)],
+        vec![copy_addend, fmac[0], fmac[1]],
+    ] {
+        probes.push(probe(words, inputs.clone(), Kind::Halves { ulps: 0 }, move |i| {
+            expected(i, [0, 7], [0, 0], false)
+        }));
+    }
+    assert_clean(check(&probes));
 }
 
 #[test]
@@ -2515,6 +2555,50 @@ fn byte_dot_products_match_the_hardware() {
             move |i| vec![dot(i[0], i[1], i[2])],
         ),
     ]));
+}
+
+/// `v_dot8_i32_i4`: eight signed nibble products and the accumulator,
+/// wrapping (RDNA2 ISA), with `op_sel_hi` as assemblers write it (all set).
+#[test]
+fn nibble_dot_products_match_the_hardware() {
+    let nibbles = [
+        0u32,
+        0x1234_5678,
+        0x7777_7777,
+        0x8888_8888,
+        0xF0F0_F0F0,
+        0x89AB_CDEF,
+        0xFFFF_FFFF,
+    ];
+    let inputs = triples(
+        &nibbles,
+        &nibbles,
+        &[0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FF00],
+    );
+    assert_clean(check(&[probe(
+        vop3p(0x18, 5, [v(1), v(2), v(3)], 0, 7, [0, 0]),
+        inputs,
+        INT,
+        move |i| vec![dot8_i4(i[0], i[1], i[2])],
+    )]));
+}
+
+/// The CPU model of `v_dot8_i32_i4`.
+fn dot8_i4(a: u32, b: u32, c: u32) -> u32 {
+    let nibble = |x: u32, k: u32| ((x << (28 - 4 * k)) as i32) >> 28;
+    (0..8).fold(c as i32, |s, k| s.wrapping_add(nibble(a, k) * nibble(b, k))) as u32
+}
+
+#[test]
+fn nibble_dot_model_follows_the_isa() {
+    // Every nibble -8 (0x8): 8 * 64 = 512.
+    assert_eq!(dot8_i4(0x8888_8888, 0x8888_8888, 0), 512);
+    // -1 * 7 in every lane: -56, plus the accumulator.
+    assert_eq!(dot8_i4(0xFFFF_FFFF, 0x7777_7777, 100), 44);
+    // Only the lowest nibble pair: 3 * -2.
+    assert_eq!(dot8_i4(0x0000_0003, 0x0000_000E, 0) as i32, -6);
+    // The sum wraps in 32 bits.
+    assert_eq!(dot8_i4(0x8888_8888, 0x8888_8888, 0x7FFF_FFFF), 0x8000_01FF);
 }
 
 // ---- SDWA ----
@@ -2762,6 +2846,11 @@ fn scalar_probes() -> Vec<Probe> {
             (if a == 0 { u32::MAX } else { a.trailing_zeros() }, None)
         }),
         sop1_probe(0x15, unary(U32_EDGES), |a| (ffbh(a), None)),
+        // First bit that differs from the sign bit; -1 for 0 and -1.
+        sop1_probe(0x17, unary(U32_EDGES), |a| {
+            let x = if a >> 31 != 0 { !a } else { a };
+            (if x == 0 { u32::MAX } else { x.leading_zeros() }, None)
+        }),
         sop1_probe(0x0F, unary(U32_EDGES), |a| (a.count_ones(), Some(a != 0))),
         sop1_probe(0x0B, unary(U32_EDGES), |a| (a.reverse_bits(), None)),
         sop1_probe(0x34, unary(U32_EDGES), |a| {
@@ -2795,6 +2884,12 @@ fn scalar_probes() -> Vec<Probe> {
         (0x08, |a, b| a > b),
         (0x04, |a, b| (a as i32) < (b as i32)),
         (0x02, |a, b| (a as i32) > (b as i32)),
+        (0x00, |a, b| a as i32 == b as i32),
+        (0x01, |a, b| a as i32 != b as i32),
+        (0x03, |a, b| (a as i32) >= (b as i32)),
+        (0x05, |a, b| (a as i32) <= (b as i32)),
+        (0x09, |a, b| a >= b),
+        (0x0B, |a, b| a <= b),
     ] {
         p.push(scalar(
             [
@@ -2806,13 +2901,97 @@ fn scalar_probes() -> Vec<Probe> {
             move |i| vec![if f(i[0], i[1]) { i[2] } else { i[3] }],
         ));
     }
+    // s_bitcmp0/1_b32: SCC is whether bit src1[4:0] of src0 is clear / set.
+    let bits = pairs(&U32_EDGES[..24], &[0, 1, 16, 31, 32, 33, 0xFFFF_FFE1]);
+    for (op, set) in [(0x0Cu16, false), (0x0D, true)] {
+        p.push(scalar(
+            [
+                sopc(op, s(16), s(17)),
+                sop2(0x0A, 20, s(18), s(19)),
+                vop1(0x01, 5, s(20)),
+            ],
+            bits.clone(),
+            move |i| {
+                let bit = i[0] >> (i[1] & 31) & 1 != 0;
+                vec![if bit == set { i[2] } else { i[3] }]
+            },
+        ));
+    }
     // SCC as a vector operand (`src_scc`).
     p.push(scalar(
         [sopc(0x0A, s(16), s(17)), vop1(0x01, 5, SRC_SCC)],
         ab,
         |i| vec![u32::from(i[0] < i[1])],
     ));
+    p.extend(scalar_64_probes());
     p
+}
+
+/// The 64-bit scalar logic and shift ops (RDNA2 ISA, SOP2): operands are
+/// `s[16:17]` and `s[18:19]`, the result `s[20:21]`; SCC is whether it is
+/// nonzero. Shifts read six bits of the count.
+fn scalar_64_probes() -> Vec<Probe> {
+    const EDGES: [u64; 8] = [
+        0,
+        1,
+        0xFFFF_FFFF,
+        0x1_0000_0000,
+        0x8000_0000_0000_0000,
+        u64::MAX,
+        0x1234_5678_9ABC_DEF0,
+        0xD2F9_0159_0BAD_F00D,
+    ];
+    let split = |x: u64| [x as u32, (x >> 32) as u32];
+    let logic: Vec<[u32; 4]> = EDGES
+        .iter()
+        .flat_map(|&a| {
+            EDGES.iter().map(move |&b| {
+                let (a, b) = (split(a), split(b));
+                [a[0], a[1], b[0], b[1]]
+            })
+        })
+        .collect();
+    let shifts: Vec<[u32; 4]> = EDGES
+        .iter()
+        .flat_map(|&a| {
+            [0u32, 1, 31, 32, 33, 63, 64, 65, 0xFFFF_FFC1].map(move |n| {
+                let a = split(a);
+                [a[0], a[1], n, OLD]
+            })
+        })
+        .collect();
+    let probe = |op: u16, inputs: Vec<[u32; 4]>, f: fn(u64, u64) -> u64| {
+        scalar(
+            [
+                sop2(op, 20, s(16), s(18)),
+                sop2(0x0A, 22, int(1), int(0)),
+                vop1(0x01, 5, s(20)),
+                vop1(0x01, 6, s(21)),
+                vop1(0x01, 7, s(22)),
+            ],
+            inputs,
+            move |i| {
+                let r = f(
+                    u64::from(i[0]) | u64::from(i[1]) << 32,
+                    u64::from(i[2]) | u64::from(i[3]) << 32,
+                );
+                vec![r as u32, (r >> 32) as u32, u32::from(r != 0)]
+            },
+        )
+    };
+    vec![
+        probe(0x0F, logic.clone(), |a, b| a & b),
+        probe(0x11, logic.clone(), |a, b| a | b),
+        probe(0x13, logic.clone(), |a, b| a ^ b),
+        probe(0x15, logic.clone(), |a, b| a & !b),
+        probe(0x17, logic.clone(), |a, b| a | !b),
+        probe(0x19, logic.clone(), |a, b| !(a & b)),
+        probe(0x1B, logic.clone(), |a, b| !(a | b)),
+        probe(0x1D, logic, |a, b| !(a ^ b)),
+        probe(0x1F, shifts.clone(), |a, n| a << (n & 63)),
+        probe(0x21, shifts.clone(), |a, n| a >> (n & 63)),
+        probe(0x23, shifts, |a, n| ((a as i64) >> (n & 63)) as u64),
+    ]
 }
 
 #[test]
@@ -2950,6 +3129,36 @@ fn floor_conversions_match_the_hardware() {
     defect(conversion_probes(), FLOOR_CVT);
 }
 
+/// `abs` and `neg` act on the sign bit alone, of a NaN too (RDNA2 ISA: the
+/// input modifiers clear or flip bit 31). The floor conversions show a
+/// NaN's sign, as they saturate it by its sign. Was a defect: `neg` was
+/// `-0.0 - x`, which leaves the sign of a NaN to the host (WARP keeps it).
+#[test]
+fn source_modifiers_set_the_sign_of_a_nan() {
+    let xs = unary(F32_EDGES);
+    let mut p = Vec::new();
+    for (op, half) in [(0x18D_u16, false), (0x18C, true)] {
+        for m in source_mods().into_iter().filter(|m| m.abs | m.neg == 1) {
+            p.push(probe(
+                vop3(op, 5, [v(1), 0, 0], m),
+                xs.clone(),
+                INT,
+                move |i| {
+                    let mut x = i[0];
+                    if m.abs != 0 {
+                        x &= 0x7FFF_FFFF;
+                    }
+                    if m.neg != 0 {
+                        x ^= 0x8000_0000;
+                    }
+                    vec![to_i32_floor(x, half)]
+                },
+            ));
+        }
+    }
+    assert_clean(check(&p));
+}
+
 /// `v_med3_f32` orders -0 below +0, as its min and max do. Was a defect:
 /// plain DXIL `FMin`/`FMax` gave either zero (the adapters differed).
 #[test]
@@ -2991,6 +3200,31 @@ fn f16_results_round_as_the_mode_says() {
         vec![
             i[3] & 0xFFFF_0000 | narrow(i[0], true),
             i[3] & 0xFFFF_0000 | narrow(i[0], false),
+        ]
+    })]));
+}
+
+#[test]
+fn whole_wave_sections_keep_rounding_mode_changes() {
+    let save = 0xBE86_3DC1; // s_or_saveexec_b32 s6, -1
+    let restore = 0xBEFE_0306; // s_mov_b32 exec_lo, s6
+    let body = [
+        save,
+        0xBFA4_000C, // s_round_mode: f16 toward zero
+        restore,
+        vop1(0x0A, 5, v(1)),
+        save,
+        0xBA80_0881, // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0
+        0,
+        restore,
+        vop1(0x0A, 6, v(1)),
+    ];
+    let inputs = unary(&[0x3F7F_FFFF, 0xBF7F_FFFF]);
+    assert_clean(check(&[probe(body, inputs, F16, |i| {
+        let f = f64::from(fl(i[0]));
+        vec![
+            i[3] & 0xFFFF_0000 | to_f16(f, true),
+            i[3] & 0xFFFF_0000 | to_f16(f, false),
         ]
     })]));
 }

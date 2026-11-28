@@ -322,7 +322,7 @@ fn direct_and_indirect_dispatch_write_each_group_once() {
         // Bind the same PSO and root signature through ExecuteIndirect, but write
         // to a second buffer so the two results can be checked independently.
         state.set_table(true, 0, handle + 32);
-        assert!(state.execute_indirect(&list, (2, 12, 1), arg_data as u64, None));
+        assert!(state.execute_indirect(&list, (2, 12, 1), (arg_data as u64, 12), None));
         list.close();
         host.execute(&[&list]);
         // SAFETY: the list's synchronous submission and UAV copyback are done.

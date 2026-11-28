@@ -284,7 +284,6 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         .iter()
         .filter_map(|&(reg, v)| loaded.iter().find(|l| l.0 == reg).map(|l| (v, l.1)))
         .collect();
-    let input_of = |v: Value| inputs.iter().find(|i| i.0 == v).map(|i| i.1);
     let attribute = |inst: &Inst, attr: &Operand| match *attr {
         Operand::Attr { index, chan, high } => ps_inputs
             .iter()
@@ -301,14 +300,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             )),
         _ => Err(unsupported(inst.machine.offset, "an interpolation operand")),
     };
-    // A VGPR value's barycentric kind and index, if it is one as loaded.
-    let barycentric = |v: Option<Value>| match v.and_then(input_of) {
-        Some(Input::Barycentric { kind, index }) => Some((kind, index)),
-        _ => None,
-    };
 
     let mut io = Io {
-        inputs: inputs.clone(),
+        inputs,
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
             StageIo::Ps { .. } => {
@@ -323,35 +317,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         },
         ..Io::default()
     };
-    let defs: std::collections::HashMap<Value, Site> = p
-        .blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(b, block)| {
-            block
-                .insts
-                .iter()
-                .enumerate()
-                .flat_map(move |(i, inst)| inst.writes.iter().map(move |w| (w.1, (b, i))))
-        })
-        .collect();
-    let phis: std::collections::HashMap<Value, (usize, usize)> = p
-        .blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(b, block)| {
-            block
-                .phis
-                .iter()
-                .enumerate()
-                .map(move |(i, phi)| (phi.value, (b, i)))
-        })
-        .collect();
-    let halves = Halves {
-        p,
-        defs: &defs,
-        phis: &phis,
-    };
+    let mut halves = Halves::new(p);
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -376,7 +342,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                     attr,
                                     inst.read(Reg::V(d)),
                                     inst.read(Reg::V(reg)),
-                                    &barycentric,
+                                    &io.inputs,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
                             io.interps.push((site, interp.with(attribute)));
@@ -393,7 +359,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             _ => None,
                         };
                         let interp = halves
-                            .pair(&v.src[0], read(2), read(1), &barycentric)
+                            .pair(&v.src[0], read(2), read(1), &io.inputs)
                             .map_err(|what| unsupported(at, what))?;
                         io.interps.push((site, interp.with(attribute)));
                     }
@@ -484,24 +450,84 @@ impl Pair {
     }
 }
 
+/// Where a dense SSA [`Value`] is defined for [`Halves`] lookups.
+#[derive(Clone, Copy)]
+enum Def {
+    None,
+    Phi(u32, u32),
+    Inst(u32, u32),
+}
+
+/// A VGPR value's barycentric kind and index, if it is one as loaded.
+fn barycentric_of(inputs: &[(Value, Input)], v: Option<Value>) -> Option<(Barycentric, u8)> {
+    let v = v?;
+    match inputs.iter().find(|i| i.0 == v)?.1 {
+        Input::Barycentric { kind, index } => Some((kind, index)),
+        _ => None,
+    }
+}
+
 /// Finds the first halves of interpolations.
 struct Halves<'a> {
     p: &'a Program,
-    defs: &'a std::collections::HashMap<Value, Site>,
-    phis: &'a std::collections::HashMap<Value, (usize, usize)>,
+    /// Built lazily on the first `v_interp_p2_*` instruction, indexed by `Value.0`.
+    defs: Option<Vec<Def>>,
 }
 
-impl Halves<'_> {
+impl<'a> Halves<'a> {
+    fn new(p: &'a Program) -> Self {
+        Self { p, defs: None }
+    }
+
+    fn ensure_defs(&mut self) {
+        if self.defs.is_some() {
+            return;
+        }
+        let max_v = self
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                b.phis
+                    .iter()
+                    .map(|phi| phi.value.0)
+                    .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1.0)))
+            })
+            .max()
+            .map_or(0, |m| m as usize + 1);
+        let mut defs = vec![Def::None; max_v];
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, phi) in block.phis.iter().enumerate() {
+                defs[phi.value.0 as usize] = Def::Phi(b as u32, i as u32);
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.writes {
+                    defs[v.0 as usize] = Def::Inst(b as u32, i as u32);
+                }
+            }
+        }
+        self.defs = Some(defs);
+    }
+
+    #[inline]
+    fn def_of(&self, v: Value) -> Def {
+        self.defs
+            .as_deref()
+            .and_then(|d| d.get(v.0 as usize).copied())
+            .unwrap_or(Def::None)
+    }
+
     /// The interpolation whose second half reads the first half's result
     /// `acc`, the barycentric `j`, and attribute `attr`: every first half
     /// must read the same attribute channel and the same kind's i.
     fn pair(
-        &self,
+        &mut self,
         attr: &Operand,
         acc: Option<Value>,
         j: Option<Value>,
-        barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
+        inputs: &[(Value, Input)],
     ) -> Result<Pair, &'static str> {
+        self.ensure_defs();
         let mut first = Vec::new();
         self.sites(
             acc.ok_or("an interpolation without its first half")?,
@@ -509,7 +535,7 @@ impl Halves<'_> {
             &mut first,
         )?;
         let mut unless = Vec::new();
-        let Some((kind, 1)) = self.joined(j, barycentric, &mut unless) else {
+        let Some((kind, 1)) = self.joined(j, inputs, &mut unless) else {
             return Err("an interpolation with computed barycentrics");
         };
         for &(b, i) in &first {
@@ -529,7 +555,7 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if self.joined(i, barycentric, &mut unless) != Some((kind, 0)) {
+            if self.joined(i, inputs, &mut unless) != Some((kind, 0)) {
                 return Err("an interpolation with computed barycentrics");
             }
         }
@@ -547,7 +573,7 @@ impl Halves<'_> {
     fn joined(
         &self,
         v: Option<Value>,
-        barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
+        inputs: &[(Value, Input)],
         other: &mut Vec<Elsewhere>,
     ) -> Option<(Barycentric, u8)> {
         let (mut found, mut stack, mut seen) = (None, vec![v?], Vec::new());
@@ -556,15 +582,18 @@ impl Halves<'_> {
                 continue;
             }
             seen.push(v);
-            if let Some(k) = barycentric(Some(v)) {
+            if let Some(k) = barycentric_of(inputs, Some(v)) {
                 if found.is_some_and(|f| f != k) {
                     return None;
                 }
                 found = Some(k);
-            } else if let Some(&(b, i)) = self.phis.get(&v) {
+            } else if let Def::Phi(b, i) = self.def_of(v) {
+                let (b, i) = (b as usize, i as usize);
                 let block = &self.p.blocks[b];
                 for (n, &a) in block.phis[i].args.iter().enumerate() {
-                    if barycentric(Some(a)).is_some() || self.phis.contains_key(&a) {
+                    if barycentric_of(inputs, Some(a)).is_some()
+                        || matches!(self.def_of(a), Def::Phi(..))
+                    {
                         stack.push(a);
                     } else {
                         other.push(Elsewhere::Edge(block.preds[n], b));
@@ -573,7 +602,10 @@ impl Halves<'_> {
             } else {
                 // A vector write keeps the old value in the lanes it skips
                 // (`v_writelane` ignores EXEC).
-                let &(b, i) = self.defs.get(&v)?;
+                let Def::Inst(b, i) = self.def_of(v) else {
+                    return None;
+                };
+                let (b, i) = (b as usize, i as usize);
                 let inst = &self.p.blocks[b].insts[i];
                 let &(reg, _) = inst.writes.iter().find(|w| w.1 == v)?;
                 if !matches!(reg, Reg::V(_)) || inst.name() == "v_writelane_b32" {
@@ -581,7 +613,14 @@ impl Halves<'_> {
                 }
                 // A plain copy of a barycentric: that one where it runs.
                 let copied = match (&inst.fields, inst.name()) {
-                    (Fields::Valu(c), "v_mov_b32") if c.dpp.is_none() && c.sdwa.is_none() => {
+                    (Fields::Valu(c), "v_mov_b32")
+                        if c.abs == 0
+                            && c.neg == 0
+                            && !c.clamp
+                            && c.omod == 0
+                            && c.dpp.is_none()
+                            && c.sdwa.is_none() =>
+                    {
                         match c.src.first() {
                             Some(&Operand::Vector { reg: from, .. }) => inst.read(Reg::V(from)),
                             _ => None,
@@ -589,7 +628,7 @@ impl Halves<'_> {
                     }
                     _ => None,
                 };
-                match copied.filter(|&c| barycentric(Some(c)).is_some()) {
+                match copied.filter(|&c| barycentric_of(inputs, Some(c)).is_some()) {
                     Some(c) => {
                         other.push(Elsewhere::Skip((b, i)));
                         stack.push(c);
@@ -612,23 +651,25 @@ impl Halves<'_> {
         seen: &mut Vec<Value>,
         out: &mut Vec<Site>,
     ) -> Result<(), &'static str> {
-        if let Some(&site) = self.defs.get(&v) {
-            if !out.contains(&site) {
-                out.push(site);
+        match self.def_of(v) {
+            Def::Inst(b, i) => {
+                let site = (b as usize, i as usize);
+                if !out.contains(&site) {
+                    out.push(site);
+                }
+                Ok(())
             }
-            return Ok(());
-        }
-        let &(b, i) = self
-            .phis
-            .get(&v)
-            .ok_or("an interpolation without its first half")?;
-        if !seen.contains(&v) {
-            seen.push(v);
-            for &a in &self.p.blocks[b].phis[i].args {
-                self.sites(a, seen, out)?;
+            Def::Phi(b, i) => {
+                if !seen.contains(&v) {
+                    seen.push(v);
+                    for &a in &self.p.blocks[b as usize].phis[i as usize].args {
+                        self.sites(a, seen, out)?;
+                    }
+                }
+                Ok(())
             }
+            Def::None => Err("an interpolation without its first half"),
         }
-        Ok(())
     }
 }
 
@@ -731,6 +772,27 @@ mod tests {
     }
 
     #[test]
+    fn modified_barycentric_copy_is_not_treated_as_plain_barycentric() {
+        let check = |w0: u32, w1: u32| {
+            let p = program(&[
+                w0,
+                w1,          // v_mov_b32_e64 v4, <v0 with optional modifiers>
+                0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                S_ENDPGM,
+            ]);
+            raise(&p, &pixel(vec![TEXCOORD], 2))
+        };
+        // Plain VOP3 copy of v0 keeps the hardware barycentric.
+        assert!(check(0xD581_0004, 0x0000_0100).is_ok());
+        // Any float modifier changes the barycentric and must be rejected.
+        assert!(check(0xD581_0004, 0x2000_0100).is_err()); // neg
+        assert!(check(0xD581_0104, 0x0000_0100).is_err()); // abs
+        assert!(check(0xD581_8004, 0x0000_0100).is_err()); // clamp
+        assert!(check(0xD581_0004, 0x0800_0100).is_err()); // mul:2
+    }
+
+    #[test]
     fn mesh_inputs_and_primitive_export() {
         let mesh = |words: &[u32]| {
             let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -792,5 +854,92 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
+    }
+
+    #[test]
+    fn halves_defs_are_lazy_and_match_phi_and_inst_defs() {
+        // Branching PS where v_interp_p1_f32 runs in two arms and joins at a phi
+        // before v_interp_p2_f32.
+        let p = program(&[
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> arm_b
+            0xC808_0000, // arm_a: v_interp_p1_f32 v2, v0, attr0.x
+            0xBF82_0001, // s_branch -> join
+            0xC808_0000, // arm_b: v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // join: v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0302_0102, // exp mrt0, v2, v1, v2, v3 done vm
+            S_ENDPGM,
+        ]);
+        let mut h = Halves::new(&p);
+        assert!(h.defs.is_none(), "defs table stays unallocated before pair()");
+        h.ensure_defs();
+        let defs = h.defs.as_ref().unwrap();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, phi) in block.phis.iter().enumerate() {
+                assert!(matches!(defs[phi.value.0 as usize], Def::Phi(bb, ii) if bb as usize == b && ii as usize == i));
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.writes {
+                    assert!(matches!(defs[v.0 as usize], Def::Inst(bb, ii) if bb as usize == b && ii as usize == i));
+                }
+            }
+        }
+        // Out-of-range value id safely resolves to Def::None.
+        assert!(matches!(h.def_of(Value(u32::MAX)), Def::None));
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 1);
+        let Interp::Interpolated { first, .. } = &io.interps[0].1 else {
+            panic!("expected interpolated attribute");
+        };
+        assert_eq!(first.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_io_raise() {
+        // 1) Compute shader with 4,000 ALU ops (no v_interp_p2_*).
+        let mut cs_words = vec![0x7E00_0280u32; 4000];
+        cs_words.push(S_ENDPGM);
+        let cs_code: Vec<u8> = cs_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let cs_p = crate::ir::build(&cs_code, true, 256).unwrap();
+        let cs_native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: cs_code,
+        };
+        // 2) Pixel shader with 4,000 ALU ops + 16 v_interp_p1/p2 pairs.
+        let mut ps_words = Vec::with_capacity(4040);
+        for _ in 0..16 {
+            ps_words.push(0xC808_0000); // v_interp_p1_f32 v2, v0, attr0.x
+            ps_words.push(0xC809_0001); // v_interp_p2_f32 v2, v1, attr0.x
+        }
+        ps_words.extend(std::iter::repeat_n(0x7E06_0202u32, 4000));
+        ps_words.extend_from_slice(&[0xF800_180F, 0x0302_0102, S_ENDPGM]);
+        let ps_p = program(&ps_words);
+        let ps_native = pixel(vec![TEXCOORD], 2);
+
+        let _ = raise(&cs_p, &cs_native).unwrap();
+        let _ = raise(&ps_p, &ps_native).unwrap();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..200 {
+            std::hint::black_box(raise(&cs_p, &cs_native).unwrap().inputs.len());
+        }
+        let cs_us = t0.elapsed().as_secs_f64() * 1e6 / 200.0;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..200 {
+            std::hint::black_box(raise(&ps_p, &ps_native).unwrap().interps.len());
+        }
+        let ps_us = t1.elapsed().as_secs_f64() * 1e6 / 200.0;
+        eprintln!("io::raise (4000 insts): cs={cs_us:.1} us/run, ps_16interp={ps_us:.1} us/run");
     }
 }

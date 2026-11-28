@@ -2,7 +2,7 @@
 //! (tests/fixtures/hle-probe), without any game data.
 #![cfg(windows)]
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -25,14 +25,29 @@ fn host_dll() -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\version.dll")
 }
 
+fn probe_dll_override(value: Option<&OsStr>) -> Option<PathBuf> {
+    let path = value.filter(|p| !p.is_empty()).map(PathBuf::from)?;
+    assert!(
+        path.is_file(),
+        "VICTORY_HLE_PROBE_DLL must point to an existing file: {}",
+        path.display()
+    );
+    Some(path)
+}
+
 /// Builds the fixture into its own target dir (the outer cargo holds the
 /// lock on the main one while tests run), in the outer one's scratch folder
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
 /// build. `VICTORY_HLE_PROBE` names a fixture built beforehand instead, for
-/// runners that cannot start cargo (tests under Wine).
+/// runners that cannot start cargo (tests under Wine). When
+/// `VICTORY_HLE_PROBE_DLL` is set and non-empty, uses that prebuilt DLL
+/// directly instead of invoking Cargo.
 fn build_probe() -> PathBuf {
     if let Some(prebuilt) = std::env::var_os("VICTORY_HLE_PROBE") {
         return prebuilt.into();
+    }
+    if let Some(path) = probe_dll_override(std::env::var_os("VICTORY_HLE_PROBE_DLL").as_deref()) {
+        return path;
     }
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
@@ -136,7 +151,7 @@ fn loads_binds_and_calls_probe() {
     );
 
     let dir = tempfile::tempdir().unwrap();
-    let image = victory_loader::load(&prepared, dir.path()).unwrap();
+    let image = victory_loader::load(&prepared, dir.path(), "hle_probe.dll").unwrap();
 
     // The "title" ships victory-probe-title.dll: any real DLL will do.
     let title_dir = tempfile::tempdir().unwrap();
@@ -252,6 +267,56 @@ fn loads_binds_and_calls_probe() {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+#[test]
+fn patch_lookup_uses_the_original_module_name() {
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            // SAFETY: this test restores the process environment it changed.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("VICTORY_PATCH", value),
+                    None => std::env::remove_var("VICTORY_PATCH"),
+                }
+            }
+        }
+    }
+
+    let original = std::fs::read(build_probe()).unwrap();
+    let prepared = prepare(&original).unwrap();
+    let rva = prepared
+        .info
+        .exports
+        .iter()
+        .find(|export| export.name.as_deref() == Some("probe_pid"))
+        .and_then(|export| export.rva)
+        .unwrap();
+    assert_ne!(prepared.file_name(), "game.exe");
+
+    // Both entries replace `probe_pid` with `mov eax, IMM32; ret`. The old
+    // lookup applies the content-hashed entry and returns 99; the original
+    // title name must win and return 42 (with case-insensitive matching).
+    let spec = format!(
+        "GaMe.ExE:{rva:x}:b82a000000c3,{}:{rva:x}:b863000000c3",
+        prepared.file_name()
+    );
+    let _restore = RestoreEnv(std::env::var_os("VICTORY_PATCH"));
+    // SAFETY: restored above, including when the test panics.
+    unsafe { std::env::set_var("VICTORY_PATCH", spec) };
+    let dir = tempfile::tempdir().unwrap();
+    let image = victory_loader::load(&prepared, dir.path(), "game.exe").unwrap();
+    let address = image.export("probe_pid").unwrap();
+    // SAFETY: the patch gives this export the signature `extern "system" fn() -> u32`.
+    let actual = unsafe {
+        let f: extern "system" fn() -> u32 = std::mem::transmute(address);
+        f()
+    };
+    // SAFETY: no title code is running, and the image was never attached.
+    unsafe { image.unload() };
+    assert_eq!(actual, 42);
+}
+
 #[test]
 fn maps_a_title_dll_the_title_loads_itself() {
     let title_dir = tempfile::tempdir().unwrap();
@@ -267,4 +332,32 @@ fn maps_a_title_dll_the_title_loads_itself() {
     assert!(dlls[0].1.export("GetFileVersionInfoW").is_some());
     assert!(load("absent.dll", &|_| true).is_empty());
     assert!(load("late.dll", &|_| false).is_empty());
+}
+
+#[test]
+fn probe_dll_override_validates_file_paths() {
+    assert_eq!(probe_dll_override(None), None);
+    assert_eq!(probe_dll_override(Some(OsStr::new(""))), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dll = dir.path().join("custom_hle_probe.dll");
+    std::fs::write(&dll, b"MZ").unwrap();
+    assert_eq!(probe_dll_override(Some(dll.as_os_str())), Some(dll));
+
+    for invalid in [
+        dir.path().join("missing_hle_probe.dll"),
+        dir.path().to_path_buf(),
+    ] {
+        let err = std::panic::catch_unwind(|| probe_dll_override(Some(invalid.as_os_str())))
+            .expect_err("non-file override path must fail");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("VICTORY_HLE_PROBE_DLL"),
+            "expected VICTORY_HLE_PROBE_DLL in panic message, got: {msg}"
+        );
+    }
 }

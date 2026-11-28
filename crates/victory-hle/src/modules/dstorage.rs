@@ -17,7 +17,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -50,6 +49,11 @@ type Out = *mut *mut c_void;
 static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
 
 pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write(std::ptr::null_mut()) };
     // SAFETY: the title passes a GUID (null tolerated).
     match unsafe { iid.as_ref() } {
         Some(&iid) if iid == FACTORY => {
@@ -117,34 +121,46 @@ type Factory = *const Object;
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_SHARE_DELETE: u32 = 4;
     const OPEN_EXISTING: u32 = 3;
     if path.is_null() {
         return E_INVALIDARG;
     }
-    // Goes through `files`, so paths on our virtual drives work too.
+    // Goes through `files`, so paths on our virtual drives work too. The
+    // title's own tools and mods hold its files open for writing; a read
+    // that shares only reads fails them.
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         std::ptr::null(),
         OPEN_EXISTING,
         0,
         std::ptr::null_mut(),
     );
+    // Read the error before anything allocates: the host keeps it in
+    // thread-local storage that a heap allocation may overwrite.
+    let error = (handle as isize == -1).then(std::io::Error::last_os_error);
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
-    if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
+    if let Some(error) = error {
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: name });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File {
+            files: Files::new(file),
+            path: name,
+        },
+    );
     put(out, file)
 }
 
@@ -257,9 +273,83 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    file: std::fs::File,
+    files: Files,
     /// As the title named it (diagnostics).
     path: String,
+}
+
+/// A file as the workers read it: the handle the title opened, and a handle
+/// for each worker, made from it when that worker first reads. The host does
+/// the reads of one handle (opened for synchronous reads, as the title's is)
+/// one after the other, so every worker read a file through one queue: 48 KiB
+/// at random from a large archive went at 185 MB/s through one handle and
+/// 990 MB/s through a handle per worker (24 workers).
+/// `VICTORY_DSTORAGE_HANDLES=0`: every worker reads through the title's
+/// handle, as before.
+struct Files {
+    first: std::fs::File,
+    /// Indexed by [`this_thread`], modulo their count; `None` inside if the
+    /// host made no other handle (then `first` is read).
+    others: Box<[OnceLock<Option<std::fs::File>>]>,
+}
+
+impl Files {
+    fn new(first: std::fs::File) -> Files {
+        static HANDLES: OnceLock<bool> = OnceLock::new();
+        let handles = *HANDLES
+            .get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HANDLES").is_none_or(|v| v != "0"));
+        Files::with(first, if handles { workers() } else { 0 })
+    }
+
+    /// With `others` handles besides `first` (0: `first` alone).
+    fn with(first: std::fs::File, others: usize) -> Files {
+        Files {
+            first,
+            others: (0..others).map(|_| OnceLock::new()).collect(),
+        }
+    }
+
+    /// Reads at `offset`, as [`FileExt::seek_read`].
+    fn read_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let other = match self.others.len() {
+            0 => None,
+            n => self.others[this_thread() % n]
+                .get_or_init(|| reopen(&self.first))
+                .as_ref(),
+        };
+        other.unwrap_or(&self.first).seek_read(out, offset)
+    }
+}
+
+/// The scheduler's workers: one for each of the host's processors.
+fn workers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+/// A number for this thread: 0 for the first that asks, and so on.
+fn this_thread() -> usize {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    thread_local! {
+        static NUMBER: usize = NEXT.fetch_add(1, Ordering::Relaxed) as usize;
+    }
+    NUMBER.with(|n| *n)
+}
+
+/// Another handle to `file`, for synchronous reads; `None` if the host gives
+/// none.
+fn reopen(file: &std::fs::File) -> Option<std::fs::File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, ReOpenFile};
+    // SAFETY: a file we hold open.
+    let handle = unsafe { ReOpenFile(file.as_raw_handle(), GENERIC_READ, FILE_SHARE_READ, 0) };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(%error, "dstorage: a file could not be opened again");
+        return None;
+    }
+    // SAFETY: a handle just opened, ours alone.
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -428,8 +518,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
+        let started = (0..workers())
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
@@ -450,6 +539,7 @@ impl Scheduler {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    let mut scratch = WorkerScratch::new();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -458,7 +548,8 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, &mut scratch);
+        scratch.trim();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -511,21 +602,36 @@ impl Lanes {
     /// its lane that has started the fewest bytes, if the staging buffer
     /// has room for it (or nothing else holds any).
     fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
-            .min()?;
-        let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        let next_read = |without_staging| {
+            self.lanes
+                .iter()
+                .filter_map(|(&id, lane)| {
+                    let (seq, request) = lane.reads.front()?;
+                    let staging = staging_bytes(request);
+                    if without_staging && staging != 0 {
+                        return None;
+                    }
+                    let class = lane.class;
+                    Some((self.clock[class], class, lane.clock, *seq, id, staging))
+                })
+                .min()
+        };
+        let selected = next_read(false)?;
+        let (_, class, _, _, id, staging) = if selected.5 != 0
+            && self.staged > 0
+            && self.staged + selected.5 > self.staging
+        {
+            // Do not let smaller buffered reads keep a large read waiting
+            // forever, but other queues can still run without staging.
+            let raw = next_read(true);
             self.starved = true;
             self.refused += 1;
-            return None;
-        }
-        lane.reads.pop_front();
+            raw?
+        } else {
+            selected
+        };
+        let lane = self.lanes.get_mut(&id)?;
+        let (seq, request) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -846,8 +952,41 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Maximum capacity retained per scratch buffer on an idle worker after a
+/// request finishes, preventing a single oversized read from pinning memory.
+const SCRATCH_RETAIN_CAP: usize = 8 * 1024 * 1024;
+
+/// Per-worker reusable zlib decompressor state and scratch buffers.
+/// Each worker in [`work`] runs one request at a time, so reusing these avoids
+/// zero-initializing a ~10.5 KiB `DecompressorOxide` and heap-allocating or
+/// zero-filling `source` / `intermediate` buffers on every request.
+struct WorkerScratch {
+    decompressor: Box<miniz_oxide::inflate::core::DecompressorOxide>,
+    source: Vec<u8>,
+    intermediate: Vec<u8>,
+}
+
+impl WorkerScratch {
+    fn new() -> Self {
+        Self {
+            decompressor: Box::new(miniz_oxide::inflate::core::DecompressorOxide::new()),
+            source: Vec::new(),
+            intermediate: Vec::new(),
+        }
+    }
+
+    fn trim(&mut self) {
+        if self.source.capacity() > SCRATCH_RETAIN_CAP {
+            self.source = Vec::new();
+        }
+        if self.intermediate.capacity() > SCRATCH_RETAIN_CAP {
+            self.intermediate = Vec::new();
+        }
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, scratch: &mut WorkerScratch) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -880,21 +1019,29 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let WorkerScratch {
+        decompressor,
+        source: source_buf,
+        intermediate,
+    } = scratch;
+    let source = read_source(request, source_buf).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let inter_size = request.intermediate_size as usize;
+        if intermediate.len() < inter_size {
+            intermediate.resize(inter_size, 0);
+        }
+        let n = inflate(decompressor, source, &mut intermediate[..inter_size])
+            .map_err(|hr| fail(hr, "zlib"))?;
+        &intermediate[..n]
     } else {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+        Some(tables) => bcpack::decode(bc, source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(decompressor, source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -908,12 +1055,34 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
-fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
+fn inflate(
+    decompressor: &mut miniz_oxide::inflate::core::DecompressorOxide,
+    source: &[u8],
+    out: &mut [u8],
+) -> Result<usize, HRESULT> {
+    use miniz_oxide::inflate::TINFLStatus;
+    use miniz_oxide::inflate::core::{decompress, inflate_flags};
+    // Reset only the parser state machine; Huffman tables are overwritten per
+    // deflate block, matching a fresh `DecompressorOxide::new()` without
+    // zeroing ~10.5 KiB on every request.
+    decompressor.init();
+    let flags =
+        inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER;
+    let (status, _read, written) = decompress(decompressor, source, out, 0, flags);
+    match status {
+        TINFLStatus::Done => Ok(written),
+        TINFLStatus::NeedsMoreInput => {
+            tracing::debug!(
+                status = ?TINFLStatus::FailedCannotMakeProgress,
+                "dstorage: zlib stream"
+            );
+            Err(INVALID_DATA)
+        }
+        status => {
             tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+            Err(INVALID_DATA)
+        }
+    }
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -957,17 +1126,18 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// file into the worker's reusable `scratch` buffer.
+fn read_source<'a>(request: &Request, scratch: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    if scratch.len() < size {
+        scratch.resize(size, 0);
+    }
+    read_into(request, &mut scratch[..size])?;
+    Ok(&scratch[..size])
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -981,16 +1151,16 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
+    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
-        .file;
+        .files;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match files.read_at(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1022,22 +1192,30 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    let mut pages = vec![0usize; (offset + len).div_ceil(PAGE)];
+    let snapshot = |dst: &mut [usize]| {
+        let src = request.destination.cast::<usize>();
+        for (i, slot) in dst.iter_mut().enumerate() {
+            // SAFETY: the title passes a page number per 64 KiB of destination
+            // (aligned for `usize`, as the atomic load needs). An atomic load
+            // into a local buffer avoids creating a shared `&[usize]` slice
+            // over memory that a concurrent producer (compiled title x86-64
+            // aligned 64-bit stores, or atomic stores in Rust tests) may still
+            // be populating after submission.
+            *slot = unsafe {
+                std::sync::atomic::AtomicUsize::from_ptr(src.add(i)).load(Ordering::Acquire)
+            };
+        }
     };
+    snapshot(&mut pages);
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
+    if super::xmem::write_physical(&pages, offset, &data[..n]) {
         return Ok(());
     }
     // Page number 0 is no page (numbers start at 0x10_0000): a list naming
@@ -1049,11 +1227,8 @@ fn into_destination(
     if pages.contains(&0) {
         for _ in 0..LATE_LIST_TRIES {
             std::thread::sleep(std::time::Duration::from_millis(1));
-            // SAFETY: as above; the title's list, read again.
-            let again = unsafe {
-                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
-            };
-            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
+            snapshot(&mut pages);
+            if !pages.contains(&0) && super::xmem::write_physical(&pages, offset, &data[..n]) {
                 let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
                 if late.is_power_of_two() {
                     tracing::info!(
@@ -1069,7 +1244,7 @@ fn into_destination(
         offset,
         len,
         pages = pages.len(),
-        unknown = super::xmem::unknown_pages(pages),
+        unknown = super::xmem::unknown_pages(&pages),
         list = format_args!("{:x?}", &pages[..pages.len().min(8)]),
         options = format_args!("{:#x}", request.options),
         file = source_name(request),
@@ -1138,6 +1313,27 @@ mod tests {
         let mut factory = std::ptr::null_mut();
         assert_eq!(DStorageGetFactory(&FACTORY, &mut factory), S_OK);
         factory
+    }
+
+    #[test]
+    fn a_refused_factory_interface_clears_the_out_pointer() {
+        // `_COM_Outptr_`: *ppv is null on failure, not the caller's stale value.
+        let unknown = Guid::new(0, 0, 0, [0; 8]);
+        let mut out = 0x1234 as *mut c_void;
+        assert_eq!(DStorageGetFactory(&unknown, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+
+        let mut out = 0x1234 as *mut c_void;
+        assert_eq!(
+            DStorageGetFactory(std::ptr::null(), &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+
+        assert_eq!(
+            DStorageGetFactory(&FACTORY, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
     }
 
     fn open(path: &std::path::Path) -> *mut c_void {
@@ -1249,6 +1445,102 @@ mod tests {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
     }
 
+    /// Reads all of `out` at `at` through `files`.
+    fn read_all(files: &Files, out: &mut [u8], at: u64) {
+        let mut done = 0;
+        while done < out.len() {
+            let n = files.read_at(&mut out[done..], at + done as u64).unwrap();
+            assert_ne!(n, 0, "{at} {}", out.len());
+            done += n;
+        }
+    }
+
+    /// Threads reading through handles of their own, or all through the
+    /// title's, get the file's bytes, and nothing past its end.
+    #[test]
+    fn workers_read_a_file_through_handles_of_their_own() {
+        let plain = pattern(300_001);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, &plain).unwrap();
+        for others in [0, 3] {
+            let files = Files::with(std::fs::File::open(&path).unwrap(), others);
+            std::thread::scope(|s| {
+                for _ in 0..6 {
+                    s.spawn(|| {
+                        let reads = [
+                            (0, 4096),
+                            (1, 100),
+                            (4095, 2),
+                            (12_345, 250_000),
+                            (299_990, 11),
+                        ];
+                        for (at, len) in reads {
+                            let mut out = vec![0; len];
+                            read_all(&files, &mut out, at as u64);
+                            assert!(out == plain[at..at + len], "{others} {at} {len}");
+                        }
+                        let mut out = [0; 16];
+                        assert_eq!(files.read_at(&mut out, 299_999).unwrap(), 2);
+                        assert_eq!(files.read_at(&mut out, 300_001).unwrap(), 0);
+                        assert_eq!(files.read_at(&mut out, 400_000).unwrap(), 0);
+                    });
+                }
+            });
+            let made = files
+                .others
+                .iter()
+                .filter(|o| o.get().is_some_and(Option::is_some))
+                .count();
+            assert_eq!(made, others, "a handle for each slot a thread read through");
+        }
+    }
+
+    /// How fast threads read a file through one handle and through a handle
+    /// each, at `VICTORY_BENCH_FILE` (a large file, only read): requests of
+    /// 48 KiB at random, first from places nobody read lately, then the same
+    /// again. `VICTORY_BENCH_FILE=... cargo test --release -p victory-hle
+    /// --lib read_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a benchmark"]
+    fn read_bench() {
+        const SIZE: usize = 48 << 10;
+        const READS: usize = 12_000;
+        let threads = workers();
+        let path = std::env::var("VICTORY_BENCH_FILE").expect("VICTORY_BENCH_FILE");
+        let len = std::fs::metadata(&path).unwrap().len();
+        let mut seed = Instant::now().elapsed().as_nanos() as u64 | 0x9e37_79b9;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (name, others) in [("one handle", 0), ("a handle each", threads)] {
+            let files = Files::with(std::fs::File::open(&path).unwrap(), others);
+            let at: Vec<u64> = (0..READS)
+                .map(|_| (random() % (len - SIZE as u64)) & !15)
+                .collect();
+            for pass in ["cold", "again"] {
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let start = Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(|| {
+                            let mut out = vec![0; SIZE];
+                            while let Some(&at) = at.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                read_all(&files, &mut out, at);
+                            }
+                        });
+                    }
+                });
+                let took = start.elapsed().as_secs_f64();
+                let rate = (READS * SIZE) as f64 / took / 1e6;
+                println!("{threads} threads, {name}, {pass}: {rate:.0} MB/s");
+            }
+        }
+    }
+
     #[test]
     fn request_layout_is_the_titles() {
         assert_eq!(size_of::<Request>(), 0x48);
@@ -1257,6 +1549,63 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+    }
+
+    /// A file another writer holds open (sharing reads and writes, not
+    /// deletes) still opens: the title's own tools keep its files open.
+    /// And the sharing is mutual: beside the title's own handle a
+    /// delete-access open succeeds, because it shares deletes.
+    #[test]
+    fn open_file_shares_writes_and_deletes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let delete = || {
+            std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(0x7)
+                .open(&path)
+        };
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, no FILE_SHARE_DELETE.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x3)
+            .open(&path)
+            .unwrap();
+        let file = open(&path);
+        // Beside `held`, which shares no deletes, the delete open fails:
+        // the check has teeth.
+        assert_eq!(
+            delete().unwrap_err().raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION)
+        );
+        drop(held);
+        // Beside the title's handle alone it succeeds: the title shared
+        // deletes.
+        delete().expect("the title's handle shares deletes");
+        let release: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(release(file), 0);
+    }
+
+    /// A missing path fails with the host's own error code, captured before
+    /// anything allocates.
+    #[test]
+    fn open_file_reports_the_os_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.bin");
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x20);
+        let mut file = std::ptr::null_mut();
+        // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND).
+        assert_eq!(
+            open(factory(), wide.as_ptr(), std::ptr::null(), &mut file),
+            0x8007_0002_u32 as i32
+        );
     }
 
     #[test]
@@ -1438,6 +1787,33 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn raw_reads_from_other_queues_can_run_while_staging_drains() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        read(&mut l, 0, ZLIB, 60);
+        l.submit(0);
+        let running = l.start().unwrap();
+
+        l.lanes.insert(1, Lane::new(-1, 64));
+        l.lanes.insert(2, Lane::new(1, 64));
+        l.lanes.insert(3, Lane::new(0, 64));
+        read(&mut l, 1, ZLIB, 120);
+        read(&mut l, 2, 0, 1000);
+        read(&mut l, 3, ZLIB, 10);
+        for id in 1..=3 {
+            l.submit(id);
+        }
+
+        let raw = l.start().expect("a raw read does not need staging space");
+        assert_eq!((raw.lane, raw.staging), (2, 0));
+        assert_eq!(l.staged, 60);
+        assert!(l.start().is_none(), "reserve staging for the blocked request");
+        l.finish(&running, Ok(()));
+        let next = l.start().unwrap();
+        assert_eq!((next.lane, next.staging), (1, 120));
     }
 
     #[test]
@@ -1635,8 +2011,12 @@ mod tests {
         let number = page[0];
         let filler = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(2));
-            // SAFETY: the leaked list, alive for the whole test.
-            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+            // SAFETY: the leaked aligned list, alive for the whole test; paired
+            // with the worker's atomic loads in `into_destination`.
+            unsafe {
+                std::sync::atomic::AtomicUsize::from_ptr(at as *mut usize)
+                    .store(number, Ordering::Release);
+            }
         });
         enqueue(queue, &r);
         enqueue_status(queue, array, 0);
@@ -1793,5 +2173,139 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn reused_decompressor_matches_fresh_on_valid_and_error_streams() {
+        let reference = |src: &[u8], out: &mut [u8]| -> Result<usize, HRESULT> {
+            miniz_oxide::inflate::decompress_slice_iter_to_slice(
+                out,
+                std::iter::once(src),
+                true,
+                false,
+            )
+            .map_err(|_| INVALID_DATA)
+        };
+        let mut scratch = WorkerScratch::new();
+        let plain_a = pattern(4096);
+        let plain_b = pattern(65536);
+        let packed_a = miniz_oxide::deflate::compress_to_vec_zlib(&plain_a, 6);
+        let packed_b = miniz_oxide::deflate::compress_to_vec_zlib(&plain_b, 1);
+
+        let mut bad_header = packed_a.clone();
+        bad_header[0] ^= 0xFF;
+
+        let mut bad_adler = packed_a.clone();
+        let last = bad_adler.len() - 1;
+        bad_adler[last] ^= 0x01;
+
+        let truncated = &packed_a[..packed_a.len() / 2];
+
+        let cases: &[(&str, &[u8], usize)] = &[
+            ("exact_small", &packed_a, plain_a.len()),
+            ("short_output_slack", &packed_a, plain_a.len() + 512),
+            ("empty_stream", &[], 64),
+            ("bad_header", &bad_header, plain_a.len()),
+            ("recover_after_bad_header", &packed_b, plain_b.len()),
+            ("bad_adler32", &bad_adler, plain_a.len()),
+            ("recover_after_bad_adler", &packed_a, plain_a.len()),
+            ("truncated", truncated, plain_a.len()),
+            ("recover_after_truncated", &packed_b, plain_b.len()),
+            ("output_too_small", &packed_b, 128),
+            ("recover_after_short_buf", &packed_a, plain_a.len()),
+        ];
+
+        for &(label, src, out_len) in cases {
+            let mut got = vec![0xAA; out_len];
+            let mut want = vec![0xAA; out_len];
+            let r_got = inflate(&mut scratch.decompressor, src, &mut got);
+            let r_want = reference(src, &mut want);
+            assert_eq!(r_got, r_want, "status mismatch on {label}");
+            if let Ok(n) = r_got {
+                assert_eq!(&got[..n], &want[..n], "bytes mismatch on {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn worker_scratch_reuses_capacity_and_trims_outliers() {
+        let mut scratch = WorkerScratch::new();
+        scratch.source.resize(64 * 1024, 0);
+        scratch.intermediate.resize(128 * 1024, 0);
+        let src_ptr = scratch.source.as_ptr();
+        let inter_ptr = scratch.intermediate.as_ptr();
+        scratch.trim();
+        assert_eq!(scratch.source.as_ptr(), src_ptr);
+        assert_eq!(scratch.intermediate.as_ptr(), inter_ptr);
+
+        scratch.source.resize(SCRATCH_RETAIN_CAP + 4096, 0);
+        scratch.intermediate.resize(SCRATCH_RETAIN_CAP + 4096, 0);
+        scratch.trim();
+        assert_eq!(scratch.source.capacity(), 0);
+        assert_eq!(scratch.intermediate.capacity(), 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_dstorage_worker_scratch() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for &(label, plain_len, iters) in &[
+            ("4KiB", 4 * 1024, 8_000usize),
+            ("32KiB", 32 * 1024, 2_000usize),
+            ("256KiB", 256 * 1024, 400usize),
+        ] {
+            let plain = pattern(plain_len);
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            let mut out = vec![0u8; plain_len];
+
+            // Baseline: per-request Vec alloc+zero for source & intermediate + fresh DecompressorOxide.
+            let t0 = Instant::now();
+            let mut sum_old = 0u64;
+            for _ in 0..iters {
+                let mut src = vec![0u8; packed.len()];
+                src.copy_from_slice(&packed);
+                let mut inter = vec![0u8; plain_len];
+                let n = miniz_oxide::inflate::decompress_slice_iter_to_slice(
+                    &mut inter,
+                    std::iter::once(src.as_slice()),
+                    true,
+                    false,
+                )
+                .unwrap();
+                out[..n].copy_from_slice(&inter[..n]);
+                sum_old = sum_old.wrapping_add(u64::from(black_box(out[n - 1])));
+            }
+            let old_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+            // Patched: worker-local reusable DecompressorOxide + source/intermediate scratch.
+            let mut scratch = WorkerScratch::new();
+            let t1 = Instant::now();
+            let mut sum_new = 0u64;
+            for _ in 0..iters {
+                if scratch.source.len() < packed.len() {
+                    scratch.source.resize(packed.len(), 0);
+                }
+                scratch.source[..packed.len()].copy_from_slice(&packed);
+                if scratch.intermediate.len() < plain_len {
+                    scratch.intermediate.resize(plain_len, 0);
+                }
+                let n = inflate(
+                    &mut scratch.decompressor,
+                    &scratch.source[..packed.len()],
+                    &mut scratch.intermediate[..plain_len],
+                )
+                .unwrap();
+                out[..n].copy_from_slice(&scratch.intermediate[..n]);
+                sum_new = sum_new.wrapping_add(u64::from(black_box(out[n - 1])));
+            }
+            let new_ms = t1.elapsed().as_secs_f64() * 1e3;
+            assert_eq!(sum_old, sum_new);
+            eprintln!(
+                "dstorage_scratch[{label} x{iters}]: old={old_ms:.2}ms new={new_ms:.2}ms speedup={:.2}x",
+                old_ms / new_ms
+            );
+        }
     }
 }

@@ -14,7 +14,8 @@
 //!   exist for one. Proxies are off and proxy auto-detection (WPAD, PAC
 //!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
-//!   network can connect in.
+//!   network can connect in; so is the bind the host would make for a
+//!   datagram socket that sends before it is bound.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -320,7 +321,28 @@ pub extern "system" fn WSAConnectByList(
             return 0;
         }
     }
-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
+    type ConnectByList = extern "system" fn(
+        Socket,
+        *const u8,
+        *mut u32,
+        *mut c_void,
+        *mut u32,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+    ) -> i32;
+    static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    // Wine's ws2_32 has no WSAConnectByList: fail the call as unsupported.
+    let Some(address) =
+        *ADDRESS.get_or_init(|| crate::host::function("ws2_32.dll", "WSAConnectByList"))
+    else {
+        const WSAEOPNOTSUPP: i32 = 10045;
+        host!("ws2_32.dll", "WSASetLastError": extern "system" fn(i32))(WSAEOPNOTSUPP);
+        return 0;
+    };
+    // SAFETY: the host exports this function with this signature.
+    let connect = unsafe { std::mem::transmute::<usize, ConnectByList>(address) };
+    connect(
         s, list, local_len, local, remote_len, remote, timeout, reserved,
     )
 }
@@ -435,6 +457,54 @@ pub extern "system" fn WSAIoctl(
 
 // Datagram sends.
 
+/// `addr` as a `sockaddr_in` or `sockaddr_in6`, and its length.
+fn sockaddr(addr: SocketAddr) -> ([u8; 28], i32) {
+    let mut out = [0u8; 28];
+    out[2..4].copy_from_slice(&addr.port().to_be_bytes());
+    match addr {
+        SocketAddr::V4(a) => {
+            out[..2].copy_from_slice(&AF_INET.to_le_bytes());
+            out[4..8].copy_from_slice(&a.ip().octets());
+            (out, 16)
+        }
+        SocketAddr::V6(a) => {
+            out[..2].copy_from_slice(&AF_INET6.to_le_bytes());
+            out[8..24].copy_from_slice(&a.ip().octets());
+            (out, 28)
+        }
+    }
+}
+
+/// Before a vetted datagram send to `to`: a socket not bound yet would be
+/// bound by the host to every interface, where the network can send to it,
+/// so it is bound to loopback first (any port, as the host would pick).
+/// False, with the bind's error, if it cannot be.
+fn bound_to_loopback(s: Socket, to: SocketAddr) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let getsockname = host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut u8, *mut i32) -> i32);
+    let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+    let (mut name, mut len) = ([0u8; 28], 28i32);
+    // Bound already, or no socket (the send fails as it would have).
+    if getsockname(s, name.as_mut_ptr(), &mut len) == 0 || last_error() != WSAEINVAL {
+        return true;
+    }
+    let home: IpAddr = match to.ip() {
+        IpAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
+        // A dual-stack socket sending to 127.0.0.1.
+        IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(),
+        IpAddr::V6(_) => Ipv6Addr::LOCALHOST.into(),
+    };
+    let (local, len) = sockaddr((home, 0).into());
+    host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32)(s, local.as_ptr(), len) == 0
+}
+
+/// A datagram send to `to` (of `to_len` bytes) may go ahead: loopback, on a
+/// socket bound there.
+fn datagram_allowed(s: Socket, to: *const u8, to_len: i32) -> bool {
+    reachable("network datagram blocked", to, to_len)
+        && socket_addr(to, to_len).is_some_and(|a| bound_to_loopback(s, a))
+}
+
 /// Without an address it sends to the connected peer, which `connect` vetted;
 /// so does a stream socket whatever `to` says (Winsock ignores it there).
 pub extern "system" fn sendto(
@@ -445,7 +515,7 @@ pub extern "system" fn sendto(
     to: *const u8,
     to_len: i32,
 ) -> i32 {
-    if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
+    if !to.is_null() && !stream(s) && !datagram_allowed(s, to, to_len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "sendto": extern "system" fn(Socket, *const u8, i32, i32, *const u8, i32) -> i32)(
@@ -464,7 +534,7 @@ pub extern "system" fn WSASendTo(
     overlapped: *mut c_void,
     completion: *const c_void,
 ) -> i32 {
-    if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
+    if !to.is_null() && !stream(s) && !datagram_allowed(s, to, to_len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "WSASendTo": extern "system" fn(Socket, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32)(
@@ -500,7 +570,7 @@ pub extern "system" fn WSASendMsg(
     // SAFETY: the title passes a `WSAMSG` or null.
     if let Some(m) = unsafe { message.cast::<MessageName>().as_ref() }
         && !m.name.is_null()
-        && !reachable("network datagram blocked", m.name, m.len)
+        && !datagram_allowed(s, m.name, m.len)
     {
         return SOCKET_ERROR;
     }
@@ -588,7 +658,28 @@ pub extern "system" fn GetAddrInfoExA(
     if !resolvable(narrow(name)) {
         return blocked_lookup(result);
     }
-    host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
+    type Resolve = extern "system" fn(
+        *const c_char,
+        *const c_char,
+        u32,
+        *const c_void,
+        *const c_void,
+        *mut *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut Handle,
+    ) -> i32;
+    static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    // Wine's ws2_32 has no GetAddrInfoExA: the name is not found.
+    let Some(address) =
+        *ADDRESS.get_or_init(|| crate::host::function("ws2_32.dll", "GetAddrInfoExA"))
+    else {
+        return blocked_lookup(result);
+    };
+    // SAFETY: the host exports this function with this signature.
+    let resolve = unsafe { std::mem::transmute::<usize, Resolve>(address) };
+    resolve(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
 }
@@ -1106,6 +1197,9 @@ mod tests {
         // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
         // them only when the host really lacks them.
         const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        // Wine's ws2_32 lacks these; their overrides fail the call instead
+        // of forwarding it.
+        const MISSING_ON_WINE: &[&str] = &["WSAConnectByList", "GetAddrInfoExA"];
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
@@ -1113,10 +1207,94 @@ mod tests {
                 "ws2_32.dll"
             };
             let present = crate::host::function(dll, e.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
+            if !present
+                && (NEWER_WINDOWS_ONLY.contains(&e.name) || MISSING_ON_WINE.contains(&e.name))
+            {
                 continue;
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    /// The address a socket is bound to, if it is bound.
+    fn local(s: Socket) -> Option<SocketAddr> {
+        let getsockname = host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut u8, *mut i32) -> i32);
+        let (mut name, mut len) = ([0u8; 28], 28i32);
+        (getsockname(s, name.as_mut_ptr(), &mut len) == 0).then(|| socket_addr(name.as_ptr(), len))?
+    }
+
+    /// A datagram socket that sends before it is bound was bound by the host
+    /// to every interface, where the network could send to it.
+    #[test]
+    fn a_datagram_socket_sending_unbound_is_bound_to_loopback() {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap(); // also starts Winsock
+        let port = peer.local_addr().unwrap().port();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+
+        // IPv6, to [::1].
+        let peer6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        let (to, to_len) = sockaddr(peer6.local_addr().unwrap());
+        let u = socket(23, 2, 17);
+        assert_eq!(sendto(u, b"x".as_ptr(), 1, 0, to.as_ptr(), to_len), 1);
+        let bound = local(u).expect("bound by its send");
+        assert_eq!(bound.ip(), IpAddr::from(std::net::Ipv6Addr::LOCALHOST), "bound to {bound}");
+        close(u);
+
+        let u = socket(2, 2, 17);
+        assert_eq!(local(u), None, "not bound before its first send");
+        assert_eq!(sendto(u, b"x".as_ptr(), 1, 0, v4(HOME, port).as_ptr(), 16), 1);
+        let bound = local(u).expect("bound by its send");
+        assert!(bound.ip().is_loopback(), "bound to {bound}, not loopback");
+        close(u);
+
+        // `WSASendMsg` (from `WSAIoctl`) sends unbound sockets the same way.
+        #[repr(C)]
+        struct Buf(u32, *const u8);
+        #[repr(C)]
+        struct Msg(*const u8, i32, *const Buf, u32, Buf, u32);
+        let u = socket(2, 2, 17);
+        let to = v4(HOME, port);
+        let data = Buf(1, b"x".as_ptr());
+        let msg = Msg(to.as_ptr(), 16, &data, 1, Buf(0, std::ptr::null()), 0);
+        let mut sent = 0u32;
+        let null = std::ptr::null_mut();
+        assert_eq!(WSASendMsg(u, (&raw const msg).cast(), 0, &mut sent, null, null), 0);
+        let bound = local(u).expect("bound by its send");
+        assert!(bound.ip().is_loopback(), "bound to {bound}, not loopback");
+        close(u);
+    }
+
+    /// End to end: after one send to loopback, a datagram sent to the
+    /// machine's own network address does not reach the title's socket.
+    #[test]
+    fn the_network_cannot_send_to_a_title_datagram_socket() {
+        // The machine's address on its default route (a connected datagram
+        // socket sends nothing); none without a network.
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let lan = match probe.connect("192.0.2.1:9").ok().and_then(|_| probe.local_addr().ok()) {
+            Some(SocketAddr::V4(a)) if !a.ip().is_loopback() && !a.ip().is_unspecified() => *a.ip(),
+            _ => return, // no network here
+        };
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let setsockopt = host!("ws2_32.dll", "setsockopt": extern "system" fn(Socket, i32, i32, *const u32, i32) -> i32);
+        let recv = host!("ws2_32.dll", "recv": extern "system" fn(Socket, *mut u8, i32, i32) -> i32);
+
+        let u = socket(2, 2, 17);
+        let home = v4(HOME, peer.local_addr().unwrap().port());
+        assert_eq!(sendto(u, b"x".as_ptr(), 1, 0, home.as_ptr(), 16), 1);
+        let port = local(u).unwrap().port();
+        const SOL_SOCKET: i32 = 0xffff;
+        const SO_RCVTIMEO: i32 = 0x1006;
+        assert_eq!(setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &500, 4), 0);
+
+        let outside = std::net::UdpSocket::bind((lan, 0)).unwrap();
+        outside.send_to(b"in", (lan, port)).unwrap();
+        let mut buf = [0u8; 8];
+        let got = recv(u, buf.as_mut_ptr(), 8, 0);
+        close(u);
+        assert!(got <= 0, "a datagram to {lan}:{port} reached the title's socket");
     }
 }

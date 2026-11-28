@@ -103,9 +103,13 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let lowered = lowered(&native)?;
+    build_native(&native)
+}
+
+fn build_native(native: &NativeProgram) -> Result<HostShader, crate::ShaderError> {
+    let lowered = lowered(native)?;
     Ok(HostShader {
-        stage: HwStage::Cs,
+        stage: native.stage,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         static_samplers: lowered
@@ -124,6 +128,96 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
     })
+}
+
+#[test]
+fn global_stores_keep_each_lanes_offset_after_exec_is_restored() {
+    // The first store covers lanes 0-15, which all add 128 to their
+    // offset. After restoring EXEC, lanes 16-31 still use lane * 4.
+    let words: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x4A04_0081, // v_add_nc_u32 v2, 1, v0
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0x4A02_02FF,
+        128, // v_add_nc_u32 v1, 128, v1
+        0xDC70_8100,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:256
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        0xDC70_8000,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 3,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let shader = build_native(&native).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let mut want = vec![0; 112];
+    for lane in 0..32 {
+        let value = lane as u32 + 1;
+        if lane < 16 {
+            want[96 + lane] = value;
+            want[32 + lane] = value;
+        } else {
+            want[lane] = value;
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let (host, label) = if !warp && let Ok(host) = Host::new(false) {
+        (host, "hardware")
+    } else {
+        (Host::new(true).expect("WARP SM 6.6 device"), "WARP")
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(
+                    0,
+                    Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                )],
+                views: &[View::RawUav(want.len() as u32)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    assert_eq!(out[0], want, "{label}");
+    eprintln!("{label}: verified narrowed and restored EXEC stores");
 }
 
 fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
@@ -280,7 +374,9 @@ fn gathers_at_a_level_match_the_hardware() {
             }
         }
     }
-    assert!(ran > 0, "no device");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device for the gather", &[]);
+    }
 }
 
 #[test]
@@ -344,12 +440,16 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        // The program declares the console's wave of 32, which WARP refuses.
-        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp, "{label}: no pipeline for a wave of 32");
-            eprintln!("{label}: no pipeline for a wave of 32; skipped");
+        // The program declares the console's wave of 32, which WARP and some
+        // integrated GPUs cannot run: skip those, and still fail a device
+        // that claims 32 lanes and refuses the pipeline.
+        if !host.wave32() {
+            eprintln!("{label}: no wave of 32 on this device; skipped");
             continue;
-        };
+        }
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
             .dispatch(
@@ -1154,4 +1254,79 @@ fn cs_spread_prologue_remaps_group_ids_and_bounds_groups() {
         }
         eprintln!("{label}: verified {ASKED} group IDs");
     }
+}
+
+/// Empty root-constant slices (`Vec::new()`, whose pointer is dangling `0x4`)
+/// bind a single zero dword so the `user_data_dwords().max(1)` slot declared
+/// by `root_signature_for` stays defined without dereferencing `0x4` on NVIDIA.
+#[test]
+fn empty_root_constants_bind_zero_in_draw_and_dispatch() {
+    let mut cs = super::shader::Shader::new(false);
+    cs.threads = Some([1, 1, 1]);
+    cs.m.terminate(cs.entry, super::bitcode::Term::Ret);
+    let cs = HostShader {
+        stage: HwStage::Cs,
+        dxil: cs.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        memory: false,
+        memory_writes: false,
+        view_addresses: false,
+        heap: false,
+        heap_writes: false,
+        view_marks: false,
+    };
+    let ps = super::host::stub_ps();
+    let vs = super::host::stub_vs(&ps).expect("stub_vs");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (c_root, c_pso) = host.compute_pipeline(&cs).expect("compute pipeline");
+        let out = host
+            .dispatch(
+                &c_root,
+                &c_pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(Vec::new()))],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label} dispatch: {e}"));
+        assert!(out.is_empty(), "{label}");
+
+        let (g_root, g_pso) = host.pipeline(&vs, &ps).expect("graphics pipeline");
+        let texels = host
+            .draw(
+                &g_root,
+                &g_pso,
+                &super::host::Draw {
+                    roots: vec![
+                        (0, Root::Constants(Vec::new())),
+                        (1, Root::Constants(Vec::new())),
+                    ],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (1, 1),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label} draw: {e}"));
+        assert_eq!(texels.len(), 1, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }

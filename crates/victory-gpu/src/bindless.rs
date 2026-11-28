@@ -9,7 +9,7 @@
 //! such shaders first brings all of them up to date (what changed since,
 //! `crate::watch`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -48,17 +48,26 @@ type Range = (usize, u64, u64, bool);
 /// the change tracker (`crate::watch::clean_bit`).
 type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
-/// A viewed texture: slot count, cached watch::DIRTY bit, idle stamp epoch,
-/// title memory range once asked (none: no console layout).
-type Viewing = (u32, Option<u32>, u64, Option<Option<(usize, usize)>>);
+/// A viewed texture: the slots that view it (so a release touches only
+/// these), and what [`uploads`] caches for it: its `watch::DIRTY` bit when
+/// tracked, the idle stamp epoch it was last skipped at, and its title
+/// memory range once asked (none: no console layout).
+#[derive(Default)]
+struct Viewing {
+    slots: BTreeSet<u32>,
+    dirty: Option<u32>,
+    epoch: u64,
+    range: Option<Option<(usize, usize)>>,
+}
 
 #[derive(Default)]
 struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
-    /// Distinct title-written textures viewed in this heap ([`Viewing`]) so
+    /// Distinct title-written textures viewed in this heap ([`Viewing`]) —
+    /// the reverse index release walks, and the cache [`uploads`] checks so
     /// clean and idle textures skip `Resource::host` and
-    /// `HostTexture::staging` locks during [`uploads`].
+    /// `HostTexture::staging` locks.
     textures: BTreeMap<usize, Viewing>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
@@ -86,7 +95,26 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
-    fn count(&mut self, seen: &Seen, add: bool) {
+    fn replace(&mut self, index: u32, seen: Option<Seen>) {
+        if let Some(old) = self.slots.remove(&index) {
+            self.count(index, &old, false);
+        }
+        if let Some(seen) = seen {
+            self.count(index, &seen, true);
+            self.slots.insert(index, seen);
+        }
+    }
+
+    fn forget_texture(&mut self, resource: usize) {
+        if let Some(viewing) = self.textures.remove(&resource) {
+            for index in viewing.slots {
+                let old = self.slots.remove(&index);
+                debug_assert!(matches!(old, Some(Seen::Texture(r)) if r == resource));
+            }
+        }
+    }
+
+    fn count(&mut self, index: u32, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
@@ -122,10 +150,13 @@ impl Inner {
                 }
             }
             Seen::Texture(r) => {
-                let entry = self.textures.entry(*r).or_insert((0, None, 0, None));
-                step(&mut entry.0);
-                if entry.0 == 0 {
-                    self.textures.remove(r);
+                if add {
+                    self.textures.entry(*r).or_default().slots.insert(index);
+                } else if let Some(viewing) = self.textures.get_mut(r) {
+                    viewing.slots.remove(&index);
+                    if viewing.slots.is_empty() {
+                        self.textures.remove(r);
+                    }
                 }
             }
             Seen::Left(_) => {}
@@ -139,13 +170,7 @@ impl Viewed {
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = inner.slots.remove(&index) {
-            inner.count(&old, false);
-        }
-        if let Some(seen) = seen {
-            inner.count(&seen, true);
-            inner.slots.insert(index, seen);
-        }
+        inner.replace(index, seen);
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
@@ -276,11 +301,11 @@ pub(crate) fn uploads(
         for viewed in heaps {
             let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
             for (&r, entry) in inner.textures.iter_mut() {
-                let clean = entry.1.is_some_and(|bit| crate::watch::clean_bit(Some(bit)));
-                let crossed = (clean || entry.2 == epoch)
+                let clean = entry.dirty.is_some_and(|bit| crate::watch::clean_bit(Some(bit)));
+                let crossed = (clean || entry.epoch == epoch)
                     && flying.is_some()
-                    && entry.3.get_or_insert_with(|| texture_range(r)).is_some_and(crosses);
-                if (clean || entry.2 == epoch) && !crossed {
+                    && entry.range.get_or_insert_with(|| texture_range(r)).is_some_and(crosses);
+                if (clean || entry.epoch == epoch) && !crossed {
                     continue;
                 }
                 if let Some(done) = done.as_mut()
@@ -297,16 +322,16 @@ pub(crate) fn uploads(
                 // old (a slot the title rewrites is made fresh anyway); upload on
                 // the mark itself if that shows.
                 let (bit, copy) = crate::resource::bindless_upload_check(r as This, presented, crossed);
-                if entry.1.is_none() && bit.is_some() {
-                    entry.1 = bit;
+                if entry.dirty.is_none() && bit.is_some() {
+                    entry.dirty = bit;
                 }
                 if let Some(texture) = copy {
-                    entry.2 = 0;
+                    entry.epoch = 0;
                     pending.push((r, texture));
                 } else if bit.is_none() || !crate::watch::clean_bit(bit) {
                     // Skipped because it has no host copy, is not recently used,
                     // or is host-written: stays skipped until STAMP_EPOCH bumps.
-                    entry.2 = epoch;
+                    entry.epoch = epoch;
                 }
             }
         }
@@ -459,9 +484,7 @@ pub(crate) fn forget(resource: usize) {
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.textures.remove(&resource).is_some() {
-            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
-        }
+        inner.forget_texture(resource);
     }
 }
 
@@ -474,8 +497,8 @@ pub(crate) fn clear_texture_bits(resources: &[usize]) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         for &r in resources {
             if let Some(entry) = inner.textures.get_mut(&r) {
-                entry.1 = None;
-                entry.2 = 0;
+                entry.dirty = None;
+                entry.epoch = 0;
             }
         }
     }
@@ -540,6 +563,9 @@ pub(crate) fn log(frames: f64) {
         );
     }
 }
+
+#[cfg(test)]
+mod slot_tests;
 
 #[cfg(test)]
 mod tests {
@@ -654,14 +680,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         let viewed = Viewed::default();
         let set = |slot: u32, range: Option<(u64, u64)>| {
             let mut inner = viewed.inner.lock().unwrap();
-            if let Some(old) = inner.slots.remove(&slot) {
-                inner.count(&old, false);
-            }
-            if let Some((from, len)) = range {
-                let seen = Seen::Buffer(copy.clone(), at + from, len, false);
-                inner.count(&seen, true);
-                inner.slots.insert(slot, seen);
-            }
+            let seen = range.map(|(from, len)| Seen::Buffer(copy.clone(), at + from, len, false));
+            inner.replace(slot, seen);
         };
         let hull = || viewed.ranges().iter().map(|h| (h.1 - at, h.2)).collect::<Vec<_>>();
         set(0, Some((0x100, 0x100)));
@@ -813,7 +833,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_none(), "clean skips list");
         assert_eq!(crate::texture::uploads(tex), 1);
         assert!(
-            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.1).is_some(),
+            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.dirty).is_some(),
             "dirty bit cached in Viewed"
         );
         // Third submission hits the lock-free cached-bit fast path.
@@ -831,7 +851,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(copy);
         assert!(crate::resource::give_up_now(tex), "evicted");
         assert!(
-            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.1).is_none(),
+            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.dirty).is_none(),
             "cached dirty bit cleared on eviction"
         );
         let copy2 = crate::resource::host_copy(tex).expect("recreated host texture");
@@ -871,7 +891,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(crate::texture::uploads(tex), 1);
         assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_none(), "unchanged hash skips");
         assert!(
-            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.1).is_none(),
+            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.dirty).is_none(),
             "untracked texture has no cached dirty bit"
         );
         // SAFETY: as above.

@@ -366,6 +366,7 @@ pub(crate) struct HostPipeline {
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
+    pub(crate) in_library: bool,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
@@ -393,6 +394,16 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
     None
+}
+
+#[cfg(feature = "diagnostics")]
+struct HostCreationTimer(std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for HostCreationTimer {
+    fn drop(&mut self) {
+        super::timing::HOST.record(self.0.elapsed().as_micros() as u64);
+    }
 }
 
 impl HostPipeline {
@@ -433,6 +444,8 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        #[cfg(feature = "diagnostics")]
+        let _creation_timer = HostCreationTimer(std::time::Instant::now());
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
@@ -458,6 +471,20 @@ impl HostPipeline {
         }
 
         let aniso_point_mip_supported = crate::sampler::aniso_point_mip(&host.device);
+
+        // A pipeline whose creation ended an earlier run is not tried again
+        // (`VICTORY_PIPELINE_JOURNAL`); the note lives until this returns.
+        let key = stages
+            .iter()
+            .map(|(s, _)| s.hash.as_str())
+            .collect::<Vec<_>>()
+            .join("+");
+        let detail = stages
+            .iter()
+            .map(|(s, _)| format!("{}-{}", s.stage.to_lowercase(), s.container.len()))
+            .collect::<Vec<_>>()
+            .join("+");
+        let _pending = super::journal::enter(&key, &detail)?;
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -592,15 +619,14 @@ impl HostPipeline {
                 return None;
             }
         };
-        let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+        let stage_dxil = |i: usize| {
+            stages
+                .get(i)
+                .and_then(|(s, _)| s.translated())
+                .map(|t| t.host.dxil.as_slice())
         };
+        let code = |i: usize| shader_bytecode(stage_dxil(i));
+        let stage_bytes = |i: usize| stage_dxil(i).unwrap_or(&[]);
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
@@ -608,7 +634,7 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[stage_bytes(0)], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -616,8 +642,8 @@ impl HostPipeline {
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
-            let pso = match made {
-                Ok(pso) => pso,
+            let made = match made {
+                Ok(made) => made,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
@@ -625,11 +651,12 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&made.pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
-                pso,
+                pso: made.pso,
+                in_library: made.in_library,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -648,7 +675,7 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[stage_bytes(0), stage_bytes(1)],
                 &state,
             );
             let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
@@ -664,8 +691,8 @@ impl HostPipeline {
                     &name,
                 ),
             };
-            let pso = match made {
-                Ok(pso) => pso,
+            let made = match made {
+                Ok(made) => made,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
@@ -673,11 +700,12 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&made.pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
-                pso,
+                pso: made.pso,
+                in_library: made.in_library,
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
@@ -729,7 +757,7 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs],
+            &[stage_bytes(0), stage_bytes(1), &gs],
             &state,
         );
         let started = std::time::Instant::now();
@@ -757,8 +785,8 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
             )
         };
-        let pso = match made {
-            Ok(pso) => pso,
+        let made = match made {
+            Ok(made) => made,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
@@ -766,7 +794,7 @@ impl HostPipeline {
             }
         };
         tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
-        crate::host::name(&pso, || format!("{shaders:?}"));
+        crate::host::name(&made.pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
             depth = ?g.depth,
@@ -779,7 +807,8 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
-            pso,
+            pso: made.pso,
+            in_library: made.in_library,
             root,
             stages: bound,
             name: format!("{shaders:?}"),
@@ -823,7 +852,7 @@ fn stream_pipeline<S, D>(
     g: &GraphicsState,
     depth: Sub<D>,
     name: &str,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> windows::core::Result<super::library::PipelineState> {
     #[repr(C)]
     struct Stream<S, D> {
         root: Sub<*mut std::ffi::c_void>,
@@ -869,13 +898,15 @@ fn stream_pipeline<S, D>(
     )
 }
 
-/// The bytes of shader code (none for an absent stage).
-fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
-    if code.pShaderBytecode.is_null() {
-        return Vec::new();
-    }
-    // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+/// Shader bytecode referencing a translated DXIL slice (default for an absent stage).
+fn shader_bytecode(dxil: Option<&[u8]>) -> D3D12_SHADER_BYTECODE {
+    dxil.map_or(
+        D3D12_SHADER_BYTECODE::default(),
+        |bytes| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        },
+    )
 }
 
 fn root_signature(
@@ -928,6 +959,202 @@ fn root_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_mesh_dispatch_uses_all_group_counts() {
+        use crate::object::{S_OK, This, guid, slot};
+        use victory_shader::native::{MeshIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, emit, io, ir, resource, structure,
+        };
+
+        let Some(host) = host().filter(|host| host.mesh_shaders()) else {
+            eprintln!("mesh shaders unavailable; skipped");
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        // SAFETY: the query writes one correctly sized options structure.
+        if unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS9,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_err()
+            || !options.MeshShaderPipelineStatsSupported.as_bool()
+        {
+            eprintln!("mesh pipeline statistics unavailable; skipped");
+            return;
+        }
+        // A one-thread mesh shader with no geometry. The query counts
+        // invocations, so one invocation is one dispatched workgroup.
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 1,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2, // Triangle
+                lds_bytes: 0,
+            }),
+            code: 0xbf81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+        };
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![],
+        };
+        let program = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        let resources =
+            resource::track(&program, &native.layout, native.stage, Some(&structured)).unwrap();
+        let shader_io = io::raise(&program, &native).unwrap();
+        let host_shader = emit::emit(
+            &container,
+            &native,
+            &program,
+            &structured,
+            &shader_io,
+            &resources,
+            victory_shader::emit::Target::ANY,
+        )
+        .unwrap();
+        let shader = Shader::new("mesh", &host_shader.dxil);
+        assert!(
+            shader
+                .translated
+                .set(Some(Translated {
+                    host: host_shader,
+                    used: vec![],
+                }))
+                .is_ok()
+        );
+
+        let mut graphics = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
+        graphics.depth.DepthEnable = false.into();
+        let null = std::ptr::null();
+        let mut pipeline = null;
+        assert_eq!(
+            crate::pipeline::hand_out(
+                vec![Arc::new(shader)],
+                Some(Box::new(graphics)),
+                &[],
+                &crate::pipeline::PIPELINE_IIDS[0],
+                &mut pipeline
+            ),
+            S_OK
+        );
+        assert!(
+            crate::pipeline::host_pipeline(pipeline).is_some(),
+            "native mesh pipeline did not build"
+        );
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut alloc, mut list) = (null, null);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut alloc),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list),
+            S_OK
+        );
+        // Bind a guest view heap. The normal list path supplies the fallback
+        // sampler heap needed by the pipeline's directly indexed signature.
+        let desc: [u32; 8] = [0, 1, 1, 0, 0, 0, 0, 0];
+        let iid = ID3D12DescriptorHeap::IID;
+        let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
+        let mut heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(null, desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(
+            list, crate::list::slot_offset_for_test(list, 0x100),
+        )(list, 1, &heap);
+        let native = crate::list::host_list(list).unwrap();
+        slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
+        let mut queries: Option<ID3D12QueryHeap> = None;
+        let groups = [(2, 1, 1), (2, 3, 1), (2, 1, 4), (2, 3, 4), (2, 0, 4)];
+        // SAFETY: a live device and storage for the returned query heap.
+        unsafe {
+            host.device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1,
+                        Count: groups.len() as u32 + 1,
+                        NodeMask: 0,
+                    },
+                    &mut queries,
+                )
+                .unwrap();
+        }
+        let queries = queries.unwrap();
+        let count = groups.len() + 1;
+        let size = (count * size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>()) as u64;
+        let (readback, mapped) = native.readback(host, size).unwrap();
+        let kind = D3D12_QUERY_TYPE_PIPELINE_STATISTICS1;
+        let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(list, crate::list::slot_offset_for_test(list, 0x3f8));
+        for (index, (x, y, z)) in groups.into_iter().enumerate() {
+            // SAFETY: the open list and the indexed query belong to this fixture.
+            unsafe { native.list.BeginQuery(&queries, kind, index as u32) };
+            dispatch(list, x, y, z);
+            // SAFETY: ends the query begun above, of the same type and index.
+            unsafe { native.list.EndQuery(&queries, kind, index as u32) };
+        }
+        let last = groups.len() as u32;
+        // SAFETY: a live query heap with one more query and a live command list.
+        unsafe { native.list.BeginQuery(&queries, kind, last) };
+        slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, crate::list::slot_offset_for_test(list, 0x310))(list, 2, 0, 0, 0);
+        // SAFETY: every query has been begun and ended by this command list;
+        // readback holds one statistics record per query.
+        unsafe {
+            native.list.EndQuery(&queries, kind, last);
+            native
+                .list
+                .ResolveQueryData(&queries, kind, 0, count as u32, &readback, 0);
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> i32>(list, 0x48)(list),
+            S_OK
+        );
+        host.execute(&[native]);
+        // SAFETY: the completed resolve wrote count live mapped records.
+        let actual: Vec<_> = unsafe {
+            std::slice::from_raw_parts(
+                mapped.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>(),
+                count,
+            )
+        }
+        .iter()
+        .map(|s| s.MSInvocations)
+        .collect();
+        for object in [list, alloc, pipeline, heap] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        assert_eq!(actual, [2, 6, 8, 24, 0, 2]);
+    }
 
     fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
         let mut t = D3D12_RT_FORMAT_ARRAY {
@@ -984,6 +1211,171 @@ mod tests {
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
     }
+    #[test]
+    fn a_host_pipeline_refused_by_the_library_is_not_listed_as_prebuilt() {
+        use super::super::{Prebuild, library, prebuilt, save_pipeline_cache, use_pipeline_cache};
+        use victory_shader::native::{ComputeIo, NativeProgram, StageIo};
+        use victory_shader::{Container, HwStage, emit, io, range, resource};
+        use windows::Win32::Foundation::E_INVALIDARG;
+        use windows::core::{HSTRING, PCWSTR};
+
+        // The device's pipeline cache has process-wide state.
+        const CHILD: &str = "VICTORY_TEST_PIPELINE_STORE_REFUSAL";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::host::tests::a_host_pipeline_refused_by_the_library_is_not_listed_as_prebuilt",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                output.status.success(),
+                "pipeline cache child exited with {}\n{stdout}{stderr}",
+                output.status
+            );
+            eprint!("{stderr}");
+            return;
+        }
+
+        eprintln!("opening the D3D12 device");
+        let Some(host) = host() else {
+            return;
+        };
+        eprintln!("creating the directly indexed root signature");
+        let Ok((root, root_bytes)) = root_signature(&host.device, &[], &[], true) else {
+            eprintln!("no directly indexed root signature; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        use_pipeline_cache(dir.path().to_owned());
+
+        // Use the same SM 6.6 DXIL path as real prebuilds. The two shaders
+        // differ in group size, so the incoming description cannot load
+        // the pipeline stored under its name.
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = |threads| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 1,
+                layout: Vec::new(),
+                used: Vec::new(),
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [threads, 1, 1],
+                }),
+                code: 0xbf81_0000u32.to_le_bytes().to_vec(), // s_endpgm
+            };
+            let (program, flow) = range::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let flow = flow.unwrap();
+            let resources =
+                resource::track(&program, &native.layout, native.stage, Some(&flow)).unwrap();
+            let io = io::raise(&program, &native).unwrap();
+            emit::emit(
+                &container,
+                &native,
+                &program,
+                &flow,
+                &io,
+                &resources,
+                victory_shader::emit::Target::ANY,
+            )
+            .unwrap()
+        };
+        eprintln!("emitting the synthetic compute shaders");
+        let original = shader(1);
+        let incoming = shader(2);
+        assert_ne!(original.dxil, incoming.dxil);
+        let desc = |code: &[u8]| D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: the descriptor borrows the live root and bytecode.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
+            ..Default::default()
+        };
+        let (original_desc, incoming_desc) = (desc(&original.dxil), desc(&incoming.dxil));
+        let name = library::name("compute", &root_bytes, &[&incoming.dxil], "");
+        eprintln!("storing the seed PSO");
+        let mut cache = None;
+        library::pipeline(
+            &name,
+            |lib, name| {
+                cache = Some(lib.clone());
+                // SAFETY: the descriptor borrows live data.
+                unsafe { lib.LoadComputePipeline(name, &original_desc) }
+            },
+            // SAFETY: the descriptor borrows live data.
+            || unsafe { host.device.CreateComputePipelineState(&original_desc) },
+        )
+        .expect("seed the library name");
+        let Some(cache) = cache else {
+            eprintln!("no D3D12 pipeline library; skipped");
+            return;
+        };
+        eprintln!("checking the mismatched load and refused store");
+        let wide = HSTRING::from(&name);
+        let name = PCWSTR(wide.as_ptr());
+        // SAFETY: both descriptions borrow the live root and bytecode.
+        unsafe {
+            let _: ID3D12PipelineState = cache
+                .LoadComputePipeline(name, &original_desc)
+                .expect("seeded PSO");
+            assert!(
+                cache
+                    .LoadComputePipeline::<_, ID3D12PipelineState>(name, &incoming_desc)
+                    .is_err()
+            );
+            let made: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&incoming_desc)
+                .unwrap();
+            assert_eq!(
+                cache.StorePipeline(name, &made).unwrap_err().code(),
+                E_INVALIDARG
+            );
+        }
+
+        let prebuild = |container: &[u8], host| {
+            let item = Prebuild::compute(container);
+            assert!(
+                item.shaders[0]
+                    .translated
+                    .set(Some(Translated {
+                        host,
+                        used: Vec::new()
+                    }))
+                    .is_ok()
+            );
+            item.make().expect("host PSO creation succeeds");
+            item.key()
+        };
+        eprintln!("running and saving the two prebuilds");
+        let refused = prebuild(b"refused synthetic PSO", incoming);
+        let stored = prebuild(b"stored synthetic PSO", original);
+        save_pipeline_cache();
+        assert!(prebuilt(&stored));
+        assert!(
+            !prebuilt(&refused),
+            "PSO whose store failed is marked prebuilt"
+        );
+        let list = std::fs::read_to_string(dir.path().join("prebuilt-pipelines.txt")).unwrap();
+        assert_eq!(list.lines().skip(1).collect::<Vec<_>>(), [stored.as_str()]);
+        eprintln!("the stored key is persisted and the refused PSO remains pending");
+    }
+
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
         D3D12_INPUT_ELEMENT_DESC {
             SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
@@ -1041,5 +1433,75 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[test]
+    fn stage_bytes_matches_code_bytes_for_pipeline_names() {
+        fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
+            if code.pShaderBytecode.is_null() {
+                return Vec::new();
+            }
+            // SAFETY: test slice lives for the duration of this call.
+            unsafe {
+                std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength)
+            }
+            .to_vec()
+        }
+
+        let root_blob = b"root-blob";
+        let s0 = b"DXBC-stage0";
+        let s1 = b"DXBC-stage1";
+        let gs = b"DXBC-rect-gs";
+
+        for dx0 in [None, Some(&[][..]), Some(&s0[..])] {
+            let n_old = super::super::library::name(
+                "compute",
+                root_blob,
+                &[&code_bytes(&shader_bytecode(dx0))],
+                "",
+            );
+            let n_new =
+                super::super::library::name("compute", root_blob, &[dx0.unwrap_or(&[])], "");
+            assert_eq!(n_new, n_old);
+
+            for dx1 in [None, Some(&[][..]), Some(&s1[..])] {
+                let mesh_old = super::super::library::name(
+                    "mesh",
+                    root_blob,
+                    &[
+                        &code_bytes(&shader_bytecode(dx0)),
+                        &code_bytes(&shader_bytecode(dx1)),
+                    ],
+                    "mesh-state",
+                );
+                let mesh_new = super::super::library::name(
+                    "mesh",
+                    root_blob,
+                    &[dx0.unwrap_or(&[]), dx1.unwrap_or(&[])],
+                    "mesh-state",
+                );
+                assert_eq!(mesh_new, mesh_old);
+
+                for gs_bytes in [&[][..], &gs[..]] {
+                    let gfx_old = super::super::library::name(
+                        "graphics",
+                        root_blob,
+                        &[
+                            &code_bytes(&shader_bytecode(dx0)),
+                            &code_bytes(&shader_bytecode(dx1)),
+                            gs_bytes,
+                        ],
+                        "gfx-state",
+                    );
+                    let gfx_new = super::super::library::name(
+                        "graphics",
+                        root_blob,
+                        &[dx0.unwrap_or(&[]), dx1.unwrap_or(&[]), gs_bytes],
+                        "gfx-state",
+                    );
+                    assert_eq!(gfx_new, gfx_old);
+                }
+            }
+        }
     }
 }

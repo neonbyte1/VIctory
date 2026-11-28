@@ -114,9 +114,9 @@ pub fn is_sgd5(file: &[u8]) -> bool {
     memchr::memmem::find(file, MAGIC).is_some()
 }
 
-/// Every database whose tables parse, in file order.
-pub fn databases(file: &[u8]) -> Vec<Database<'_>> {
+fn scan_databases(file: &[u8]) -> (Vec<Database<'_>>, bool) {
     let mut out = Vec::new();
+    let mut unparsed = false;
     let mut from = 0;
     while let Some(at) = memchr::memmem::find(&file[from..], MAGIC).map(|p| from + p) {
         match parse(file, at) {
@@ -124,24 +124,53 @@ pub fn databases(file: &[u8]) -> Vec<Database<'_>> {
                 from = db.end;
                 out.push(db);
             }
-            None => from = at + 1,
+            None => {
+                unparsed = true;
+                from = at + 1;
+            }
         }
     }
-    out
+    (out, unparsed)
 }
 
-/// Every record in an SGD5 file, in file order: from the tables, or found
-/// by marker if no table parses.
+/// Every database whose tables parse, in file order.
+pub fn databases(file: &[u8]) -> Vec<Database<'_>> {
+    scan_databases(file).0
+}
+
+/// Every record in an SGD5 file, in file order: from the tables, with
+/// marker fallback for any database whose tables do not parse.
 pub fn records(file: &[u8]) -> Vec<Record<'_>> {
-    let dbs = databases(file);
+    let (dbs, unparsed) = scan_databases(file);
     if dbs.is_empty() {
         return memchr::memmem::find_iter(file, &MARKER)
             .filter_map(|at| record(file, at))
             .collect();
     }
-    dbs.into_iter()
+    if !unparsed {
+        return dbs
+            .into_iter()
+            .flat_map(|db| db.shaders.into_iter().flatten().map(|s| s.record))
+            .collect();
+    }
+    let spans: Vec<(usize, usize)> = dbs.iter().map(|db| (db.start, db.end)).collect();
+    let mut out: Vec<Record<'_>> = dbs
+        .into_iter()
         .flat_map(|db| db.shaders.into_iter().flatten().map(|s| s.record))
-        .collect()
+        .collect();
+    let covered = |at: usize| {
+        let i = spans.partition_point(|&(_, end)| end <= at);
+        spans
+            .get(i)
+            .is_some_and(|&(start, end)| at >= start && at < end)
+    };
+    out.extend(
+        memchr::memmem::find_iter(file, &MARKER)
+            .filter(|&at| !covered(at))
+            .filter_map(|at| record(file, at)),
+    );
+    out.sort_by_key(|r| r.offset);
+    out
 }
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
@@ -568,5 +597,47 @@ mod tests {
         let found = records(&file);
         assert_eq!(found.len(), 4);
         assert_eq!(found[1].name, Some("PS_a"));
+    }
+
+    #[test]
+    fn intact_database_does_not_suppress_fallback_for_damaged_sibling() {
+        let good = database();
+        let mut bad = database();
+        let at = memchr::memmem::find(&bad, b"\x03fx\0").unwrap() + 4;
+        bad[at] ^= 1;
+
+        for (label, first, second) in [
+            ("good-then-bad", &good, &bad),
+            ("bad-then-good", &bad, &good),
+        ] {
+            let mut archive = Vec::with_capacity(first.len() + second.len() + 32);
+            archive.extend_from_slice(first);
+            archive.extend_from_slice(&[0x5A; 32]);
+            archive.extend_from_slice(second);
+
+            assert_eq!(databases(&archive).len(), 1, "{label}");
+            let found = records(&archive);
+            assert_eq!(found.len(), 8, "{label}: all records from both databases");
+            assert!(
+                found.windows(2).all(|w| w[0].offset < w[1].offset),
+                "{label}: records stay in file order without duplicates"
+            );
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(
+                names,
+                [
+                    Some("VS_a"),
+                    Some("PS_a"),
+                    Some("PS_b"),
+                    Some("x:CS_c"),
+                    Some("VS_a"),
+                    Some("PS_a"),
+                    Some("PS_b"),
+                    Some("x:CS_c"),
+                ],
+                "{label}"
+            );
+            assert_eq!(found[6].unpack(), Some(vec![17; 40]), "{label}");
+        }
     }
 }

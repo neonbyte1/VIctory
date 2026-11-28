@@ -278,13 +278,14 @@ fn pump(held: &mut Holding, why: Why) {
     });
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::EarlyReleased, u64::from(pumped.early));
-    if pumped.segments > 0 || pumped.unknown > 0 {
+    if pumped.segments > 0 || pumped.unknown > 0 || pumped.unreadable > 0 {
         let mut a = account();
         a.pump += started.elapsed().saturating_sub(ran);
         a.pieces += pumped.pieces;
         a.segments += pumped.segments;
         a.unknown += pumped.unknown;
         a.early += pumped.early;
+        a.unreadable += pumped.unreadable;
         for (queue, waited) in pumped.waited {
             a.released.push((kind(queue), waited, why));
         }
@@ -327,6 +328,8 @@ struct Account {
     /// Segments that waited: queue type, how long, what ran them.
     released: Vec<(u32, std::time::Duration, Why)>,
     unknown: u32,
+    /// Tests of waits on memory that could not be read.
+    unreadable: u32,
     forced: u32,
     mappings: u32,
     /// PresentX calls queued behind work their queue held.
@@ -356,6 +359,7 @@ fn account_frame(frame: u64) {
         && blocked.is_empty()
         && a.forced == 0
         && a.unknown == 0
+        && a.unreadable == 0
         && a.mappings == 0
         && a.presents_held == 0
     {
@@ -401,14 +405,16 @@ fn account_frame(frame: u64) {
             tracing::info!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "a queue holds work at the present");
         }
     }
-    if a.forced > 0 || a.unknown > 0 || a.mappings > 0 {
+    if a.forced > 0 || a.unknown > 0 || a.unreadable > 0 || a.mappings > 0 {
         tracing::warn!(
             frame,
             forced = a.forced,
             unknown = a.unknown,
+            unreadable = a.unreadable,
             mappings = a.mappings,
             "held work: run without its waits (valve), waits with an unknown comparison (taken as holding), \
-             page mappings done ahead of held work"
+             tests of waits on memory that could not be read (taken as holding), page mappings done ahead \
+             of held work"
         );
     }
 }
@@ -497,7 +503,15 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     unsafe { out.write(TIMESTAMP_FREQUENCY) };
     S_OK
 }
-const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+pub(crate) const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+
+/// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
+/// process first asked.
+pub(crate) fn gpu_clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+}
 
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
@@ -508,6 +522,12 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// What the host GPU resolved into a list's read-back memory at this
+    /// address (8 bytes of a query's result), read once the list has run.
+    HostValue(usize),
+    /// A host GPU timestamp read back at this address, put on the GPU clock
+    /// by the submission that resolved it (the GPU clock now elsewhere).
+    HostTimestamp(usize),
 }
 
 impl Written {
@@ -515,11 +535,10 @@ impl Written {
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
-            Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
-            }
+            // SAFETY: the list's mapped read-back memory, which lives until
+            // the list is reset; the submission that wrote it has run.
+            Written::HostValue(from) => unsafe { (from as *const u64).read_volatile() },
+            Written::GpuTimestamp | Written::HostTimestamp(_) => gpu_clock(),
             Written::SystemTimestamp => system_timestamp(),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
@@ -545,6 +564,12 @@ fn system_timestamp() -> u64 {
     0
 }
 
+#[cfg(windows)]
+fn count_since(last: &AtomicU64, now: u64) -> u64 {
+    // A concurrent presenter may have already reported a newer snapshot.
+    now.saturating_sub(last.fetch_max(now, Ordering::Relaxed))
+}
+
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -566,6 +591,9 @@ extern "system" fn present(
     // queue still holds (it shows the frame as far as it ran), as before;
     // the frame line names such work.
     pump_held(Why::Present);
+    // The draw trace ends with the frame even when there is no image to show.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let draw_trace = crate::draw::take_frame();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -577,10 +605,9 @@ extern "system" fn present(
         let (drawn, dispatched) = {
             static DRAWN: AtomicU64 = AtomicU64::new(0);
             static DISPATCHED: AtomicU64 = AtomicU64::new(0);
-            let since = |last: &AtomicU64, now: u64| now - last.swap(now, Ordering::Relaxed);
             (
-                since(&DRAWN, crate::draw::drawn()),
-                since(&DISPATCHED, crate::draw::dispatched()),
+                count_since(&DRAWN, crate::draw::drawn()),
+                count_since(&DISPATCHED, crate::draw::dispatched()),
             )
         };
         #[cfg(not(windows))]
@@ -659,7 +686,7 @@ extern "system" fn present(
                     planes.iter().map(|(tex, state)| (tex, *state)).collect();
                 let shown = host.present(&sources, frame);
                 #[cfg(feature = "diagnostics")]
-                blinks(frame, first as This, first_state, shown);
+                blinks(frame, first as This, first_state, shown, draw_trace);
                 #[cfg(not(feature = "diagnostics"))]
                 let _ = shown;
             };
@@ -724,12 +751,11 @@ fn holds(frame: u64, planes: &[Plane]) -> bool {
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
+fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>, draws: Vec<String>) {
     static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let drawn = crate::draw::drawn();
     let black = shown.unwrap_or(false);
-    let draws = crate::draw::take_frame();
     if black && !last.0 {
         last.2 += 1;
         tracing::warn!(
@@ -780,7 +806,10 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once.
+/// one constant page or of unmapped pages). Waits for any running submission
+/// (under `Host::submitted`, strictly outside `xmem`'s physical-page lock
+/// and `watch`'s guard lock) so pages are not unmapped under a submission's
+/// reads or copy-backs.
 ///
 /// shortcut: done ahead of work the queue still holds (counted in the frame
 /// line); queue it as an item like Signal if that count is not 0.
@@ -808,6 +837,9 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // Not under a submission's reads and writes of title memory.
+    #[cfg(windows)]
+    let _quiet = crate::host::host().map(|h| h.hold_submissions());
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -893,6 +925,56 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn present_without_a_plane_drains_the_draw_trace() {
+        use tracing::{Event, Metadata, Subscriber, span};
+
+        struct DrawTrace;
+        impl Subscriber for DrawTrace {
+            fn enabled(&self, meta: &Metadata<'_>) -> bool {
+                meta.target() == "victory_gpu::draw" && *meta.level() == tracing::Level::DEBUG
+            }
+
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        let trace = tracing::Dispatch::new(DrawTrace);
+        let marker = "draw 3 from 7001 ";
+        let record = |state: &mut crate::draw::State| {
+            tracing::dispatcher::with_default(&trace, || state.draw(&list, 3, 1, 7001, 0));
+        };
+        record(&mut state);
+        assert!(
+            crate::draw::take_frame().iter().any(|draw| draw.starts_with(marker)),
+            "the draw entered the trace"
+        );
+        record(&mut state);
+        list.close();
+
+        let null = std::ptr::null();
+        assert_eq!(present(null, 0, null.cast(), null.cast()), S_OK);
+        let pending = crate::draw::take_frame();
+        assert!(
+            !pending.iter().any(|draw| draw.starts_with(marker)),
+            "previous frame's draw leaked: {pending:?}"
+        );
+    }
     use crate::object::slot;
 
     /// Held by tests that submit through title queues: their work stays in
@@ -966,7 +1048,7 @@ pub(crate) mod tests {
         // SAFETY: the texture is a live render target, on an open list.
         unsafe {
             list.list.ClearRenderTargetView(
-                host.rtv(&primary.texture, None),
+                host.rtv(Some(&primary.texture), None),
                 &[0.25, 0.5, 0.75, 1.0],
                 None,
             );
@@ -1084,6 +1166,32 @@ pub(crate) mod tests {
         assert_eq!(release(q), 0);
     }
 
+    /// A page remap waits for the submission running (which holds the
+    /// host's submission lock) instead of unmapping under its reads.
+    #[cfg(windows)]
+    #[test]
+    fn page_mappings_wait_for_a_running_submission() {
+        let Some(host) = crate::host::host() else { return };
+        crate::resource::use_page_mapper(|_, _, _| true);
+        let running = host.hold_submissions();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mapping = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let range = PageRange { kind: 3, start: 0, count: 1 };
+                let batch = PageBatch { destination: 0x10000, count: 1, ranges: &range };
+                let null = std::ptr::null();
+                assert_eq!(copy_page_mappings(null, 1, &batch, 0x20000, 1, 0), S_OK);
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "mapped under a running submission");
+        drop(running);
+        mapping.join().unwrap();
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's
     /// own table decides.
@@ -1191,5 +1299,16 @@ pub(crate) mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_present_totals_do_not_move_the_reported_count_back() {
+        let last = AtomicU64::new(0);
+        // One presenter can read 6 and get descheduled while another one
+        // reads and reports 8. The first then reports the stale snapshot.
+        let deltas = [5, 8, 6, 8, 11].map(|total| count_since(&last, total));
+        assert_eq!(deltas, [5, 3, 0, 0, 3]);
+        assert_eq!(last.load(Ordering::Relaxed), 11);
     }
 }

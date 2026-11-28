@@ -4,10 +4,14 @@
 use std::ffi::CString;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+#[cfg(test)]
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+#[cfg(test)]
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, PCSTR};
 
 use super::HostShader;
@@ -17,6 +21,87 @@ use crate::dxbc::{Container, FourCC};
 pub struct Host {
     pub device: ID3D12Device,
     warp: bool,
+    /// The objects a dispatch makes once and reuses; see [`Reused`].
+    #[cfg(test)]
+    reused: std::sync::Mutex<Option<Reused>>,
+}
+
+/// What a dispatch needs that does not depend on its inputs: the queue,
+/// allocator, list, fence and event. Making them cost 4.2 ms of an 8.3 ms
+/// dispatch, and the `valu_tests` cases run hundreds of dispatches for one
+/// shader, so they are made once per host instead. The GPU tests run one at a
+/// time (`ONE_AT_A_TIME`) and every dispatch waits for its fence, so the
+/// objects are free to reuse.
+#[cfg(test)]
+struct Reused {
+    queue: ID3D12CommandQueue,
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    event: HANDLE,
+    /// The fence value of the last dispatch.
+    value: u64,
+    /// A recording has begun and its fence has not been waited for: the
+    /// allocator is in use and the list is open, so neither may be reset.
+    recording: std::cell::Cell<bool>,
+}
+
+#[cfg(test)]
+impl Reused {
+    fn new(dev: &ID3D12Device) -> Result<Self, String> {
+        // SAFETY: plain D3D12 calls with descriptions that outlive them; the
+        // event is closed by `Drop`.
+        unsafe {
+            let alloc: ID3D12CommandAllocator = dev
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .map_err(err)?;
+            let list: ID3D12GraphicsCommandList =
+                dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                    .map_err(err)?;
+            list.Close().map_err(err)?;
+            Ok(Reused {
+                queue: dev
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .map_err(err)?,
+                alloc,
+                list,
+                fence: dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?,
+                event: CreateEventW(None, false, false, None).map_err(err)?,
+                value: 0,
+                recording: std::cell::Cell::new(false),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for Reused {
+    fn drop(&mut self) {
+        // SAFETY: the event is ours, and the last dispatch waited for the
+        // fence, so nothing is left to signal it.
+        unsafe {
+            let _ = CloseHandle(self.event);
+        }
+    }
+}
+
+/// What a GPU check does when no device ran it: a local machine without the
+/// capability skips it, but CI must prove that some device runs these checks,
+/// so a runner image that loses SM 6.6 fails instead of passing silently.
+#[cfg(test)]
+pub(crate) fn no_device(what: &str, errors: &[String]) {
+    let why = if errors.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", errors.join("; "))
+    };
+    if std::env::var_os("CI").is_some() {
+        panic!("{what}: no device on CI{why}");
+    }
+    eprintln!("{what}; skipped{why}");
 }
 
 /// What the stage declares that a pipeline must match.
@@ -264,6 +349,37 @@ static WARP_LOCK: Mutex<()> = Mutex::new(());
 /// tiers 1 and 2), as `victory_gpu`'s host has it.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// Waits until `fence` reaches `value`, without spinning: the queue sets an
+/// event when it does. The timeout keeps the device-removal check - a removed
+/// device never signals - so the wait reports it instead of hanging the run.
+#[cfg(test)]
+fn wait(event: HANDLE, fence: &ID3D12Fence, dev: &ID3D12Device, value: u64) -> Result<(), String> {
+    // SAFETY: the event is the caller's, and the fence is done with it once it
+    // signals (it must not be closed before that).
+    unsafe {
+        if let Err(e) = fence.SetEventOnCompletion(value, event) {
+            return Err(err(e));
+        }
+        // 100 ms: nothing while the GPU runs, and a wedged device is reported
+        // rather than waited for.
+        loop {
+            match WaitForSingleObject(event, 100) {
+                WAIT_OBJECT_0 => break,
+                WAIT_TIMEOUT => {
+                    if let Err(e) = dev.GetDeviceRemovedReason() {
+                        return Err(format!("device removed: {}", err(e)));
+                    }
+                }
+                other => return Err(format!("wait failed: {}", other.0)),
+            }
+        }
+        if let Err(e) = dev.GetDeviceRemovedReason() {
+            return Err(format!("device removed: {}", err(e)));
+        }
+        Ok(())
+    }
+}
+
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
@@ -288,6 +404,8 @@ impl Host {
                 .map(|d| Host {
                     device: d.0.clone(),
                     warp: true,
+                    #[cfg(test)]
+                    reused: std::sync::Mutex::new(None),
                 })
                 .map_err(Clone::clone);
         }
@@ -299,6 +417,8 @@ impl Host {
         Ok(Host {
             device: create_device(false, None)?,
             warp: false,
+            #[cfg(test)]
+            reused: std::sync::Mutex::new(None),
         })
     }
 
@@ -324,6 +444,8 @@ impl Host {
         Ok(Host {
             device: create_device(false, Some(adapter))?,
             warp: false,
+            #[cfg(test)]
+            reused: std::sync::Mutex::new(None),
         })
     }
 
@@ -331,7 +453,12 @@ impl Host {
     /// serialised as WARP's is when the device runs on a software adapter.
     pub fn from_device(device: ID3D12Device) -> Self {
         let warp = on_software_adapter(&device);
-        Host { device, warp }
+        Host {
+            device,
+            warp,
+            #[cfg(test)]
+            reused: std::sync::Mutex::new(None),
+        }
     }
 
     /// The wave sizes the device runs ([`super::Target::ANY`] if it does
@@ -356,6 +483,24 @@ impl Host {
         } else {
             super::Target::ANY
         }
+    }
+
+    /// Whether this device can run a program that asks for 32-lane waves:
+    /// WARP before Windows 11 and some integrated GPUs report fewer lanes
+    /// (4 or 16) and refuse such a pipeline.
+    pub fn wave32(&self) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a plain device query with a valid out pointer.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+        };
+        ok && options.WaveLaneCountMin <= 32 && 32 <= options.WaveLaneCountMax
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -757,6 +902,34 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// Whether this device runs 64-bit atomics on typed resources in the
+    /// descriptor heap, which translated 64-bit image atomics need (the
+    /// same query as `victory-gpu`'s `heap_atomics64`).
+    pub fn heap_atomics64(&self) -> bool {
+        let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+        // SAFETY: each query writes its own structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS9,
+                    (&raw mut typed).cast(),
+                    size_of_val(&typed) as u32,
+                )
+                .is_ok()
+                && self
+                    .device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS11,
+                        (&raw mut heap).cast(),
+                        size_of_val(&heap) as u32,
+                    )
+                    .is_ok()
+        };
+        ok && typed.AtomicInt64OnTypedResourceSupported.as_bool()
+            && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+    }
+
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing
@@ -853,7 +1026,17 @@ impl Host {
                 }),
                 views.GetCPUDescriptorHandleForHeapStart(),
             );
-            list.SetDescriptorHeaps(&[Some(views.clone())]);
+            // The root signature indexes the sampler heap directly, so one
+            // must be bound too, though the probe samples nothing.
+            let samplers: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(&root);
             list.SetComputeRoot32BitConstants(
                 0,
@@ -879,18 +1062,89 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
-            let mut p = std::ptr::null_mut();
-            readback.Map(0, None, Some(&mut p)).map_err(err)?;
-            let bits = p.cast::<u32>().read();
-            readback.Unmap(0, None);
-            Ok(bits != 0)
+            read_fmad_after_wait(
+                || fence.GetCompletedValue(),
+                || dev.GetDeviceRemovedReason(),
+                || {
+                    let mut p = std::ptr::null_mut();
+                    readback.Map(0, None, Some(&mut p)).map_err(err)?;
+                    let bits = p.cast::<u32>().read();
+                    readback.Unmap(0, None);
+                    Ok(bits != 0)
+                },
+            )
         }
+    }
+}
+
+fn read_fmad_after_wait(
+    mut completed_value: impl FnMut() -> u64,
+    mut device_status: impl FnMut() -> windows::core::Result<()>,
+    readback: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    while completed_value() < 1 {
+        if let Err(e) = device_status() {
+            return Err(format!("device removed: {}", err(e)));
+        }
+        std::thread::yield_now();
+    }
+    // A removed device reports u64::MAX, which also exits the wait.
+    if let Err(e) = device_status() {
+        return Err(format!("device removed: {}", err(e)));
+    }
+    readback()
+}
+
+#[cfg(test)]
+mod fmad_wait_tests {
+    use super::{err, read_fmad_after_wait};
+    use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+    use windows::core::Error;
+
+    fn check_readback(
+        completed_values: &[u64],
+        statuses: impl IntoIterator<Item = windows::core::Result<()>>,
+        readback_value: bool,
+        expected_calls: usize,
+        expected_result: Result<bool, String>,
+    ) {
+        let mut completed_values = completed_values.iter().copied();
+        let mut statuses = statuses.into_iter();
+        let mut readback_calls = 0;
+        let result = read_fmad_after_wait(
+            || completed_values.next().expect("unexpected fence poll"),
+            || statuses.next().expect("unexpected device status check"),
+            || {
+                readback_calls += 1;
+                Ok(readback_value)
+            },
+        );
+        assert_eq!(readback_calls, expected_calls, "unexpected readback count");
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn immediate_removal_skips_readback() {
+        let removed = Error::from_hresult(DXGI_ERROR_DEVICE_REMOVED);
+        let expected = format!("device removed: {}", err(removed.clone()));
+        check_readback(&[u64::MAX], [Err(removed)], true, 0, Err(expected));
+    }
+
+    #[test]
+    fn ordinary_completion_reads_back_once() {
+        check_readback(&[0, 1], [Ok(()), Ok(())], true, 1, Ok(true));
+    }
+
+    #[test]
+    fn removal_during_polling_skips_readback() {
+        let removed = Error::from_hresult(DXGI_ERROR_DEVICE_REMOVED);
+        let expected = format!("device removed: {}", err(removed.clone()));
+        check_readback(&[0], [Err(removed)], true, 0, Err(expected));
+    }
+
+    #[test]
+    fn immediate_healthy_completion_reads_back_once() {
+        check_readback(&[1], [Ok(())], false, 1, Ok(false));
     }
 }
 
@@ -1323,12 +1577,15 @@ impl Host {
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        let words = if data.is_empty() { &[0u32][..] } else { data.as_slice() };
+                        list.SetGraphicsRoot32BitConstants(
+                            *param,
+                            words.len() as u32,
+                            words.as_ptr().cast(),
+                            0,
+                        );
+                    }
                     Root::Table { sampler, index } => {
                         let (heap, size) = if *sampler {
                             (&sampler_heap, sampler_size)
@@ -1410,19 +1667,11 @@ impl Host {
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+            let event = CreateEventW(None, false, false, None).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(format!(
-                        "device removed: {}",
-                        err(dev.GetDeviceRemovedReason().unwrap_err())
-                    ));
-                }
-                std::thread::yield_now();
-            }
-            if let Err(e) = dev.GetDeviceRemovedReason() {
-                return Err(format!("device removed: {}", err(e)));
-            }
+            let waited = wait(event, &fence, dev, 1);
+            let _ = CloseHandle(event);
+            waited?;
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let mut out = Vec::with_capacity((w * h) as usize);
@@ -1466,9 +1715,15 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An R32_FLOAT texture SRV (width, height, texels): supports comparison
+    /// sampling and comparison gathers, which RGBA32F does not.
+    RedTexture(u32, u32, &'a [f32]),
     /// An RGBA32F texture SRV with mips (width, height, levels, texels of
     /// each level in turn).
     Mipped(u32, u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F volume SRV (width, height, depth, levels, texels in
+    /// x, y, z order within each mip level).
+    Volume(u32, u32, u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV with mips (face size, levels, texels of each
@@ -1571,21 +1826,28 @@ impl Host {
     ) -> Result<Vec<Vec<u32>>, String> {
         let _guard = self.lock_warp();
         let dev = &self.device;
+        let mut reused = self.reused.lock().unwrap_or_else(|e| e.into_inner());
+        // A dispatch that failed between `Reset` and its fence left the list
+        // recording and the allocator in use: make new ones rather than fail
+        // every later dispatch with a second, misleading error.
+        if reused.as_ref().is_some_and(|r| r.recording.get()) {
+            *reused = None;
+        }
+        if reused.is_none() {
+            *reused = Some(Reused::new(dev)?);
+        }
+        let r = reused.as_mut().expect("just made");
+        r.value += 1;
+        let value = r.value;
+        let (queue, list, fence) = (&r.queue, &r.list, &r.fence);
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
-            let alloc: ID3D12CommandAllocator = dev
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                .map_err(err)?;
-            let list: ID3D12GraphicsCommandList = dev
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso)
-                .map_err(err)?;
+            // Free the memory of the previous recording; its fence was waited
+            // for, and a dispatch that did not wait is dropped above.
+            r.alloc.Reset().map_err(err)?;
+            r.recording.set(true);
+            list.Reset(&r.alloc, pso).map_err(err)?;
             let make = |heap: D3D12_HEAP_TYPE, desc: &D3D12_RESOURCE_DESC, state| {
                 let mut r: Option<ID3D12Resource> = None;
                 dev.CreateCommittedResource(
@@ -1729,16 +1991,22 @@ impl Host {
                     View::Texture(..)
                     | View::Cube(..)
                     | View::Mipped(..)
+                    | View::Volume(..)
                     | View::MippedCube(..) => {
-                        let (w0, h0, mut texels, faces, levels) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::Mipped(w, h, l, t) => (w, h, t, 1, l),
-                            View::Cube(n, t) => (n, n, t, 6, 1),
-                            View::MippedCube(n, l, t) => (n, n, t, 6, l),
+                        let (w0, h0, depth, mut texels, faces, levels) = match *v {
+                            View::Texture(w, h, t) => (w, h, 1, t, 1, 1),
+                            View::Mipped(w, h, l, t) => (w, h, 1, t, 1, l),
+                            View::Volume(w, h, d, l, t) => (w, h, d, t, 1, l),
+                            View::Cube(n, t) => (n, n, 1, t, 6, 1),
+                            View::MippedCube(n, l, t) => (n, n, 1, t, 6, l),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w0, h0, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        if matches!(v, View::Volume(..)) {
+                            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                            desc.DepthOrArraySize = depth as u16;
+                        }
                         desc.MipLevels = levels as u16;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
@@ -1749,15 +2017,17 @@ impl Host {
                         for face in 0..(faces * levels) as usize {
                             let level = face as u32 % levels;
                             let (w, h) = ((w0 >> level).max(1), (h0 >> level).max(1));
+                            let d = (depth >> level).max(1);
+                            let rows = h as usize * d as usize;
                             let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
-                                &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                &buffer((pitch * rows) as u64, D3D12_RESOURCE_FLAG_NONE),
                                 D3D12_RESOURCE_STATE_GENERIC_READ,
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            for y in 0..h as usize {
+                            for y in 0..rows {
                                 let row = &texels[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
@@ -1765,16 +2035,18 @@ impl Host {
                                     row.len() * 16,
                                 );
                             }
-                            texels = &texels[(w * h) as usize..];
+                            texels = &texels[w as usize * rows..];
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
                             at_face.Anonymous.SubresourceIndex = face as u32;
+                            let mut source = footprint(&upload, w, h);
+                            source.Anonymous.PlacedFootprint.Footprint.Depth = d;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
                                 0,
                                 0,
-                                &footprint(&upload, w, h),
+                                &source,
                                 None,
                             );
                             keep.push(upload);
@@ -1841,6 +2113,56 @@ impl Host {
                             );
                             keep.push(upload);
                         }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(tex);
+                    }
+                    View::RedTexture(w, h, texels) => {
+                        let desc = texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R32_FLOAT);
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let pitch = (w as usize * 4).next_multiple_of(256);
+                        let upload = make(
+                            D3D12_HEAP_TYPE_UPLOAD,
+                            &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                        )?;
+                        let mut p = std::ptr::null_mut();
+                        upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                        for y in 0..h as usize {
+                            let row = &texels[y * w as usize..(y + 1) * w as usize];
+                            std::ptr::copy_nonoverlapping(
+                                row.as_ptr().cast::<u8>(),
+                                p.cast::<u8>().add(y * pitch),
+                                row.len() * 4,
+                            );
+                        }
+                        upload.Unmap(0, None);
+                        let from = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: std::mem::transmute_copy(&upload),
+                            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                    Offset: 0,
+                                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                        Format: DXGI_FORMAT_R32_FLOAT,
+                                        Width: w,
+                                        Height: h,
+                                        Depth: 1,
+                                        RowPitch: pitch as u32,
+                                    },
+                                },
+                            },
+                        };
+                        list.CopyTextureRegion(&subresource(&tex), 0, 0, 0, &from, None);
+                        keep.push(upload);
                         list.ResourceBarrier(&[transition(
                             &tex,
                             D3D12_RESOURCE_STATE_COPY_DEST,
@@ -2086,12 +2408,15 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetComputeRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        let words = if data.is_empty() { &[0u32][..] } else { data.as_slice() };
+                        list.SetComputeRoot32BitConstants(
+                            *param,
+                            words.len() as u32,
+                            words.as_ptr().cast(),
+                            0,
+                        );
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
@@ -2169,14 +2494,9 @@ impl Host {
             }
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            queue.Signal(fence, value).map_err(err)?;
+            wait(r.event, fence, dev, value)?;
+            r.recording.set(false);
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();

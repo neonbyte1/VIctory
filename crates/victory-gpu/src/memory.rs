@@ -122,6 +122,18 @@ unsafe impl Sync for Bitmap {}
 /// Reusable zeroed dirty-page bitmap buffers, capped at [`BITMAP_POOL_CAP`].
 static BITMAP_POOL: Mutex<Vec<Bitmap>> = Mutex::new(Vec::new());
 
+/// Serialises the tests that take a page table: [`BITMAP_POOL`] is shared by
+/// the whole process, hands bitmaps back last-in-first-out and is capped, so
+/// a test that checks a reset list gets its bitmap back again must have no
+/// other test taking or returning one in between. Every test that binds a
+/// list (`memory::bind`, directly or through `draw::State::bind`) holds this
+/// lock for its whole run.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Bitmap {
     /// Pops a zeroed bitmap from [`BITMAP_POOL`] or allocates and zeroes a new one.
     fn acquire() -> Option<Self> {
@@ -336,9 +348,15 @@ pub(crate) fn note_withheld(bytes: u64) {
     stats(|s| s.withheld_bytes += bytes);
 }
 
-/// A draw or dispatch of `pipeline` uses title memory.
+/// A draw or dispatch of `pipeline` uses title memory (the name is copied
+/// once per frame, not per draw).
 pub(crate) fn note_use(pipeline: &str) {
-    stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
+    stats(|s| match s.uses.get_mut(pipeline) {
+        Some(n) => *n += 1,
+        None => {
+            s.uses.insert(pipeline.to_owned(), 1);
+        }
+    });
 }
 
 /// Frames presented, and the last one in which a list using title memory
@@ -419,6 +437,11 @@ fn retake_dropped() {
     for (address, len) in dropped {
         crate::watch::retake(address, len);
     }
+}
+
+#[cfg(test)]
+pub(super) fn completed_title_frames() -> u64 {
+    FRAMES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Logs what title memory did since the last call, if anything: a line per
@@ -555,6 +578,19 @@ impl Shared {
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
         let vram = (!h.is_uma()).then(|| h.default_uav_buffer(bytes)).flatten();
+        // Point every level-1 region at block 0 and fill block 0 with `null`
+        // so a table used before its first `rewrite` (for example if its heap
+        // is released before its first submission) routes every lookup to the
+        // null views rather than descriptor slot 0.
+        // SAFETY: `data` is the persistent mapping of `table`, with room for
+        // `TABLE_DWORDS` dwords.
+        let out = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), TABLE_DWORDS) };
+        out[..LEVEL1].fill(0);
+        let (null_slots, _) = out[LEVEL1..LEVEL1 + BLOCK * 2].as_chunks_mut::<2>();
+        for slot in null_slots {
+            slot[0] = null;
+            slot[1] = 0;
+        }
         // SAFETY: a live buffer.
         let gpu = unsafe { vram.as_ref().unwrap_or(&table).GetGPUVirtualAddress() };
         Some(Shared {
@@ -588,6 +624,7 @@ impl Shared {
             keep
         });
         let (mut named, mut slots) = (Vec::with_capacity(copies.len()), Vec::with_capacity(copies.len()));
+        let mut left_out = false;
         for c in copies {
             let key = Arc::as_ptr(&c) as usize;
             let slot = match self.pairs.get(&key) {
@@ -596,6 +633,7 @@ impl Shared {
                     let Some(slot) = heap.pair() else {
                         static ONCE: std::sync::Once = std::sync::Once::new();
                         ONCE.call_once(|| tracing::warn!("no descriptor slots for a title memory copy's views: it reads as missing"));
+                        left_out = true;
                         continue;
                     };
                     heap.raw_pair_at(slot, Some(&c.buffer), c.range().1.next_multiple_of(4));
@@ -618,7 +656,9 @@ impl Shared {
             blocks,
             owner,
         });
-        self.generation = now;
+        // A copy left out is tried again at the next submission (slots come
+        // back as lists reset), not only when some copy comes or goes.
+        self.generation = if left_out { u64::MAX } else { now };
         stats(|s| s.tables += 1);
     }
 }
@@ -951,11 +991,6 @@ mod tests {
         assert!(has_missed(&marks, &l));
     }
 
-    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     #[test]
     fn bitmap_pool_reuses_and_zeroes_across_resets() {
         let _guard = gpu_test_lock();
@@ -1042,6 +1077,46 @@ void main(uint3 id : SV_DispatchThreadID) {
         ];
         let host = crate::host::host().unwrap();
         compute(&host.device, windows::core::s!("memory"), source, D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, &params).unwrap()
+    }
+
+    /// A copy that found no view slots at a rewrite is tried again at the
+    /// next submission, not only when some copy comes or goes.
+    #[test]
+    fn a_copy_without_view_slots_is_named_when_slots_come_back() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let heap = HostHeap::new(false, 16).unwrap();
+        let mut s = Shared::new(&heap).unwrap();
+        // Every slot a pair can come from, taken.
+        let mut taken = Vec::new();
+        while let Some(slot) = heap.pair() {
+            taken.push(slot);
+        }
+        let memory = (0..256u64)
+            .map(|k| 0x40_0000_0000 + (k << 28))
+            // SAFETY: a fresh allocation where nothing is mapped, or none.
+            .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .find(|&p| p != 0)
+            .expect("memory below 2^40");
+        crate::shadow::register(memory, memory as u64, PAGE as u64);
+        let copy = crate::shadow::find(memory as u64, PAGE as u64).unwrap();
+        let now = crate::shadow::generation();
+        s.rewrite(&heap, now);
+        assert!(!s.pairs.contains_key(&(Arc::as_ptr(&copy) as usize)), "no slots for it");
+        assert_ne!(s.generation, now, "so the next submission rewrites again");
+        // Slots come back (a list was reset): the copy is named, and the
+        // table is then up to date. (Other tests' copies are named too:
+        // every slot is given back.)
+        for slot in taken {
+            heap.free_pair(slot);
+        }
+        s.rewrite(&heap, now);
+        assert!(s.pairs.contains_key(&(Arc::as_ptr(&copy) as usize)));
+        assert_eq!(s.generation, now);
+        crate::shadow::unregister(memory, memory as u64);
     }
 
     /// A copy's view pair, in view heap `key`'s table.
@@ -1244,10 +1319,9 @@ void main() {
         // SAFETY: our pool.
         let title = || unsafe { (at as *const u32).read_volatile() };
         write(0x33, true);
-        // Another test's submission may have refreshed the copy already.
-        let held = copy.read_host(at as u64, 1)[0];
-        assert!(!copy.clean() || held == 0x11, "the written page counts as changed at once");
         assert_eq!(title(), 0x11, "nothing went back");
+        // Observe the retake through the next dispatch. Another submission
+        // may refresh the copy before this read.
         assert_eq!(read(), 0x11, "the next submission reads title memory's bytes");
         // Unless another test ends a frame meanwhile (its retake is right).
         let frame = FRAMES.load(std::sync::atomic::Ordering::Relaxed);
@@ -1358,5 +1432,83 @@ void main() {
         let title_word = unsafe { (at as *const u32).read_volatile() };
         assert_eq!(title_word, 0xcafe_f00d);
         crate::shadow::unregister(p, p as u64);
+    }
+
+    /// A freshly created page table routes every lookup to its `null` view
+    /// pair before `rewrite` has run (for example if its heap is released
+    /// before its first submission), rather than indexing descriptor slot 0.
+    #[test]
+    fn new_table_routes_all_lookups_to_null_before_first_rewrite() {
+        let _guard = gpu_test_lock();
+        let (Some(host), Some(views)) = (crate::host::host(), HostHeap::new(false, 16)) else {
+            return; // no host GPU here
+        };
+        let s = Shared::new(&views).expect("a page table");
+        assert_ne!(
+            s.null, 0,
+            "null view pair is distinct from descriptor slot 0"
+        );
+        // SAFETY: `s.data` is the persistent mapping of `s.table` with room for
+        // `TABLE_DWORDS` dwords and no GPU submission reads it yet.
+        let dwords = unsafe { std::slice::from_raw_parts(s.data as *const u32, TABLE_DWORDS) };
+        assert!(
+            dwords[..LEVEL1].iter().all(|&b| b == 0),
+            "every level-1 entry points at block 0"
+        );
+        let (block0, _) = dwords[LEVEL1..LEVEL1 + BLOCK * 2].as_chunks::<2>();
+        assert!(
+            block0.iter().all(|&slot| slot == [s.null, 0]),
+            "every block-0 slot must point at the null view pair"
+        );
+        for address in [
+            0u64,
+            0x10,
+            0x40_0010,
+            0xd_1234_0010,
+            0xff_ffff_fff0,
+            1u64 << 40,
+        ] {
+            assert_eq!(look_up(dwords, address), (s.null, address as u32));
+        }
+
+        // Bind a non-zero buffer at descriptor slot 0 and dispatch `SOURCE`
+        // against the un-rewritten table; it must read zeros from `s.null`
+        // instead of leaking slot 0's contents.
+        let (slot0, slot0_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: `slot0_cpu` is the mapped 256-byte buffer, not in GPU use.
+        unsafe { std::slice::from_raw_parts_mut(slot0_cpu.cast::<u32>(), 4).fill(0xDEAD_BEEF) };
+        views.raw_pair_at(0, Some(&slot0), 256);
+
+        let (out, out_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: `out_cpu` is the mapped 256-byte buffer, not in GPU use.
+        unsafe { std::slice::from_raw_parts_mut(out_cpu.cast::<u32>(), 4).fill(0xCAFE_BABE) };
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+
+        let (root, pso) = pipeline(SOURCE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 3);
+        let list = host.new_list().unwrap();
+        let address = 0x80_0000_0000u64;
+        let constants = [address as u32, (address >> 32) as u32, 0];
+        // SAFETY: an open list and live objects owned by this test.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+            list.list.SetComputeRootShaderResourceView(1, s.gpu);
+            list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+            list.list
+                .SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: `out_cpu` is the mapped output buffer and the GPU has finished.
+        let got = unsafe { std::slice::from_raw_parts(out_cpu.cast::<u32>(), 4) };
+        assert_eq!(
+            got,
+            [0, 0, 0, 0],
+            "un-rewritten table must read from null view, not slot 0"
+        );
     }
 }

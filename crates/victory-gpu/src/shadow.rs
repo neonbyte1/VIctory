@@ -17,7 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -264,6 +264,13 @@ fn sub_of(subs: &mut Vec<Sub>, owner: u64) -> &mut Sub {
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Capacity of idle snapshots retained in the pool, in bytes.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn idle_snapshot_bytes() -> Option<usize> {
+    let pool = POOL.try_lock().ok()?;
+    Some(pool.iter().map(Vec::capacity).sum())
+}
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
 fn pooled(n: usize) -> Vec<u8> {
@@ -1624,17 +1631,25 @@ pub(crate) fn take_reads(clear: bool) -> Vec<u32> {
 /// slots seen keeps a slot read again from being reported as new.
 pub(crate) fn reads_since() -> Vec<u32> {
     let mut slots = Vec::new();
-    for bits in [false, true].into_iter().filter_map(bitmap).map(read_marks) {
-        for (w, word) in bits.iter().enumerate() {
-            // Most words are clear (no submission marks meanwhile).
-            if word.load(AtomicOrdering::Relaxed) == 0 {
-                continue;
-            }
-            let mut x = word.swap(0, AtomicOrdering::AcqRel);
-            while x != 0 {
-                slots.push(w as u32 * 32 + x.trailing_zeros());
-                x &= x - 1;
-            }
+    for (w, word) in [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        .map(read_marks)
+        .flat_map(|bits| bits.iter().enumerate())
+    {
+        // No further than any view heap's slots: a slot past them is no
+        // heap's, and its mark is left for a larger heap to find.
+        if w * 32 >= crate::descriptor::view_slots() as usize {
+            break;
+        }
+        // Most words are clear (no submission marks meanwhile).
+        if word.load(AtomicOrdering::Relaxed) == 0 {
+            continue;
+        }
+        let mut x = word.swap(0, AtomicOrdering::AcqRel);
+        while x != 0 {
+            slots.push(w as u32 * 32 + x.trailing_zeros());
+            x &= x - 1;
         }
     }
     slots.sort_unstable();
@@ -2475,12 +2490,19 @@ fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// The longest title buffer registered so far (it stays after the buffer is
+/// released): a buffer starting further below an address than this cannot
+/// hold it. Changed under `BUFFERS`' lock.
+static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    MAX_SPAN.fetch_max(len, Ordering::Relaxed);
+    map.insert(
         (start, resource),
         Entry {
-            end: start + len,
+            end: start.saturating_add(len),
             shadow: None,
         },
     );
@@ -2493,17 +2515,28 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// The innermost entry holding `[address, end)`: the one starting closest
+/// below `address` that reaches `end`, among those starting at most `span`
+/// (the longest entry's length) below `end`. Big buffers hold many smaller
+/// ones (a heap's placed buffers), so the one holding an address past
+/// those can be any number of entries back.
+fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: u64) -> Option<(u64, usize)> {
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    map.range((lowest, 0)..=(address, usize::MAX))
+        .rev()
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k)
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);

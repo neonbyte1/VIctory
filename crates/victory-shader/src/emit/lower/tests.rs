@@ -4,6 +4,9 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+mod image_refusals;
+mod size_handles;
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// A program's constant table starts after its instructions, unless a
@@ -1420,4 +1423,95 @@ fn an_image_read_as_float_and_by_an_atomic_is_annotated_twice() {
         "the atomic's annotation: {:x?}",
         lowered.annotations
     );
+}
+
+#[test]
+fn global_writes_add_a_uav_fence_to_barriers() {
+    let uav = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 2,
+        user_data: 0,
+        slot: 0,
+    };
+    for (name, op, mode) in [
+        ("global_store_dword", 0x1C, 11),
+        ("global_atomic_add", 0x32, 11),
+        ("global_load_dword", 0x0C, 9),
+    ] {
+        let words = [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xDC00_8000 | op << 18,
+            0x0200_0001, // address v1 + s[0:1], store data v0 or load result v2
+            0xBF8A_0000, // s_barrier
+            S_ENDPGM,
+        ];
+        let shader = lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], vec![uav])
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(shader.barrier_modes, [Some(mode)], "{name}");
+    }
+}
+
+#[test]
+fn a_global_load_into_lds_is_refused() {
+    // Encoding from gfx10::sp3::tests::loads_into_lds_have_no_result_register:
+    // global_load_dword v2, s[4:5] inst_offset:1024 lds.
+    let words = [
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xBE84_0380, // s_mov_b32 s4, 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xDC30_A400,
+        0x0004_0002, // global_load_dword v2, s[4:5] inst_offset:1024 lds
+        S_ENDPGM,
+    ];
+    let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&words, 6 << 1) else {
+        panic!("a global load into LDS translated");
+    };
+    assert_eq!(what, "a global load result");
+}
+
+#[test]
+fn signed_nibble_dot_product_decodes_and_lowers() {
+    // VOP3P 0x18 `v_dot8_i32_i4 v0, v1, v2, v3` with op_sel_hi set (v0
+    // is stored, so the product is not dead).
+    let words: [u32; 2] = [0xCC18_4000, 0x101 | 0x102 << 9 | 0x103 << 18 | 3 << 27];
+    let code: Vec<u8> = [words[0], words[1], S_ENDPGM]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let decoded = crate::gfx10::decode(&code).unwrap();
+    assert_eq!(decoded[0].name(), Some("v_dot8_i32_i4"));
+    lowers_valu(&words).unwrap();
+    // Saturation is not modelled: refused, not computed wrongly.
+    assert!(lowers_valu(&[words[0] | 1 << 15, words[1]]).is_err());
+}
+
+#[test]
+fn scalar_64_bit_field_ops_lower() {
+    // Each makes a 64-bit field from constants and branches on SCC (only
+    // code with an effect needs its operands).
+    let tail = [
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE87_0380, // s_mov_b32 s7, 0
+        S_ENDPGM,
+    ];
+    let consts = [
+        0xBE80_0387, // s_mov_b32 s0, 7
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0xBE82_0388, // s_mov_b32 s2, 8
+    ];
+    let field_tests: [&[u32]; 3] = [
+        &[0x9484_0200], // s_bfe_u64 s[4:5], s[0:1], s2
+        &[0x9504_0200], // s_bfe_i64 s[4:5], s[0:1], s2
+        // s_bfm_b64 s[4:5], s0, s1; its result is read by s_or_b32,
+        // which sets the SCC the branch uses.
+        &[0x9284_0100, 0x8806_0504],
+    ];
+    for body in field_tests {
+        let words: Vec<u32> = consts.iter().chain(body).chain(&tail).copied().collect();
+        lowers(&words, 0).unwrap();
+    }
 }

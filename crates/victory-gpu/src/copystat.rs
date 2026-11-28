@@ -322,12 +322,35 @@ pub(crate) enum C {
     /// (`crate::pipeline::builder`, `VICTORY_BVH_HALVES`).
     BvhRun,
     BvhHeld,
+    /// Not a counter: how many there are. Keep it last.
+    Count,
 }
-const COUNTERS: usize = 183;
-static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+const COUNTERS: usize = C::Count as usize;
+
+struct Counters([AtomicU64; COUNTERS]);
+
+impl Counters {
+    const fn new() -> Self {
+        Counters([const { AtomicU64::new(0) }; COUNTERS])
+    }
+
+    fn add(&self, c: C, n: u64) {
+        self.0[c as usize].fetch_add(n, Relaxed);
+    }
+
+    /// Each counter per frame over `frames` frames, zeroing it.
+    fn take(&self, frames: f64) -> Vec<f64> {
+        self.0
+            .iter()
+            .map(|a| a.swap(0, Relaxed) as f64 / frames)
+            .collect()
+    }
+}
+
+static COUNT: Counters = Counters::new();
 
 pub(crate) fn add(c: C, n: u64) {
-    COUNT[c as usize].fetch_add(n, Relaxed);
+    COUNT.add(c, n);
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -340,20 +363,42 @@ pub(crate) fn mode() -> u8 {
     })
 }
 
-/// Per source range (start, length): copies, bytes, microseconds, memory type.
-type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
-static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
+/// Copies, bytes, microseconds, memory type.
+type Copies = (u64, u64, u64, u32);
+
+/// Per source range (start, length): its copies.
+struct Ranges(Mutex<Option<HashMap<(usize, usize), Copies>>>);
+
+impl Ranges {
+    const fn new() -> Self {
+        Ranges(Mutex::new(None))
+    }
+
+    fn add(&self, src: usize, len: usize, us: u64, kind: u32) {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let e = map
+            .get_or_insert_with(HashMap::new)
+            .entry((src, len))
+            .or_insert((0, 0, 0, kind));
+        e.0 += 1;
+        e.1 += len as u64;
+        e.2 += us;
+    }
+
+    /// The ranges so far, most bytes first, emptying the table.
+    fn take(&self) -> Vec<((usize, usize), Copies)> {
+        let ranges = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
+        ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
+        ranges
+    }
+}
+
+static RANGES: Ranges = Ranges::new();
 
 /// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
 pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
-    let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map
-        .get_or_insert_with(HashMap::new)
-        .entry((src, len))
-        .or_insert((0, 0, 0, kind));
-    e.0 += 1;
-    e.1 += len as u64;
-    e.2 += us;
+    RANGES.add(src, len, us, kind);
 }
 
 /// Snapshot bytes per host copy (its title start and length).
@@ -435,10 +480,7 @@ pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
-    let c: Vec<f64> = COUNT
-        .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
-        .collect();
+    let c = COUNT.take(frames);
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
@@ -556,6 +598,19 @@ pub(crate) fn log(frames: f64) {
         c[C::ListsRun as usize],
         c[C::EclCalls as usize],
     );
+    let snapshots = crate::shadow::idle_snapshot_bytes();
+    let textures = crate::texture::cached_staging_bytes();
+    if let (Some(idle_snapshot_bytes), Some((texture_upload_bytes, texture_read_capacity_bytes))) =
+        (snapshots, textures)
+    {
+        tracing::info!(
+            idle_snapshot_bytes,
+            texture_upload_bytes,
+            texture_read_capacity_bytes,
+            "retained copy memory"
+        );
+    }
+
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
@@ -748,10 +803,7 @@ pub(crate) fn log(frames: f64) {
         c[C::BvhRun as usize],
         c[C::BvhHeld as usize],
     );
-    let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
-    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+    for ((src, len), (n, bytes, us, _)) in RANGES.take().into_iter().take(10) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -844,5 +896,52 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
             }
         }
         q
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Each test has its own counters and ranges: the GPU tests count into
+    // the global ones while these run.
+
+    #[test]
+    fn range_accumulates_same_key_and_separates_distinct_ranges() {
+        let ranges = Ranges::new();
+        ranges.add(0x1000, 64, 10, 0x20000);
+        ranges.add(0x1000, 64, 25, 0x20000);
+        ranges.add(0x2000, 256, 7, 0x40000);
+
+        assert_eq!(
+            ranges.take(),
+            [
+                ((0x2000, 256), (1, 256, 7, 0x40000)),
+                ((0x1000, 64), (2, 128, 35, 0x20000))
+            ]
+        );
+        assert!(ranges.take().is_empty());
+    }
+
+    #[test]
+    fn take_drains_counters_per_frame() {
+        let counters = Counters::new();
+        counters.add(C::Submissions, 4);
+        counters.add(C::Copies, 12);
+        counters.add(C::Copies, 8);
+        counters.add(C::SavedPages, 6);
+
+        let c = counters.take(4.0);
+        assert_eq!(c.len(), COUNTERS);
+        assert_eq!(c[C::Submissions as usize], 1.0);
+        assert_eq!(c[C::Copies as usize], 5.0);
+        assert_eq!(c[C::SavedPages as usize], 1.5);
+        assert_eq!(c.iter().sum::<f64>(), 7.5);
+
+        // The next line counts from zero.
+        counters.add(C::Copies, 2);
+        let c = counters.take(1.0);
+        assert_eq!(c[C::Copies as usize], 2.0);
+        assert_eq!(c.iter().sum::<f64>(), 2.0);
     }
 }

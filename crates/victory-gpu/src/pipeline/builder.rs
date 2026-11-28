@@ -10,7 +10,9 @@
 //! into title memory: on fxceless/victory-fork, garbage bounds that crashed
 //! the title. So the builder's dispatches run only in frames where every
 //! pipeline it has created has its host pipeline; otherwise none of them
-//! run (the structures keep what they held).
+//! run (the structures keep what they held). A dispatch of a made pipeline
+//! can still be dropped (`State::bind` fails, say): that holds the builder
+//! back at once, for the rest of the frame and while that pipeline lives.
 //!
 //! Its pipelines are known by where they come from: created by its code (a
 //! return address in its image on the stack) or from bytecode in its image.
@@ -77,8 +79,15 @@ fn callers() -> Vec<usize> {
     Vec::new()
 }
 
-/// The builder's pipelines (alive while the title holds them).
-static PIPELINES: Mutex<Vec<Weak<Pending>>> = Mutex::new(Vec::new());
+/// One of the builder's pipelines (alive while the title holds it), and
+/// whether a dispatch of it was dropped though it is made.
+struct Noted {
+    pipeline: Weak<Pending>,
+    dropped: bool,
+}
+
+/// The builder's pipelines.
+static PIPELINES: Mutex<Vec<Noted>> = Mutex::new(Vec::new());
 
 /// The builder created pipeline `p`: it counts towards [`runs`], and is
 /// made at once (no frame's wait budget holds it back).
@@ -86,8 +95,38 @@ pub(crate) fn note(p: &Arc<Pending>) {
     PIPELINES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(Arc::downgrade(p));
+        .push(Noted {
+            pipeline: Arc::downgrade(p),
+            dropped: false,
+        });
     make::begin(p);
+}
+
+/// A dispatch of the builder's pipeline `p` was not run on the host
+/// (`why`): none of the builder's dispatches run for the rest of the frame.
+/// If `p` is made, none run while it lives either; one not made yet holds
+/// the builder back through [`runs`] until it is.
+pub(crate) fn dropped(p: &Arc<Pending>, why: &str) {
+    let frame = crate::frame::current();
+    let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());
+    if decided.0 == frame {
+        decided.1 = false;
+    }
+    if make::state(p) != Some(true) {
+        return;
+    }
+    let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = pipelines
+        .iter_mut()
+        .find(|n| std::ptr::eq(n.pipeline.as_ptr(), Arc::as_ptr(p)) && !n.dropped)
+    {
+        n.dropped = true;
+        tracing::warn!(
+            frame,
+            why,
+            "BVH builder held back: a dispatch of it was dropped"
+        );
+    }
 }
 
 /// The frame [`runs`] last decided for, and its decision.
@@ -102,16 +141,17 @@ pub(crate) fn runs() -> bool {
     if decided.0 == frame {
         return decided.1;
     }
-    let states: Vec<Option<bool>> = {
+    let (states, dropped): (Vec<Option<bool>>, usize) = {
         let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
-        pipelines.retain(|p| p.strong_count() > 0);
-        pipelines
+        pipelines.retain(|n| n.pipeline.strong_count() > 0);
+        let states = pipelines
             .iter()
-            .filter_map(Weak::upgrade)
+            .filter_map(|n| n.pipeline.upgrade())
             .map(|p| make::state(&p))
-            .collect()
+            .collect();
+        (states, pipelines.iter().filter(|n| n.dropped).count())
     };
-    let open = all_made(&states);
+    let open = all_made(&states) && dropped == 0;
     if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
         let (made, refused) = (
             states.iter().filter(|s| **s == Some(true)).count(),
@@ -122,9 +162,12 @@ pub(crate) fn runs() -> bool {
             pipelines = states.len(),
             made,
             refused,
+            dropped,
             "BVH builder {}",
             if open {
                 "runs"
+            } else if dropped > 0 {
+                "held back: a dispatch of it was dropped"
             } else {
                 "held back: not all its pipelines are made"
             }
@@ -146,8 +189,14 @@ fn all_made(states: &[Option<bool>]) -> bool {
 pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = (u64::MAX, true);
+    forget_decision();
     guard
+}
+
+/// As if a new frame began: [`runs`] decides afresh.
+#[cfg(test)]
+pub(crate) fn forget_decision() {
+    *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = (u64::MAX, true);
 }
 
 #[cfg(test)]

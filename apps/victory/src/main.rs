@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod coverage;
 mod inspect;
 mod prebuild;
 mod run;
@@ -72,15 +73,18 @@ enum Command {
         disasm: bool,
         /// Instead list the effects of shader databases: technique, pass,
         /// shaders (name, container hash, engine hash) and pass state.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["verbose", "disasm"])]
         effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
     Translate {
         paths: Vec<PathBuf>,
-        /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
-        /// else the newest Windows SDK's).
+        /// Check emitted DXIL with the validator from VICTORY_DXIL or the newest Windows SDK.
+        ///
+        /// Set VICTORY_DXIL to the full path to bin\x64\dxil.dll from Microsoft
+        /// DXC v1.8.2502 or newer. Validators before 1.8, including standalone
+        /// DXC builds, can reject shaders with repeated semantic names.
         #[arg(long)]
         validate: bool,
         /// Also create a host D3D12 pipeline for each emitted shader
@@ -112,6 +116,13 @@ enum Command {
         /// host's wave sizes as `run` translates.
         #[arg(long, conflicts_with_all = ["validate", "list", "host_lanes"])]
         cache: bool,
+    },
+    /// Compare runtime shader failures with offline emission of matching containers.
+    ShaderCoverage {
+        /// Runtime tracing log (plain UTF-8 text).
+        log: PathBuf,
+        /// Files or directories to scan; defaults to the configured title paths.
+        paths: Vec<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -205,6 +216,7 @@ fn main() -> Result<()> {
             host_lanes,
             !no_pair_meetings,
         ),
+        Command::ShaderCoverage { log, paths } => coverage::run(&log, paths),
         Command::Run {
             exe,
             unimplemented,
@@ -243,7 +255,10 @@ fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
 
 fn show_config() -> Result<()> {
     let cfg = victory_core::Config::load()?;
-    let status = |p: &Option<PathBuf>| match p {
+    let status = |p: &Option<PathBuf>, directory: bool| match p {
+        Some(p) if directory && p.exists() && !p.is_dir() => {
+            format!("{}  (not a directory)", p.display())
+        }
         Some(p) if p.exists() => format!("{}", p.display()),
         Some(p) => format!("{}  (does not exist)", p.display()),
         None => "(not set)".to_owned(),
@@ -254,12 +269,12 @@ fn show_config() -> Result<()> {
             .as_ref()
             .map_or("(none)".into(), |p| p.display().to_string())
     );
-    println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("game_dir    : {}", status(&cfg.game_dir, true));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
-    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
+    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir, true));
     for t in &cfg.test_titles {
-        println!("test_title  : {}", status(&Some(t.clone())));
+        println!("test_title  : {}", status(&Some(t.clone()), false));
     }
     check_policy(&cfg)
 }
@@ -272,6 +287,7 @@ fn check_policy(cfg: &victory_core::Config) -> Result<()> {
         .game_dir
         .iter()
         .chain(&cfg.test_titles)
+        .chain(cfg.fidelityfx_dir.iter())
         .chain([&cfg.cache_dir, &cfg.data_dir])
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {

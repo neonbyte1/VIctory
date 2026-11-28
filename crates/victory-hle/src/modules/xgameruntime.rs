@@ -165,8 +165,7 @@ pub fn text(s: *const c_char) -> Option<String> {
     (!s.is_null()).then(|| unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned())
 }
 
-/// A new registration token for callbacks we never call (events nobody
-/// raises offline).
+/// A new token for a runtime event registration.
 pub fn token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)

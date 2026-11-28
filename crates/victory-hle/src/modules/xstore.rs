@@ -175,6 +175,47 @@ pub struct GameLicense {
     pub expiration: i64,
 }
 
+impl xasync::ResultBytes for GameLicense {
+    fn into_result_bytes(self) -> Vec<u8> {
+        let mut bytes = vec![0; size_of::<Self>()];
+        let mut field = |offset: usize, value: &[u8]| {
+            bytes[offset..offset + value.len()].copy_from_slice(value);
+        };
+        // Moving even a zero-initialized Rust struct need not preserve its
+        // padding. Write the fields into the final byte buffer instead.
+        field(std::mem::offset_of!(Self, sku_store_id), &self.sku_store_id);
+        field(
+            std::mem::offset_of!(Self, is_active),
+            &[u8::from(self.is_active)],
+        );
+        field(
+            std::mem::offset_of!(Self, is_trial_owned_by_this_user),
+            &[u8::from(self.is_trial_owned_by_this_user)],
+        );
+        field(
+            std::mem::offset_of!(Self, is_disc_license),
+            &[u8::from(self.is_disc_license)],
+        );
+        field(
+            std::mem::offset_of!(Self, is_trial),
+            &[u8::from(self.is_trial)],
+        );
+        field(
+            std::mem::offset_of!(Self, trial_seconds_remaining),
+            &self.trial_seconds_remaining.to_ne_bytes(),
+        );
+        field(
+            std::mem::offset_of!(Self, trial_unique_id),
+            &self.trial_unique_id,
+        );
+        field(
+            std::mem::offset_of!(Self, expiration),
+            &self.expiration.to_ne_bytes(),
+        );
+        bytes
+    }
+}
+
 /// A full, active licence for the game's SKU (`<store id>/0010`, the
 /// store's first SKU), not a trial, without expiry.
 fn game_license() -> GameLicense {
@@ -300,6 +341,13 @@ extern "system" fn install_async(
     offline(block, "package download")
 }
 
+/// A store id is the installation's own when it is the running title's,
+/// and the manifest has one (an empty id matches nothing).
+fn installed_package(title: &runtime::Title, store_id: Option<&str>) -> Option<String> {
+    let id = store_id?;
+    (!title.store_id.is_empty() && id == title.store_id).then(xpackage::identifier)
+}
+
 /// The game's own store id maps to its installation; nothing else is
 /// installed, and any other id gets the documented E_INVALIDARG (not
 /// XPackage's "could not resolve" error).
@@ -309,13 +357,10 @@ extern "system" fn package_identifier(
     size: usize,
     buffer: *mut u8,
 ) -> HRESULT {
-    let title = runtime::title();
-    match text(store_id) {
-        Some(id) if !title.store_id.is_empty() && id == title.store_id => {
-            put_string(&xpackage::identifier(), size, buffer, std::ptr::null_mut())
-        }
-        _ => E_INVALIDARG,
-    }
+    let Some(identifier) = installed_package(&runtime::title(), text(store_id).as_deref()) else {
+        return E_INVALIDARG;
+    };
+    put_string(&identifier, size, buffer, std::ptr::null_mut())
 }
 
 /// Licences never change offline, so these callbacks never run.
@@ -418,6 +463,56 @@ mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
 
+    #[test]
+    fn game_license_result_bytes_follow_the_abi_and_zero_padding() {
+        let license = GameLicense {
+            sku_store_id: [0x5a; 18],
+            is_active: true,
+            is_trial_owned_by_this_user: false,
+            is_disc_license: true,
+            is_trial: true,
+            trial_seconds_remaining: 0x1234_5678,
+            trial_unique_id: [0x6b; 64],
+            expiration: -0x0102_0304_0506_0708,
+        };
+        let payload = xasync::bytes(license);
+        assert_eq!(payload.len(), 104);
+        assert_eq!(&payload[..18], &[0x5a; 18]);
+        assert_eq!(&payload[18..24], &[1, 0, 1, 1, 0, 0]);
+        assert_eq!(&payload[24..28], &0x1234_5678u32.to_ne_bytes());
+        assert_eq!(&payload[28..92], &[0x6b; 64]);
+        assert_eq!(&payload[92..96], &[0; 4]);
+        assert_eq!(&payload[96..], &license.expiration.to_ne_bytes());
+
+        let mut b = block();
+        assert_eq!(
+            xasync::finished_with(&mut b, (&raw const GAME_LICENSE).cast(), Ok(payload)),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        let mut result = std::mem::MaybeUninit::<GameLicense>::uninit();
+        assert_eq!(
+            game_license_result(&OBJECT, &mut b, result.as_mut_ptr()),
+            S_OK
+        );
+        // SAFETY: the successful result initialized every field.
+        let result = unsafe { result.assume_init() };
+        assert_eq!(result.sku_store_id, license.sku_store_id);
+        assert_eq!(result.is_active, license.is_active);
+        assert_eq!(
+            result.is_trial_owned_by_this_user,
+            license.is_trial_owned_by_this_user
+        );
+        assert_eq!(result.is_disc_license, license.is_disc_license);
+        assert_eq!(result.is_trial, license.is_trial);
+        assert_eq!(
+            result.trial_seconds_remaining,
+            license.trial_seconds_remaining
+        );
+        assert_eq!(result.trial_unique_id, license.trial_unique_id);
+        assert_eq!(result.expiration, license.expiration);
+    }
+
     fn block() -> AsyncBlock {
         AsyncBlock {
             queue: std::ptr::null(),
@@ -425,6 +520,135 @@ mod tests {
             callback: None,
             internal: [0; 4],
         }
+    }
+
+    /// Runs `begin` on `b` and checks its call finished at once, as the title
+    /// then reads it: the status word, and a result size (none if it failed).
+    /// The block stays where it is, since a call is keyed by its address.
+    fn ran(b: &mut AsyncBlock, begin: impl FnOnce(*mut AsyncBlock) -> HRESULT, expected: HRESULT) {
+        assert_eq!(begin(b), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(b, true), expected);
+        assert_eq!(b.internal[1], expected as u32 as usize);
+        if expected < 0 {
+            assert_eq!(b.internal[2], 0, "a failed call has no result");
+        }
+    }
+
+    #[test]
+    fn a_package_licence_names_the_installed_package() {
+        type Ask = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type Result = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        type Valid = extern "system" fn(This, Handle) -> bool;
+        let this: This = &OBJECT;
+        let context = handle(&CONTEXT);
+        let ask = method::<Ask>(&OBJECT, 0xa0);
+        let result = method::<Result>(&OBJECT, 0xa8);
+        let valid = method::<Valid>(&OBJECT, 0xb0);
+        let licence_for = |package: *const c_char| {
+            let mut b = block();
+            ran(&mut b, |b| ask(this, context, package, b), S_OK);
+            let mut license: Handle = std::ptr::null();
+            assert_eq!(result(this, &mut b, &mut license), S_OK);
+            assert!(!license.is_null());
+            valid(this, license)
+        };
+
+        let ours = format!("{}\0", xpackage::identifier());
+        assert!(licence_for(ours.as_ptr().cast()));
+        assert!(!licence_for(c"another-package".as_ptr()));
+        assert!(!licence_for(std::ptr::null()));
+
+        // Only a licence we handed out is valid.
+        assert!(!valid(this, std::ptr::null()));
+        assert!(!valid(this, handle(&CONTEXT)));
+        assert!(!valid(this, handle(&QUERY)));
+        assert!(valid(this, handle(&VALID)));
+    }
+
+    #[test]
+    fn the_game_license_is_full_and_names_the_first_sku() {
+        type Begin = extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
+        type Result = extern "system" fn(This, *mut AsyncBlock, *mut GameLicense) -> HRESULT;
+        let this: This = &OBJECT;
+        let mut b = block();
+        ran(
+            &mut b,
+            |b| method::<Begin>(&OBJECT, 0xe0)(this, handle(&CONTEXT), b),
+            S_OK,
+        );
+        let result = method::<Result>(&OBJECT, 0xe8);
+
+        let mut size = 0;
+        assert_eq!(xasync::XAsyncGetResultSize(&mut b, &mut size), S_OK);
+        assert_eq!(size, size_of::<GameLicense>());
+        // No room, no result; the call goes on.
+        assert_eq!(
+            result(this, &mut b, std::ptr::null_mut()),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+
+        let mut license = std::mem::MaybeUninit::<GameLicense>::zeroed();
+        assert_eq!(result(this, &mut b, license.as_mut_ptr()), S_OK);
+        // SAFETY: written by the call above.
+        let license = unsafe { license.assume_init() };
+        assert!(license.is_active);
+        assert!(
+            !license.is_trial && !license.is_disc_license && !license.is_trial_owned_by_this_user
+        );
+        assert_eq!(
+            (license.trial_seconds_remaining, license.expiration),
+            (0, 0)
+        );
+        assert_eq!(license.trial_unique_id, [0; 64]);
+        let end = license.sku_store_id.iter().position(|b| *b == 0).unwrap();
+        let sku = std::str::from_utf8(&license.sku_store_id[..end]).unwrap();
+        assert!(sku.ends_with("/0010"), "{sku:?}");
+
+        // The result ends the call, as the query's did.
+        let mut after = std::mem::MaybeUninit::<GameLicense>::zeroed();
+        assert_eq!(
+            result(this, &mut b, after.as_mut_ptr()),
+            E_ILLEGAL_METHOD_CALL
+        );
+    }
+
+    #[test]
+    fn the_store_id_maps_to_the_installation() {
+        type Ident = extern "system" fn(This, *const c_char, usize, *mut u8) -> HRESULT;
+        let this: This = &OBJECT;
+        let ident = method::<Ident>(&OBJECT, 0x208);
+        let mut buffer = [0u8; 33];
+        // This test's title has no store id, so nothing resolves.
+        assert_eq!(
+            ident(this, std::ptr::null(), buffer.len(), buffer.as_mut_ptr()),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            ident(this, c"9XYZ".as_ptr(), buffer.len(), buffer.as_mut_ptr()),
+            E_INVALIDARG
+        );
+        assert_eq!(buffer, [0u8; 33], "nothing written");
+
+        // The mapping itself, for a title whose manifest has one.
+        let title = runtime::Title {
+            id: 0,
+            store_id: "9XYZ".to_owned(),
+            ..Default::default()
+        };
+        let package = installed_package(&title, Some("9XYZ")).unwrap();
+        assert!(
+            !package.is_empty() && package.chars().all(|c| c.is_ascii_hexdigit()),
+            "{package:?}"
+        );
+        assert_eq!(installed_package(&title, Some("other")), None);
+        assert_eq!(installed_package(&title, Some("")), None);
+        assert_eq!(installed_package(&title, None), None);
+        let unnamed = runtime::Title::default();
+        assert_eq!(
+            installed_package(&unnamed, Some("9XYZ")),
+            None,
+            "a manifest without a store id names nothing"
+        );
     }
 
     #[test]

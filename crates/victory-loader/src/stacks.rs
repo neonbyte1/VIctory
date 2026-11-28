@@ -14,12 +14,14 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use windows_sys::Win32::System::Kernel::NT_TIB;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::crash::{MAX_FRAMES, locate, unwind_into};
+use crate::crash::locate;
+use crate::unwind::{MAX_FRAMES, UnwindFault, tib_stack, unwind_into};
 
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
@@ -55,11 +57,36 @@ fn schedule(list: &str) -> Vec<std::time::Duration> {
 #[repr(C)]
 struct BasicInfo {
     exit_status: i32,
-    teb: *const usize,
+    teb: *const NT_TIB,
     client_id: [usize; 2],
     affinity: usize,
     priority: i32,
     base_priority: i32,
+}
+
+impl BasicInfo {
+    /// `thread`'s basic information, if the query succeeds and names a TEB.
+    fn of(thread: HANDLE) -> Option<Self> {
+        let mut info = Self {
+            exit_status: 0,
+            teb: std::ptr::null(),
+            client_id: [0; 2],
+            affinity: 0,
+            priority: 0,
+            base_priority: 0,
+        };
+        // SAFETY: writes `info`, whose layout and size are the system's.
+        let status = unsafe {
+            NtQueryInformationThread(
+                thread,
+                ThreadBasicInformation,
+                (&raw mut info).cast(),
+                size_of::<Self>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        (status == 0 && !info.teb.is_null()).then_some(info)
+    }
 }
 
 /// `GetThreadContext` wants a 16-byte aligned context.
@@ -109,7 +136,7 @@ pub fn dump_stacks() {
         if thread.is_null() {
             continue;
         }
-        let (frames, (priority, base)) = frames_of(thread);
+        let (frames, walked, (priority, base)) = frames_of(thread);
         eprintln!(
             "  thread {id} \"{}\" start {} priority {priority} (base {base})",
             name_of(thread),
@@ -118,59 +145,52 @@ pub fn dump_stacks() {
         for (i, pc) in frames.into_iter().enumerate() {
             eprintln!("    #{i:<2} {}", locate(pc as usize));
         }
+        if let Err(fault) = walked {
+            eprintln!("    walk ended: {fault}");
+        }
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };
     }
 }
 
-/// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+/// The thread's frames, why the walk ended early if it did, and its current
+/// and base scheduling priority (0-31).
+fn frames_of(thread: HANDLE) -> (Vec<u64>, Result<(), UnwindFault>, (i32, i32)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
-    let mut info: BasicInfo = BasicInfo {
-        exit_status: 0,
-        teb: std::ptr::null(),
-        client_id: [0; 2],
-        affinity: 0,
-        priority: 0,
-        base_priority: 0,
-    };
     // Suspended first: a running thread may exit and free its TEB between
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
     if unsafe { SuspendThread(thread) } == u32::MAX {
-        return (frames, (0, 0));
+        return (frames, Ok(()), (0, 0));
     }
-    // SAFETY: writes `info`, whose layout and size are the system's.
-    let status = unsafe {
-        NtQueryInformationThread(
-            thread,
-            ThreadBasicInformation,
-            (&raw mut info).cast(),
-            size_of::<BasicInfo>() as u32,
-            std::ptr::null_mut(),
-        )
-    };
-    if status != 0 || info.teb.is_null() {
+    let Some(info) = BasicInfo::of(thread) else {
         // SAFETY: suspended above.
         unsafe { ResumeThread(thread) };
-        return (frames, (0, 0));
-    }
-    // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
-    // holds the stack base at +8 and the stack limit at +0x10.
-    let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
+        return (frames, Ok(()), (0, 0));
+    };
+    let mut walked = Ok(());
     // SAFETY: zeroed is a valid CONTEXT.
     let mut context = Aligned(unsafe { std::mem::zeroed() });
     context.0.ContextFlags = CONTEXT_FULL_AMD64;
     // SAFETY: reads and resumes the thread suspended above; nothing until
-    // the resume allocates or takes a lock the thread could hold besides
-    // the unwinder's own.
+    // the resume allocates, and nothing of ours takes a lock the thread
+    // could hold besides the unwinder's own. A fault the walk recovers is
+    // dispatched by Windows, which takes the vectored handler list's lock
+    // for short spans between handlers: a thread suspended inside its own
+    // dispatch in such a span holds it, and the dump then hangs with that
+    // thread suspended. Accepted for this diagnostics-only aid. Its
+    // committed stack is read from its TEB, which
+    // starts with its NT_TIB, only after `GetThreadContext` returns for it,
+    // when its suspension is known complete, so the TEB stays mapped (a
+    // suspended thread's does unless something terminates it).
     unsafe {
         if GetThreadContext(thread, &mut context.0) != 0 {
-            unwind_into(context.0, low, high, &mut frames);
+            let stack = tib_stack(info.teb);
+            walked = unwind_into(context.0, stack.start, stack.end, &mut frames);
         }
         ResumeThread(thread);
     }
-    (frames, (info.priority, info.base_priority))
+    (frames, walked, (info.priority, info.base_priority))
 }
 
 fn start_of(thread: HANDLE) -> usize {
@@ -225,7 +245,8 @@ mod tests {
             )
         };
         assert!(!thread.is_null());
-        let (frames, _) = frames_of(thread);
+        let (frames, walked, _) = frames_of(thread);
+        assert_eq!(walked, Ok(()));
         // Waiting in the kernel, several frames down from the thread start.
         assert!(frames.len() >= 3, "{frames:?}");
         assert!(start_of(thread) != 0);

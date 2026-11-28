@@ -80,8 +80,8 @@ a folder under `VICTORY_DATA_DIR`. Other paths reach the host unchanged.
 An exe's code reaches its static TLS as slot 0; mapped as a DLL it gets
 another slot, so the loader redirects those loads (`victory-loader::tls`).
 `victory run --execute` installs a crash reporter that names faults as
-`module+rva` and unwinds the faulting thread's stack
-(`victory-loader::crash`).
+`module+rva` (`victory-loader::crash`) and unwinds the faulting thread's
+stack (`victory-loader::unwind`).
 
 `victory census` shows this classification without running anything (it
 does not map title DLLs; `victory run` without `--execute` does).

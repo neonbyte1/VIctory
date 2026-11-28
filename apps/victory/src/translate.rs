@@ -15,7 +15,7 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{Source, shader_files, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -69,7 +69,7 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
-    /// Reason → programs stopped by it, and the first one.
+    /// Reason → programs stopped by it, and the smallest recorded label.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
@@ -78,16 +78,19 @@ struct Tally {
 
 impl Tally {
     fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
+        let example = example();
         if self.list {
-            let e = example();
-            self.lines.push(format!("{e}  {reason}"));
-            self.failed.entry(reason).or_insert((0, e)).0 += 1;
-            return;
+            self.lines.push(format!("{example}  {reason}"));
         }
-        self.failed
-            .entry(reason)
-            .or_insert_with(|| (0, example()))
-            .0 += 1;
+        self.record_failure(reason, 1, example);
+    }
+
+    fn record_failure(&mut self, reason: String, n: usize, example: String) {
+        let (count, sample) = self.failed.entry(reason).or_default();
+        if *count == 0 || example < *sample {
+            *sample = example;
+        }
+        *count += n;
     }
 
     fn merge(&mut self, other: Tally) {
@@ -135,7 +138,7 @@ impl Tally {
         }
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
-            self.failed.entry(reason).or_insert((0, example)).0 += n;
+            self.record_failure(reason, n, example);
         }
     }
 }
@@ -208,13 +211,7 @@ pub fn run(
     let total = Mutex::new(Tally::default());
     let started = std::time::Instant::now();
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
+        for entry in shader_files(root, true) {
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
@@ -345,16 +342,16 @@ pub fn run(
 /// (`prebuild`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let threads =
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    // The pre-build's key listing reads the pack without warming the caches.
+    if pipelines && let Some(file) = std::env::var_os("VICTORY_PREBUILD_KEYS") {
+        return crate::prebuild::run(&paths, threads, Some(file.into()));
+    }
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());
     };
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
-    // The pre-build's key listing (diagnostics) translates nothing.
-    if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
-        return crate::prebuild::run(&paths, threads);
-    }
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     // Containers already cached, translated now, refused now.
@@ -363,13 +360,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     // another target's would never be found.
     let target = victory_gpu::shader_cache::host_target();
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
+        for entry in shader_files(root, true) {
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
@@ -449,7 +440,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         started.elapsed().as_secs_f64()
     );
     if pipelines {
-        crate::prebuild::run(&paths, threads)?;
+        crate::prebuild::run(&paths, threads, None)?;
     }
     Ok(())
 }
@@ -888,6 +879,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use super::Tally;
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {
@@ -904,5 +897,34 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn failure_example_is_independent_of_worker_order() {
+        for list in [false, true] {
+            for reverse in [false, true] {
+                let mut first = Tally {
+                    list,
+                    ..Tally::default()
+                };
+                first.fail("reason".into(), || "z@0x0".into());
+                first.fail("reason".into(), || "a@0x0".into());
+                let mut second = Tally {
+                    list,
+                    ..Tally::default()
+                };
+                second.fail("reason".into(), || "m@0x0".into());
+                let mut total = Tally::default();
+                if reverse {
+                    std::mem::swap(&mut first, &mut second);
+                }
+                total.merge(first);
+                total.merge(second);
+                let (count, example) = &total.failed["reason"];
+                assert_eq!(*count, 3);
+                assert_eq!(example, "a@0x0");
+                assert_eq!(total.lines.len(), if list { 3 } else { 0 });
+            }
+        }
     }
 }

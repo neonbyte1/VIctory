@@ -136,6 +136,14 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             soffset,
             cache,
         } => {
+            let off = match (soffset, offset) {
+                (Operand::Scalar { code: NULL, .. }, 0) => soffset.to_string(),
+                (Operand::Scalar { code: NULL, .. }, _) => {
+                    format!("0x{:06x}", offset & 0x1F_FFFF)
+                }
+                (_, 0) => soffset.to_string(),
+                _ => format!("{soffset} offset:0x{:06x}", offset & 0x1F_FFFF),
+            };
             if let Some(data) = data {
                 let data = match (name, data) {
                     ("s_atc_probe" | "s_atc_probe_buffer", Operand::Literal(imm)) => {
@@ -143,19 +151,14 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                     }
                     _ => data.to_string(),
                 };
-                let off = match (soffset, offset) {
-                    (Operand::Scalar { code: NULL, .. }, 0) => soffset.to_string(),
-                    (Operand::Scalar { code: NULL, .. }, _) => {
-                        format!("0x{:06x}", offset & 0x1F_FFFF)
-                    }
-                    (_, 0) => soffset.to_string(),
-                    _ => format!("{soffset} offset:0x{:06x}", offset & 0x1F_FFFF),
-                };
                 out = match name {
                     // The data is a counter or the wave ID; these have no address.
                     "s_memtime" | "s_memrealtime" | "s_get_waveid_in_workgroup" => data.to_string(),
                     _ => format!("{data}, {base}, {off}"),
                 };
+            } else if name.starts_with("s_dcache_discard") {
+                // No data, but the address of what is discarded.
+                out = format!("{base}, {off}");
             }
             flags(&mut out, cache, false);
         }
@@ -333,7 +336,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                 0..=7 => format!("mrt{target}"),
                 8 => "mrtz".into(),
                 9 => "null".into(),
-                12..=15 => format!("pos{}", target - 12),
+                12..=16 => format!("pos{}", target - 12),
                 20 => "prim".into(),
                 32..=63 => format!("param{}", target - 32),
                 _ => format!("<target {target}>"),
@@ -382,7 +385,7 @@ fn flags(out: &mut String, cache: &Cache, dlc_first: bool) {
 }
 
 fn label(inst: &Instruction, imm: u16) -> String {
-    let target = inst.offset as i64 + 4 * inst.words.len() as i64 + 4 * i64::from(imm as i16);
+    let target = inst.offset as i64 + 4 * inst.words().len() as i64 + 4 * i64::from(imm as i16);
     format!("label_{target:04X}")
 }
 
@@ -804,6 +807,27 @@ mod tests {
     }
 
     #[test]
+    fn discards_name_their_address_and_position_four_its_target() {
+        // Encodings from LLVM's llvm/test/MC/AMDGPU/gfx10_asm_smem.s and
+        // exp-gfx10.s. LLVM spells the first offset `0x64`.
+        let got = [
+            one(&[0xF4A0_0001, 0xFA00_0064], true),
+            one(&[0xF4A0_0001, 0x0400_0000], true),
+            one(&[0xF4A4_0001, 0x0E00_0064], true),
+            one(&[0xF800_010F, 0x0102_0304], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "s_dcache_discard s[2:3], 0x000064",
+                "s_dcache_discard s[2:3], s2",
+                "s_dcache_discard_x2 s[2:3], s7 offset:0x000064",
+                "exp pos4, v4, v3, v2, v1",
+            ]
+        );
+    }
+
+    #[test]
     fn lane_masks_follow_the_wave_size() {
         let cmp = [0x7C08_06F0]; // v_cmp_gt_f32 with 0.5 and v3
         assert_eq!(one(&cmp, false), "v_cmp_gt_f32 vcc_lo, 0.5, v3");
@@ -850,6 +874,28 @@ mod tests {
     }
 
     #[test]
+    fn loads_into_lds_have_no_result_register() {
+        // Encodings from LLVM's llvm/test/MC/AMDGPU/gfx10_asm_flat.s (LLVM
+        // spells the offset `offset:1024`): with `lds` the load goes to LDS
+        // and the instruction has no VGPR destination.
+        let got = [
+            one(&[0xDC30_A400, 0x0004_0002], true),
+            one(&[0xDC30_A400, 0x007D_0002], true),
+            one(&[0xDC30_6400, 0x0004_0000], true),
+            one(&[0xDC30_6400, 0x007D_0002], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "global_load_dword v2, s[4:5] inst_offset:1024 lds",
+                "global_load_dword v[2:3], off inst_offset:1024 lds",
+                "scratch_load_dword off, s4 inst_offset:1024 lds",
+                "scratch_load_dword v2, off inst_offset:1024 lds",
+            ]
+        );
+    }
+
+    #[test]
     fn memory_and_export() {
         assert_eq!(
             one(&[0xE034_7010, 0x0102_0402], true),
@@ -862,6 +908,27 @@ mod tests {
         assert_eq!(
             one(&[0xF800_1C0F, 0x0000_0302], true),
             "exp mrt0, v2, v2, v3, v3 done compr vm"
+        );
+    }
+
+    #[test]
+    fn scratch_without_an_address_names_no_register() {
+        // Encodings from LLVM's llvm/test/MC/AMDGPU/flat-scratch-st-mode.s
+        // (gfx1030 only): the SGPR field holds 0x7F, which is no operand.
+        let got = [
+            one(&[0xDC30_4000, 0x017F_0000], true),
+            one(&[0xDC34_4000, 0x017F_0000], true),
+            one(&[0xDC70_4000, 0x007F_0200], true),
+            one(&[0xDC60_4000, 0x007F_0200], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "scratch_load_dword v1, off, off",
+                "scratch_load_dwordx2 v[1:2], off, off",
+                "scratch_store_dword off, v2, off",
+                "scratch_store_byte off, v2, off",
+            ]
         );
     }
 
@@ -909,6 +976,28 @@ mod tests {
     }
 
     #[test]
+    fn gws_operands_are_in_the_address_field() {
+        // Encodings from LLVM's llvm/test/MC/AMDGPU/gfx10_asm_ds.s: the one
+        // operand of these three is where other DS instructions have their
+        // address, not in the first data field.
+        let got = [
+            one(&[0xD876_1234, 0x0000_00FF], true),
+            one(&[0xD866_0000, 0x0000_00FF], true),
+            one(&[0xD86E_FFFF, 0x0000_00FF], true),
+            one(&[0xD876_0000, 0x0000_0000], true),
+        ];
+        assert_eq!(
+            got,
+            [
+                "ds_gws_barrier v255 offset:4660 gds",
+                "ds_gws_init v255 gds",
+                "ds_gws_sema_br v255 offset:65535 gds",
+                "ds_gws_barrier v0 gds",
+            ]
+        );
+    }
+
+    #[test]
     fn image_d16_data_is_packed() {
         // Three f16 channels occupy two VGPRs; NSA lists the addresses.
         let words = [0xF09C_070A, 0x8024_0801, 0x0000_0005];
@@ -926,5 +1015,87 @@ mod tests {
         };
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
+    }
+
+    #[test]
+    fn v_cmpx_vop3_and_sdwa_always_write_exec() {
+        let dst_of = |words: &[u32], wave64: bool| {
+            let code: Vec<u8> = words
+                .iter()
+                .chain(&[0xBF81_0000])
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let Fields::Valu(v) = decode(&code).unwrap()[0].fields(wave64) else {
+                panic!("not a VALU instruction");
+            };
+            v.dst
+        };
+
+        // VOP3 v_cmpx_lt_f32 with non-EXEC vdst (0x00, ignored by GFX10 HW)
+        // and canonical vdst (0x7e): both decode and print EXEC.
+        for vop3_cmpx in [[0xD411_0100, 0x0001_E501], [0xD411_017E, 0x0001_E501]] {
+            assert_eq!(
+                dst_of(&vop3_cmpx, false),
+                Some(Operand::Scalar {
+                    code: 126,
+                    dwords: 1
+                })
+            );
+            assert_eq!(
+                dst_of(&vop3_cmpx, true),
+                Some(Operand::Scalar {
+                    code: 126,
+                    dwords: 2
+                })
+            );
+            assert_eq!(one(&vop3_cmpx, false), "v_cmpx_lt_f32 exec_lo, abs(v1), 1.0");
+            assert_eq!(one(&vop3_cmpx, true), "v_cmpx_lt_f32 exec, abs(v1), 1.0");
+        }
+
+        // VOPC SDWA v_cmpx_eq_f16 (opcode 0xda) with sd=1, sdst=s6 in ext:
+        // GFX10 VOPCX_SDWA has no sdst and still writes EXEC.
+        let sdwa_cmpx = [0x7DB4_04F9, 0x0600_8601];
+        assert_eq!(
+            dst_of(&sdwa_cmpx, false),
+            Some(Operand::Scalar {
+                code: 126,
+                dwords: 1
+            })
+        );
+        assert_eq!(
+            dst_of(&sdwa_cmpx, true),
+            Some(Operand::Scalar {
+                code: 126,
+                dwords: 2
+            })
+        );
+        assert_eq!(
+            one(&sdwa_cmpx, false),
+            "v_cmpx_eq_f16 exec_lo, v1, v2 src0_sel:BYTE_0"
+        );
+        assert_eq!(
+            one(&sdwa_cmpx, true),
+            "v_cmpx_eq_f16 exec, v1, v2 src0_sel:BYTE_0"
+        );
+
+        // Control: non-EXEC v_cmp_eq_f16 (opcode 0xca) with SDWA sd=1, sdst=s6
+        // still writes s6 / s[6:7].
+        let sdwa_cmp = [0x7D94_04F9, 0x0600_8601];
+        assert_eq!(
+            dst_of(&sdwa_cmp, false),
+            Some(Operand::Scalar { code: 6, dwords: 1 })
+        );
+        assert_eq!(
+            dst_of(&sdwa_cmp, true),
+            Some(Operand::Scalar { code: 6, dwords: 2 })
+        );
+        assert_eq!(
+            one(&sdwa_cmp, false),
+            "v_cmp_eq_f16 s6, v1, v2 src0_sel:BYTE_0"
+        );
+        assert_eq!(
+            one(&sdwa_cmp, true),
+            "v_cmp_eq_f16 s[6:7], v1, v2 src0_sel:BYTE_0"
+        );
     }
 }

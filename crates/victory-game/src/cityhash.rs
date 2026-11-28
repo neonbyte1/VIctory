@@ -185,6 +185,88 @@ mod tests {
         }
     }
 
+    // Expected values from Google's CityHash64 at commit
+    // f5dc54147fcce12cefd16548c8e760d68ac04226 (src/city.cc):
+    // https://github.com/google/cityhash/blob/f5dc54147fcce12cefd16548c8e760d68ac04226/src/city.cc
+    // Inputs are generated here, independently of any title files.
+    #[test]
+    fn matches_reference_at_length_and_block_boundaries() {
+        for (n, want) in [
+            (0, 0x9ae16a3b2f90404f),
+            (1, 0xc1e85b3b818699e7),
+            (2, 0xe4b375192f565c30),
+            (3, 0x7132d2b3725b6cf8),
+            (4, 0x84e71ea48cad56ba),
+            (7, 0xe6d810c948bf6f84),
+            (8, 0x172890724578852d),
+            (9, 0xfd7aa7ddfe20b332),
+            (15, 0xb8b35d07d4b10606),
+            (16, 0x94c221f27b6ff832),
+            (17, 0x0ba34e613c825fb5),
+            (23, 0x7243b7099a6b51af),
+            (24, 0x6a4fffcba118dc78),
+            (25, 0xa4671fb2316476db),
+            (31, 0xb7b13c4aa1d81e8a),
+            (32, 0x01982ea44fa352a8),
+            (33, 0x0c163245007b9e61),
+            (63, 0x338e03a0bbdcffe7),
+            (64, 0x057235a6fd1baeba),
+            (65, 0xdf44b1f02be8b95d),
+            (67, 0x18a6791ebac2b223),
+            (68, 0xe02b97d804d16231),
+            (69, 0xee48e394b28ef987),
+            (127, 0x0fc81cd0271a6c5a),
+            (128, 0x2abacd0811b365e4),
+            (129, 0xb19c08b9e276dcc7),
+            (191, 0xbc5c3d8145211c37),
+            (192, 0xf7dbe43d06a96370),
+            (193, 0x5ea48ccb21bbcfa9),
+            (255, 0xe7f38ded97cb4d10),
+            (256, 0x72c8b745bf98fae2),
+            (257, 0x0523660c4c4c6f7c),
+            (1024, 0x169547feec69553c),
+            (1025, 0x6c1b252709ce3fe4),
+            (4096, 0x56d62998af61b6d2),
+            (4097, 0x0808ab0a2c118504),
+        ] {
+            let input: Vec<_> = (0..n).map(|i| (i * 131 + i / 8 * 29 + 17) as u8).collect();
+            check_subslices(&input, want);
+        }
+    }
+
+    /// Zero bytes are data, including in the compact 16/24/68-byte states.
+    /// The all-ones controls also exercise high bits in every input byte.
+    #[test]
+    fn matches_reference_for_binary_state_sizes() {
+        for (n, byte, want) in [
+            (16, 0, 0x30902d4dcfed5815),
+            (24, 0, 0xc959b5bcf95917dc),
+            (68, 0, 0xdb5dfcf83e06574e),
+            (16, 255, 0xef2c139c8ec2f065),
+            (24, 255, 0x8cac77e604bda6b4),
+            (68, 255, 0x96208946399152d4),
+        ] {
+            check_subslices(&vec![byte; n], want);
+        }
+    }
+
+    fn check_subslices(input: &[u8], want: u64) {
+        // Every byte alignment, with unrelated bytes before and after the
+        // slice: neither their contents nor the address may affect the hash.
+        for offset in 0..8 {
+            let mut padded = vec![0xa5; offset];
+            padded.extend_from_slice(input);
+            padded.extend_from_slice(&[0x5a; 8]);
+            assert_eq!(
+                city64(&padded[offset..offset + input.len()]),
+                want,
+                "length {}, offset {offset}, first byte {:?}",
+                input.len(),
+                input.first()
+            );
+        }
+    }
+
     const REFERENCE: [(usize, u64); 13] = [
         (0, 0x9ae16a3b2f90404f),
         (3, 0x40b4412e33eefd64),

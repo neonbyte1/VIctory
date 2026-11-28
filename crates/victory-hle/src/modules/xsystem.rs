@@ -3,6 +3,7 @@
 //! chose ([`victory_gpu::console`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use super::xasync::E_NOT_SUFFICIENT_BUFFER;
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
 };
@@ -35,6 +36,9 @@ pub const ANALYTICS: Guid = Guid::new(
 const CONSOLE_ID: &str = "00000000000000000000000000000000000001";
 /// The retail sandbox.
 const SANDBOX: &str = "RETAIL";
+/// The smallest sandbox-id buffer the runtime accepts, whatever the sandbox's
+/// own length.
+const SANDBOX_ID_MAX_BYTES: usize = 16;
 /// Base64 of 32 bytes: 44 characters (45 bytes with the NUL).
 const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
 
@@ -62,6 +66,9 @@ extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut 
     put_string(CONSOLE_ID, size, buffer, used)
 }
 extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+    if size < SANDBOX_ID_MAX_BYTES {
+        return E_NOT_SUFFICIENT_BUFFER;
+    }
     put_string(SANDBOX, size, buffer, used)
 }
 /// The device id this title sees (titles see different ones).
@@ -180,11 +187,22 @@ mod device_type {
         text.eq_ignore_ascii_case(expected)
     }
 
-    /// Opens our key for its path; the key has no subkeys. `None`: not
-    /// ours, ask the host.
+    /// Opens our key for its path; the key has no subkeys, and a null or
+    /// empty path below it opens the key itself, as the host's do. `None`:
+    /// not ours, ask the host.
     fn open(root: Key, sub: *const u16, out: *mut Key) -> Option<u32> {
         if root == oem() {
-            return Some(FILE_NOT_FOUND);
+            // The host checks for somewhere to put the key before it looks
+            // at the path.
+            if out.is_null() {
+                return Some(INVALID_PARAMETER);
+            }
+            if !(sub.is_null() || is(sub, "")) {
+                return Some(FILE_NOT_FOUND);
+            }
+            // SAFETY: checked non-null; the title passes room for a key.
+            unsafe { out.write(oem()) };
+            return Some(SUCCESS);
         }
         if root == LOCAL_MACHINE && is(sub, KEY) && !out.is_null() {
             // SAFETY: checked non-null; the title passes room for a key.
@@ -270,7 +288,11 @@ mod device_type {
     pub(crate) fn module() -> HleModule {
         HleModule {
             name: "device type",
-            dlls: &["advapi32.dll", "api-ms-win-core-registry-*"],
+            dlls: &[
+                "advapi32.dll",
+                "kernelbase.dll",
+                "api-ms-win-core-registry-*",
+            ],
             exports: vec![
                 hle_export!(RegOpenKeyW),
                 hle_export!(RegOpenKeyExW),
@@ -340,6 +362,60 @@ mod device_type {
         }
 
         #[test]
+        fn a_null_or_empty_path_opens_the_key_itself() {
+            const KEY_READ: u32 = 0x2_0019;
+            let empty = w("");
+            let host_key = w(r"Software\Microsoft\Windows NT\CurrentVersion");
+            for (root, path) in [(oem(), w(KEY)), (std::ptr::null_mut(), host_key)] {
+                // Ours, then the host's for comparison.
+                let mut key = std::ptr::null_mut();
+                assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+                assert!(root.is_null() || key == root);
+                for sub in [std::ptr::null(), empty.as_ptr()] {
+                    // `RegOpenKeyW` gives back the key it was passed.
+                    let mut same = std::ptr::null_mut();
+                    assert_eq!(RegOpenKeyW(key, sub, &mut same), SUCCESS, "{sub:?}");
+                    assert_eq!(same, key);
+                    // `RegOpenKeyExW` a handle to the same key.
+                    let mut again = std::ptr::null_mut();
+                    assert_eq!(
+                        RegOpenKeyExW(key, sub, 0, KEY_READ, &mut again),
+                        SUCCESS,
+                        "{sub:?}"
+                    );
+                    assert_eq!(RegCloseKey(again), SUCCESS);
+                }
+                assert_eq!(RegCloseKey(key), SUCCESS);
+            }
+        }
+
+        #[test]
+        fn nowhere_to_put_the_key_is_an_invalid_parameter() {
+            const KEY_READ: u32 = 0x2_0019;
+            let (missing, empty) = (w("NoSuchSubkey"), w(""));
+            let host_key = w(r"Software\Microsoft\Windows NT\CurrentVersion");
+            for (root, path) in [(oem(), w(KEY)), (std::ptr::null_mut(), host_key)] {
+                // Ours, then the host's for comparison.
+                let mut key = std::ptr::null_mut();
+                assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+                assert!(root.is_null() || key == root);
+                let none = std::ptr::null_mut();
+                for sub in [missing.as_ptr(), empty.as_ptr(), std::ptr::null()] {
+                    assert_eq!(RegOpenKeyW(key, sub, none), INVALID_PARAMETER, "{sub:?}");
+                    assert_eq!(
+                        RegOpenKeyExW(key, sub, 0, KEY_READ, none),
+                        INVALID_PARAMETER,
+                        "{sub:?}"
+                    );
+                }
+                // With somewhere to put it, the path is looked at.
+                let mut sub = std::ptr::null_mut();
+                assert_eq!(RegOpenKeyW(key, missing.as_ptr(), &mut sub), FILE_NOT_FOUND);
+                assert_eq!(RegCloseKey(key), SUCCESS);
+            }
+        }
+
+        #[test]
         fn other_keys_reach_the_host() {
             let mut key = std::ptr::null_mut();
             let path = w(r"Software\Microsoft\Windows NT\CurrentVersion");
@@ -359,6 +435,89 @@ mod device_type {
             );
             assert!(size > 0);
             assert_eq!(RegCloseKey(key), SUCCESS);
+        }
+
+        #[test]
+        fn kernelbase_registry_lookups_get_our_overrides() {
+            use crate::HleResolver;
+            use crate::modules::kernel::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+            use victory_loader::Provenance;
+            use victory_pe::ImportSymbol;
+
+            let resolver = HleResolver::default();
+            for name in ["RegOpenKeyExW", "RegQueryValueExW", "RegCloseKey"] {
+                let symbol = ImportSymbol::Name {
+                    hint: 0,
+                    name: name.into(),
+                };
+                assert_eq!(
+                    resolver.classify("kernelbase.dll", &symbol),
+                    Some(Provenance::Hle),
+                    "kernelbase.dll!{name}"
+                );
+            }
+
+            let kernelbase = GetModuleHandleW(w("kernelbase.dll").as_ptr());
+            assert!(!kernelbase.is_null());
+            let api_set = LoadLibraryW(w("api-ms-win-core-registry-l1-1-0.dll").as_ptr());
+            assert!(!api_set.is_null());
+
+            type OpenEx = extern "system" fn(Key, *const u16, u32, u32, *mut Key) -> u32;
+            type Query =
+                extern "system" fn(Key, *const u16, *mut u32, *mut u32, *mut u8, *mut u32) -> u32;
+            type Close = extern "system" fn(Key) -> u32;
+
+            for (label, module) in [
+                ("kernelbase.dll", kernelbase),
+                ("api-ms-win-core-registry-l1-1-0.dll", api_set),
+            ] {
+                let open_ptr = GetProcAddress(module, c"RegOpenKeyExW".as_ptr().cast());
+                let query_ptr = GetProcAddress(module, c"RegQueryValueExW".as_ptr().cast());
+                let close_ptr = GetProcAddress(module, c"RegCloseKey".as_ptr().cast());
+                assert_eq!(
+                    open_ptr as usize, RegOpenKeyExW as *const () as usize,
+                    "{label}!RegOpenKeyExW"
+                );
+                assert_eq!(
+                    query_ptr as usize, RegQueryValueExW as *const () as usize,
+                    "{label}!RegQueryValueExW"
+                );
+                assert_eq!(
+                    close_ptr as usize, RegCloseKey as *const () as usize,
+                    "{label}!RegCloseKey"
+                );
+
+                // SAFETY: the addresses verified above are our functions with these signatures.
+                let (open_ex, query, close) = unsafe {
+                    (
+                        std::mem::transmute::<*mut c_void, OpenEx>(open_ptr),
+                        std::mem::transmute::<*mut c_void, Query>(query_ptr),
+                        std::mem::transmute::<*mut c_void, Close>(close_ptr),
+                    )
+                };
+                let mut key = std::ptr::null_mut();
+                assert_eq!(
+                    open_ex(LOCAL_MACHINE, w(KEY).as_ptr(), 0, 1, &mut key),
+                    SUCCESS
+                );
+                let (mut kind, mut value, mut size) = (0, 0u32, 4);
+                assert_eq!(
+                    query(
+                        key,
+                        w(VALUE).as_ptr(),
+                        std::ptr::null_mut(),
+                        &mut kind,
+                        (&raw mut value).cast(),
+                        &mut size,
+                    ),
+                    SUCCESS
+                );
+                assert_eq!(
+                    (kind, size, value),
+                    (DWORD, 4, console_mode(console::current()))
+                );
+                assert_eq!(close(key), SUCCESS);
+            }
         }
     }
 }
@@ -382,6 +541,24 @@ mod tests {
             assert!(used <= size && buffer[used - 1] == 0, "slot {slot:#x}");
         }
         assert_eq!(&buffer[..7], b"VkljdG9");
+    }
+
+    #[test]
+    fn a_sandbox_id_buffer_under_the_documented_minimum_is_refused() {
+        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        let get = method::<Get>(&OBJECT, 0x20);
+        let mut buffer = [0xAAu8; 16];
+        let mut used = 0;
+        for size in [7, 15] {
+            assert_eq!(
+                get(&OBJECT, size, buffer.as_mut_ptr(), &mut used),
+                E_NOT_SUFFICIENT_BUFFER,
+                "size {size}"
+            );
+            assert_eq!((used, buffer), (0, [0xAA; 16]));
+        }
+        assert_eq!(get(&OBJECT, 16, buffer.as_mut_ptr(), &mut used), S_OK);
+        assert_eq!((used, &buffer[..7]), (7, &b"RETAIL\0"[..]));
     }
 
     #[test]

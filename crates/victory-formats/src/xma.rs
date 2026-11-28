@@ -63,6 +63,23 @@ pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
     })
 }
 
+/// Bit offset of the first frame that begins in this stream's input buffer.
+pub fn first_frame(data: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    loop {
+        let header = packet(data, index)?;
+        if header.frames != 0 {
+            let offset = HEADER_BITS + header.first_frame_bit as usize;
+            if offset >= PACKET_BITS {
+                return None;
+            }
+            let start = index.checked_mul(PACKET_BITS)?.checked_add(offset)?;
+            return (start / 8 < data.len()).then_some(start);
+        }
+        index += 1 + header.skip as usize;
+    }
+}
+
 /// One frame's bits gathered out of its packets.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -161,10 +178,8 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     while at < start {
         let mut cursor = Cursor { data, pos: at };
         let bits = cursor.bits(LENGTH_BITS)? as usize;
-        // The same rule as `read_frame`: a length that does not cover its own
-        // field is not a frame. A zero length would never move `at`, so a
-        // damaged packet would loop here for good.
-        if bits <= LENGTH_BITS as usize {
+        // Match `read_frame`: reject short lengths and the padding marker.
+        if bits <= LENGTH_BITS as usize || bits == 0x7fff {
             return None;
         }
         at += bits;
@@ -201,6 +216,15 @@ struct Bits<'a> {
 
 impl Bits<'_> {
     fn peek32(&self) -> u32 {
+        let byte = self.pos / 8;
+        if let Some(chunk) = self.data.get(byte..byte + 8) {
+            let v = u64::from_be_bytes(chunk.try_into().unwrap());
+            return ((v << (self.pos & 7)) >> 32) as u32;
+        }
+        self.peek32_tail()
+    }
+
+    fn peek32_tail(&self) -> u32 {
         let mut v = 0u64;
         let byte = self.pos / 8;
         for i in 0..5 {
@@ -238,11 +262,17 @@ impl Bits<'_> {
 /// A prefix code built like FFmpeg's `ff_vlc_init_from_lengths`: codes are
 /// handed out in table order, each the next free one of its length.
 struct Vlc {
+    /// Primary `FAST_BITS`-bit direct lookup table: `(symbol, len)` when
+    /// `len != 0`, else `(start_index_in_codes, 0)` for codes longer than
+    /// `FAST_BITS`.
+    fast: Box<[(i32, u8); 1 << Self::FAST_BITS]>,
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
 }
 
 impl Vlc {
+    const FAST_BITS: usize = 10;
+
     fn new(entries: impl Iterator<Item = (i32, u8)>) -> Vlc {
         let mut code = 0u64;
         let mut codes = Vec::new();
@@ -250,15 +280,75 @@ impl Vlc {
             codes.push((code as u32, len, symbol));
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        let mut fast = vec![(-1i32, 0u8); 1 << Self::FAST_BITS].into_boxed_slice();
+        for (idx, &(c, len, symbol)) in codes.iter().enumerate() {
+            let prefix = (c >> (32 - Self::FAST_BITS)) as usize;
+            if usize::from(len) <= Self::FAST_BITS {
+                let span = 1usize << (Self::FAST_BITS - usize::from(len));
+                fast[prefix..prefix + span].fill((symbol, len));
+            } else if fast[prefix].0 < 0 {
+                fast[prefix] = (idx as i32, 0);
+            }
+        }
+        for slot in &mut fast {
+            if slot.1 == 0 && slot.0 < 0 {
+                slot.0 = 0;
+            }
+        }
+        Vlc {
+            fast: fast.try_into().unwrap(),
+            codes,
+        }
     }
 
     fn read(&self, bits: &mut Bits) -> i32 {
+        let v = bits.peek32();
+        let (sym, len) = self.fast[(v >> (32 - Self::FAST_BITS)) as usize];
+        if len != 0 {
+            bits.pos += len as usize;
+            return sym;
+        }
+        self.read_slow(bits, v, sym as usize)
+    }
+
+    #[cold]
+    fn read_slow(&self, bits: &mut Bits, v: u32, start: usize) -> i32 {
+        let slice = &self.codes[start..];
+        let i = slice.partition_point(|c| c.0 <= v) - 1;
+        let (_, len, symbol) = slice[i];
+        bits.pos += len as usize;
+        symbol
+    }
+
+    #[cfg(test)]
+    fn read_binary_search(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
         let i = self.codes.partition_point(|c| c.0 <= v) - 1;
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
         symbol
+    }
+}
+
+/// Cached `10^(exp / 20)` quantization multipliers for integer exponents
+/// `[-128, 256)`, bit-exact with `10f32.powf(exp as f32 / 20.0)`.
+const QUANT_MIN: i32 = -128;
+const QUANT_LEN: usize = 384;
+
+fn quant_factor(exp: i32) -> f32 {
+    static TABLE: OnceLock<Box<[f32; QUANT_LEN]>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = vec![0.0f32; QUANT_LEN].into_boxed_slice();
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = 10f32.powf((QUANT_MIN + i as i32) as f32 / 20.0);
+        }
+        t.try_into().unwrap()
+    });
+    let idx = exp.wrapping_sub(QUANT_MIN) as u32 as usize;
+    if let Some(&q) = table.get(idx) {
+        q
+    } else {
+        10f32.powf(exp as f32 / 20.0)
     }
 }
 
@@ -320,44 +410,16 @@ fn log2(v: usize) -> u32 {
 /// The rotations come from [`Rotations`], built once per subframe size, so
 /// a subframe costs no sines or cosines and no allocation.
 fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
-    let n = input.len();
-    let m = n / 2;
-    let built;
-    let rotations = match rotations().get(log2(n).wrapping_sub(7) as usize) {
-        Some(r) if r.pre_re.len() == m => r,
-        _ => {
-            built = Rotations::new(n);
-            &built
+    match input.len() {
+        128 => rotations()[0].transform(input, out, scale, &mut [0.0; 64], &mut [0.0; 64]),
+        256 => rotations()[1].transform(input, out, scale, &mut [0.0; 128], &mut [0.0; 128]),
+        512 => rotations()[2].transform(input, out, scale, &mut [0.0; 256], &mut [0.0; 256]),
+        n => {
+            let m = n / 2;
+            let mut scratch = vec![0.0; 2 * m];
+            let (re, im) = scratch.split_at_mut(m);
+            Rotations::new(n).transform(input, out, scale, re, im);
         }
-    };
-    let mut stack = [0f64; FRAME_SAMPLES];
-    let mut heap = Vec::new();
-    let (re, im) = if m <= stack.len() / 2 {
-        stack.split_at_mut(m)
-    } else {
-        heap.resize(2 * m, 0f64);
-        heap.split_at_mut(m)
-    };
-    let im = &mut im[..m];
-    // Pre-rotation, each point stored at its bit-reversed place, which is
-    // where the FFT's input permutation would move it.
-    let pre = rotations
-        .pre_re
-        .iter()
-        .zip(&rotations.pre_im)
-        .zip(&rotations.reversed);
-    for (k, ((&c, &s), &to)) in pre.enumerate() {
-        let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
-        re[to as usize] = a * c - b * s;
-        im[to as usize] = a * s + b * c;
-    }
-    rotations.butterflies(re, im);
-    let post = rotations.post_re.iter().zip(&rotations.post_im);
-    for (k, ((&re, &im), (&c, &s))) in re.iter().zip(im.iter()).zip(post).enumerate() {
-        let (wr, wi) = (re * c - im * s, re * s + im * c);
-        // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
-        out[n - 1 - 2 * k] = (wr as f32) * scale;
-        out[2 * k] = -(wi as f32) * scale;
     }
 }
 
@@ -434,24 +496,67 @@ impl Rotations {
         }
     }
 
+    #[inline(always)]
+    fn transform(
+        &self,
+        input: &[f32],
+        out: &mut [f32],
+        scale: f32,
+        re: &mut [f64],
+        im: &mut [f64],
+    ) {
+        let n = input.len();
+        // Pre-rotation, each point stored at its bit-reversed place, which is
+        // where the FFT's input permutation would move it.
+        let pre = self.pre_re.iter().zip(&self.pre_im).zip(&self.reversed);
+        for (k, ((&c, &s), &to)) in pre.enumerate() {
+            let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
+            re[to as usize] = a * c - b * s;
+            im[to as usize] = a * s + b * c;
+        }
+        self.butterflies(re, im);
+        let post = self.post_re.iter().zip(&self.post_im);
+        for (k, ((&re, &im), (&c, &s))) in re.iter().zip(im.iter()).zip(post).enumerate() {
+            let (wr, wi) = (re * c - im * s, re * s + im * c);
+            // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
+            out[n - 1 - 2 * k] = (wr as f32) * scale;
+            out[2 * k] = -(wi as f32) * scale;
+        }
+    }
+
     /// The butterfly stages of an in-place radix-2 forward DFT
     /// (`exp(-2πi nk/N)`) on points already in bit-reversed order.
+    #[inline(always)]
     fn butterflies(&self, re: &mut [f64], im: &mut [f64]) {
         let m = re.len().min(im.len());
+        // Complete the short stages in a single pass over each eight-point
+        // block. Fixed stage widths let the compiler unroll the butterflies.
         let mut len = 2;
-        while len <= m {
-            let half = len / 2;
-            let wr = &self.twiddle_re[half - 1..][..half];
-            let wi = &self.twiddle_im[half - 1..][..half];
-            let blocks = re[..m]
-                .chunks_exact_mut(len)
-                .zip(im[..m].chunks_exact_mut(len));
-            for (re, im) in blocks {
-                let (are, bre) = re.split_at_mut(half);
-                let (aim, bim) = im.split_at_mut(half);
-                butterfly_block(are, aim, bre, bim, wr, wi);
+        if m >= 8 && m.is_multiple_of(8) {
+            let (real, _) = re.as_chunks_mut::<8>();
+            let (imag, _) = im.as_chunks_mut::<8>();
+            for (re, im) in real.iter_mut().zip(imag) {
+                self.stage(re, im, 2);
+                self.stage(re, im, 4);
+                self.stage(re, im, 8);
             }
+            len = 16;
+        }
+        while len <= m {
+            self.stage(re, im, len);
             len <<= 1;
+        }
+    }
+
+    #[inline(always)]
+    fn stage(&self, re: &mut [f64], im: &mut [f64], len: usize) {
+        let half = len / 2;
+        let wr = &self.twiddle_re[half - 1..][..half];
+        let wi = &self.twiddle_im[half - 1..][..half];
+        for (re, im) in re.chunks_exact_mut(len).zip(im.chunks_exact_mut(len)) {
+            let (are, bre) = re.split_at_mut(half);
+            let (aim, bim) = im.split_at_mut(half);
+            butterfly_block(are, aim, bre, bim, wr, wi);
         }
     }
 }
@@ -1091,7 +1196,7 @@ impl Decoder {
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
                     let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
-                    let quant = 10f32.powf(exp as f32 / 20.0);
+                    let quant = quant_factor(exp);
                     for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
                         *t = c * quant;
                     }
@@ -1235,16 +1340,16 @@ mod tests {
 
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
     /// the standard formula, negated).
-    fn imdct_reference(input: &[f32]) -> Vec<f32> {
+    fn imdct_reference(input: &[f32]) -> Vec<f64> {
         let n = input.len();
         (0..n)
             .map(|j| {
                 let t = (j + n / 2) as f64 + 0.5 + n as f64 / 2.0;
-                -(input
+                -input
                     .iter()
                     .enumerate()
                     .map(|(k, &x)| x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos())
-                    .sum::<f64>() as f32)
+                    .sum::<f64>()
             })
             .collect()
     }
@@ -1252,14 +1357,53 @@ mod tests {
     #[test]
     fn fast_imdct_matches_the_direct_sum() {
         for n in [128usize, 256, 512] {
-            let input: Vec<f32> = (0..n).map(|i| ((i * 7919) % 97) as f32 - 48.0).collect();
-            let mut fast = vec![0f32; n];
-            imdct_half(&input, &mut fast, 1.0);
-            let reference = imdct_reference(&input);
-            for (a, b) in fast.iter().zip(&reference) {
-                assert!((a - b).abs() < 1e-2 * (1.0 + b.abs()), "n {n}: {a} vs {b}");
+            let mut max_error = 0.0_f64;
+            let mut check = |input: &[f32], scale: f32| {
+                let mut fast = vec![0.0; n];
+                imdct_half(input, &mut fast, scale);
+                for (i, (&actual, expected)) in fast.iter().zip(imdct_reference(input)).enumerate() {
+                    let error = (f64::from(actual) - expected * f64::from(scale)).abs();
+                    assert!(error < 1e-5, "n {n}, sample {i}, error {error}");
+                    max_error = max_error.max(error);
+                }
+            };
+            let mut input = vec![0.0; n];
+            check(&input, 1.0);
+            for k in [0, 1, n / 2 - 1, n / 2, n - 2, n - 1] {
+                input[k] = -1.0;
+                check(&input, 1.0);
+                input[k] = 0.0;
             }
+            for (i, value) in input.iter_mut().enumerate() {
+                *value = [0.25, -0.25, f32::MIN_POSITIVE, -0.0][i % 4];
+            }
+            check(&input, 1.0);
+            for seed in [17, 91, 731, 8129] {
+                check(&noise(n, seed), 2.0 / n as f32 / 32768.0);
+            }
+            println!("n {n}: max absolute IMDCT error {max_error:e}");
         }
+    }
+
+    #[test]
+    fn decode_single_bin_xma_frame() {
+        // Mono, 48 kHz, one 512-sample subframe. All scale factors are equal,
+        // quant_step = 80 and coefficient 0 is +1, followed by end-of-block.
+        let frame = [0x00, 0xa5, 0x00, 0x0c, 0x03, 0x63, 0xff, 0xff, 0xf8, 0xab, 0x00];
+        let mut decoder = Decoder::new(1, 48_000);
+        let mut pcm = Vec::new();
+        decoder.decode(&frame, 82, &mut pcm).unwrap();
+        decoder.flush(&mut pcm);
+
+        let n = FRAME_SAMPLES;
+        let mut spectrum = vec![0.0; n];
+        spectrum[0] = 10_000.0;
+        let mut expected = vec![0.0; n / 2];
+        for sample in imdct_reference(&spectrum) {
+            expected.push(sample as f32 * (2.0 / n as f32 / 32768.0));
+        }
+        window_overlap(&mut expected[..n], &sine_window(n));
+        assert_eq!(pcm, expected.into_iter().map(to_i16).collect::<Vec<_>>());
     }
 
     /// The transform as it was before [`Rotations`]: every rotation worked
@@ -1345,6 +1489,141 @@ mod tests {
         }
         let mut out = [0f32; 0];
         imdct_half(&[], &mut out, 1.0);
+    }
+
+    /// The fast 8-byte `Bits::peek32` path matches the 5-byte tail loop at
+    /// every bit position across short, aligned, and tail-crossing buffers.
+    #[test]
+    fn fast_peek32_matches_byte_loop() {
+        for len in 0..=24 {
+            let data: Vec<u8> = (0..len)
+                .map(|i| ((i as u32).wrapping_mul(73).wrapping_add(0x5a)) as u8)
+                .collect();
+            for pos in 0..=(len * 8 + 16) {
+                let bits = Bits {
+                    data: &data,
+                    pos,
+                    end: len * 8,
+                };
+                assert_eq!(bits.peek32(), bits.peek32_tail(), "len {len} pos {pos}");
+            }
+        }
+    }
+
+    /// All 7 XMA2 Huffman tables match binary search across every code
+    /// boundary (exact code, code + span - 1, and random bitstreams).
+    #[test]
+    fn tabled_vlc_matches_binary_search() {
+        let c = codes();
+        let all = [
+            ("scale", &c.scale),
+            ("scale_rl", &c.scale_rl),
+            ("coef0", &c.coef[0]),
+            ("coef1", &c.coef[1]),
+            ("vec4", &c.vec4),
+            ("vec2", &c.vec2),
+            ("vec1", &c.vec1),
+        ];
+        for (name, vlc) in all {
+            for &(code, len, _) in &vlc.codes {
+                let end = code.wrapping_add((1u64 << (32 - len)).wrapping_sub(1) as u32);
+                for word in [code, end] {
+                    let bytes = word.to_be_bytes();
+                    let mut a = Bits { data: &bytes, pos: 0, end: 32 };
+                    let mut b = Bits { data: &bytes, pos: 0, end: 32 };
+                    assert_eq!(
+                        (vlc.read(&mut a), a.pos),
+                        (vlc.read_binary_search(&mut b), b.pos),
+                        "{name} word {word:#010x}"
+                    );
+                }
+            }
+            let mut rng = 0x1234_5678_9abc_def0u64;
+            let mut buf = vec![0u8; 4096];
+            for byte in &mut buf {
+                rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *byte = (rng >> 56) as u8;
+            }
+            let (mut a, mut b) = (
+                Bits { data: &buf, pos: 0, end: buf.len() * 8 - 32 },
+                Bits { data: &buf, pos: 0, end: buf.len() * 8 - 32 },
+            );
+            while a.pos < a.end {
+                assert_eq!(
+                    (vlc.read(&mut a), a.pos),
+                    (vlc.read_binary_search(&mut b), b.pos),
+                    "{name} stream pos {}",
+                    a.pos
+                );
+            }
+        }
+    }
+
+    /// `quant_factor` returns the exact `f32` bits of `10f32.powf(exp / 20.0)`
+    /// both inside and outside the cached range.
+    #[test]
+    fn quant_table_matches_powf_bits() {
+        for exp in -200..=300 {
+            let got = quant_factor(exp).to_bits();
+            let want = 10f32.powf(exp as f32 / 20.0).to_bits();
+            assert_eq!(got, want, "exp {exp}");
+        }
+    }
+
+    /// Release benchmark comparing tabled VLC + `quant_factor` against binary
+    /// search + `powf`:
+    /// `cargo test --release -p victory-formats vlc_and_quant_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn vlc_and_quant_throughput() {
+        let c = codes();
+        let mut rng = 0xfeed_face_cafe_babeu64;
+        let mut buf = vec![0u8; 65536];
+        for byte in &mut buf {
+            rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            *byte = (rng >> 56) as u8;
+        }
+        let end = (buf.len() - 8) * 8;
+        for (name, vlc) in [("coef0", &c.coef[0]), ("coef1", &c.coef[1]), ("vec4", &c.vec4)] {
+            let time_vlc = |f: fn(&Vlc, &mut Bits) -> i32| {
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let started = std::time::Instant::now();
+                    let mut sum = 0i64;
+                    let mut syms = 0u64;
+                    for _ in 0..20 {
+                        let mut bits = Bits { data: &buf, pos: 0, end };
+                        while bits.pos < bits.end {
+                            sum = sum.wrapping_add(f(vlc, &mut bits) as i64);
+                            syms += 1;
+                        }
+                    }
+                    std::hint::black_box(sum);
+                    best = best.min(started.elapsed().as_secs_f64() * 1e9 / syms as f64);
+                }
+                best
+            };
+            let before = time_vlc(Vlc::read_binary_search);
+            let after = time_vlc(Vlc::read);
+            println!("vlc {name:6}: bsearch {before:.2} ns/sym, lut {after:.2} ns/sym ({:.2}x)", before / after);
+        }
+        let exps: Vec<i32> = (-120..240).cycle().take(1_000_000).collect();
+        let time_q = |f: fn(i32) -> f32| {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let mut acc = 0.0f32;
+                for &e in &exps {
+                    acc += f(std::hint::black_box(e));
+                }
+                std::hint::black_box(acc);
+                best = best.min(started.elapsed().as_secs_f64() * 1e9 / exps.len() as f64);
+            }
+            best
+        };
+        let q_before = time_q(|e| 10f32.powf(e as f32 / 20.0));
+        let q_after = time_q(quant_factor);
+        println!("quant     : powf {q_before:.2} ns/op, lut {q_after:.2} ns/op ({:.2}x)", q_before / q_after);
     }
 
     /// The cached tables are the ones the sizes ask for.
@@ -1462,6 +1741,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn padding_marker_before_start_ends_the_search() {
+        let mut data = vec![0u8; 2 * PACKET_BYTES];
+        put_bits(&mut data, 0, 32, 2 << 26);
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, 0x7fff);
+        let start = HEADER_BITS + 100;
+        put_bits(&mut data, start, LENGTH_BITS, 100);
+        put_bits(&mut data, PACKET_BITS, 32, 1 << 26);
+        put_bits(&mut data, PACKET_BITS + HEADER_BITS, LENGTH_BITS, 100);
+        let frame = read_frame(&data, start).unwrap();
+        assert_eq!(frame.start, start);
+        assert_eq!(frame.next, None);
+    }
+
+    #[test]
+    fn truncated_frame_and_out_of_range_starts_are_rejected() {
+        let mut data = vec![0u8; 8];
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, 100);
+        assert!(read_frame(&data, HEADER_BITS).is_none());
+        assert!(read_frame(&data, data.len() * 8).is_none());
+        assert!(read_frame(&data, usize::MAX).is_none());
     }
 
     #[test]
@@ -1584,6 +1886,28 @@ mod tests {
     /// frame and ends within the frames the buffer can hold (each is over
     /// 15 bits and the walk only moves on).
     #[test]
+    fn first_frame_follows_stream_skips_past_continuation_packets() {
+        let mut data = vec![0; 3 * PACKET_BYTES];
+        // No starts in packet 0. Packet 1 belongs to another stream.
+        put_bits(&mut data, 0, 32, 1);
+        put_bits(&mut data, PACKET_BITS, 32, 1 << 26);
+        put_bits(&mut data, 2 * PACKET_BITS, 32, (1 << 26) | (9 << 11));
+        let start = 2 * PACKET_BITS + HEADER_BITS + 9;
+        put_bits(&mut data, start, 15, 31);
+        assert_eq!(first_frame(&data), Some(start));
+        assert_eq!(read_frame(&data, start).unwrap().bits, 31);
+        assert_eq!(first_frame(&data[..2 * PACKET_BYTES]), None);
+    }
+
+    #[test]
+    fn first_frame_rejects_an_offset_outside_the_announcing_payload() {
+        let mut data = vec![0; 2 * PACKET_BYTES];
+        let payload = (PACKET_BITS - HEADER_BITS) as u32;
+        put_bits(&mut data, 0, 32, (1 << 26) | (payload << 11));
+        assert_eq!(first_frame(&data), None);
+    }
+
+    #[test]
     fn noise_packets_walk_and_decode() {
         let mut noise = Noise(0x2545_f491_4f6c_dd1d);
         for round in 0..60 {
@@ -1608,7 +1932,7 @@ mod tests {
                 let mut decoder = Decoder::new(channels, 48_000);
                 let per_frame = FRAME_SAMPLES * channels;
                 let (mut pcm, mut frames) = (Vec::new(), 0);
-                let mut at = packet(&data, 0).map(|p| HEADER_BITS + p.first_frame_bit as usize);
+                let mut at = first_frame(&data);
                 while let Some(frame) = at.and_then(|bit| read_frame(&data, bit)) {
                     frames += 1;
                     let moves_on = frame.next.is_none_or(|next| next > frame.start);
@@ -1759,7 +2083,7 @@ mod tests {
             let rate = [24_000, 32_000, 44_100, 48_000][(word >> 27 & 3) as usize];
             let mut decoder = Decoder::new(1 + (word >> 29 & 1) as usize, rate);
             let (mut walked, mut errors, mut peak, mut pcm) = (0, 0, 0i16, Vec::new());
-            let mut at = Some(HEADER_BITS + packet(&data, 0).unwrap().first_frame_bit as usize);
+            let mut at = first_frame(&data);
             while let Some(frame) = at.and_then(|bit| read_frame(&data, bit)) {
                 pcm.clear();
                 errors += decoder.decode(&frame.data, frame.bits, &mut pcm).is_err() as u32;
@@ -1797,7 +2121,7 @@ mod tests {
                 .collect();
             let mut decoder = Decoder::new(channels, 48_000);
             let mut pcm = Vec::new();
-            let mut at = Some(HEADER_BITS + packet(&data, 0).unwrap().first_frame_bit as usize);
+            let mut at = first_frame(&data);
             let mut errors = 0;
             while let Some(frame) = at.and_then(|bit| read_frame(&data, bit)) {
                 errors += decoder.decode(&frame.data, frame.bits, &mut pcm).is_err() as usize;

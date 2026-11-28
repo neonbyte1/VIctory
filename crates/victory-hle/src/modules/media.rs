@@ -92,10 +92,25 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         let whole = percent_decode(path);
         let path = percent_decode(path.trim_start_matches(['/', '\\'])).replace('/', "\\");
         if !drive(&path) {
-            // With no host named, a path that starts with two separators
-            // names one: `file:////server/share` is `\\server\share`.
-            if !this_machine && share(&whole) {
-                return Err((scheme, host_of(whole.trim_start_matches(['/', '\\']))));
+            // After `localhost`, `PathCreateFromUrlW` consumes one leading
+            // separator; two or more remaining separators still name a share
+            // (`file://localhost///server/share` -> `\\server\share`).
+            let effective = if this_machine {
+                whole.strip_prefix(['/', '\\']).unwrap_or(&whole)
+            } else {
+                &whole
+            };
+            if share(effective) {
+                return Err((scheme, host_of(effective.trim_start_matches(['/', '\\']))));
+            }
+            if let Some(rest) = path.trim_start_matches('\\').strip_prefix(r"??\")
+                && !drive(rest)
+            {
+                let host = rest
+                    .get(..4)
+                    .filter(|p| p.eq_ignore_ascii_case(r"UNC\"))
+                    .map_or(rest, |_| &rest[4..]);
+                return Err((scheme, host_of(host)));
             }
             // A local file without a drive: the host resolves it as is.
             return Ok(with_nul(url));
@@ -591,6 +606,63 @@ mod tests {
         assert_eq!(
             asked("file:////C:/Windows/a.wav"),
             Ok(r"C:\Windows\a.wav".into())
+        );
+    }
+
+    const LOCALHOST_SHARE_URLS: [&str; 3] = [
+        "file://localhost///server/share/a.mp4",
+        r"file://localhost/\\server/share/a.mp4",
+        "file://localhost/%5C%5Cserver/share/a.mp4",
+    ];
+    const OBJECT_PREFIX_SHARE_URL: &str = "file:///%3F%3F/UNC/server/share/a.mp4";
+
+    #[test]
+    fn localhost_and_object_prefix_file_urls_are_refused() {
+        let asked = |url: &str| local(&wide(url)).map(|v| text(&v));
+        for url in LOCALHOST_SHARE_URLS
+            .into_iter()
+            .chain([OBJECT_PREFIX_SHARE_URL])
+        {
+            assert_eq!(asked(url), Err(("file".into(), "server".into())), "{url}");
+        }
+        // Control: two slashes after `localhost` become one leading backslash,
+        // which is a local path on the current drive.
+        assert_eq!(
+            asked("file://localhost//server/share/a.mp4"),
+            Ok("file://localhost//server/share/a.mp4".into())
+        );
+        // Control: a drive after `\??\` stays local.
+        assert_eq!(
+            asked("file:///%3F%3F/C:/Windows/a.wav"),
+            Ok("file:///%3F%3F/C:/Windows/a.wav".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_host_reads_localhost_and_object_prefix_share_urls_as_shares() {
+        let from_url = files::host!("shlwapi.dll", "PathCreateFromUrlW":
+            extern "system" fn(*const u16, *mut u16, *mut u32, u32) -> HRESULT);
+        let host_path = |url: &str| {
+            let url: Vec<u16> = url.encode_utf16().chain([0]).collect();
+            let (mut path, mut n) = ([0u16; 260], 260);
+            assert_eq!(from_url(url.as_ptr(), path.as_mut_ptr(), &mut n, 0), S_OK);
+            String::from_utf16_lossy(&path[..n as usize])
+        };
+        for url in LOCALHOST_SHARE_URLS {
+            let path = host_path(url);
+            assert!(
+                path.starts_with(r"\\") && path.ends_with(r"server\share\a.mp4"),
+                "{url}: {path}"
+            );
+        }
+        assert_eq!(
+            host_path(OBJECT_PREFIX_SHARE_URL),
+            r"\??\UNC\server\share\a.mp4"
+        );
+        assert_eq!(
+            host_path("file://localhost//server/share/a.mp4"),
+            r"\server\share\a.mp4"
         );
     }
 

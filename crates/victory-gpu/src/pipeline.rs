@@ -76,18 +76,66 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+/// Optional idle-cache sweeps are amortized over new containers, not hits.
+const SHADER_TRIM_INTERVAL: usize = 256;
+
+#[derive(Default)]
+struct ShaderCache {
+    entries: HashMap<[u8; 32], Arc<Shader>>,
+    misses_since_trim: usize,
+}
+
+impl ShaderCache {
+    fn get(
+        &mut self,
+        full: blake3::Hash,
+        stage: &'static str,
+        bytes: &[u8],
+        trim: bool,
+    ) -> Arc<Shader> {
+        if let Some(shader) = self.entries.get(full.as_bytes()) {
+            return shader.clone();
+        }
+        if trim {
+            self.misses_since_trim += 1;
+            if self.misses_since_trim == SHADER_TRIM_INTERVAL {
+                self.misses_since_trim = 0;
+                self.trim_idle();
+            }
+        }
+        let shader = Arc::new(Shader::new(stage, bytes));
+        self.entries.insert(*full.as_bytes(), shader.clone());
+        shader
+    }
+
+    /// Keep all containers still owned by a pipeline, worker or other user.
+    /// The cache lock prevents another lookup from racing with eviction.
+    fn trim_idle(&mut self) {
+        let before = self.entries.len();
+        self.entries.retain(|_, shader| Arc::strong_count(shader) > 1);
+        let removed = before - self.entries.len();
+        if removed != 0 {
+            // Avoid retaining a large table after a substantial sweep.
+            if self.entries.capacity() > self.entries.len().saturating_mul(2).max(256) {
+                self.entries.shrink_to_fit();
+            }
+            tracing::debug!(removed, remaining = self.entries.len(), "idle shaders trimmed");
+        }
+    }
+}
+
+/// Containers shared by full content hash. By default they stay for the run.
+static SHADERS: Mutex<Option<ShaderCache>> = Mutex::new(None);
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+    static TRIM: OnceLock<bool> = OnceLock::new();
+    let trim = *TRIM.get_or_init(|| {
+        matches!(std::env::var("VICTORY_TRIM_IDLE_SHADERS").as_deref(), Ok("1"))
+    });
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
-        .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
-        .clone()
+    shaders.get_or_insert_with(ShaderCache::default).get(full, stage, bytes, trim)
 }
 
 impl Shader {
@@ -111,6 +159,18 @@ impl Shader {
     }
 }
 
+/// Tests: a shader whose translation is `translated` (its container is
+/// the host code), for host pipelines without a console program.
+#[cfg(all(test, windows))]
+pub(crate) fn translated_for_test(
+    stage: &'static str,
+    translated: Translated,
+) -> std::sync::Arc<Shader> {
+    let shader = Shader::new(stage, &translated.host.dxil);
+    let _ = shader.translated.set(Some(translated));
+    std::sync::Arc::new(shader)
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -118,13 +178,179 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+#[cfg(all(windows, any(feature = "diagnostics", test)))]
+mod timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    #[derive(Default)]
+    pub(super) struct Counter {
+        calls: AtomicU64,
+        us: AtomicU64,
+    }
+
+    impl Counter {
+        pub(super) fn record(&self, us: u64) {
+            self.us.fetch_add(us, Ordering::Relaxed);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn snapshot(&self) -> (u64, u64) {
+            (self.calls.load(Ordering::Relaxed), self.us.load(Ordering::Relaxed))
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) static INITIALIZE: Counter = Counter {
+        calls: AtomicU64::new(0),
+        us: AtomicU64::new(0),
+    };
+    #[cfg(feature = "diagnostics")]
+    pub(super) static WAIT: Counter = Counter {
+        calls: AtomicU64::new(0),
+        us: AtomicU64::new(0),
+    };
+    #[cfg(feature = "diagnostics")]
+    pub(super) static HOST: Counter = Counter {
+        calls: AtomicU64::new(0),
+        us: AtomicU64::new(0),
+    };
+    #[cfg(feature = "diagnostics")]
+    pub(super) static WORK: Counter = Counter {
+        calls: AtomicU64::new(0),
+        us: AtomicU64::new(0),
+    };
+
+    // Only the caller whose initializer executes owns initialization time.
+    // A racing completion may make the measured wait effectively zero.
+    fn lookup<'a, T>(
+        cell: &'a OnceLock<T>,
+        initialize: impl FnOnce() -> T,
+        init: &Counter,
+        wait: &Counter,
+    ) -> &'a T {
+        if let Some(value) = cell.get() {
+            return value;
+        }
+        lookup_uncached(cell, initialize, init, wait)
+    }
+
+    // A lookup that observed an empty cell may race with another initializer.
+    fn lookup_uncached<'a, T>(
+        cell: &'a OnceLock<T>,
+        initialize: impl FnOnce() -> T,
+        init: &Counter,
+        wait: &Counter,
+    ) -> &'a T {
+        let started = Instant::now();
+        let mut initialized = false;
+        let result = cell.get_or_init(|| {
+            initialized = true;
+            initialize()
+        });
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        if initialized {
+            init.record(elapsed_us);
+        } else {
+            wait.record(elapsed_us);
+        }
+        result
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn shader_lookup<T>(
+        cell: &OnceLock<T>,
+        initialize: impl FnOnce() -> T,
+    ) -> &T {
+        lookup(cell, initialize, &INITIALIZE, &WAIT)
+    }
+
+    // Cumulative process totals; snapshots are approximate while work is active.
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn report() {
+        let (initializations, initialization_us) = INITIALIZE.snapshot();
+        let (dependency_lookups, dependency_lookup_us) = WAIT.snapshot();
+        let (host_attempts, host_us) = HOST.snapshot();
+        let (worker_jobs, worker_job_us) = WORK.snapshot();
+        tracing::info!(
+            initializations,
+            initialization_us,
+            dependency_lookups,
+            dependency_lookup_us,
+            host_attempts,
+            host_us,
+            worker_jobs,
+            worker_job_us,
+            "cumulative pipeline timing"
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn completed_and_failed_initializations_are_not_counted_twice() {
+            let cell = OnceLock::new();
+            let init = Counter::default();
+            let wait = Counter::default();
+            assert_eq!(*lookup(&cell, || None::<u32>, &init, &wait), None);
+            assert_eq!(*lookup(&cell, || panic!("must not retry"), &init, &wait), None);
+            assert_eq!(init.snapshot().0, 1);
+            assert_eq!(wait.snapshot(), (0, 0));
+        }
+
+        #[test]
+        fn racing_completion_is_attributed_to_dependency_lookup() {
+            let cell = OnceLock::new();
+            let init = Counter::default();
+            let wait = Counter::default();
+            // Model a caller that observed an empty cell, then lost the race
+            // to a second caller before entering get_or_init.
+            assert!(cell.get().is_none());
+            assert_eq!(*lookup(&cell, || 42, &init, &wait), 42);
+            let before = init.snapshot();
+            assert_eq!(
+                *lookup_uncached(&cell, || panic!("must not initialize again"), &init, &wait),
+                42
+            );
+            assert_eq!(init.snapshot(), before);
+            assert_eq!(wait.snapshot().0, 1);
+        }
+
+        #[test]
+        fn successful_cached_lookup_does_not_record_a_wait() {
+            let cell = OnceLock::new();
+            let init = Counter::default();
+            let wait = Counter::default();
+            assert_eq!(*lookup(&cell, || 42, &init, &wait), 42);
+            let before = init.snapshot();
+            assert_eq!(*lookup(&cell, || panic!("must not retry"), &init, &wait), 42);
+            assert_eq!(init.snapshot(), before);
+            assert_eq!(wait.snapshot(), (0, 0));
+        }
+
+        #[test]
+        fn separate_uncached_shaders_are_attributed_to_initialization() {
+            let init = Counter::default();
+            let wait = Counter::default();
+            let first = OnceLock::new();
+            let second = OnceLock::new();
+            assert_eq!(*lookup(&first, || 7, &init, &wait), 7);
+            assert_eq!(*lookup(&second, || 13, &init, &wait), 13);
+            assert_eq!(init.snapshot().0, 2);
+            assert_eq!(wait.snapshot(), (0, 0));
+        }
+    }
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
-            .get_or_init(|| {
+        let initialize = || {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
                 let (done, cached) = translate(&self.container);
                 let ms = started.elapsed().as_millis() as u64;
@@ -153,8 +379,12 @@ impl Shader {
                     ),
                 }
                 done.ok()
-            })
-            .as_ref()
+        };
+        #[cfg(feature = "diagnostics")]
+        let result = timing::shader_lookup(&self.translated, initialize);
+        #[cfg(not(feature = "diagnostics"))]
+        let result = self.translated.get_or_init(initialize);
+        result.as_ref()
     }
 
     /// The console resources its code reads, without translating it (the
@@ -365,10 +595,27 @@ pub(crate) fn hurry_feeders(feeders: &[Waited]) {
     }
 }
 
+/// A dispatch with the title pipeline was not run on the host (`why`): one
+/// of the acceleration-structure builder's holds the builder back
+/// ([`builder::dropped`]).
+#[cfg(windows)]
+pub(crate) fn not_dispatched(this: This, why: &str) {
+    if !this.is_null() && pipeline(this).builder {
+        builder::dropped(&pipeline(this).host, why);
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Milliseconds in which a recording thread waited for a host pipeline
+/// since the last call (see [`make::take_waited_ms`]).
+#[cfg(windows)]
+pub(crate) fn take_waited_ms() -> f64 {
+    make::take_waited_ms()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -711,6 +958,8 @@ mod builder;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod journal;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
@@ -721,6 +970,7 @@ mod placed_uav_tests;
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
+    journal::use_dir(dir.with_file_name("pipeline-journal"));
     library::use_pipeline_cache(dir);
 }
 
@@ -796,9 +1046,7 @@ impl Prebuild {
         });
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
-        if made.is_some() {
-            // shortcut: a pipeline the library refused to store is listed
-            // too; a run then makes it at first use.
+        if made.as_ref().is_some_and(|pipeline| pipeline.in_library) {
             library::note_prebuilt(key);
         }
         library::save(false);
@@ -924,6 +1172,146 @@ mod tests {
         for q in [p, other] {
             slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
         }
+    }
+
+    /// A compute shader that only ends (`s_endpgm`), translated.
+    #[cfg(windows)]
+    fn ending_shader() -> Arc<Shader> {
+        use victory_shader::native::{ComputeIo, NativeProgram, StageIo};
+        use victory_shader::{Container, HwStage, emit, io, ir, resource, structure};
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+        };
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let host = emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY)
+            .unwrap();
+        Shader::for_test(
+            "compute",
+            Translated {
+                host,
+                used: native.used,
+            },
+        )
+    }
+
+    /// A dispatch of a made builder pipeline that is dropped all the same
+    /// (as `State::bind` drops one whose root view offset it cannot place)
+    /// holds the builder back at once and in later frames, until the title
+    /// releases that pipeline.
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_builder_dispatch_holds_the_builder() {
+        let _one = builder::test_lock();
+        let image = [0xB0u8; 64];
+        builder::note_title_dll("XboxBvhBuilder.dll", image.as_ptr() as usize, image.len());
+        let mut p: This = std::ptr::null();
+        assert_eq!(
+            hand_out(
+                vec![ending_shader()],
+                None,
+                &[image.as_ptr()],
+                &PIPELINE_IIDS[0],
+                &mut p
+            ),
+            S_OK
+        );
+        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
+        let release = || slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
+        assert!(pipeline(p).builder);
+        let made = (0..500).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host)
+        });
+        if made != Some(true) {
+            release();
+            return; // no host GPU here
+        }
+        assert!(
+            !held_back(p),
+            "every builder pipeline made: the builder runs"
+        );
+        not_dispatched(
+            p,
+            "a root view's offset: no root view, or outside title buffers",
+        );
+        assert!(held_back(p), "held back for the rest of the frame");
+        builder::forget_decision();
+        assert!(held_back(p), "and in later frames");
+        release();
+        builder::forget_decision();
+        assert!(builder::runs(), "the pipeline released: the hold is lifted");
+    }
+
+    #[test]
+    fn idle_shader_trim_preserves_live_identity() {
+        let mut cache = ShaderCache::default();
+        let live_hash = blake3::hash(b"live");
+        let idle_hash = blake3::hash(b"idle");
+        let live = cache.get(live_hash, "compute", b"live", true);
+        let idle = cache.get(idle_hash, "compute", b"idle", true);
+        let idle_weak = Arc::downgrade(&idle);
+        drop(idle);
+        cache.trim_idle();
+        assert!(idle_weak.upgrade().is_none());
+        assert!(!cache.entries.contains_key(idle_hash.as_bytes()));
+        assert!(Arc::ptr_eq(
+            &live,
+            &cache.get(live_hash, "compute", b"live", true)
+        ));
+        let recreated = cache.get(idle_hash, "compute", b"idle", true);
+        assert_eq!(recreated.container.as_slice(), b"idle");
+        assert_eq!(recreated.hash, idle_hash.to_hex()[..16]);
+    }
+
+    #[test]
+    fn idle_shader_trim_is_opt_in_and_amortized_over_misses() {
+        let mut cache = ShaderCache::default();
+        let old = blake3::hash(b"old");
+        drop(cache.get(old, "compute", b"old", false));
+        cache.misses_since_trim = SHADER_TRIM_INTERVAL - 1;
+        drop(cache.get(blake3::hash(b"disabled"), "compute", b"disabled", false));
+        assert!(cache.entries.contains_key(old.as_bytes()));
+        // A cache hit must not trigger a sweep.
+        drop(cache.get(old, "compute", b"old", true));
+        assert_eq!(cache.misses_since_trim, SHADER_TRIM_INTERVAL - 1);
+        assert!(cache.entries.contains_key(old.as_bytes()));
+        drop(cache.get(blake3::hash(b"new"), "compute", b"new", true));
+        assert_eq!(cache.misses_since_trim, 0);
+        assert!(!cache.entries.contains_key(old.as_bytes()));
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn idle_shader_trim_reduces_retained_container_bytes() {
+        let retained = |trim| {
+            let mut cache = ShaderCache::default();
+            let mut bytes = vec![0; 64 * 1024];
+            for index in 0..SHADER_TRIM_INTERVAL {
+                bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                drop(cache.get(blake3::hash(&bytes), "compute", &bytes, trim));
+            }
+            cache.entries.values().map(|shader| shader.container.len()).sum::<usize>()
+        };
+        // Synthetic payloads only; no shader translation or GPU is involved.
+        assert_eq!(retained(false), SHADER_TRIM_INTERVAL * 64 * 1024);
+        assert_eq!(retained(true), 64 * 1024);
     }
 
     #[test]

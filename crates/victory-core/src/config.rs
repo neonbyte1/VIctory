@@ -54,18 +54,7 @@ impl Config {
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
-        let file = if path.is_file() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            Some((path, text))
-        } else if let Some(p) = explicit {
-            anyhow::bail!(
-                "VICTORY_CONFIG points at {}, which does not exist",
-                p.display()
-            );
-        } else {
-            None
-        };
+        let file = read_config_file(&path, explicit.is_some())?.map(|text| (path, text));
         let (source, parsed) = match file {
             Some((path, text)) => {
                 let parsed: FileConfig =
@@ -132,6 +121,17 @@ fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Opt
         .map(PathBuf::from)
 }
 
+/// A missing implicit config is optional; an unreadable one is not.
+fn read_config_file(path: &Path, required: bool) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
+        Err(error) if required => Err(error)
+            .with_context(|| format!("reading VICTORY_CONFIG at {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     let dir = root.join(sub);
     ensure_outside_repo(&dir)?;
@@ -141,10 +141,17 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
 
 /// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
 fn default_dir(name: &str) -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    default_dir_from(name, |k| std::env::var_os(k))
+}
+
+fn default_dir_from(
+    name: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let get = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = get("LOCALAPPDATA")
+        .or_else(|| get("XDG_CACHE_HOME"))
+        .or_else(|| get("HOME").map(|h| h.join(".cache")))
         .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
     Ok(base.join("victory").join(name))
 }
@@ -153,6 +160,44 @@ fn default_dir(name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn missing_implicit_config_is_optional_but_explicit_is_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        assert_eq!(read_config_file(&path, false).unwrap(), None);
+        assert!(read_config_file(&path, true).is_err());
+        std::fs::write(&path, "[paths]").unwrap();
+        assert_eq!(
+            read_config_file(&path, false).unwrap().as_deref(),
+            Some("[paths]")
+        );
+    }
+
+    #[test]
+    fn unreadable_implicit_config_is_not_silently_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_config_file(&path, false).is_err());
+        assert!(read_config_file(&path, true).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_config_is_an_error_in_both_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("victory.toml");
+        std::fs::write(&path, [0xff]).unwrap();
+        for required in [false, true] {
+            let error = read_config_file(&path, required).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert!(error.to_string().contains("victory.toml"));
+            assert_eq!(error.to_string().contains("VICTORY_CONFIG"), required);
+        }
+    }
 
     #[test]
     fn environment_overrides_file() {
@@ -237,5 +282,28 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.data_subdir("x").is_err());
+    }
+
+    #[test]
+    fn default_dir_ignores_empty_user_env_vars() {
+        let dir = default_dir_from("cache", |k| match k {
+            "LOCALAPPDATA" | "XDG_CACHE_HOME" => Some(OsString::new()),
+            "HOME" => Some(OsString::from("/tmp/victory-home")),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            dir,
+            PathBuf::from("/tmp/victory-home")
+                .join(".cache")
+                .join("victory")
+                .join("cache")
+        );
+
+        let missing = default_dir_from("cache", |k| match k {
+            "LOCALAPPDATA" | "XDG_CACHE_HOME" | "HOME" => Some(OsString::new()),
+            _ => None,
+        });
+        assert!(missing.is_err());
     }
 }

@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+mod reuse;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 
@@ -15,6 +17,7 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -92,6 +95,8 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FPTrunc = 7,
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -232,6 +237,9 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
+    }
+    pub fn double(&mut self) -> Ty {
+        self.ty(TypeDef::Double)
     }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
@@ -518,6 +526,18 @@ impl Module {
         }
     }
 
+    /// The first word of the resource properties on an annotated handle.
+    fn resource_props0(&self, handle: V) -> Option<i64> {
+        let V::Inst(i) = handle else { return None };
+        let Op::Call(f, args) = &self.insts[i as usize].op else { return None };
+        if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
+            return None;
+        }
+        let [_, _, V::Const(props)] = args[..] else { return None };
+        let Const::Aggregate(fields) = &self.consts[props as usize].1 else { return None };
+        self.int_value(V::Const(*fields.first()?))
+    }
+
     /// What the instructions [`Module::write`] writes use, of what the
     /// shader flags declare (which must match it, or the validator refuses
     /// the module: "Flags must match usage").
@@ -539,6 +559,18 @@ impl Module {
                     u.sampler_heap |= sampler;
                 }
                 u.wave |= name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad");
+                if name == "dx.op.annotateHandle" {
+                    u.rovs |= self.resource_props0(V::Inst(i)).is_some_and(|p| p & 0x2000 != 0);
+                } else if !u.typed_uav_loads
+                    && (name.starts_with("dx.op.bufferLoad.") || name.starts_with("dx.op.textureLoad."))
+                {
+                    // Lowering chooses the descriptor index before creating and
+                    // annotating the handle, so the load reads the annotation directly.
+                    u.typed_uav_loads = args
+                        .get(1)
+                        .and_then(|&h| self.resource_props0(h))
+                        .is_some_and(|p| p & 0x1000 != 0 && (1..=10).contains(&(p & 0xFF)));
+                }
             }
         }
         u
@@ -717,15 +749,18 @@ impl Module {
         })
     }
 
-    /// Calls of functions named `name` that [`Module::write`] writes.
+    /// Arguments of calls to `name` that [`Module::write`] writes.
     #[cfg(test)]
-    pub fn written_calls(&self, name: &str) -> usize {
+    pub fn written_calls<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a [V]> {
         let plan = self.plan();
-        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
-        calls
-            .filter(|&&i| plan.live[i as usize])
-            .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name))
-            .count()
+        plan.layout
+            .into_iter()
+            .flat_map(|b| &self.blocks[b].body)
+            .filter(move |&&i| plan.live[i as usize])
+            .filter_map(move |&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => Some(args.as_slice()),
+                _ => None,
+            })
     }
 
     /// Test builds: the headers each written block branches back to, as
@@ -1061,6 +1096,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -1336,6 +1372,10 @@ pub struct Uses {
     pub wave: bool,
     /// 64-bit integers.
     pub int64: bool,
+    /// Loads from typed unordered access views.
+    pub typed_uav_loads: bool,
+    /// Rasterizer-ordered view annotations.
+    pub rovs: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).
@@ -1373,7 +1413,7 @@ impl Plan {
     /// is still there (not a constant branch's other edge, not from a block
     /// left out).
     fn edge(&self, m: &Module, b: usize, x: usize) -> bool {
-        self.seen[b] && successors(m.term(b)).iter().any(|&s| self.to(s) == x)
+        self.seen[b] && successors(m.term(b)).contains(&x)
     }
 }
 
@@ -1823,6 +1863,44 @@ mod tests {
         assert!(plan.edge(&m, f2, t2) && plan.edge(&m, q2, t2));
         assert!(!plan.layout.contains(&f2));
         let _ = m.write();
+    }
+
+    /// A constant branch to an empty block that folds into the other target:
+    /// the join's phi drops the untaken direct edge instead of emitting two
+    /// entries for the same predecessor.
+    #[test]
+    fn a_constant_branch_through_a_folded_block_drops_the_direct_phi_entry() {
+        let build = |with_dead_edge: bool| {
+            let (mut m, b, sink) = module(3);
+            let [entry, empty, join] = b[..] else {
+                unreachable!()
+            };
+            let i32t = m.int(32);
+            let (one, two, t) = (m.i32(1), m.i32(2), m.bool(true));
+            let term = if with_dead_edge {
+                Term::CondBr(t, empty, join)
+            } else {
+                Term::Br(empty)
+            };
+            m.terminate(entry, term);
+            m.terminate(empty, Term::Br(join));
+            let phi = m.phi(join, i32t);
+            let inc = if with_dead_edge {
+                vec![(one, empty), (two, entry)]
+            } else {
+                vec![(one, empty)]
+            };
+            m.set_phi(phi, inc);
+            let _ = m.call(join, sink, vec![phi]);
+            m.terminate(join, Term::Ret);
+            m
+        };
+        let m = build(true);
+        let plan = m.plan();
+        assert_eq!(plan.fold[1], Some((0, 2)));
+        assert!(plan.edge(&m, 1, 2), "the taken folded edge stays");
+        assert!(!plan.edge(&m, 0, 2), "the untaken direct edge goes");
+        assert_eq!(m.write(), build(false).write());
     }
 
     /// A value only a dropped value reads is dropped too; operations with

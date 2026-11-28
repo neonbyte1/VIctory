@@ -121,6 +121,9 @@ impl CodeViewInfo {
 /// Upper bound on TLS callbacks we are willing to walk (defends against garbage).
 const MAX_TLS_CALLBACKS: usize = 1024;
 
+/// Size of `IMAGE_TLS_DIRECTORY64`.
+const TLS_DIRECTORY_SIZE: u32 = size_of::<pe::ImageTlsDirectory64>() as u32;
+
 impl ImageInfo {
     /// Parses a complete PE32+ x86-64 image from its file bytes.
     pub fn parse(data: &[u8]) -> Result<Self, PeError> {
@@ -186,12 +189,12 @@ impl ImageInfo {
         };
 
         let imports = match file.import_table()? {
-            Some(table) => parse_imports(&table, opt.size_of_image())?,
+            Some(table) => parse_imports(&table, &sections, opt.size_of_image())?,
             None => Vec::new(),
         };
-        let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
+        let delay_imports = parse_delay_imports(&file, &sections, opt.size_of_image())?;
         let exports = parse_exports(&file, opt.image_base())?;
-        let tls = parse_tls(&file, data, opt.image_base())?;
+        let tls = parse_tls(&file, data, opt.image_base(), opt.size_of_image())?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
             guid: cv.guid(),
@@ -280,6 +283,7 @@ fn convert_import(import: Import<'_>) -> ImportSymbol {
 
 fn parse_imports(
     table: &ImportTable<'_>,
+    sections: &[SectionInfo],
     size_of_image: u32,
 ) -> Result<Vec<ImportModule>, PeError> {
     let mut modules = Vec::new();
@@ -293,9 +297,13 @@ fn parse_imports(
         };
         modules.push(ImportModule {
             dll: utf8(table.name(desc.name.get(LE))?),
-            entries: entries(table.thunks(int_rva)?, iat_rva, size_of_image, |t| {
-                table.import::<ImageNtHeaders64>(t)
-            })?,
+            entries: entries(
+                table.thunks(int_rva)?,
+                iat_rva,
+                sections,
+                size_of_image,
+                |t| table.import::<ImageNtHeaders64>(t),
+            )?,
         });
     }
     Ok(modules)
@@ -303,6 +311,7 @@ fn parse_imports(
 
 fn parse_delay_imports(
     file: &PeFile64<'_>,
+    sections: &[SectionInfo],
     size_of_image: u32,
 ) -> Result<Vec<ImportModule>, PeError> {
     let Some(table) = file.delay_load_import_table()? else {
@@ -316,6 +325,7 @@ fn parse_delay_imports(
             entries: entries(
                 table.thunks(desc.import_name_table_rva.get(LE))?,
                 desc.import_address_table_rva.get(LE),
+                sections,
                 size_of_image,
                 |t| table.import::<ImageNtHeaders64>(t),
             )?,
@@ -324,11 +334,32 @@ fn parse_delay_imports(
     Ok(modules)
 }
 
+/// Returns whether the 8-byte IAT slot at `rva` lies inside one file-backed
+/// section.
+fn iat_slot_in_section(sections: &[SectionInfo], rva: u32) -> bool {
+    sections.iter().any(|s| {
+        let Some(delta) = rva.checked_sub(s.rva) else {
+            return false;
+        };
+        let backed = match s.virtual_size {
+            0 => s.file_size,
+            vs => vs.min(s.file_size),
+        };
+        delta.checked_add(8).is_some_and(|end| end <= backed)
+            && s.file_offset
+                .checked_add(delta)
+                .and_then(|offset| offset.checked_add(7))
+                .is_some()
+    })
+}
+
 /// Pairs each name-table entry with its IAT slot. The IAT RVA is not checked
-/// by `object`, so every slot is checked to lie inside the image here.
+/// by `object`, so every slot is checked to lie inside a file-backed section
+/// within the image here.
 fn entries<'data>(
     mut thunks: ImportThunkList<'data>,
     iat_rva: u32,
+    sections: &[SectionInfo],
     size_of_image: u32,
     import: impl Fn(pe::ImageThunkData64) -> object::read::Result<Import<'data>>,
 ) -> Result<Vec<ImportEntry>, PeError> {
@@ -337,9 +368,14 @@ fn entries<'data>(
         let iat_slot_rva = u32::try_from(entries.len() * 8)
             .ok()
             .and_then(|offset| iat_rva.checked_add(offset))
-            .filter(|&rva| rva.checked_add(8).is_some_and(|end| end <= size_of_image))
+            .filter(|&rva| {
+                rva.checked_add(8).is_some_and(|end| end <= size_of_image)
+                    && iat_slot_in_section(sections, rva)
+            })
             .ok_or_else(|| {
-                PeError::Malformed(format!("IAT at {iat_rva:#x} runs outside the image"))
+                PeError::Malformed(format!(
+                    "IAT at {iat_rva:#x} runs outside a file-backed section"
+                ))
             })?;
         entries.push(ImportEntry {
             symbol: convert_import(import(thunk)?),
@@ -395,6 +431,7 @@ fn parse_tls(
     file: &PeFile64<'_>,
     data: &[u8],
     image_base: u64,
+    size_of_image: u32,
 ) -> Result<Option<TlsInfo>, PeError> {
     let Some(dd) = file.data_directory(pe::IMAGE_DIRECTORY_ENTRY_TLS) else {
         return Ok(None);
@@ -402,6 +439,16 @@ fn parse_tls(
     let directory_rva = dd.virtual_address.get(LE);
     if directory_rva == 0 {
         return Ok(None);
+    }
+    // Header values are untrusted. The loader reads the directory's index
+    // field from the mapped image, so all of the directory must lie inside it.
+    if directory_rva
+        .checked_add(TLS_DIRECTORY_SIZE)
+        .is_none_or(|end| end > size_of_image)
+    {
+        return Err(PeError::Malformed(format!(
+            "TLS directory at {directory_rva:#x} runs outside the image"
+        )));
     }
     let sections = file.section_table();
     let tls = sections
@@ -412,7 +459,7 @@ fn parse_tls(
 
     let mut callback_rvas = Vec::new();
     if callbacks_va != 0 {
-        let array_rva = va_to_rva(callbacks_va, image_base)?;
+        let array_rva = va_to_rva(callbacks_va, image_base, size_of_image)?;
         let array = sections
             .pe_data_at(data, array_rva)
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
@@ -421,7 +468,7 @@ fn parse_tls(
             if va == 0 {
                 break;
             }
-            callback_rvas.push(va_to_rva(va, image_base)?);
+            callback_rvas.push(va_to_rva(va, image_base, size_of_image)?);
         }
     }
     Ok(Some(TlsInfo {
@@ -431,9 +478,10 @@ fn parse_tls(
     }))
 }
 
-fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
+fn va_to_rva(va: u64, image_base: u64, size_of_image: u32) -> Result<u32, PeError> {
     va.checked_sub(image_base)
         .and_then(|rva| u32::try_from(rva).ok())
+        .filter(|&rva| rva < size_of_image)
         .ok_or_else(|| PeError::Malformed(format!("VA 0x{va:x} is outside the image")))
 }
 
@@ -475,13 +523,15 @@ mod tests {
 
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
-        let mut info = ImageInfo::parse(&own_image()).unwrap();
-        let rva = info.sections[0].rva + 0x20;
-        assert!(info.rva_to_file_offset(rva).is_some());
+        let mut info = section_image(0x200, 0x200);
+        assert_eq!(info.rva_to_file_offset(0x1020), Some(0x220));
         // Used to overflow (a panic in debug builds, a wrong offset in
         // release ones).
         info.sections[0].file_offset = u32::MAX - 0x10;
-        assert_eq!(info.rva_to_file_offset(rva), None);
+        assert_eq!(info.rva_to_file_offset(0x1000), Some(u32::MAX - 0x10));
+        assert_eq!(info.rva_to_file_offset(0x1010), Some(u32::MAX));
+        assert_eq!(info.rva_to_file_offset(0x1011), None);
+        assert_eq!(info.rva_to_file_offset(0x1020), None);
     }
 
     #[test]
@@ -509,6 +559,41 @@ mod tests {
             Err(PeError::Malformed(_))
         ));
     }
+
+    #[test]
+    fn rejects_null_iat_for_regular_imports() {
+        let mut data = own_image();
+        let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
+        let import_rva = layout::read_u32(&data, dd).unwrap();
+        let info = ImageInfo::parse(&data).unwrap();
+        let desc = info.rva_to_file_offset(import_rva).unwrap() as usize;
+        assert_ne!(layout::read_u32(&data, desc).unwrap(), 0); // OriginalFirstThunk
+        assert!(!info.imports[0].entries.is_empty());
+
+        data[desc + 16..desc + 20].fill(0); // FirstThunk
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_header_iat_for_regular_imports() {
+        let mut data = own_image();
+        let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
+        let import_rva = layout::read_u32(&data, dd).unwrap();
+        let info = ImageInfo::parse(&data).unwrap();
+        let desc = info.rva_to_file_offset(import_rva).unwrap() as usize;
+        assert_ne!(layout::read_u32(&data, desc).unwrap(), 0); // OriginalFirstThunk
+        assert!(!info.imports[0].entries.is_empty());
+
+        data[desc + 16..desc + 20].copy_from_slice(&0x40u32.to_le_bytes()); // FirstThunk in headers
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
     /// A minimal PE32+ image: one section at RVA 0x1000 holding `body`, with
     /// the export directory (RVA 0x1000, 0x80 bytes) pointing at it.
     fn synthetic_image(body: &[u8]) -> Vec<u8> {
@@ -539,6 +624,127 @@ mod tests {
         d.extend_from_slice(body);
         d.resize(0x400, 0);
         d
+    }
+
+    /// An export-free section at RVA 0x1000, backed at file offset 0x200.
+    fn section_image(virtual_size: u32, raw_size: u32) -> ImageInfo {
+        let mut data = synthetic_image(&[0; 0x200]);
+        let opt = layout::optional_header_offset(&data).unwrap();
+        let export = layout::data_directory_offset(&data, 0).unwrap();
+        data[export..export + 8].fill(0);
+        let sec = opt + 240;
+        data[sec + 8..sec + 12].copy_from_slice(&virtual_size.to_le_bytes());
+        data[sec + 16..sec + 20].copy_from_slice(&raw_size.to_le_bytes());
+        ImageInfo::parse(&data).unwrap()
+    }
+
+    #[test]
+    fn section_rvas_stop_at_the_shorter_of_virtual_and_raw_data() {
+        for (virtual_size, raw_size) in [(0x80, 0x200), (0x200, 0x80)] {
+            let info = section_image(virtual_size, raw_size);
+            // Raw padding beyond VirtualSize and a zero-filled virtual
+            // tail beyond SizeOfRawData are both outside the file mapping.
+            for (rva, expected) in [
+                (0x0FFF, None),
+                (0x1000, Some(0x200)),
+                (0x107F, Some(0x27F)),
+                (0x1080, None),
+                (0x11FF, None),
+                (0x1200, None),
+            ] {
+                assert_eq!(
+                    info.rva_to_file_offset(rva),
+                    expected,
+                    "RVA {rva:#x}, virtual {virtual_size:#x}, raw {raw_size:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section_rvas_use_raw_size_when_virtual_size_is_zero() {
+        let info = section_image(0, 0x200);
+        assert_eq!(info.rva_to_file_offset(0x1000), Some(0x200));
+        assert_eq!(info.rva_to_file_offset(0x11FF), Some(0x3FF));
+        assert_eq!(info.rva_to_file_offset(0x1200), None);
+    }
+
+    #[test]
+    fn section_rvas_skip_empty_sections_and_gaps() {
+        let mut info = section_image(0x180, 0x80);
+        let mut empty = info.sections[0].clone();
+        empty.rva = 0x2000;
+        empty.file_size = 0;
+        let mut later = info.sections[0].clone();
+        later.rva = 0x3000;
+        later.file_offset = 0x280;
+        info.sections.extend([empty, later]);
+        for _ in 0..2 {
+            for (rva, expected) in [
+                (0x1000, Some(0x200)),
+                (0x107F, Some(0x27F)),
+                (0x1080, None),
+                (0x2000, None),
+                (0x217F, None),
+                (0x2FFF, None),
+                (0x3000, Some(0x280)),
+                (0x307F, Some(0x2FF)),
+                (0x3080, None),
+            ] {
+                assert_eq!(info.rva_to_file_offset(rva), expected, "RVA {rva:#x}");
+            }
+            // Lookup must not depend on section-table order.
+            info.sections.reverse();
+        }
+    }
+
+    #[test]
+    fn section_rvas_near_u32_max_do_not_wrap() {
+        let mut info = section_image(0x200, 0x200);
+        info.sections[0].rva = u32::MAX - 0x1F;
+        assert_eq!(info.rva_to_file_offset(u32::MAX - 0x1F), Some(0x200));
+        assert_eq!(info.rva_to_file_offset(u32::MAX), Some(0x21F));
+        assert_eq!(info.rva_to_file_offset(u32::MAX - 0x20), None);
+        assert_eq!(info.rva_to_file_offset(0), None);
+    }
+
+    #[test]
+    fn rejects_null_iat_for_delay_imports() {
+        let mut body = [0u8; 0x80];
+        let delay_rva = 0x1000u32;
+        let iat_rva = 0x1060u32;
+        let name_rva = 0x1070u64;
+        body[0..4].copy_from_slice(&1u32.to_le_bytes()); // RVA-based descriptor
+        body[4..8].copy_from_slice(&0x1040u32.to_le_bytes()); // DllNameRVA
+        body[12..16].copy_from_slice(&iat_rva.to_le_bytes()); // ImportAddressTableRVA
+        body[16..20].copy_from_slice(&0x1050u32.to_le_bytes()); // ImportNameTableRVA
+        body[0x40..0x49].copy_from_slice(b"test.dll\0");
+        body[0x50..0x58].copy_from_slice(&name_rva.to_le_bytes());
+        body[0x60..0x68].copy_from_slice(&name_rva.to_le_bytes());
+        body[0x72..0x77].copy_from_slice(b"test\0"); // name after the zero hint
+
+        let mut data = synthetic_image(&body);
+        let export_dd =
+            layout::data_directory_offset(&data, pe::IMAGE_DIRECTORY_ENTRY_EXPORT).unwrap();
+        data[export_dd..export_dd + 8].fill(0);
+        let delay_dd =
+            layout::data_directory_offset(&data, pe::IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT).unwrap();
+        data[delay_dd..delay_dd + 4].copy_from_slice(&delay_rva.to_le_bytes());
+        data[delay_dd + 4..delay_dd + 8].copy_from_slice(&0x40u32.to_le_bytes());
+
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(info.delay_imports.len(), 1);
+        let module = &info.delay_imports[0];
+        assert_eq!(module.dll, "test.dll");
+        assert_eq!(module.entries.len(), 1);
+        assert_eq!(module.entries[0].iat_slot_rva, iat_rva);
+
+        let desc = info.rva_to_file_offset(delay_rva).unwrap() as usize;
+        data[desc + 12..desc + 16].fill(0); // ImportAddressTableRVA
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -607,6 +813,61 @@ mod tests {
             info.is_ok(),
             "section with zero raw size should be accepted"
         );
+    }
+
+    /// `synthetic_image` with no exports, its section moved to end with the
+    /// image (RVA 0x1E00..0x2000), and a TLS directory without callbacks
+    /// declared at `directory_rva`.
+    fn image_with_tls_directory(directory_rva: u32) -> Vec<u8> {
+        let mut data = synthetic_image(&[0; 0x200]);
+        let opt = 0x58;
+        let export = opt + layout::OPT_DATA_DIRECTORY;
+        data[export..export + layout::DATA_DIRECTORY_SIZE].fill(0);
+        let tls = export + pe::IMAGE_DIRECTORY_ENTRY_TLS * layout::DATA_DIRECTORY_SIZE;
+        data[tls..tls + 4].copy_from_slice(&directory_rva.to_le_bytes());
+        data[tls + 4..tls + 8].copy_from_slice(&TLS_DIRECTORY_SIZE.to_le_bytes());
+        let sec = opt + 240;
+        data[sec + 12..sec + 16].copy_from_slice(&0x1E00u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn accepts_tls_directory_ending_at_the_image_end() {
+        // 40 bytes from 0x1FD8 end at 0x2000, the size of the image.
+        let data = image_with_tls_directory(0x1FD8);
+
+        let tls = ImageInfo::parse(&data).unwrap().tls.unwrap();
+
+        assert_eq!(tls.directory_rva, 0x1FD8);
+        assert_eq!(tls.callbacks_va, 0);
+    }
+
+    #[test]
+    fn rejects_tls_directory_running_past_the_image_end() {
+        let data = image_with_tls_directory(0x1FD9);
+
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(reason))
+                if reason == "TLS directory at 0x1fd9 runs outside the image"
+        ));
+    }
+
+    #[test]
+    fn rejects_tls_directory_running_past_the_rva_range() {
+        let mut data = image_with_tls_directory(0xFFFF_FFF0);
+        // The largest image, and the section under the directory: its end is
+        // past 4 GiB, which no image size admits.
+        let opt = 0x58;
+        data[opt + 56..opt + 60].copy_from_slice(&u32::MAX.to_le_bytes());
+        let sec = opt + 240;
+        data[sec + 12..sec + 16].copy_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(reason))
+                if reason == "TLS directory at 0xfffffff0 runs outside the image"
+        ));
     }
 
     #[test]
@@ -691,5 +952,35 @@ mod tests {
                 (Some("gamma"), 2, Some(0x1204)),
             ]
         );
+    }
+
+    #[test]
+    fn rejects_tls_callback_outside_size_of_image() {
+        let image_base = 0x1_8000_0000u64;
+        let size_of_image = 0x2000u64;
+        // Section starts at RVA 0x1000: place TLS directory at +0x00 and callback array at +0x40.
+        let mut body = vec![0u8; 0x200];
+        let callbacks_va = image_base + 0x1040;
+        body[layout::TLS64_ADDRESS_OF_CALLBACKS..layout::TLS64_ADDRESS_OF_CALLBACKS + 8]
+            .copy_from_slice(&callbacks_va.to_le_bytes());
+
+        // Callback VA inside the image is accepted.
+        body[0x40..0x48].copy_from_slice(&(image_base + 0x1100).to_le_bytes());
+        let mut data = synthetic_image(&body);
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0); // clear export dir
+        let tls_dd = opt + 112 + pe::IMAGE_DIRECTORY_ENTRY_TLS * 8;
+        data[tls_dd..tls_dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[tls_dd + 4..tls_dd + 8].copy_from_slice(&40u32.to_le_bytes());
+        let ok = ImageInfo::parse(&data).unwrap();
+        assert_eq!(ok.tls.unwrap().callback_rvas, vec![0x1100]);
+
+        // Callback VA at `image_base + size_of_image` (fits in u32 RVA, but outside image) fails.
+        body[0x40..0x48].copy_from_slice(&(image_base + size_of_image).to_le_bytes());
+        let mut bad = synthetic_image(&body);
+        bad[opt + 112..opt + 120].fill(0);
+        bad[tls_dd..tls_dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        bad[tls_dd + 4..tls_dd + 8].copy_from_slice(&40u32.to_le_bytes());
+        assert!(matches!(ImageInfo::parse(&bad), Err(PeError::Malformed(_))));
     }
 }

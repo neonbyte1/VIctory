@@ -323,6 +323,292 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
         }
         ran += 1;
     }
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
+}
+
+fn global_store_barrier_shader(wave32: bool) -> HostShader {
+    let mut w = if wave32 {
+        // Use the wave lane index to require wave32. v1 = 1 + wave lane + wave base.
+        vec![
+            0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 1
+            0x0001_02C1,
+            0x3606_00A0, // v_and_b32 v3, 32, v0
+            0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+        ]
+    } else {
+        vec![0x4A02_0081] // v_add_nc_u32 v1, 1, v0
+    };
+    w.push(0x3404_0082); // v_lshlrev_b32 v2, 2, v0
+    w.extend(global(28, 0, 2, 1, 0, 0)); // global_store_dword v2, v1, s[0:1]
+    w.extend([S_WAITCNT_ALL, 0xBF8A_0000]); // s_waitcnt; s_barrier
+    w.extend([
+        0x3A06_00A0, // v_xor_b32 v3, 32, v0
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+    ]);
+    w.extend(global(12, 3, 3, 0, 0, 0)); // global_load_dword v3, v3, s[0:1]
+    w.push(S_WAITCNT_ALL);
+    // Keep the results after the source values so the reads cannot race the stores.
+    w.extend(global(28, 0, 2, 3, 0, 64 * 4)); // global_store_dword v2, v3, s[0:1] offset:256
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let container = crate::Container {
+        digest: [0; 16],
+        version: (1, 0),
+        parts: vec![],
+    };
+    let mut shader =
+        super::emit(&container, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
+            .expect("emit");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil)
+            .expect("DXIL validation failed");
+    }
+    shader
+}
+
+#[test]
+fn global_store_values_are_visible_across_waves_after_a_barrier() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let values: Vec<u32> = (1..=64).collect();
+    let swapped: Vec<u32> = (0..64).map(|lane| (lane ^ 32) + 1).collect();
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        if warp_only && !warp {
+            continue;
+        }
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .expect("wave size limits");
+        if options.WaveLaneCountMin > 32 {
+            eprintln!("no wave size of 32 or less on {label}; skipped");
+            continue;
+        }
+        let shader = global_store_barrier_shader(options.WaveLaneCountMax > 32);
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        // User data selects the root UAV's copy at heap index and byte offset 0.
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[0][..64], values, "{label}: source values");
+        assert_eq!(out[0][64..], swapped, "{label}: swapped values");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn global_atomic_fmin_and_fmax_ignore_nan_operands() {
+    let shader = program();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut memory = vec![0u32; 256];
+    let pointer = TITLE + 0x100;
+    memory[2] = pointer as u32;
+    memory[3] = (pointer >> 32) as u32;
+    let (next, far) = (TITLE + 0x1_0010, 0x55_0000_0040u64);
+    memory[4..8].copy_from_slice(&[
+        next as u32,
+        (next >> 32) as u32,
+        far as u32,
+        (far >> 32) as u32,
+    ]);
+    let root_uav = TITLE + 0x200;
+    let view_addresses = vec![0u32; 4 * 5];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        // Verify all four NaN bit patterns leave finite and infinite memory
+        // cells bit-identical, while +/-Inf and -0.0 still participate.
+        let cases = [
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                0x7FC0_0000u32,
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                "+qNaN vs finite",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                0xFFC0_0000,
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                "-qNaN vs finite",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                0x7F80_0001,
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                "+sNaN vs finite",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                0xFF80_0001,
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                "-sNaN vs finite",
+            ),
+            (
+                f32::NEG_INFINITY.to_bits(),
+                f32::INFINITY.to_bits(),
+                0x7FC0_0000,
+                f32::NEG_INFINITY.to_bits(),
+                f32::INFINITY.to_bits(),
+                "+qNaN vs Inf",
+            ),
+            (
+                f32::NEG_INFINITY.to_bits(),
+                f32::INFINITY.to_bits(),
+                0xFFC0_0000,
+                f32::NEG_INFINITY.to_bits(),
+                f32::INFINITY.to_bits(),
+                "-qNaN vs Inf",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                f32::INFINITY.to_bits(),
+                1.0f32.to_bits(),
+                f32::INFINITY.to_bits(),
+                "+Inf updates fmax",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+                f32::NEG_INFINITY.to_bits(),
+                (-1.0f32).to_bits(),
+                "-Inf updates fmin",
+            ),
+            (
+                1.0f32.to_bits(),
+                (-1.0f32).to_bits(),
+                (-0.0f32).to_bits(),
+                (-0.0f32).to_bits(),
+                (-0.0f32).to_bits(),
+                "-0.0 updates both",
+            ),
+        ];
+        for (init_min, init_max, op_bits, want_min, want_max, desc) in cases {
+            memory[0x80 / 4] = init_min;
+            memory[0x84 / 4] = init_max;
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                let constants = [TITLE as u32, (TITLE >> 32) as u32, 0, op_bits];
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => constants[u.dword as usize],
+                    RootType::Descriptor => (root_uav >> (32 * u.dword)) as u32,
+                    _ => 0,
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (1, Root::View { srv: true, data: page_table(1, 3) }),
+                            (2, Root::Uav(2 * 4096 / 32)),
+                            (3, Root::View { srv: true, data: view_addresses.clone() }),
+                        ],
+                        views: &[
+                            View::RawUav(9),
+                            View::Memory(&memory),
+                            View::Pair,
+                            View::NullPair,
+                            View::Pair,
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} ({desc}): {e}"));
+            assert_eq!(
+                out[1][0x20], want_min,
+                "{label} ({desc}): global_atomic_fmin got {:#010x}, want {want_min:#010x}",
+                out[1][0x20]
+            );
+            assert_eq!(
+                out[1][0x21], want_max,
+                "{label} ({desc}): global_atomic_fmax got {:#010x}, want {want_max:#010x}",
+                out[1][0x21]
+            );
+        }
+        ran += 1;
+    }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
@@ -492,7 +778,9 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         assert_eq!(out[0], want, "{label}");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// Writes through unordered buffer views mark their pages (`emit`, "Write
@@ -638,19 +926,29 @@ fn writes_through_views_mark_their_pages() {
         assert_eq!(marked, [100, 101, 200], "{label}: pages");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 /// Reads of texture views the program takes from the resource heap itself
 /// mark their heap index (`emit`, "Read marks"): an `image_load` of the view
 /// at heap byte offset 32 (index 1) sets exactly the bit one past
 /// [`super::VIEW_READS`]. The same read through a table marks nothing (a
-/// table read makes its slot on the host).
+/// table read makes its slot on the host), unless the table entry is
+/// computed (a descriptor array: the host makes only the entries the
+/// used-resource list names).
 #[test]
 fn heap_direct_texture_reads_mark_their_heap_index() {
-    let lower_with = |root: RootType, used: Vec<UsedResource>, offset: u32| {
+    let lower_with = |root: RootType, used: Vec<UsedResource>, offset: u32, dynamic: bool| {
         let mut w = vec![s_mov_b32(5, ZERO as u8)];
-        w.extend(s_load(3, 12, 4, offset));
+        let mut load = s_load(3, 12, 4, offset);
+        if dynamic {
+            // v_readfirstlane_b32 s6, v0; s_lshl_b32 s6, s6, 5; s6 the soffset.
+            w.extend([0x7E0C_0500, 0x8F06_8506]);
+            load[1] = 6 << 25 | offset;
+        }
+        w.extend(load);
         w.push(S_WAITCNT_ALL);
         w.extend((0..2).map(|v| v_mov_b32(v, ZERO)));
         // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
@@ -697,22 +995,24 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         })
         .expect("lower")
     };
-    let table = lower_with(
-        RootType::Table,
-        vec![UsedResource {
-            kind: ResourceType::Srv,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 8,
-            user_data: 4,
-            slot: 0,
-        }],
-        0,
-    );
+    let used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 4,
+        slot: 0,
+    }];
+    let table = lower_with(RootType::Table, used.clone(), 0, false);
     assert!(!table.view_marks, "a table read marks nothing");
-    let l = lower_with(RootType::ResourceHeap, Vec::new(), 32);
+    let computed = lower_with(RootType::Table, used, 0, true);
+    assert!(
+        computed.view_marks && !computed.heap,
+        "a read at a computed table entry is marked"
+    );
+    let l = lower_with(RootType::ResourceHeap, Vec::new(), 32, false);
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
     let shader = HostShader {
         stage: HwStage::Cs,

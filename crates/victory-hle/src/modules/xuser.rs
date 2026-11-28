@@ -156,7 +156,8 @@ extern "system" fn get_state(_: This, _: Handle, out: *mut u32) -> HRESULT {
 }
 /// The user's gamertag as the component asked for (`XUserGamertagComponent`):
 /// it has no suffix, so the modern suffix is empty and every other component
-/// (classic, modern, unique modern) is the name itself.
+/// (classic, modern, unique modern) is the name itself. Any other component is
+/// the documented `E_INVALIDARG`.
 extern "system" fn get_gamertag(
     _: This,
     _: Handle,
@@ -165,10 +166,14 @@ extern "system" fn get_gamertag(
     buffer: *mut u8,
     used: *mut usize,
 ) -> HRESULT {
+    const CLASSIC: u32 = 0;
+    const MODERN: u32 = 1;
     const MODERN_SUFFIX: u32 = 2;
+    const UNIQUE_MODERN: u32 = 3;
     let text = match component {
         MODERN_SUFFIX => "",
-        _ => GAMERTAG,
+        CLASSIC | MODERN | UNIQUE_MODERN => GAMERTAG,
+        _ => return xasync::E_INVALIDARG,
     };
     put_string(text, size, buffer, used)
 }
@@ -344,6 +349,22 @@ mod tests {
                 let hr = get(this, user, component, 16, name.as_mut_ptr(), &mut used);
                 assert_eq!(hr, S_OK);
                 assert_eq!(&name[..used], expected, "component {component}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_gamertag_component_is_an_invalid_argument() {
+        type Gamertag =
+            extern "system" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
+        let this: This = &OBJECT;
+        let user = std::ptr::null();
+        for (object, at) in [(&GAMERTAG_OBJECT, 0x18), (&OBJECT, 0x78)] {
+            let get = slot::<Gamertag>(object, at);
+            for component in [4, 5, u32::MAX] {
+                let (mut name, mut used) = ([0xff_u8; 16], 0);
+                let hr = get(this, user, component, 16, name.as_mut_ptr(), &mut used);
+                assert_eq!(hr, xasync::E_INVALIDARG, "component {component}");
             }
         }
     }

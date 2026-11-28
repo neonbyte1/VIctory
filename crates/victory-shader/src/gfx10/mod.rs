@@ -54,8 +54,13 @@ pub struct Instruction {
     pub offset: usize,
     pub encoding: Encoding,
     pub opcode: u16,
-    /// Every dword of the instruction, including literals and extra dwords.
-    pub words: Vec<u32>,
+    /// Every dword of the instruction, including literals and extra dwords;
+    /// `len` of them. The longest instruction here is an MIMG with its three
+    /// extra address dwords, five in all, so they live inline: a heap vector
+    /// per instruction was one allocation and one cache miss for a word or
+    /// two of data.
+    words: [u32; Instruction::MAX_WORDS],
+    len: u8,
     /// [`name`] of `encoding` and `opcode`, resolved once at decode time.
     /// The translator asks about every instruction eight times; the table is
     /// a binary search.
@@ -63,9 +68,18 @@ pub struct Instruction {
 }
 
 impl Instruction {
+    /// The most dwords an instruction here has: an MIMG with its three extra
+    /// address dwords.
+    pub const MAX_WORDS: usize = 5;
+
     /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
         self.name
+    }
+
+    /// Every dword of the instruction, including literals and extra dwords.
+    pub fn words(&self) -> &[u32] {
+        &self.words[..usize::from(self.len)]
     }
 }
 
@@ -74,12 +88,87 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     if !code.len().is_multiple_of(4) {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
     }
+    decode_aligned(code).unwrap_or_else(|| decode_any(code))
+}
+
+/// The most dwords an instruction takes (an image instruction with three
+/// dwords of extra address registers).
+const MAX_WORDS: usize = 5;
+
+/// [`decode`] while every offset it reaches is a dword's (None at the first
+/// that is not, which only a far jump's literal can give): what is found is
+/// kept in a table by dword, and put in order once, instead of in a tree
+/// per instruction.
+fn decode_aligned(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> {
+    // Per dword: the index in `found` of the instruction starting there.
+    // It grows to the furthest dword reached, so bytes past the code (data,
+    // padding) cost nothing; room for short programs is made at once.
+    let mut at: Vec<u32> = Vec::with_capacity((code.len() / 4).min(4096));
+    let mut found: Vec<Instruction> = Vec::new();
+    let mut pending = vec![0usize];
+    while let Some(mut offset) = pending.pop() {
+        loop {
+            if !offset.is_multiple_of(4) {
+                return None;
+            }
+            if at.get(offset / 4).is_some_and(|&i| i != u32::MAX) {
+                break;
+            }
+            let inst = match instruction(code, offset) {
+                Ok(inst) => inst,
+                Err(e) => return Some(Err(e)),
+            };
+            let next = offset + 4 * inst.words().len();
+            // The instruction found last below `end`, as the tree has it,
+            // where it can end at `end` (all a far jump looks for): within
+            // the longest instruction's reach.
+            let before = |end: usize| {
+                (1..=MAX_WORDS.min(end / 4))
+                    .map(|k| at.get(end / 4 - k).copied().unwrap_or(u32::MAX))
+                    .find(|&i| i != u32::MAX)
+                    .map(|i| &found[i as usize])
+            };
+            let flow = match control(&inst, code.len(), before) {
+                Ok(flow) => flow,
+                Err(e) => return Some(Err(e)),
+            };
+            if at.len() <= offset / 4 {
+                at.resize(offset / 4 + 1, u32::MAX);
+            }
+            at[offset / 4] = found.len() as u32;
+            found.push(inst);
+            match flow {
+                Flow::Next => offset = next,
+                Flow::Stop => break,
+                Flow::Jump(target) => offset = target,
+                Flow::Branch(target) => {
+                    pending.push(target);
+                    offset = next;
+                }
+            }
+        }
+    }
+    found.sort_unstable_by_key(|i| i.offset);
+    if let Some(w) = found
+        .windows(2)
+        .find(|w| w[0].offset + 4 * w[0].words().len() > w[1].offset)
+    {
+        return Some(Err(isa(
+            w[1].offset,
+            "a branch lands inside an instruction",
+        )));
+    }
+    Some(Ok(found))
+}
+
+/// [`decode`] at any offsets.
+fn decode_any(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     let mut found = BTreeMap::new();
     let mut pending = vec![0usize];
     while let Some(mut offset) = pending.pop() {
         while !found.contains_key(&offset) {
             let inst = instruction(code, offset)?;
-            let next = offset + 4 * inst.words.len();
+            let next = offset + 4 * inst.words().len();
             let flow = control(&inst, code.len(), |at| {
                 found.range(..at).next_back().map(|(_, i)| i)
             })?;
@@ -98,7 +187,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     let list: Vec<Instruction> = found.into_values().collect();
     if let Some(w) = list
         .windows(2)
-        .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+        .find(|w| w[0].offset + 4 * w[0].words().len() > w[1].offset)
     {
         return Err(isa(w[1].offset, "a branch lands inside an instruction"));
     }
@@ -123,7 +212,7 @@ pub(crate) fn control<'a>(
     len: usize,
     before: impl Fn(usize) -> Option<&'a Instruction>,
 ) -> Result<Flow, ShaderError> {
-    Ok(match flow(inst, inst.offset + 4 * inst.words.len(), len)? {
+    Ok(match flow(inst, inst.offset + 4 * inst.words().len(), len)? {
         Flow::Stop if inst.name() == Some("s_setpc_b64") => {
             far_jump(before, inst, len)?.map_or(Flow::Stop, Flow::Jump)
         }
@@ -133,7 +222,7 @@ pub(crate) fn control<'a>(
 
 fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError> {
     let target = || {
-        let delta = 4 * i64::from(inst.words[0] as u16 as i16);
+        let delta = 4 * i64::from(inst.words()[0] as u16 as i16);
         usize::try_from(next as i64 + delta)
             .ok()
             .filter(|&t| t < len)
@@ -163,17 +252,17 @@ fn far_jump<'a>(
     setpc: &Instruction,
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
-    let n = setpc.words[0] & 0xFF;
+    let n = setpc.words()[0] & 0xFF;
     let mut delta = None;
     let mut at = setpc.offset;
     for _ in 0..4 {
         let Some(prev) = before(at) else {
             break;
         };
-        if prev.offset + 4 * prev.words.len() != at {
+        if prev.offset + 4 * prev.words().len() != at {
             break;
         }
-        let w = prev.words[0];
+        let w = prev.words()[0];
         let (sdst, ssrc0, ssrc1) = ((w >> 16) & 0x7F, w & 0xFF, (w >> 8) & 0xFF);
         match (prev.encoding, prev.name()) {
             (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
@@ -181,7 +270,7 @@ fn far_jump<'a>(
             {
                 // The low dword of a signed 64-bit offset: a backward jump
                 // adds a negative one (its high dword is -1).
-                let literal = i64::from(prev.words[1] as i32);
+                let literal = i64::from(prev.words()[1] as i32);
                 delta = Some(if op == "s_add_u32" { literal } else { -literal });
             }
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
@@ -286,12 +375,20 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
+    if len > Instruction::MAX_WORDS {
+        return Err(isa(offset, "instruction longer than the decoder's budget"));
+    }
+    let mut words = [0u32; Instruction::MAX_WORDS];
+    for (i, w) in words.iter_mut().enumerate().take(len) {
+        *w = word(i)?;
+    }
     let opcode = opcode as u16;
     Ok(Instruction {
         offset,
         encoding,
         opcode,
-        words: (0..len).map(word).collect::<Result<_, _>>()?,
+        words,
+        len: len as u8,
         name: name(encoding, opcode),
     })
 }
@@ -332,6 +429,35 @@ fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         .map(|i| table[i].1)
 }
 
+/// The opcodes of an encoding (for VOP3, only the VOP3-only ones), for
+/// tests that assemble programs.
+#[cfg(test)]
+pub(crate) fn opcodes(encoding: Encoding) -> &'static [(u16, &'static str)] {
+    use opcodes as t;
+    match encoding {
+        Encoding::Sop2 => t::SOP2,
+        Encoding::Sopk => t::SOPK,
+        Encoding::Sop1 => t::SOP1,
+        Encoding::Sopc => t::SOPC,
+        Encoding::Sopp => t::SOPP,
+        Encoding::Smem => t::SMEM,
+        Encoding::Vop2 => t::VOP2,
+        Encoding::Vop1 => t::VOP1,
+        Encoding::Vopc => t::VOPC,
+        Encoding::Vop3 => t::VOP3,
+        Encoding::Vop3p => t::VOP3P,
+        Encoding::Vintrp => t::VINTRP,
+        Encoding::Ds => t::DS,
+        Encoding::Mubuf => t::MUBUF,
+        Encoding::Mtbuf => t::MTBUF,
+        Encoding::Mimg => t::MIMG,
+        Encoding::Exp => &[],
+        Encoding::Flat => t::FLAT,
+        Encoding::Global => t::GLOBAL,
+        Encoding::Scratch => t::SCRATCH,
+    }
+}
+
 fn isa(offset: usize, reason: &'static str) -> ShaderError {
     ShaderError::Isa { offset, reason }
 }
@@ -354,7 +480,7 @@ mod tests {
         decode(&bytes(code))
             .unwrap()
             .iter()
-            .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
+            .map(|i| (i.offset, i.words().len(), i.name().unwrap_or("?")))
             .collect()
     }
 
@@ -494,6 +620,69 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
+    }
+
+    /// Instructions found by dword (`decode_aligned`) are the tree's
+    /// (`decode_any`): branches both ways, a loop, data after the end, far
+    /// jumps both ways and bad code. A far jump to an offset that is no
+    /// dword's leaves it to the tree.
+    #[test]
+    fn the_table_decodes_as_the_tree_does() {
+        let far = |literal: u32| {
+            [
+                0xBE88_1F00, // s_getpc_b64 s[8:9]
+                0x8008_FF08,
+                literal,     // s_add_u32 s8, s8, literal
+                0x8209_8009, // s_addc_u32 s9, s9, 0
+                0xBE80_2008, // s_setpc_b64 s[8:9]
+                0xFFFF_FFFF, // not code
+                S_ENDPGM,
+                S_ENDPGM,
+            ]
+        };
+        let programs: [&[u32]; 8] = [
+            &[
+                sopp(0x04, 1),
+                sopp(0x02, 1),
+                S_ENDPGM,
+                S_ENDPGM,
+                S_ENDPGM,
+                0xFFFF_FFFF,
+            ],
+            // A loop: a backward branch to an instruction already found.
+            &[
+                0x4A00_0081,
+                0xD52C_0001,
+                0x0002_0501,
+                sopp(0x04, -4),
+                S_ENDPGM,
+            ],
+            &far(20),
+            &[
+                sopp(0x02, 1),
+                S_ENDPGM,
+                0xBE88_1F00,
+                0x8008_FF08,
+                0xFFFF_FFF8,
+                0x8209_C109,
+                0xBE80_2008,
+            ],
+            &[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM],
+            &[sopp(0x02, 100)],
+            &[0xBE80_03FF],
+            &far(21),
+        ];
+        for (n, code) in programs.iter().enumerate() {
+            let code = bytes(code);
+            let tree = format!("{:?}", decode_any(&code));
+            match decode_aligned(&code) {
+                Some(table) => assert_eq!(format!("{table:?}"), tree, "program {n}"),
+                None => {
+                    assert_eq!(n, 7, "only the unaligned far jump leaves it to the tree");
+                    assert_eq!(format!("{:?}", decode(&code)), tree);
+                }
+            }
+        }
     }
 
     #[test]

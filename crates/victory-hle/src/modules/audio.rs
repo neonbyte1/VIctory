@@ -28,6 +28,8 @@ use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
+#[cfg(all(windows, test, not(feature = "diagnostics")))]
+mod capture;
 
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
@@ -370,6 +372,14 @@ struct Voice {
     trace: Trace,
 }
 
+impl Voice {
+    fn append_samples(&mut self, pcm: &[i16], channels: usize) {
+        let skip = (self.skip * channels).min(pcm.len());
+        self.skip -= skip / channels;
+        self.pcm.extend(&pcm[skip..]);
+    }
+}
+
 /// What a voice did, for the debug log when it is disabled.
 struct Trace {
     since: Instant,
@@ -555,8 +565,21 @@ fn pump(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
-            return;
+        let mut empty = 0;
+        while voice.pcm.len() < SAMPLES_PER_BLOCK {
+            let before = voice.pcm.len();
+            if !decode(context, voice) {
+                if voice.pcm.is_empty() {
+                    return;
+                }
+                break;
+            }
+            if voice.pcm.len() == before {
+                empty += 1;
+                if empty >= 16 {
+                    return;
+                }
+            }
         }
         // The write block is the title's too: taken modulo the ring before
         // the first write, which would otherwise land past the ring's end.
@@ -598,8 +621,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
                 let mut tail = Vec::new();
+                let channels = decoder.channels();
                 decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.append_samples(&tail, channels);
             }
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
@@ -619,11 +643,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let mut at = context.field(2, 0, 26) as usize;
-    if at < 32 {
-        at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
-    }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let at = context.field(2, 0, 26) as usize;
+    let start = if at < 32 { xma::first_frame(data) } else { Some(at) };
+    let Some(frame) = start.and_then(|pos| xma::read_frame(data, pos)) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
@@ -638,7 +660,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
-                at,
+                at = frame.start,
                 bits = frame.bits,
                 head = ?&frame.data[..frame.data.len().min(8)],
                 %e,
@@ -646,7 +668,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
             );
         }
     }
-    let mut next = frame.next.unwrap_or(0);
+    let mut next = frame.next;
     let loops = context.field(0, 12, 8);
     let loop_end = context.field(4, 0, 26) as usize;
     let ends_loop = loop_end != 0
@@ -656,25 +678,23 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     if looping {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
         pcm.truncate(keep);
-        next = context.field(3, 0, 26) as usize;
+        next = Some(context.field(3, 0, 26) as usize);
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
         }
     }
     // What is still to skip is this frame's (the stream's first, or a
     // loop's first when it is its last too).
-    let skip = (voice.skip * channels).min(pcm.len());
-    voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
+    voice.append_samples(&pcm, channels);
     if looping {
         // The loop's own skip is of its first frame, decoded next: not of
         // this one, its last.
         voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
     }
-    if next == 0 {
+    if next.is_none() {
         context.set_field(0, 20 + current, 1, 0);
     }
-    context.set_field(2, 0, 26, next as u32);
+    context.set_field(2, 0, 26, next.unwrap_or(0) as u32);
     true
 }
 
@@ -903,10 +923,9 @@ extern "system" fn submit(
         state.post(COMMAND_COMPLETED, &done);
     }
     if notification != 0
-        && let Some(word) = heap_unmap(notification)
+        && let Some(bytes) = heap_bytes(notification, 4)
     {
-        // SAFETY: a u32 in a heap block, which the title reads as volatile.
-        unsafe { word.cast::<u32>().write_volatile(1) };
+        bytes.copy_from_slice(&1u32.to_le_bytes());
     }
     S_OK
 }
@@ -1298,11 +1317,73 @@ mod tests {
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 
+    fn test_voice() -> Voice {
+        Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip: 0,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_start_skip_can_reach_into_the_final_overlap() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x800, 0x800, 1), S_OK);
+        let mut stream = silent_stream();
+        stream[..4].copy_from_slice(&(1u32 << 26).to_be_bytes());
+        // SAFETY: copy one packet into the allocation of exactly that size.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), xma::PACKET_BYTES) };
+
+        for skip in 4..=7 {
+            let mut words = [0u32; 16];
+            let context = Context(words.as_mut_ptr());
+            context.set(0, 1 | 1 << 20);
+            context.set(2, 32);
+            context.set(5, input_apu);
+            let mut voice = test_voice();
+            voice.skip = skip * xma::SUBFRAME_SAMPLES;
+            assert!(decode(context, &mut voice));
+            assert_eq!(voice.trace.bad_frames, 0);
+            assert!(voice.pcm.is_empty());
+
+            // One 512-sample frame plus a 256-sample overlap is six subframes.
+            let expected = 6usize.saturating_sub(skip) * xma::SUBFRAME_SAMPLES;
+            let has_tail = decode(context, &mut voice);
+            assert_eq!(voice.pcm.len(), expected, "skip {skip} subframes");
+            assert_eq!(has_tail, expected != 0);
+            assert!(voice.ended);
+            assert!(!decode(context, &mut voice));
+        }
+        ApuFree(input);
+    }
+
     /// A loop over the first two frames, which ends after the second
     /// frame's second subframe and starts two subframes into the first.
     /// Each end of the loop is cut in its own frame.
     #[test]
     fn a_loop_skips_subframes_of_its_first_frame() {
+        check_loop_start(32);
+    }
+
+    #[test]
+    fn a_loop_to_the_start_of_the_buffer_keeps_the_input_valid() {
+        check_loop_start(0);
+    }
+
+    fn check_loop_start(loop_start: u32) {
         let _serial = lock(&CONTEXT_TESTS);
         let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
         assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
@@ -1322,26 +1403,10 @@ mod tests {
             1 << 31 | 3 << 27 | end_subframe << 12 | skip_subframes << 17,
         );
         context.set(2, first);
-        context.set(3, first);
+        context.set(3, loop_start);
         context.set(4, second);
         context.set(5, input_apu);
-        let mut voice = Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: 0,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        };
+        let mut voice = test_voice();
         let mut step = |expect_next: u32| {
             let before = voice.pcm.len();
             assert!(decode(context, &mut voice));
@@ -1352,13 +1417,98 @@ mod tests {
         // Before the loop: the first frame whole.
         assert_eq!(step(second), 4 * subframe);
         // The loop's last frame: its first two subframes, then back.
-        assert_eq!(step(first), 2 * subframe, "the loop's last frame");
+        assert_eq!(step(loop_start), 2 * subframe, "the loop's last frame");
+        assert_eq!(context.field(0, 20, 1), 1, "the loop still needs input 0");
         assert_eq!(context.field(0, 12, 8), 0, "one loop, taken");
         // The loop's first frame again: without its first two subframes.
         assert_eq!(step(second), 2 * subframe, "the loop's first frame");
         // No loops left: both frames whole, and on to the third.
         assert_eq!(step(third), 4 * subframe);
         ApuFree(input);
+    }
+
+    /// Refilling `voice.pcm` in `pump` must keep decoding across calls that
+    /// produce zero samples (an empty buffer-0 transitioning to buffer-1, or a
+    /// start-skip covering a full 4-subframe frame) instead of emitting a
+    /// spurious silent output block.
+    #[test]
+    fn pump_refills_across_empty_decode_steps_without_spurious_silence() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+
+        let drain_all = |words: &mut [u32; 16], skip: usize| -> usize {
+            let context = Context(words.as_mut_ptr());
+            let mut voice = Voice {
+                decoder: None,
+                pcm: VecDeque::new(),
+                skip,
+                ended: false,
+                trace: Trace {
+                    since: Instant::now(),
+                    produced: 0,
+                    taken: 0,
+                    takes: 0,
+                    partial_takes: 0,
+                    frames: 0,
+                    bad_frames: 0,
+                    peak: 0,
+                    ended_ms: None,
+                },
+            };
+            for _ in 0..32 {
+                pump(context, &mut voice);
+                if voice.ended {
+                    break;
+                }
+                // Advance the read pointer to free the 4-block ring.
+                let write = context.field(0, 27, 5);
+                context.set_field(9, 0, 5, write);
+                context.set_field(1, 31, 1, 1);
+            }
+            assert!(voice.ended);
+            voice.trace.produced
+        };
+
+        // Case 1: input 0 is valid with 0 packets and input 1 holds the
+        // 6-frame stream (24 blocks + 2-block overlap tail = 26 blocks).
+        let mut words = [0u32; 16];
+        words[0] = (0b11 << 20) | (4 << 22); // buf0=0 packets, both valid, ring=4
+        words[1] = 2 | (3 << 27) | (1 << 31); // buf1=2 packets, 48 kHz, writable
+        words[2] = 32;
+        words[5] = input_apu;
+        words[6] = input_apu;
+        words[7] = output_apu;
+        assert_eq!(
+            drain_all(&mut words, 0),
+            26 * SAMPLES_PER_BLOCK,
+            "switching from empty buffer 0 to buffer 1 must not emit a silent block"
+        );
+
+        // Case 2: start-skip of 4 subframes drops frame 0 whole, leaving 5
+        // frames + 2-block overlap tail = 22 blocks (not 23).
+        let mut words = [0u32; 16];
+        words[0] = 2 | (1 << 20) | (4 << 22); // buf0=2 packets, valid, ring=4
+        words[1] = (4 << 24) | (3 << 27) | (1 << 31); // start_skip=4, 48 kHz, writable
+        words[2] = 32;
+        words[5] = input_apu;
+        words[7] = output_apu;
+        assert_eq!(
+            drain_all(&mut words, 4 * xma::SUBFRAME_SAMPLES),
+            22 * SAMPLES_PER_BLOCK,
+            "skipping a whole frame must not emit a silent block"
+        );
+
+        ApuFree(input);
+        ApuFree(output);
     }
 
     #[test]
@@ -1446,5 +1596,50 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn acp_notification_checks_all_four_bytes_and_allows_unaligned() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut mem, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut mem, &mut apu, 16, 16, 1), S_OK);
+
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 16, 16), S_OK);
+
+        // Tail-overflowing notifications must not write past the block.
+        for bad in [apu + 13, apu + 14, apu + 15] {
+            assert_eq!(
+                (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), bad),
+                S_OK
+            );
+        }
+        // SAFETY: 16 bytes allocated by `ApuAlloc`.
+        let bytes = unsafe { std::slice::from_raw_parts(mem.cast::<u8>(), 16) };
+        assert_eq!(bytes, &[0u8; 16]);
+
+        // An unaligned, in-bounds notification writes 1 safely.
+        assert_eq!(
+            (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), apu + 1),
+            S_OK
+        );
+        // SAFETY: 16 bytes allocated by `ApuAlloc`.
+        let bytes = unsafe { std::slice::from_raw_parts(mem.cast::<u8>(), 16) };
+        assert_eq!(&bytes[1..5], &1u32.to_le_bytes());
+
+        // An aligned, in-bounds notification at the tail writes 1.
+        assert_eq!(
+            (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), apu + 12),
+            S_OK
+        );
+        // SAFETY: 16 bytes allocated by `ApuAlloc`, 4-byte aligned at +12.
+        let word = unsafe { mem.cast::<u32>().add(3).read_volatile() };
+        assert_eq!(word, 1);
+
+        (m.release)(acp);
+        ApuFree(mem);
     }
 }

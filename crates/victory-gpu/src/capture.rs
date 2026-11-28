@@ -4,6 +4,7 @@
 //! size. Only in builds with diagnostics.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -45,14 +46,26 @@ static WORLD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// Frame `n` was presented: notes the world's first frame.
 pub(crate) fn presented(n: u64) {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let drawn = crate::draw::drawn();
-    let draws = drawn - LAST.swap(drawn, Relaxed).min(drawn);
+    let draws = draws_since_last_present(&LAST, crate::draw::drawn());
     if draws >= 500 && WORLD.get().is_none() && !world_offsets().is_empty() {
         let _ = WORLD.set(n);
         tracing::info!(frame = n, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
     }
+}
+
+fn draws_since_last_present(last: &AtomicU64, drawn: u64) -> u64 {
+    drawn.saturating_sub(last.fetch_max(drawn, Relaxed))
+}
+
+#[test]
+fn stale_draw_samples_do_not_trigger_world_capture_early() {
+    let last = AtomicU64::new(0);
+    assert_eq!(draws_since_last_present(&last, 480), 480);
+    assert_eq!(draws_since_last_present(&last, 600), 120);
+    assert_eq!(draws_since_last_present(&last, 480), 0);
+    assert_eq!(draws_since_last_present(&last, 995), 395);
+    assert_eq!(draws_since_last_present(&last, 1495), 500);
 }
 
 /// Whether frame `n` is saved.
@@ -68,7 +81,8 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
+    // Keep the last sample when the input width or height is odd.
+    let (w, h) = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
@@ -100,6 +114,57 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn odd_capture_extents_keep_the_final_sampled_row_and_column() {
+    const TEST: &str = "capture::odd_capture_extents_keep_the_final_sampled_row_and_column";
+    const CHILD: &str = "VICTORY_TEST_ODD_CAPTURE";
+    if std::env::var_os(CHILD).is_some() {
+        let mut rows = [255u8; 5 * 16];
+        for y in 0..5u8 {
+            for x in 0..3u8 {
+                let at = usize::from(y) * 16 + usize::from(x) * 4;
+                rows[at..at + 4].copy_from_slice(&[100 + y, 50 + x, y * 10 + x, 200]);
+            }
+        }
+        save_as("odd", 3, 5, 16, true, &rows);
+        return;
+    }
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir()
+        .join(format!("victory-odd-capture-{}-{unique}", std::process::id()));
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST])
+        .env(CHILD, "1")
+        .env("VICTORY_CAPTURE", &dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let png = std::fs::read(dir.join("odd.png")).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+    assert_eq!(&png[12..16], b"IHDR");
+    assert_eq!([word(16), word(20)], [2, 3]);
+    assert_eq!(&png[37..41], b"IDAT");
+    let pixels = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
+    let expected = [
+        0, 0, 50, 100, 2, 52, 100,
+        0, 20, 50, 102, 22, 52, 102,
+        0, 40, 50, 104, 42, 52, 104,
+    ];
+    assert_eq!(pixels, expected);
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -217,7 +282,7 @@ pub(crate) fn save_read_back(
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
+        let len = buffer.GetDesc().Width as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
@@ -553,7 +618,7 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), buffer.GetDesc().Width as usize);
         // Tiny targets (exposure, averages): their values as they are.
         if f.Width * f.Height <= 16 {
             let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
@@ -622,6 +687,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
+    let i16_at = |b: &[u8], i: usize| i16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
     if matches!(format, 42 | 43) {
         let words = (0..h)
@@ -662,27 +728,47 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         }
         23..=25 | 89 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
-            [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
+            let rgb = [0, 10, 20].map(|shift| (v >> shift & 0x3ff) as f32);
+            if format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM.0 as u32 {
+                // XR_BIAS encodes 0.0 at 384 and 1.0 at 894.
+                rgb.map(|channel| (channel - 384.0) / 510.0)
+            } else {
+                rgb
+            }
         })),
         26 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
             [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
         })),
         9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
-        11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
+        11..=12 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
+        13..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(i16_at(b, i))))),
         33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
+        // Signed 32-bit RGBA and RG color channels.
+        4 => (16, Box::new(move |b| [0, 1, 2].map(|i| u32_at(b, i) as i32 as f32))),
+        18 => (8, Box::new(move |b| {
+            [u32_at(b, 0) as i32 as f32, u32_at(b, 1) as i32 as f32, 0.0]
+        })),
         1..=2 => (16, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
         })),
+        67 => (4, Box::new(move |b| {
+            let v = u32_at(b, 0);
+            // One exponent with bias 15 scales the three 9-bit fractions.
+            let scale = 2f32.powi((v >> 27) as i32 - 15 - 9);
+            [0, 9, 18].map(|shift| ((v >> shift) & 0x1ff) as f32 * scale)
+        })),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
-        35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
+        35..=36 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
+        37..=38 => (4, Box::new(move |b| [f32::from(i16_at(b, 0)), f32::from(i16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.
         39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
-        55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
+        55..=57 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
+        58..=59 => (2, Box::new(move |b| [f32::from(i16_at(b, 0)); 3])),
         60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
         _ => return None,
     };
@@ -719,8 +805,17 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let high = if grey || p99 == 0.0 { max } else { p99 };
     let range = (high - low).max(1e-20);
     tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
+    // A constant nonzero grey target has no contrast to stretch. Keep it
+    // distinguishable from an all-zero target in the dump.
+    let flat_nonzero = grey && low == high && low != 0.0;
     for v in values {
-        let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
+        let c = v.map(|c| {
+            if flat_nonzero && c.is_finite() {
+                255
+            } else {
+                (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8
+            }
+        });
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
@@ -766,24 +861,57 @@ fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8>
     out
 }
 
+#[test]
+fn signed_32_bit_color_captures_decode_negative_components() {
+    let rg = [-(1 << 30), 1 << 29, i32::MAX, 1 << 28, -(1 << 29), i32::MAX];
+    let rgba = [
+        -(1 << 30), 1 << 29, -(1 << 28), i32::MAX, i32::MAX,
+        1 << 28, -(1 << 29), 1 << 29, i32::MAX, i32::MAX,
+    ];
+    let rg: Vec<_> = rg.into_iter().flat_map(i32::to_le_bytes).collect();
+    let rgba: Vec<_> = rgba.into_iter().flat_map(i32::to_le_bytes).collect();
+    assert_eq!(
+        [
+            to_rgba(DXGI_FORMAT_R32G32_SINT.0 as u32, 1, 2, 12, &rg),
+            to_rgba(DXGI_FORMAT_R32G32B32A32_SINT.0 as u32, 1, 2, 20, &rgba),
+        ],
+        [
+            Some(vec![0, 127, 0, 255, 63, 0, 0, 255]),
+            Some(vec![0, 127, 0, 255, 63, 0, 127, 255]),
+        ]
+    );
+}
+
 /// Pixels per side of the grid [`probe`] reads.
 const GRID: u32 = 4;
 /// Bytes between the grid's pixels in the readback buffer (placement
 /// alignment).
 const SLOT: u64 = 512;
 
-/// Records copies of a grid of pixels of `texture` (8-bit color, in the
-/// copy-source state) into a readback buffer, to tell black frames.
+pub(crate) struct BlackProbe {
+    buffer: ID3D12Resource,
+    packed_rgb10: bool,
+}
+
+/// Copies a grid of pixels from a color texture in copy-source state for
+/// black-frame diagnostics.
 pub(crate) fn probe(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
-) -> Option<ID3D12Resource> {
+) -> Option<BlackProbe> {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    if !matches!(d.Format.0, 27..=29 | 87 | 90 | 91) {
-        return None;
-    }
+    let packed_rgb10 = match d.Format {
+        DXGI_FORMAT_R10G10B10A2_TYPELESS | DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_UINT => true,
+        format if matches!(format.0, 27..=29 | 87 | 90 | 91) => false,
+        _ => return None,
+    };
+    let format = if d.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS {
+        DXGI_FORMAT_R10G10B10A2_UNORM
+    } else {
+        d.Format
+    };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: SLOT * u64::from(GRID * GRID),
@@ -836,7 +964,7 @@ pub(crate) fn probe(
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                         Offset: SLOT * u64::from(i),
                         Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: d.Format,
+                            Format: format,
                             Width: 1,
                             Height: 1,
                             Depth: 1,
@@ -862,12 +990,13 @@ pub(crate) fn probe(
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&pixel));
         }
-        Some(buffer)
+        Some(BlackProbe { buffer, packed_rgb10 })
     }
 }
 
-/// Whether every pixel [`probe`] read is (near) black.
-pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
+/// Whether every sampled pixel is (near) black.
+pub(crate) fn black(probe: &BlackProbe) -> bool {
+    let buffer = &probe.buffer;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copies finished (every submission is waited for).
     unsafe {
@@ -878,7 +1007,16 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
             std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
         let level = bytes
             .chunks(SLOT as usize)
-            .flat_map(|pixel| pixel[..3].iter().copied())
+            .map(|pixel| {
+                if probe.packed_rgb10 {
+                    let packed = u32::from_le_bytes(pixel[..4].try_into().unwrap());
+                    let max = (packed & 1023).max((packed >> 10) & 1023).max((packed >> 20) & 1023);
+                    // Keep the existing 8-bit diagnostic scale and ignore alpha.
+                    ((max * 255 + 511) / 1023) as u8
+                } else {
+                    pixel[0].max(pixel[1]).max(pixel[2])
+                }
+            })
             .max()
             .unwrap_or(0);
         buffer.Unmap(0, None);
@@ -899,6 +1037,29 @@ static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
+}
+
+#[cfg(test)]
+mod rgb9e5_tests {
+    #[test]
+    fn rgb9e5_target_decodes_pitched_rows_with_shared_exponents() {
+        use super::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, to_rgba};
+
+        let pitch = 256;
+        let mut rows = [0xff; 256 + 4];
+        // The same RGB mantissas yield (1, 0.5, 0.25) and (2, 1, 0.5).
+        rows[..4].copy_from_slice(&0x8101_0100u32.to_le_bytes());
+        rows[pitch..].copy_from_slice(&0x8901_0100u32.to_le_bytes());
+        assert_eq!(
+            to_rgba(DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32, 1, 2, pitch, &rows),
+            Some(vec![127, 63, 31, 255, 255, 127, 63, 255]),
+        );
+        let rgba = to_rgba(DXGI_FORMAT_R32_UINT.0 as u32, 1, 2, pitch, &rows).unwrap();
+        assert_eq!(rgba.len(), 8);
+        for &pixel in rgba.as_chunks::<4>().0 {
+            assert_eq!(pixel, [pixel[0], pixel[0], pixel[0], 255]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -954,8 +1115,61 @@ mod tests {
     }
 
     #[test]
+    fn constant_nonzero_grayscale_targets_do_not_look_black() {
+        let capture = |format, values: [f32; 2]| {
+            let row: Vec<_> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+            super::to_rgba(format, 2, 1, row.len(), &row).unwrap()
+        };
+        let black = [0, 0, 0, 255];
+        let white = [255; 4];
+        let depth = super::DXGI_FORMAT_D32_FLOAT.0 as u32;
+        let scalar = super::DXGI_FORMAT_R32_FLOAT.0 as u32;
+        assert_eq!(capture(depth, [0.25; 2]), white.repeat(2));
+        assert_eq!(capture(scalar, [-0.25; 2]), white.repeat(2));
+        assert_eq!(capture(depth, [0.0; 2]), black.repeat(2));
+        assert_eq!(capture(depth, [0.25, 0.75]), [black, white].concat());
+    }
+
+    #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn signed_r16_colours_do_not_brighten_negative_components() {
+        let rgba: Vec<_> = [-1i16, 1024, 512, 0]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        for format in [13, 14] {
+            assert_eq!(
+                super::to_rgba(format, 1, 1, 8, &rgba),
+                Some(vec![0, 255, 127, 255]),
+            );
+        }
+        for format in [37, 38] {
+            assert_eq!(
+                super::to_rgba(format, 1, 1, 4, &rgba[..4]),
+                Some(vec![0, 255, 0, 255]),
+            );
+        }
+        let unsigned = super::to_rgba(12, 1, 1, 8, &rgba).unwrap();
+        assert_eq!(unsigned, [255, 3, 1, 255]);
+    }
+
+    #[test]
+    fn signed_r16_luma_keeps_negative_zero_and_positive_in_order() {
+        let mut rows: Vec<_> = [i16::MIN, 0, i16::MAX]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        rows.extend([0xff; 2]);
+        for format in [58, 59] {
+            assert_eq!(
+                super::to_rgba(format, 3, 1, 8, &rows),
+                Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]),
+            );
+        }
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
@@ -967,9 +1181,23 @@ mod tests {
         assert_eq!(super::to_rgba(11, 1, 1, 8, &unorm16), Some(vec![255, 127, 0, 255]));
         // Red 0x3ff, green 0x1ff, blue 0, alpha 3.
         let xr = (0x3ffu32 | 0x1ff << 10 | 3 << 30).to_le_bytes();
-        assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
+        assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 50, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    #[test]
+    fn xr_bias_targets_decode_black_and_extended_range_channels() {
+        let xr = super::DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM.0 as u32;
+        let pixel = |r: u32, g: u32, b: u32| (r | g << 10 | b << 20 | 3 << 30).to_le_bytes();
+        assert_eq!(
+            super::to_rgba(xr, 1, 1, 4, &pixel(384, 384, 384)),
+            Some(vec![0, 0, 0, 255])
+        );
+        assert_eq!(
+            super::to_rgba(xr, 1, 1, 4, &pixel(894, 639, 384)),
+            Some(vec![255, 127, 0, 255])
+        );
     }
 }
 

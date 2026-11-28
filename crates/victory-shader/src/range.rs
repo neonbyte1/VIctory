@@ -6,7 +6,8 @@
 //! A value is bounded when it is a constant; a copy (`s_mov_b32`,
 //! `v_mov_b32`, or an unguarded `v_readfirstlane_b32`: the first active
 //! lane is then a lane that runs there) of a bounded value; `min`, `and` or
-//! `med3` (unsigned) with a bounded operand; a sum of bounded values that
+//! `med3` (unsigned) with a bounded operand; an unsigned right shift by a
+//! known constant; a sum of bounded values that
 //! cannot wrap; or a phi whose every incoming value is bounded on its edge,
 //! where an unsigned compare of that value with a bounded one (`v_cmp*`,
 //! `s_cmp*`: `lt`, `le`, `eq` true or `gt`, `ge` false) that every lane
@@ -38,24 +39,41 @@ pub fn build(
     wave64: bool,
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
-    let p = ir::build(code, wave64, vgprs)?;
-    let st = structure::structure(&p);
-    let mut assumed: HashMap<usize, u8> = p
-        .blocks
+    let list = crate::gfx10::decode(code)?;
+    // The moves, found in the code: the program with every move at its
+    // full range (and its structure) is built only if no bound is proven,
+    // not first (with a relative move, that made this nearly three times
+    // the work of a program without one).
+    let mut assumed: HashMap<usize, u8> = list
         .iter()
-        .flat_map(|b| &b.insts)
-        .filter(|i| relative(i))
-        .map(|i| (i.machine.offset, 0))
+        .filter(|i| i.name().is_some_and(relative_name))
+        .map(|i| (i.offset, 0))
         .collect();
-    if st.is_err() {
-        assumed.clear();
+    if assumed.is_empty() {
+        let p = ir::build_decoded(code, list, wave64, vgprs, &assumed)?;
+        let st = structure::structure(&p);
+        return Ok((p, st));
     }
     // Each round grows a bound or drops a move; few programs need more than two.
-    for _ in 0..8 {
+    for round in 0..8 {
         if assumed.is_empty() {
             break;
         }
-        let q = ir::build_bounded(code, wave64, vgprs, &assumed)?;
+        let q = ir::build_decoded(code, list.clone(), wave64, vgprs, &assumed)?;
+        if round == 0 {
+            // Only the moves the program reaches (which bounds do not change).
+            let reached: HashSet<usize> = q
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| relative(i))
+                .map(|i| i.machine.offset)
+                .collect();
+            assumed.retain(|o, _| reached.contains(o));
+            if assumed.is_empty() {
+                break;
+            }
+        }
         let Ok(s) = structure::structure(&q) else {
             break;
         };
@@ -68,7 +86,7 @@ pub fn build(
             if proven == assumed {
                 return Ok((q, Ok(s)));
             }
-            let q = ir::build_bounded(code, wave64, vgprs, &proven)?;
+            let q = ir::build_decoded(code, list, wave64, vgprs, &proven)?;
             let s = structure::structure(&q);
             return Ok((q, s));
         }
@@ -77,12 +95,18 @@ pub fn build(
             .filter_map(|(&o, &m)| Some((o, u8::try_from(found[&o]).ok()?.max(m))))
             .collect();
     }
+    let p = ir::build_decoded(code, list, wave64, vgprs, &HashMap::new())?;
+    let st = structure::structure(&p);
     Ok((p, st))
 }
 
 fn relative(inst: &Inst) -> bool {
+    relative_name(inst.name())
+}
+
+fn relative_name(name: &str) -> bool {
     matches!(
-        inst.name(),
+        name,
         "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" | "v_movrelsd_2_b32" | "v_swaprel_b32"
     )
 }
@@ -209,7 +233,7 @@ impl Ranges<'_> {
                 best = best.min(h);
             }
         }
-        if best == u32::MAX { self.hi(a) } else { best }
+        best.min(self.hi(a))
     }
 
     /// What an unsigned compare whose result `c` is `holds` says of the
@@ -279,6 +303,10 @@ impl Ranges<'_> {
             ("s_mov_b32" | "v_mov_b32" | "v_readfirstlane_b32", &[x]) => x,
             ("s_min_u32" | "v_min_u32" | "s_and_b32" | "v_and_b32", &[x, y]) => x.min(y),
             ("s_max_u32" | "v_max_u32", &[x, y]) => x.max(y),
+            // Unsigned right shift is monotone for a fixed shift amount.
+            // A shift count's upper bound alone is not enough to narrow it.
+            ("s_lshr_b32", &[x, _]) => constant_shift(&src[1]).map_or(u32::MAX, |n| x >> n),
+            ("v_lshrrev_b32", &[_, x]) => constant_shift(&src[0]).map_or(u32::MAX, |n| x >> n),
             // The median is at most the larger of any two operands.
             ("v_med3_u32", &[x, y, z]) => x.max(y).min(x.max(z)).min(y.max(z)),
             // A sum that may wrap is unbounded.
@@ -293,6 +321,15 @@ impl Ranges<'_> {
             Operand::Literal(x) => x,
             _ => value(inst, op).map_or(u32::MAX, |v| self.hi(v)),
         }
+    }
+}
+
+/// A known shift count in the unambiguous 32-bit range.
+fn constant_shift(op: &Operand) -> Option<u32> {
+    match *op {
+        Operand::Const(c @ 128..=159) => Some(u32::from(c - 128)),
+        Operand::Literal(n) if n < 32 => Some(n),
+        _ => None,
     }
 }
 
@@ -383,6 +420,70 @@ mod tests {
     }
 
     #[test]
+    fn shift_bounds_accept_only_unambiguous_constant_counts() {
+        for count in 0..32 {
+            assert_eq!(constant_shift(&Operand::Literal(count)), Some(count));
+        }
+        for code in 128..=159 {
+            assert_eq!(
+                constant_shift(&Operand::Const(code)),
+                Some(u32::from(code - 128))
+            );
+        }
+        for count in [32, 63, u32::MAX] {
+            assert_eq!(constant_shift(&Operand::Literal(count)), None);
+        }
+        for code in [127, 160, 192, 193, 208] {
+            assert_eq!(constant_shift(&Operand::Const(code)), None);
+        }
+    }
+
+    #[test]
+    fn constant_right_shifts_bound_relative_register_reads() {
+        for (shift, expected) in [
+            (30, vec![8, 9, 10, 11, 4]),
+            (31, vec![8, 9, 4]),
+            (0, (8..16).chain([4]).collect()),
+        ] {
+            let p = build_words(&[
+                vop2(0x16, 1, 128 + shift, 0), // v_lshrrev_b32 v1, shift, v0
+                vop1(0x02, 0, V + 1),         // v_readfirstlane_b32 s0, v1
+                M0_S0,
+                vop1(0x43, 4, V + 8),         // v_movrels_b32 v4, v8
+                S_ENDPGM,
+            ]);
+            let reads = vgprs(&p.blocks[0].insts[3].reads);
+            assert_eq!(reads, expected, "vector shift {shift}");
+
+            let p = build_words(&[
+                0x9000_000A | ((128 + shift) << 8), // s_lshr_b32 s0, s10, shift
+                M0_S0,
+                vop1(0x43, 4, V + 8),
+                S_ENDPGM,
+            ]);
+            assert_eq!(
+                vgprs(&p.blocks[0].insts[2].reads),
+                expected,
+                "scalar shift {shift}"
+            );
+        }
+
+        // A variable shift can be zero, even if its upper bound is small.
+        let p = build_words(&[
+            vop2(0x1B, 2, 159, 3),    // v_and_b32 v2, 31, v3
+            vop2(0x16, 1, V + 2, 0), // v_lshrrev_b32 v1, v2, v0
+            vop1(0x02, 0, V + 1),
+            M0_S0,
+            vop1(0x43, 4, V + 8),
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            vgprs(&p.blocks[0].insts[4].reads),
+            (8..16).chain([4]).collect::<Vec<u8>>()
+        );
+    }
+
+    #[test]
     fn a_loop_counter_bounds_the_index() {
         // for (v7 = 0; v7 < 4; v7++) v[2 + v7] = v0. Without the bound the
         // move could overwrite its own counter.
@@ -470,6 +571,47 @@ mod tests {
                 reads[..],
                 "{narrow_first}"
             );
+        }
+    }
+
+    #[test]
+    fn compare_against_looser_or_unbounded_operand_preserves_existing_bound() {
+        // s0 = s2 & 3 (bounded to 3). Joining s0 (along an edge where s0 < s3
+        // or !(s0 >= s3), with s3 either unbounded or bounded looser to 255)
+        // with 0 must keep s0's tighter bound of 3: `edge_hi` must take the
+        // minimum of the compare fact and `self.hi(s0)` rather than letting a
+        // looser compare bound hide `self.hi(s0)`.
+        for (cmp, branch) in [
+            (0xBF0A_0300, 0xBF85_0001), // s_cmp_lt_u32 s0, s3; s_cbranch_scc1 +1
+            (0xBF09_0300, 0xBF84_0001), // s_cmp_ge_u32 s0, s3; s_cbranch_scc0 +1
+        ] {
+            for prefix in [
+                &[][..],
+                &[0x8703_FF04, 255][..], // s_and_b32 s3, s4, 255 (bounded to 255)
+            ] {
+                let mut words = prefix.to_vec();
+                words.extend([
+                    0x8700_8302,          // s_and_b32 s0, s2, 3
+                    cmp,                  // compare s0 against s3
+                    branch,               // -> join when s0 < s3
+                    0xBE80_0380,          // s_mov_b32 s0, 0
+                    M0_S0,                // join: s_mov_b32 m0, s0
+                    vop1(0x43, 4, V + 8), // v_movrels_b32 v4, v8
+                    S_ENDPGM,
+                ]);
+                let p = build_words(&words);
+                let movrels = p
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .find(|i| i.name() == "v_movrels_b32")
+                    .unwrap();
+                assert_eq!(
+                    vgprs(&movrels.reads),
+                    [8, 9, 10, 11, 4],
+                    "{cmp:#010x} prefix={prefix:?}"
+                );
+            }
         }
     }
 }

@@ -48,7 +48,7 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests) | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; real queries, HDR and scaling are missing |
+| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests); occlusion, pipeline statistics and timestamp queries run on the host GPU | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; HDR and scaling are missing; console-only query types get stand-in results |
 | Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: all but under 300 of 24,387 programs | Merged geometry stages (195 programs) and under 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
@@ -85,6 +85,10 @@ copy victory.example.toml victory.toml   # then set your paths (outside the repo
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
+
+With a GPU, `cargo test -p victory-shader --lib fuzz_tests -- --ignored --nocapture`
+runs each lowered VALU instruction on every adapter and on WARP and reports
+where they disagree (`VICTORY_FUZZ_OUT=report.md` writes the report).
 
 Run the title:
 
@@ -161,6 +165,7 @@ victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
+victory shader-coverage <runtime.log> [paths...]
 victory config
 ```
 
@@ -169,6 +174,8 @@ default worker count.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
+
+`shader-coverage` compares failures in a UTF-8 runtime log (keep it outside the repository) with offline shader emission, using the same build and settings; unmatched hashes are not proof of absence.
 
 ### Windows shader-test validator
 
@@ -188,6 +195,19 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+## Experimental memory option
+
+Set `VICTORY_TRIM_IDLE_SHADERS=1` before launch to periodically remove
+shader-cache entries that are no longer referenced by any pipeline or
+worker. A sweep runs after every 256 new shader-cache entries, not on cache
+hits. Live shader objects are retained; the disk shader cache is unchanged.
+
+This is opt-in: the default keeps shader objects for the entire run.
+Revisiting an evicted shader can require additional cache reads or
+translation (including previously failed translations). The option reduces
+retained CPU-side shader data when idle entries exist; it does not cap
+overall memory use or GPU VRAM, and no title-level savings are established.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
@@ -205,8 +225,10 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_PIPELINE_JOURNAL=1` | a pipeline whose creation crashed the process is refused from the next run on, until the translator changes (`pipeline-journal\crashed.txt` in the cache folder; delete a line to retry it; quitting mid-creation counts as a crash) |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `VICTORY_PATCH=<module>:<rva>:<hex bytes>,...` | writes bytes once at module load after relocation and before title protection; can patch code, unlike `VICTORY_POKE`'s repeated writes; logs replaced bytes |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
@@ -219,11 +241,13 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_MODE=<width>x<height>` | report that display mode instead of the console's 3840x2160 (smaller render targets on smaller hosts) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^14 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `VICTORY_LOOSE_WINDOW_KIB=256` | loose title memory in 256 KiB windows instead of 4 MiB; less host memory, but more copying per frame |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.

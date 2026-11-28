@@ -261,7 +261,7 @@ mod tests {
         assert!(index_rva + 4 <= u64::from(info.size_of_image));
 
         let folder = tempfile::tempdir().unwrap();
-        let image = crate::load(&prepared, folder.path()).unwrap();
+        let image = crate::load(&prepared, folder.path(), "test.exe").unwrap();
         // SAFETY: the mapped test image contains the checked DWORD above.
         let assigned =
             unsafe { ((image.base() + index_rva as usize) as *const u32).read_unaligned() };

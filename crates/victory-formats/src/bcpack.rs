@@ -13,6 +13,7 @@
 //! kept in `bcpack-tables.bin` beside this file ([`Tables::builtin`]).
 
 use std::fmt;
+use std::mem::MaybeUninit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(pub &'static str);
@@ -341,9 +342,8 @@ impl Lane {
             return Ok(());
         }
         let mut x = self.x;
-        if x < LOW
-            && let Some(b) = self.latch.take()
-        {
+        let refill = if x < LOW { self.latch.take() } else { None };
+        if let Some(b) = refill {
             self.left = self.left.wrapping_sub(1);
             x = x << 8 | u32::from(b);
         }
@@ -367,17 +367,14 @@ impl Lane {
             };
             self.x = (x >> 16).wrapping_mul(f).wrapping_add(rem);
             self.out = Some(sym as u8);
-        } else if self.left != 0 {
-            // At exactly 2^24 the lane neither reads nor decodes again; only a
-            // lane that has delivered its symbols may end up there.
+        } else if self.left != 0 || (refill.is_some() && x < LOW) {
+            // A final byte that still leaves x below LOW goes through the
+            // drain phase for one step before this lane asks for a header.
             self.x = x;
         } else {
-            // The fragment ends; a byte read in this step does not reach the carried state.
             self.phase = 0;
             self.need = self.latch.is_none();
-            if self.reset {
-                self.x = 0;
-            }
+            self.x = if self.reset { 0 } else { x };
         }
         Ok(())
     }
@@ -422,13 +419,19 @@ fn lanes(
     let (mut pos, mut done, mut idle) = (0, 0u32, 0);
     // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
     let mut at = 0;
-    while pos < blocks * per {
+    let symbols = blocks * per;
+    while pos < symbols {
         let (mut taken, mut moved) = (0, false);
         for (j, lane) in lanes.iter_mut().enumerate() {
             let bit = 1 << j;
             let before = taken;
             if !lane.stalled {
                 lane.step(t)?;
+            }
+            // A lane may still need the tail of its current payload after its
+            // last symbol. Once both are exhausted it cannot start a header.
+            if pos + 1 == symbols && done & bit != 0 && lane.left == 0 {
+                continue;
             }
             let waiting = lane.out.is_some() && done & bit != 0;
             if lane.need && !waiting && taken < ROUND_BYTES {
@@ -487,10 +490,22 @@ fn interleave(a: u8, b: u8) -> u8 {
 
 /// Block `i`'s reference `r`: 0 none, else `r` blocks back, before the first
 /// block into the dictionary.
-fn pick<'a, T>(i: usize, r: usize, history: &'a [T], dictionary: &'a [T], zero: &'a T) -> &'a T {
+fn pick<'a, T>(
+    i: usize,
+    r: usize,
+    history: &'a [MaybeUninit<T>; HISTORY],
+    dictionary: &'a [T],
+    zero: &'a T,
+) -> &'a T {
     match r {
         0 => zero,
-        r if r <= i => &history[(i - r) % HISTORY],
+        r if r <= i => {
+            // SAFETY: slot `(i - r) % HISTORY` was written by block `i - r`
+            // (its residue matches), and no later block has overwritten it:
+            // the next block with that residue is `i - r + HISTORY`, which is
+            // past block `i` because `r <= 255 < HISTORY`.
+            unsafe { history[(i - r) % HISTORY].assume_init_ref() }
+        }
         r => &dictionary[r - i - 1],
     }
 }
@@ -531,7 +546,7 @@ fn plain<'a>(
     residual: impl Fn(&[u8]) -> Plain,
     pack: fn(&Plain, &mut [u8]),
 ) -> Result<(), Error> {
-    let mut history = vec![Plain::default(); HISTORY];
+    let mut history = [MaybeUninit::<Plain>::uninit(); HISTORY];
     let zero = Plain::default();
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, w.paired);
@@ -544,7 +559,7 @@ fn plain<'a>(
         for ((v, r), bits) in v.ix.iter_mut().zip(ix_ref).zip(w.ix) {
             *v = v.wrapping_add(*r) & ((1u8 << bits) - 1);
         }
-        history[i % HISTORY] = v;
+        history[i % HISTORY].write(v);
         pack(&v, block);
     }
     Ok(())
@@ -741,10 +756,19 @@ fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
 }
 
+/// Channel rotation bits; only BC7 modes 4 and 5 have a rotation field.
+fn rotation(ctrl: u16) -> usize {
+    if matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
+}
+
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let (mode, rot) = (ctrl & 7, rotation(ctrl));
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -759,7 +783,7 @@ fn bc7<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     t: &Tables,
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
+    let mut history = [MaybeUninit::<(Bc7Ep, Bc7Ix)>::uninit(); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
@@ -838,7 +862,7 @@ fn bc7<'a>(
                 }
             }
         }
-        history[i % HISTORY] = (ep, ix);
+        history[i % HISTORY].write((ep, ix));
         bc7_pack(&ep, &ix, prec, block);
     }
     Ok(())
@@ -849,7 +873,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1059,7 +1083,7 @@ fn bc6<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[(Bc6Ep, Bc6Ix)],
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
+    let mut history = [MaybeUninit::<(Bc6Ep, Bc6Ix)>::uninit(); HISTORY];
     let zero = (
         Bc6Ep::default(),
         Bc6Ix {
@@ -1127,7 +1151,7 @@ fn bc6<'a>(
                 ix.ix[p] = add_index(v, bits, rx.ix[p], bc6_index_bits(rx.mode));
             }
         }
-        history[i % HISTORY] = (ep, ix);
+        history[i % HISTORY].write((ep, ix));
         // Fields: the working value has its top bit flipped.
         let field = |k: usize, c: usize| {
             let sh = if k == 0 { shift[0] } else { shift[1 + c] };
@@ -1224,9 +1248,7 @@ mod tests {
         out
     }
 
-    /// Interleaves per-lane fragments the way the decoder takes bytes. A lane
-    /// that has finished still asks: a filler fragment (two payload bytes)
-    /// brings its state to 2^24 with a byte latched, which parks it for good.
+    /// Interleaves per-lane fragments in the order the decoder takes bytes.
     fn stream(t: &Tables, widths: &[u8], per: usize, records: &[Vec<u8>]) -> Vec<u8> {
         let stride = widths.len() * per;
         let mut queues: Vec<std::collections::VecDeque<u8>> = (0..widths.len())
@@ -1235,9 +1257,7 @@ mod tests {
                     .iter()
                     .flat_map(|r| r[j * per..j * per + per].to_vec())
                     .collect();
-                let mut bytes = fragment(widths[j], &syms);
-                bytes.extend([0, 1, 0, 0]);
-                bytes.into()
+                fragment(widths[j], &syms).into()
             })
             .collect();
         let mut out = Vec::new();
@@ -1245,7 +1265,7 @@ mod tests {
         let fetch = |j: usize| {
             let b = queues[j]
                 .pop_front()
-                .expect("a parked lane asked for input");
+                .expect("a lane read past its fragment");
             out.push(b);
             Some(b)
         };
@@ -1284,6 +1304,44 @@ mod tests {
     }
 
     #[test]
+    fn finished_lanes_leave_the_remaining_payload_for_their_peers() {
+        // One zero symbol per BC4 lane, using the uniform 6-bit alphabet.
+        // Symbol 0 has frequency 1023 and starts at 1. Inverting the rANS
+        // step from 2^24 gives the four big-endian payload bytes below.
+        let state = ((LOW / 1023) << 16) + (LOW % 1023) + 1;
+        let mut src = Vec::new();
+        // The feeder serves eight lanes per round. These fragments request
+        // a byte on every round, so lanes 0..8 finish before 8..12 start.
+        for batch in [0..8, 8..12] {
+            src.extend(batch.clone().map(|lane| if lane < 4 { 0x90 } else { 0x10 }));
+            src.extend(std::iter::repeat_n(3, batch.len()));
+            for byte in state.to_be_bytes() {
+                src.extend(std::iter::repeat_n(byte, batch.len()));
+            }
+        }
+        let mut dst = [0xff; 8];
+        decode(4, &src, &mut dst, &Tables::parse(&tables()).unwrap()).unwrap();
+        assert_eq!(dst, [128, 128, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_last_symbol_can_precede_its_final_payload_bytes() {
+        // Lane 0 produces 0 and 31 in one fragment and retains the two
+        // trailing zero bytes that refill its state to LOW. Lane 1 produces
+        // its two zeros in separate fragments. If lane 0 stops as soon as
+        // it emits 31, lane 1 takes the second zero as its fragment length.
+        let src = [
+            0x1c, 0x10, 5, 3, 1, 0x20, 0x3c, 4, 0x0c, 0, 0x28, 5, 0, 0x10, 0, 3, 0x20, 4, 0, 5,
+        ];
+        let tables = Tables::builtin().unwrap();
+        let mut bytes = src.into_iter();
+        let mut got = [0; 4];
+        lanes(&tables, &[4, 4], 1, 2, |_| bytes.next(), &mut got).unwrap();
+        assert_eq!(got, [0, 0, 31, 0]);
+        assert_eq!(bytes.next(), None);
+    }
+
+    #[test]
     fn bc4_blocks_with_and_without_references() {
         let t = Tables::parse(&tables()).unwrap();
         // Block 0: endpoints 10, -3 (+128 stored), indices p -> p & 7.
@@ -1301,6 +1359,24 @@ mod tests {
         };
         assert_eq!(dst[..8], block(138, 125, &|p| p & 7));
         assert_eq!(dst[8..], block(139, 126, &|p| (p + 1) & 7));
+    }
+
+    #[test]
+    fn unflushed_fragments_can_split_a_refill() {
+        // Both lanes decode 31 at state 0x0100ffff, leaving 0x100.
+        // They need two bytes to reach 0x0100fffe and decode 30. Lane 0
+        // takes the first byte before its fragment boundary and drains for
+        // a clock. Lane 1 takes both bytes after its boundary. The different
+        // boundaries make an early header request change the byte order.
+        let src = [
+            0x0c, 0x0c, 4, 3, 1, 1, 0, 0, 255, 255, 255, 255, 255, 0x1d, 0x1d, 1, 0, 255, 254, 254,
+        ];
+        let mut bytes = src.into_iter();
+        let mut got = [0; 4];
+        let tables = Tables::builtin().unwrap();
+        lanes(&tables, &[4, 4], 1, 2, |_| bytes.next(), &mut got).unwrap();
+        assert_eq!(got, [31, 31, 30, 30]);
+        assert_eq!(bytes.next(), None);
     }
 
     #[test]
@@ -1355,6 +1431,102 @@ mod tests {
         w.put(1, 1);
         w.put(1, 1);
         assert_eq!(dst, w.v.to_le_bytes());
+    }
+
+    #[test]
+    fn bc7_rotation_applies_only_to_modes_4_and_5() {
+        const BC7_WIDTHS: [u8; 16] = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        const CTRL7_OFFSET: usize = MODELS * BUCKETS * 2 + 256 + 64 + 256 + 64 + 64;
+        let tables_for = |ctrl: u16| {
+            let mut raw = tables();
+            raw[CTRL7_OFFSET..CTRL7_OFFSET + 2].copy_from_slice(&ctrl.to_le_bytes());
+            let t = Tables::parse(&raw).unwrap();
+            assert_eq!(t.ctrl7[0], ctrl);
+            t
+        };
+
+        let mut record = vec![0u8; 32];
+        for (i, &val) in [11, 23, 5, 19, 13, 29, 7, 17, 3, 25, 9, 21, 15, 31, 1, 12]
+            .iter()
+            .enumerate()
+        {
+            record[4 + i] = zigzag(val);
+        }
+        record[20] = zigzag(6);
+        record[21] = zigzag(14);
+
+        // Modes without a BC7 rotation field must ignore ctrl bits 4:3 instead of
+        // panicking on shift overflow (modes 0/1/3 with rot=1) or corrupting channels.
+        for (mode, subsets) in [(0u16, 3u16), (1, 2), (2, 3), (3, 2), (6, 1), (7, 2)] {
+            let base_ctrl = (subsets << 6) | mode;
+            let base_tables = tables_for(base_ctrl);
+            let base_src = stream(&base_tables, &BC7_WIDTHS, 2, std::slice::from_ref(&record));
+            let mut want = [0u8; 16];
+            decode(7, &base_src, &mut want, &base_tables).unwrap();
+
+            for rot in 1..=3u16 {
+                let ctrl = base_ctrl | (rot << 3);
+                let t = tables_for(ctrl);
+                let src = stream(&t, &BC7_WIDTHS, 2, std::slice::from_ref(&record));
+                let mut got = [0u8; 16];
+                decode(7, &src, &mut got, &t).unwrap();
+                assert_eq!(got, want, "mode {mode} rot {rot}");
+                assert_eq!(
+                    bc7_precision(ctrl),
+                    bc7_precision(base_ctrl),
+                    "mode {mode} rot {rot}"
+                );
+            }
+        }
+
+        // Modes 4 and 5 do have a 2-bit rotation field: rotation swaps alpha with channel rot-1.
+        for (mode, base_bits) in [(4u16, [5u8, 5, 5, 6]), (5u16, [7u8, 7, 7, 8])] {
+            for rot in 1..=3usize {
+                let ctrl = (1 << 6) | ((rot as u16) << 3) | mode;
+                let mut expected_prec = base_bits;
+                expected_prec.swap(3, rot - 1);
+                assert_eq!(bc7_precision(ctrl), expected_prec, "mode {mode} rot {rot}");
+            }
+
+            // Decode mode 4/5 with rot=1 (swap R and A) and check the packed BC7 block.
+            let ctrl = (1 << 6) | (1 << 3) | mode;
+            let t = tables_for(ctrl);
+            let mut s = vec![0u8; 32];
+            s[4] = zigzag(0x21); // stored R0 (holds alpha precision after rot=1)
+            s[5] = zigzag(0x12); // stored R1
+            s[6] = zigzag(0x05); // stored G0
+            s[7] = zigzag(0x06); // stored G1
+            s[8] = zigzag(0x09); // stored B0
+            s[9] = zigzag(0x0a); // stored B1
+            s[10] = zigzag(0x0d); // stored A0 (holds color precision after rot=1)
+            s[11] = zigzag(0x0e); // stored A1
+            let src = stream(&t, &BC7_WIDTHS, 2, &[s]);
+            let mut dst = [0u8; 16];
+            decode(7, &src, &mut dst, &t).unwrap();
+
+            let color_bits = u32::from(base_bits[0]);
+            let alpha_bits = u32::from(base_bits[3]);
+            let mut w = Bits::default();
+            w.put(1 << mode, u32::from(mode) + 1);
+            w.put(1, 2); // rotation = 1
+            if mode == 4 {
+                w.put(0, 1); // indexSelectionBit = 0
+            }
+            // Endpoint order after rot=1 swaps indices 3 and 0: [3 (R), 1 (G), 2 (B), 0 (A)].
+            for (v, n) in [
+                (0x0d, color_bits),
+                (0x0e, color_bits),
+                (0x05, color_bits),
+                (0x06, color_bits),
+                (0x09, color_bits),
+                (0x0a, color_bits),
+                (0x21, alpha_bits),
+                (0x12, alpha_bits),
+            ] {
+                w.put(v, n);
+            }
+            assert_eq!(dst, w.v.to_le_bytes(), "mode {mode} rot 1");
+        }
     }
 
     #[test]
@@ -1608,5 +1780,93 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+
+    /// More blocks than the history holds, every block referring to the
+    /// block 255 before it: the first 255 read the dictionary, block 255
+    /// reads block 0, and later blocks read slots the ring has wrapped
+    /// past. The first 255 blocks carry a per-block residual so the base
+    /// values differ; from block 255 the residual is zero, so each of
+    /// those blocks must come back exactly as the block it refers to. A
+    /// wrap bug (an unwritten slot, a stale entry, an off-by-one in the
+    /// distance) shows as an unequal block.
+    #[test]
+    fn references_survive_the_dictionary_transition_and_the_history_wrap() {
+        let t = Tables::parse(&tables()).unwrap();
+        let blocks = 600usize;
+
+        // BC4 (unpaired): distance and index reference in s[1] alone.
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0u8; 12];
+                r[1] = 255;
+                if i < 255 {
+                    r[2] = 2 * (i & 127) as u8;
+                    r[3] = 2 * (i >> 7) as u8;
+                }
+                r
+            })
+            .collect();
+        let src = stream(&t, &BC4_LANES, 1, &records);
+        let mut dst = vec![0u8; blocks * 8];
+        decode(4, &src, &mut dst, &t).unwrap();
+        for i in 255..blocks {
+            assert_eq!(
+                &dst[8 * i..8 * i + 8],
+                &dst[8 * (i - 255)..8 * (i - 255) + 8],
+                "BC4 block {i}"
+            );
+        }
+
+        // BC6 (paired, mode 11): both references at distance 255 via the
+        // 4-bit interleave; endpoints 0 and 1 carry the base residual.
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0u8; 32];
+                r[2] = 0x0f;
+                r[3] = 0x0f;
+                r[30] = 10;
+                if i < 255 {
+                    r[4] = (i & 63) as u8;
+                    r[6] = (i >> 6) as u8;
+                }
+                r
+            })
+            .collect();
+        let src = stream(&t, &[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2, &records);
+        let mut dst = vec![0u8; blocks * 16];
+        decode(6, &src, &mut dst, &t).unwrap();
+        for i in 255..blocks {
+            assert_eq!(
+                &dst[16 * i..16 * i + 16],
+                &dst[16 * (i - 255)..16 * (i - 255) + 16],
+                "BC6 block {i}"
+            );
+        }
+
+        // BC7 (paired, mode 6): both references at distance 255; endpoints
+        // R0 and R1 of subset 0 carry the base residual.
+        let records: Vec<Vec<u8>> = (0..blocks)
+            .map(|i| {
+                let mut r = vec![0u8; 32];
+                r[2] = 0x0f;
+                r[3] = 0x0f;
+                if i < 255 {
+                    r[4] = 2 * (i & 127) as u8;
+                    r[5] = 2 * (i >> 7) as u8;
+                }
+                r
+            })
+            .collect();
+        let src = stream(&t, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2, &records);
+        let mut dst = vec![0u8; blocks * 16];
+        decode(7, &src, &mut dst, &t).unwrap();
+        for i in 255..blocks {
+            assert_eq!(
+                &dst[16 * i..16 * i + 16],
+                &dst[16 * (i - 255)..16 * (i - 255) + 16],
+                "BC7 block {i}"
+            );
+        }
     }
 }

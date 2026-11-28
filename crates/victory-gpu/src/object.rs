@@ -196,7 +196,7 @@ extern "system" fn get_private_data(
     S_OK
 }
 
-/// Null data removes the entry.
+/// Null data removes the entry and reports S_FALSE if it was already absent.
 extern "system" fn set_private_data(
     this: This,
     id: *const Iid,
@@ -207,14 +207,18 @@ extern "system" fn set_private_data(
     let Some(&id) = (unsafe { id.as_ref() }) else {
         return E_INVALIDARG;
     };
+    let key = (this as usize, id);
     let mut map = private_data();
     if data.is_null() {
-        map.remove(&(this as usize, id));
-    } else {
-        // SAFETY: the title passes `size` bytes.
-        let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
-        map.insert((this as usize, id), value.to_vec());
+        return if map.remove(&key).is_some() {
+            S_OK
+        } else {
+            S_FALSE
+        };
     }
+    // SAFETY: the title passes `size` bytes.
+    let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
+    map.insert(key, value.to_vec());
     S_OK
 }
 
@@ -227,18 +231,31 @@ pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*con
     f
 }
 
-/// The object methods' name setter: names only reach our log.
+// WKPDID_D3DDebugObjectNameW, the wide debug name's private-data key.
+const DEBUG_OBJECT_NAME_W: Iid = guid(
+    0x4cca5fd8,
+    0x921f,
+    0x42c8,
+    [0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41],
+);
+
+/// Stores a name as wide private data so GetPrivateData can retrieve it.
 pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
-    let name = if name.is_null() {
-        String::new()
+    let (name, result) = if name.is_null() {
+        (String::new(), S_OK)
     } else {
         // SAFETY: a non-null name is NUL-terminated UTF-16.
         let len = (0..).take_while(|&i| unsafe { *name.add(i) } != 0).count();
-        // SAFETY: `len` units were just read.
-        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
+        // SAFETY: the scan read these units and the trailing NUL.
+        let units = unsafe { std::slice::from_raw_parts(name, len + 1) };
+        let Ok(size) = u32::try_from(size_of_val(units)) else {
+            return E_INVALIDARG;
+        };
+        let result = set_private_data(this, &DEBUG_OBJECT_NAME_W, size, units.as_ptr().cast());
+        (String::from_utf16_lossy(&units[..len]), result)
     };
     tracing::debug!(object = ?this, %name, "named");
-    S_OK
+    result
 }
 
 /// The device-child method: the device that made the object, as any of
@@ -466,8 +483,11 @@ mod tests {
         assert_eq!(set(first, &TAG, 99, std::ptr::null()), S_OK);
         assert_eq!(get(first, &TAG, &mut size, data.as_mut_ptr()), NOT_FOUND);
         assert_eq!(size, 0);
+        assert_eq!(set(first, &TAG, 0, std::ptr::null()), S_FALSE);
         assert_eq!(get(first, &OTHER_TAG, &mut size, data.as_mut_ptr()), S_OK);
         assert_eq!(size, 0);
+        assert_eq!(set(first, &OTHER_TAG, 0, std::ptr::null()), S_OK);
+        assert_eq!(set(first, &OTHER_TAG, 0, std::ptr::null()), S_FALSE);
         assert_eq!(release(first), 0);
         size = 3;
         assert_eq!(get(second, &TAG, &mut size, data.as_mut_ptr()), S_OK);
@@ -594,5 +614,39 @@ mod tests {
         );
         assert!(found.is_null());
         slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
+
+    #[test]
+    fn names_round_trip_as_wide_private_data() {
+        let null = std::ptr::null();
+        let mut object = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut object),
+            S_OK
+        );
+        let set = slot::<extern "system" fn(This, *const u16) -> HRESULT>(object, 0x30);
+        let get = slot::<extern "system" fn(This, *const Iid, *mut u32, *mut u8) -> HRESULT>(
+            object, 0x18,
+        );
+
+        for name in ["Synthetic object \u{1f642}", "Updated \u{96ea}", ""] {
+            let expected: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            assert_eq!(set(object, expected.as_ptr()), S_OK);
+            let mut size = 0;
+            assert_eq!(
+                get(object, &DEBUG_OBJECT_NAME_W, &mut size, std::ptr::null_mut()),
+                S_OK
+            );
+            assert_eq!(size as usize, size_of_val(expected.as_slice()));
+
+            let mut actual = vec![u16::MAX; expected.len()];
+            assert_eq!(
+                get(object, &DEBUG_OBJECT_NAME_W, &mut size, actual.as_mut_ptr().cast()),
+                S_OK
+            );
+            assert_eq!(actual, expected);
+        }
+
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
     }
 }

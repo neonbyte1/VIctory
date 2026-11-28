@@ -17,6 +17,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod adapter;
+#[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -43,6 +45,8 @@ mod feeds;
 pub mod fence;
 pub mod frame;
 mod hold;
+#[cfg(windows)]
+mod fx;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -75,6 +79,8 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod title_copy;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;
@@ -86,5 +92,5 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
     UnseenWriting, Writing as KernelWrite, set_writable_alias, title_memory_aliased, title_memory_remapped,
-    unseen_writing, writing as kernel_will_write,
+    title_memory_unmapped, unseen_writing, writing as kernel_will_write,
 };

@@ -22,11 +22,14 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
 mod marks;
+mod phi;
 
 #[cfg(test)]
 pub(crate) use marks::per_lane_marks;
 
 type Why = &'static str;
+
+mod double;
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -64,9 +67,14 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    #[cfg(test)]
+    barrier_modes: Vec<Option<i64>>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Wave ballot calls written.
+    #[cfg(all(test, windows))]
+    pub wave_ballot_calls: usize,
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
@@ -82,6 +90,9 @@ pub(crate) struct Lowered {
     /// Test builds: the headers each written block branches back to.
     #[cfg(test)]
     pub back_edges: Vec<Vec<usize>>,
+    /// `dx.op.waveActiveBallot` calls emitted into the module.
+    #[cfg(test)]
+    pub wave_ballots: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -352,6 +363,9 @@ struct Lower<'a> {
     block: Vec<Option<usize>>,
     cur: usize,
     bools: HashMap<(usize, Bool), V>,
+    /// Source-lane activity ballots by DXIL block and EXEC predicate.
+    /// Cleared at each discard because discarded lanes become helpers.
+    source_ballots: HashMap<(usize, V), [V; 2]>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
@@ -379,6 +393,11 @@ struct Lower<'a> {
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
     join_handles: HashMap<(String, bool, u32, u32), V>,
+    /// [`Lower::handles`] of buffer size queries, which share no handle
+    /// with an access ([`Lower::swap_size_caches`]).
+    size_handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
+    /// [`Lower::entry_handles`] of buffer size queries.
+    size_entry_handles: HashMap<(EntryAddress, u8, bool, u32, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -538,10 +557,13 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
 /// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
+/// until the driver resets it. A lane that reaches the limit on a
+/// conditional back edge leaves by the loop's own exit and runs on with
+/// what it has; on an unconditional back edge it leaves the program as
+/// killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+// 2^14 keeps such a loop to milliseconds per wave, under the driver's reset.
+pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -806,7 +828,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
         .blocks
         .iter()
         .flat_map(|b| &b.insts)
-        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .map(|i| i.machine.offset + 4 * i.machine.words().len())
         .max()
         .unwrap_or(0) as u32;
     let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
@@ -827,8 +849,10 @@ impl<'a> Lower<'a> {
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
+            let name = i.name();
+            (matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
+                || matches!(i.fields, Fields::Flat { .. }) && name.starts_with("global_"))
+                && (name.contains("store") || name.contains("atomic"))
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
@@ -861,7 +885,7 @@ impl<'a> Lower<'a> {
                     || reads_mask_as_data(x.st, i)
             };
             let reads_whole = insts().any(whole);
-            let masks_held = {
+            let masks_held = phi::mask_uses_console_lanes(p, x.st, &phi_at) || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
                 let whens = x.st.exits.iter().filter_map(|e| match *e {
@@ -1060,6 +1084,7 @@ impl<'a> Lower<'a> {
             block: vec![None; p.blocks.len()],
             cur: 0,
             bools: HashMap::new(),
+            source_ballots: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
             mask_phis: HashMap::new(),
@@ -1083,6 +1108,8 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             entry_handles: HashMap::new(),
             join_handles: HashMap::new(),
+            size_handles: HashMap::new(),
+            size_entry_handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1370,7 +1397,9 @@ impl<'a> Lower<'a> {
         // and max, exchange; subtraction adds the negation. A float minimum
         // or maximum is the signed integer one where the value is positive
         // and the reversed unsigned one where negative (IEEE order of the
-        // bits), as two atomics, each a no-op in the lanes the other serves.
+        // bits), as two atomics, each a no-op in the lanes the other serves;
+        // NaN operands select the neutral element in both passes so they
+        // never overwrite a finite or infinite value in memory.
         let ops: Option<&[(u32, u32)]> = match name.strip_prefix("global_atomic_") {
             None => None,
             Some("add" | "sub") => Some(&[(0, 0)]),
@@ -1455,22 +1484,30 @@ impl<'a> Lower<'a> {
             let zero = self.s.m.i32(0);
             self.s.m.cmp(c, pred::SLT, x, zero)
         };
+        let nan = (ops.len() > 1).then(|| {
+            let abs_mask = self.s.m.i32(0x7FFF_FFFF);
+            let exp_mask = self.s.m.i32(0x7F80_0000);
+            let mag = self.s.m.bin(c, Bin::And, x, abs_mask);
+            self.s.m.cmp(c, pred::IUGT, mag, exp_mask)
+        });
         let returned = match *dst {
             Some(Operand::Vector { reg, .. }) if cache.glc => Some(reg),
             _ => None,
         };
         let mut first = None;
         for (k, &(op, neutral)) in ops.iter().enumerate() {
-            let value = if ops.len() == 1 {
-                x
-            } else {
+            let value = if let Some(nan) = nan {
                 let n = self.s.m.i32(neutral);
-                // The first serves positive values, the second negative ones.
-                if k == 0 {
+                // The first serves positive values, the second negative ones;
+                // NaN uses the neutral element in both passes.
+                let v = if k == 0 {
                     self.s.m.select(self.cur, negative, n, x)
                 } else {
                     self.s.m.select(self.cur, negative, x, n)
-                }
+                };
+                self.s.m.select(self.cur, nan, n, v)
+            } else {
+                x
             };
             let op = self.s.m.i32(op);
             let r = self.s.op(
@@ -1533,16 +1570,20 @@ impl<'a> Lower<'a> {
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
+        // The step the simulation could not follow, by operation kind
+        // ([`wave::Section::unknown`]): a census groups refused programs
+        // by this reason.
+        let unknown = self.sections[&b][&start].unknown.unwrap_or(UNKNOWN);
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
+                match shape.ok_or(unknown).and_then(|sh| self.shape(sh)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
                 }
             } else {
-                Val::Missing(UNKNOWN)
+                Val::Missing(unknown)
             };
             self.vals.insert(w, val);
         }
@@ -1893,14 +1934,14 @@ impl<'a> Lower<'a> {
                     let kill = self
                         .boolean(lanes, at)
                         .map_err(|w| unsupported(offset, w))?;
-                    self.s
-                        .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+                    self.emit_discard(at, kill);
                 }
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
+                        self.mode16 = round16_after(&p.blocks[b].insts[j], self.mode16);
                     }
                     i = end;
                     continue;
@@ -1946,17 +1987,28 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
-            heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap").count() as u32,
+            #[cfg(test)]
+            barrier_modes: self
+                .s
+                .m
+                .written_calls("dx.op.barrier")
+                .map(|args| self.s.m.int_value(args[1]))
+                .collect(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(all(test, windows))]
+            wave_ballot_calls: self.s.m.written_calls("dx.op.waveActiveBallot").count(),
             #[cfg(test)]
-            rovs: self.s.flags & flags::ROVS != 0,
+            rovs: self.s.m.uses().rovs,
             #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
             back_edges: self.s.m.back_edges(),
+            #[cfg(test)]
+            wave_ballots: self.s.m.written_calls("dx.op.waveActiveBallot").count() as u32,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2736,10 +2788,18 @@ impl<'a> Lower<'a> {
             f = self.unary(6, f);
         }
         if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
+            f = self.fneg(f);
         }
         Ok(f)
+    }
+
+    /// `-x` as the `neg` input modifier computes it: bit 31 flipped, a NaN's
+    /// sign too. `-0.0 - x` leaves a NaN's sign to the host (WARP keeps it).
+    fn fneg(&mut self, f: V) -> V {
+        let x = self.as_int(f);
+        let sign = self.s.m.i32(0x8000_0000);
+        let x = self.s.m.bin(self.cur, Bin::Xor, x, sign);
+        self.as_float(x)
     }
 
     fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
@@ -2747,11 +2807,19 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
+        let (abs, neg) = (v.abs >> k & 1 != 0, v.neg >> k & 1 != 0);
+        // VOP3 abs / neg on the shift-add and align ops act on the source's
+        // sign bit, as on a float (measured on RDNA2: boykopovar/AnyPS5#25964,
+        // #25799); other integer operations keep refusing them.
+        let sign_bit_mods = matches!(
+            inst.name(),
+            "v_lshl_add_u32" | "v_add_lshl_u32" | "v_alignbit_b32" | "v_alignbyte_b32"
+        );
+        if (abs || neg) && !sign_bit_mods {
             return Err("integer operand modifiers");
         }
-        match self.src0 {
-            Some(x) if k == 0 => Ok(x),
+        let x = match self.src0 {
+            Some(x) if k == 0 => x,
             _ => {
                 let sel = Self::sdwa_src(inst, k);
                 // A byte or word select within the low half.
@@ -2760,12 +2828,23 @@ impl<'a> Lower<'a> {
                     Some(x) => x,
                     None => self.operand(inst, &op)?,
                 };
-                Ok(match sel {
+                match sel {
                     Some((sel, sext)) => self.select_bits(x, sel, sext),
                     None => x,
-                })
+                }
             }
+        };
+        let c = self.cur;
+        let mut x = x;
+        if abs {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
         }
+        if neg {
+            let m = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        Ok(x)
     }
 
     fn unary(&mut self, op: u32, f: V) -> V {
@@ -2842,6 +2921,23 @@ impl<'a> Lower<'a> {
             46,
             &[a, b, c],
         )
+    }
+
+    /// A multiply kept apart from the add that follows it, rounding like the
+    /// plain product: a driver that folds a `fmul` feeding an `fadd`/`fsub`
+    /// into an FMA (one rounding where `v_mac_f32` and `v_mad_f32` round the
+    /// product first) does not see the `fmul` behind the FMad's call. The
+    /// third operand is a zero signed by the operands' own signs, which the
+    /// addition never steps out of and keeps a -0 product -0.
+    fn mul_apart(&mut self, a: V, b: V) -> V {
+        let c = self.cur;
+        let ia = self.as_int(a);
+        let ib = self.as_int(b);
+        let sign = self.s.m.bin(c, Bin::Xor, ia, ib);
+        let mask = self.s.m.i32(0x8000_0000);
+        let zeros = self.s.m.bin(c, Bin::And, sign, mask);
+        let zero = self.as_float(zeros);
+        self.fmad(a, b, zero)
     }
 
     /// `f` as an f16 in the low bits, rounded as the program's MODE says at
@@ -2926,9 +3022,22 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, r, sign)
     }
 
-    /// Fused f16 multiply-add with one nearest-even rounding. The product
-    /// of two finite f16s is exact in f32. TwoSum recovers the error of the
-    /// f32 addition so a rounded sum at an f16 midpoint can be resolved.
+    /// Saturates an FMA result with ordered comparisons. This avoids losing
+    /// the clamp on AMD when the sum went through an integer correction,
+    /// and maps NaN and negative zero to positive zero.
+    fn clamp01_ordered(&mut self, value: V) -> V {
+        let c = self.cur;
+        let m = &mut self.s.m;
+        let (zero, one) = (m.f32(0), m.f32(0x3F80_0000));
+        let positive = m.cmp(c, pred::OGT, value, zero);
+        let low = m.select(c, positive, value, zero);
+        let below_one = m.cmp(c, pred::OLT, low, one);
+        m.select(c, below_one, low, one)
+    }
+
+    /// Fused f16 multiply-add with one rounding. Two finite f16s have an
+    /// exact product in f32. TwoSum recovers the error in the f32 sum to
+    /// resolve f16 midpoints or correct the direction of truncation.
     fn fma_f16(&mut self, a: V, b: V, addend: V, clamp: bool) -> V {
         let c = self.cur;
         let m = &mut self.s.m;
@@ -2940,7 +3049,26 @@ impl<'a> Lower<'a> {
         let addend_lo = m.bin(c, Bin::Sub, addend, addend_hi);
         let error = m.bin(c, Bin::Add, product_lo, addend_lo);
         // Saturation only changes the sum to an endpoint, neither a midpoint.
-        let sum = if clamp { self.unary(7, sum) } else { sum };
+        if self.mode16 == Some(3) {
+            let bits = self.as_int(sum);
+            let tail = self.as_int(error);
+            let m = &mut self.s.m;
+            let sign_mask = m.i32(0x8000_0000);
+            let sign = m.bin(c, Bin::And, bits, sign_mask);
+            let tail = m.bin(c, Bin::Xor, tail, sign);
+            let tail = self.as_float(tail);
+            let m = &mut self.s.m;
+            let zero = m.f32(0);
+            // Correct the unclamped sum only when f32 rounded away from
+            // zero. NaN tails from non-finite sums fail the ordered test.
+            let inward = m.cmp(c, pred::OLT, tail, zero);
+            let step = m.cast(c, Cast::ZExt, inward, self.s.t.i32);
+            let bits = m.bin(c, Bin::Sub, bits, step);
+            let adjusted = self.as_float(bits);
+            let adjusted = if clamp { self.clamp01_ordered(adjusted) } else { adjusted };
+            return self.narrow16(adjusted);
+        }
+        let sum = if clamp { self.clamp01_ordered(sum) } else { sum };
         let bits = self.as_int(sum);
         let error_bits = self.as_int(error);
         let m = &mut self.s.m;
@@ -3533,7 +3661,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        if v.omod != 0 || (v.clamp && !matches!(inst.name(), "v_add_nc_i32" | "v_sub_nc_i32")) {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -3619,14 +3747,15 @@ impl<'a> Lower<'a> {
     /// counts come from one lane's allocation request, which DXIL cannot
     /// express (one call, dominating every output write).
     // shortcut: the counts are the declared maxima and each lane first culls
-    // its primitive (all indices 0, zero area), so primitives past the
-    // program's count are culled and vertices past it unused; this costs
-    // the host the unused vertex and primitive slots. Pass the program's own
-    // counts if that shows in frame time.
+    // its primitive (all indices 0: a triangle of zero area, a line of zero
+    // length), so primitives past the program's count are culled and
+    // vertices past it unused; this costs the host the unused vertex and
+    // primitive slots. Pass the program's own counts if that shows in frame
+    // time.
     fn mesh_prologue(&mut self, mesh: super::shader::Mesh) -> Result<(), Why> {
         let threads = self.s.threads.expect("mesh")[0];
-        if mesh.topology != 2 {
-            return Err("a mesh shader not drawing triangles");
+        if corners(mesh.topology).is_none() {
+            return Err("a mesh shader drawing neither lines nor triangles");
         }
         if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
@@ -3643,14 +3772,7 @@ impl<'a> Lower<'a> {
         let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
         let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
+        self.emit_primitive(flat, &[z; 3]);
         self.end_guarded(at, &[]);
         Ok(())
     }
@@ -3698,10 +3820,40 @@ impl<'a> Lower<'a> {
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// lane must be a constant. `pattern`, a quad permutation every quad
+    /// uses (two bits per lane), lets a broadcast or an exchange take one
+    /// quad operation instead of a read of each lane.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        match pattern {
+            Some(0xE4) => return x,
+            Some(p @ (0x00 | 0x55 | 0xAA | 0xFF)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return self.s.op(
+                    c,
+                    "quadReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    122,
+                    &[x, lane],
+                );
+            }
+            Some(p @ (0xB1 | 0x4E | 0x1B)) => {
+                // Lane 0 reads lane 1, 2 or 3: across x, across y or the
+                // diagonal (QuadOp 0, 1, 2), every lane its partner.
+                let direction = self.s.m.i8((p & 3) - 1);
+                return self.s.op(
+                    c,
+                    "quadOp.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    123,
+                    &[x, direction],
+                );
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -3789,6 +3941,12 @@ impl<'a> Lower<'a> {
         )
     }
 
+    fn emit_discard(&mut self, block: usize, kill: V) {
+        self.s
+            .op(block, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+        self.source_ballots.clear();
+    }
+
     /// Whether `src` is active under the current `EXEC` mask (`guard` for
     /// straight-line narrowing, plus the host wave's live lanes for
     /// branch-structurised control flow). Returns `None` for unguarded pixel
@@ -3800,20 +3958,20 @@ impl<'a> Lower<'a> {
             let g = guard?;
             let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
             let active_i32 = self.s.m.select(c, g, one, zero);
-            let picked = self.quad_pick(active_i32, src);
+            let picked = self.quad_pick(active_i32, src, None);
             return Some(self.s.m.cmp(c, pred::NE, picked, zero));
         }
         let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
         let i32t = self.s.t.i32;
-        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-        let ballot = self
-            .s
-            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-        self.s.flags |= flags::WAVE_OPS;
-        let (lo, hi) = (
-            self.s.m.extract(c, ballot, 0),
-            self.s.m.extract(c, ballot, 1),
-        );
+        // The ballot depends on the host lanes reaching this block as well as EXEC.
+        let [lo, hi] = *self.source_ballots.entry((c, bit)).or_insert_with(|| {
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+            self.s.flags |= flags::WAVE_OPS;
+            [self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1)]
+        });
         let ballot_lane = if mesh_quad {
             let host_lane = self
                 .s
@@ -3874,6 +4032,57 @@ impl<'a> Lower<'a> {
             Some(Operand::Vector { reg, .. }) => Some(*reg),
             _ => None,
         };
+        if name == "ds_nop" {
+            return Ok(());
+        }
+        if name == "ds_permute_b32" {
+            // Each active lane sends `data` to the lane its address plus the
+            // offset names in dwords, within its 32-lane half (RDNA2 ISA
+            // §10.4.4 "LDS Lane-permute Ops": in Wave64 mode the permute
+            // executes as two independent 32-lane halves 0..31 and 32..63);
+            // 0 where no active lane sends.
+            self.cross_lane(false)?;
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let me = self.lane_index();
+            let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+            let (o, two, k31, z) = (k(self, offset), k(self, 2), k(self, 31), k(self, 0));
+            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let to = self.s.m.bin(c, Bin::LShr, at, two);
+            let mut to = self.s.m.bin(c, Bin::And, to, k31);
+            if self.x.p.wave64 {
+                let hi = k(self, !31);
+                let base = self.s.m.bin(c, Bin::And, me, hi);
+                to = self.s.m.bin(c, Bin::Or, base, to);
+            }
+            let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+            let (lo, hi) = (
+                self.s.m.extract(c, ballot, 0),
+                self.s.m.extract(c, ballot, 1),
+            );
+            let off = self.s.m.bool(false);
+            let mut r = z;
+            for src in 0..self.wave() {
+                let ks = k(self, src);
+                let word = if src < 32 { lo } else { hi };
+                let bit = k(self, 1u32 << (src & 31));
+                let m = self.s.m.bin(c, Bin::And, word, bit);
+                let running = self.s.m.cmp(c, pred::NE, m, z);
+                let t = self.read_lane(to, ks);
+                let v = self.read_lane(x, ks);
+                let eq = self.s.m.cmp(c, pred::EQ, t, me);
+                let hit = self.s.m.select(c, running, eq, off);
+                r = self.s.m.select(c, hit, v, r);
+            }
+            let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if name == "ds_swizzle_b32" {
             // Bit 15 set: each lane of a quad picks a lane of it; else lanes
             // of each group of 32 combine their index with and/or/xor masks.
@@ -3910,7 +4119,8 @@ impl<'a> Lower<'a> {
             let use_quad = mesh_quad || self.helpers_read(quad);
             let src_ok = self.src_lane_active(src, guard, mesh_quad);
             let mut r = if use_quad {
-                self.quad_pick(x, src)
+                let pattern = (offset & 0x8000 != 0).then_some(offset as u8);
+                self.quad_pick(x, src, pattern)
             } else {
                 let safe_src = match src_ok {
                     Some(ok) => self.s.m.select(c, ok, src, lane),
@@ -4218,6 +4428,7 @@ impl<'a> Lower<'a> {
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
+                // A shorter host wave can introduce zero bits that change s_ff0's result.
                 name.starts_with("s_bcnt1_i32_")
                     || name.starts_with("s_ff1_i32_")
                     || name.starts_with("v_mbcnt_")
@@ -4232,14 +4443,17 @@ impl<'a> Lower<'a> {
             self.exchange_first(inst);
         }
         let effect = matches!(inst.fields, Fields::Exp { .. })
-            || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+            || matches!(inst.fields, Fields::Flat { .. })
+                && (!name.starts_with("global_load_")
+                    || matches!(inst.fields, Fields::Flat { lds: true, .. }))
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
-                    || name.contains("permute"));
+                    || name.contains("permute")
+                    || name == "ds_nop");
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -4409,7 +4623,10 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
+        let wide = name.ends_with("_b64")
+            || name.ends_with("_u64")
+            || name.ends_with("_i64")
+            || name == "s_bitreplicate_b64_b32";
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
@@ -4448,9 +4665,14 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
-                "s_ff1_i32_b64" => {
-                    // The lowest set bit; -1 for none (as DXIL's first bit low).
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                "s_ff0_i32_b64" | "s_ff1_i32_b64" => {
+                    // FirstbitLo returns -1 when neither half contains a match.
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name == "s_ff0_i32_b64" {
+                        let ones = self.s.m.i32(u32::MAX);
+                        a = self.s.m.bin(c, Bin::Xor, a, ones);
+                        b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    }
                     let i32t = self.s.t.i32;
                     let fa = self
                         .s
@@ -4528,6 +4750,88 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
+                "s_bfe_u64" | "s_bfe_i64" => {
+                    // src1: offset in bits 0-5, width in bits 16-22. A field
+                    // from bit 64 on, or a width of 64 and up, is not defined
+                    // by the ISA; it only has to stay in range here.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let n = src32(self, 1)?;
+                    let signed = name == "s_bfe_i64";
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let b = self.s.m.bin(c, Bin::Shl, b, k32);
+                    let x = self.s.m.bin(c, Bin::Or, a, b);
+                    let (k63, k16, k127, k64) = (
+                        self.s.m.i32(63),
+                        self.s.m.i32(16),
+                        self.s.m.i32(0x7F),
+                        self.s.m.i32(64),
+                    );
+                    let off = self.s.m.bin(c, Bin::And, n, k63);
+                    let off = self.s.m.cast(c, Cast::ZExt, off, i64t);
+                    let w = self.s.m.bin(c, Bin::LShr, n, k16);
+                    let w = self.s.m.bin(c, Bin::And, w, k127);
+                    let full = self.s.m.cmp(c, pred::IUGE, w, k64);
+                    let w = self.s.m.bin(c, Bin::And, w, k63);
+                    let w = self.s.m.cast(c, Cast::ZExt, w, i64t);
+                    let shift = if signed { Bin::AShr } else { Bin::LShr };
+                    let shifted = self.s.m.bin(c, shift, x, off);
+                    let (one, zero, ones) = (
+                        self.s.m.int_const(i64t, 1),
+                        self.s.m.int_const(i64t, 0),
+                        self.s.m.int_const(i64t, -1),
+                    );
+                    let mask = self.s.m.bin(c, Bin::Shl, one, w);
+                    let mask = self.s.m.bin(c, Bin::Sub, mask, one);
+                    let mask = self.s.m.select(c, full, ones, mask);
+                    let mut r = self.s.m.bin(c, Bin::And, shifted, mask);
+                    if signed {
+                        // Sign-extend a field narrower than 64 bits (none for
+                        // width 0).
+                        let k64l = self.s.m.int_const(i64t, 64);
+                        let k63l = self.s.m.int_const(i64t, 63);
+                        let left = self.s.m.bin(c, Bin::Sub, k64l, w);
+                        let left = self.s.m.bin(c, Bin::And, left, k63l);
+                        let t = self.s.m.bin(c, Bin::Shl, r, left);
+                        let t = self.s.m.bin(c, Bin::AShr, t, left);
+                        let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
+                        let keep = self.s.m.bin(c, Bin::Or, full, is0);
+                        r = self.s.m.select(c, keep, r, t);
+                    }
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    let s = nonzero(self, rl, rh);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    // ((1 << src0[5:0]) - 1) << src1[5:0]; SCC is untouched.
+                    let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k63 = self.s.m.i32(63);
+                    let a = self.s.m.bin(c, Bin::And, a, k63);
+                    let b = self.s.m.bin(c, Bin::And, b, k63);
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let m = self.s.m.bin(c, Bin::Shl, one, a);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let r = self.s.m.bin(c, Bin::Shl, m, b);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    Ok(())
+                }
                 "s_mov_b64" => {
                     // Dword by dword: one without a value (the high dword of
                     // a 64-bit wave sum) leaves the other usable.
@@ -4555,6 +4859,84 @@ impl<'a> Lower<'a> {
                         let r = self.s.m.select(c, cond, a, b);
                         self.set(v, Val::I32(r));
                     }
+                    Ok(())
+                }
+                "s_bitset0_b64" | "s_bitset1_b64" => {
+                    let code = dst_code.ok_or("a missing operand")?;
+                    let old_lo =
+                        self.i32_of(inst.read(Reg::S(code)).ok_or("an unread operand")?)?;
+                    let old_hi =
+                        self.i32_of(inst.read(Reg::S(code + 1)).ok_or("an unread operand")?)?;
+                    let a = src32(self, 0)?;
+                    let (k31, k32, one, zero) = (
+                        self.s.m.i32(31),
+                        self.s.m.i32(32),
+                        self.s.m.i32(1),
+                        self.s.m.i32(0),
+                    );
+                    let sh = self.s.m.bin(c, Bin::And, a, k31);
+                    let bit = self.s.m.bin(c, Bin::Shl, one, sh);
+                    let hi_flag = self.s.m.bin(c, Bin::And, a, k32);
+                    let is_hi = self.s.m.cmp(c, pred::NE, hi_flag, zero);
+                    let mask_lo = self.s.m.select(c, is_hi, zero, bit);
+                    let mask_hi = self.s.m.select(c, is_hi, bit, zero);
+                    let (new_lo, new_hi) = if name == "s_bitset1_b64" {
+                        (
+                            self.s.m.bin(c, Bin::Or, old_lo, mask_lo),
+                            self.s.m.bin(c, Bin::Or, old_hi, mask_hi),
+                        )
+                    } else {
+                        let ones = self.s.m.i32(u32::MAX);
+                        let inv_lo = self.s.m.bin(c, Bin::Xor, mask_lo, ones);
+                        let inv_hi = self.s.m.bin(c, Bin::Xor, mask_hi, ones);
+                        (
+                            self.s.m.bin(c, Bin::And, old_lo, inv_lo),
+                            self.s.m.bin(c, Bin::And, old_hi, inv_hi),
+                        )
+                    };
+                    self.set(lo, Val::I32(new_lo));
+                    self.set(hi, Val::I32(new_hi));
+                    Ok(())
+                }
+                "s_brev_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let r_lo = self
+                        .s
+                        .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[b]);
+                    let r_hi = self
+                        .s
+                        .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[a]);
+                    self.set(lo, Val::I32(r_lo));
+                    self.set(hi, Val::I32(r_hi));
+                    Ok(())
+                }
+                "s_bitreplicate_b64_b32" => {
+                    let a = src32(self, 0)?;
+                    let k16 = self.s.m.i32(16);
+                    let kffff = self.s.m.i32(0x0000_FFFF);
+                    let lo_in = self.s.m.bin(c, Bin::And, a, kffff);
+                    let hi_in = self.s.m.bin(c, Bin::LShr, a, k16);
+                    let mut spread16 = |mut x: V| {
+                        for (sh, mask) in [
+                            (8u32, 0x00FF_00FFu32),
+                            (4, 0x0F0F_0F0F),
+                            (2, 0x3333_3333),
+                            (1, 0x5555_5555),
+                        ] {
+                            let s = self.s.m.i32(sh);
+                            let t = self.s.m.bin(c, Bin::Shl, x, s);
+                            let o = self.s.m.bin(c, Bin::Or, x, t);
+                            let m = self.s.m.i32(mask);
+                            x = self.s.m.bin(c, Bin::And, o, m);
+                        }
+                        let one = self.s.m.i32(1);
+                        let t = self.s.m.bin(c, Bin::Shl, x, one);
+                        self.s.m.bin(c, Bin::Or, x, t)
+                    };
+                    let r_lo = spread16(lo_in);
+                    let r_hi = spread16(hi_in);
+                    self.set(lo, Val::I32(r_lo));
+                    self.set(hi, Val::I32(r_hi));
                     Ok(())
                 }
                 _ => Err(name),
@@ -4636,10 +5018,13 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 (r, None)
             }
-            "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
-                // First set bit (-1 for zero, as DXIL's), or the bit count.
-                let a = src32(self, 0)?;
-                let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
+            "s_ff0_i32_b32" | "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
+                let mut a = src32(self, 0)?;
+                if name == "s_ff0_i32_b32" {
+                    let ones = self.s.m.i32(u32::MAX);
+                    a = self.s.m.bin(c, Bin::Xor, a, ones);
+                }
+                let op = if name == "s_bcnt1_i32_b32" { 31 } else { 32 };
                 let r = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
@@ -4706,6 +5091,12 @@ impl<'a> Lower<'a> {
                 let neg = self.s.m.cmp(c, pred::SLT, a, z);
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
                 (self.s.m.select(c, neg, n, a), None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let shift = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let high = self.s.m.bin(c, Bin::Shl, a, shift);
+                (self.s.m.bin(c, Bin::AShr, high, shift), None)
             }
             "s_bitset0_b32" | "s_bitset1_b32" => {
                 // Sets (clears) bit src[4:0] of the destination it reads.
@@ -4961,6 +5352,14 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Trades the handle caches of accesses for those of buffer size queries,
+    /// and back when called again. A cache [`Lower::handle`] gains for a
+    /// loaded descriptor needs its twin here.
+    fn swap_size_caches(&mut self) {
+        std::mem::swap(&mut self.handles, &mut self.size_handles);
+        std::mem::swap(&mut self.entry_handles, &mut self.size_entry_handles);
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -4969,6 +5368,17 @@ impl<'a> Lower<'a> {
     /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
     /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
     /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
+    ///
+    /// A buffer's record count is queried through a handle of its own,
+    /// cached as an access's is (once for a descriptor at a fixed address,
+    /// else per block and load) and never the handle of an access. AMD's
+    /// RDNA 4 driver (32.0.32029.2010 on an RX 9070 XT) faults inside its
+    /// shader compiler, ending the process at pipeline creation, when one
+    /// handle of a raw buffer in a descriptor table feeds both a size query
+    /// whose result is used and a load; with a handle each it compiles. Every
+    /// buffer view is treated the same; an image's handle stays shared with
+    /// its accesses. A query nothing reads is not written, and neither is
+    /// its handle.
     // shortcut: the base level reads 0 (the host view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
@@ -5090,7 +5500,18 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        // The accesses' handle, made while the load is lowered and not at
+        // the first access: where it is written does not depend on whether
+        // a size is read.
         let h = self.handle(site, &src, false, props)?;
+        let h = if image.is_some() {
+            h
+        } else {
+            self.swap_size_caches();
+            let own = self.handle(site, &src, false, props);
+            self.swap_size_caches();
+            own?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -5597,19 +6018,23 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    fn cbuffer_row(&mut self, h: V, row: V) -> V {
+        self.s.op(
+            self.cur,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[h, row],
+        )
+    }
+
     /// The dword at a computed byte address of a constant buffer.
     fn cbuffer_dword(&mut self, h: V, a: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let ri = self.s.m.bin(c, Bin::LShr, a, four);
-        let r = self.s.op(
-            c,
-            "cbufferLoadLegacy.i32",
-            Attr::ReadOnly,
-            self.s.t.cbuf_ret,
-            59,
-            &[h, ri],
-        );
+        let r = self.cbuffer_row(h, ri);
         let two = self.s.m.i32(2);
         let three = self.s.m.i32(3);
         let comp = self.s.m.bin(c, Bin::LShr, a, two);
@@ -5653,12 +6078,25 @@ impl<'a> Lower<'a> {
                 .collect()
         };
         let words = if total < 32 {
-            // A byte or half inside the dword that holds it.
-            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
+            // A byte or half inside the dword that holds it. A constant
+            // offset is aligned here: vkd3d-proton turns a load at a
+            // constant offset into the same access as the buffer's other
+            // accesses, and one at a computed offset into a per-component
+            // raw access, which on NVIDIA does not see a dword the same
+            // invocation stored just before.
+            let (at, sh) = match self.s.m.int_value(off) {
+                Some(o) => {
+                    let o = o as u32;
+                    (self.s.m.i32(o & !3), self.s.m.i32((o & 3) * 8))
+                }
+                None => {
+                    let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+                    let at = self.s.m.bin(c, Bin::And, off, not3);
+                    let byte = self.s.m.bin(c, Bin::And, off, three);
+                    (at, self.s.m.bin(c, Bin::Shl, byte, three))
+                }
+            };
             let w = load(self, at, 1)[0];
-            let byte = self.s.m.bin(c, Bin::And, off, three);
-            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
             load(self, off, total / 32)
@@ -5914,15 +6352,24 @@ impl<'a> Lower<'a> {
 
     /// Channels of buffer format `format`, as [`Self::format_load`] gives
     /// them, as d16 data: 16 bits each, two per dword, low half first (an
-    /// odd last high half 0). Integer formats keep their low 16 bits; the
-    /// others become f16.
+    /// odd last high half 0). Integer formats saturate to 16 bits (UINT to
+    /// 0xFFFF, SINT to -32768..32767), as RDNA2 does for a 32-bit channel;
+    /// the others become f16.
     fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
         let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let mut halves = Vec::new();
         for x in channels {
-            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
+            halves.push(if matches!(numeric, Numeric::Uint) {
                 let m = self.s.m.i32(0xFFFF);
+                let lt = self.s.m.cmp(c, pred::IULT, x, m);
+                self.s.m.select(c, lt, x, m)
+            } else if matches!(numeric, Numeric::Sint) {
+                let (lo, hi, m) = (self.s.m.i32((-32768i32) as u32), self.s.m.i32(32767), self.s.m.i32(0xFFFF));
+                let below = self.s.m.cmp(c, pred::SLT, x, lo);
+                let x = self.s.m.select(c, below, lo, x);
+                let above = self.s.m.cmp(c, pred::SGT, x, hi);
+                let x = self.s.m.select(c, above, hi, x);
                 self.s.m.bin(c, Bin::And, x, m)
             } else {
                 let (f, i32t) = (self.as_float(x), self.s.t.i32);
@@ -6048,12 +6495,13 @@ impl<'a> Lower<'a> {
     /// A handle for the descriptor `src` read at `site`; the heap index of
     /// a texture shader view the program takes from the heap itself is noted
     /// for the instruction's read mark (handles are made once per block,
-    /// often before the instruction). A view read through a table needs
-    /// none: the host makes the slot for the draw.
+    /// often before the instruction). A view read at a fixed table entry
+    /// needs none: the host makes the used-resource list's slots for the
+    /// draw ([`Self::fixed_table_entry`]).
     fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
         let h = self.handle_made(site, src, sampler, props)?;
         if let Some(&index) = self.s.texture_index.get(&h)
-            && self.is_heap_direct(src)
+            && !self.fixed_table_entry(src)
         {
             self.s.texture_reads.push(index);
         }
@@ -6068,7 +6516,6 @@ impl<'a> Lower<'a> {
         props: (u32, u32),
     ) -> Result<V, Why> {
         let props = if self.pops && props.0 & 0x1000 != 0 {
-            self.s.flags |= flags::ROVS;
             (props.0 | 0x2000, props.1)
         } else {
             props
@@ -6298,6 +6745,19 @@ impl<'a> Lower<'a> {
                 .get(load)
                 .and_then(|a| self.x.native.layout.get(a.param))
                 .is_some_and(|p| p.root == RootType::ResourceHeap),
+            _ => false,
+        })
+    }
+
+    /// Whether a descriptor is a table entry at a fixed offset on every
+    /// path: one the used-resource list names, whose slot the host makes
+    /// for the draw. An entry at a computed offset (a descriptor array) may
+    /// be any slot past those.
+    fn fixed_table_entry(&self, src: &Source) -> bool {
+        src.leaves().iter().all(|l| match l {
+            Source::Loaded { load, .. } => self
+                .entry_address(*load)
+                .is_some_and(|(param, _)| self.x.native.layout[param].root == RootType::Table),
             _ => false,
         })
     }
@@ -6567,8 +7027,12 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Quad permutations, and DPP8 where every lane picks a lane of its
+        // own quad, stay in groups the pixel layout shares.
+        let quad = match dpp {
+            Dpp::Row { ctrl, .. } => ctrl <= 0xFF,
+            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
@@ -6660,7 +7124,11 @@ impl<'a> Lower<'a> {
             (a, b) => a.or(b),
         };
         let mut r = if use_quad {
-            self.quad_pick(x, src)
+            let pattern = match dpp {
+                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
+                Dpp::Lanes { .. } => None,
+            };
+            self.quad_pick(x, src, pattern)
         } else {
             let safe_src = match valid {
                 Some(ok) => self.s.m.select(c, ok, src, lane),
@@ -6717,6 +7185,9 @@ impl<'a> Lower<'a> {
         let float = |l: &mut Self, r: V| l.write_f(inst, r, guard);
         let int = |l: &mut Self, r: V| l.write_i(inst, r, guard);
         if let Some(r) = self.valu16(inst, name, guard) {
+            return r;
+        }
+        if let Some(r) = self.valu_f64(inst, name, guard) {
             return r;
         }
         if let Some(op) = name.strip_prefix("v_pk_") {
@@ -6927,7 +7398,7 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
-            "v_dot4_i32_i8" => {
+            "v_dot4_i32_i8" | "v_dot8_i32_i4" => {
                 // VOP3P: op_sel picks the half each multiplicand's low half
                 // reads, op_sel_hi its high half's; the accumulator is read
                 // whole (as AMD's compilers fold constants into it).
@@ -6952,6 +7423,24 @@ impl<'a> Lower<'a> {
                     xs.push(self.s.m.bin(c, Bin::Or, if lo { top } else { bottom }, hi));
                 }
                 let acc = s(self, 2)?;
+                if name == "v_dot8_i32_i4" {
+                    // Eight signed nibble products and the accumulator,
+                    // wrapping (RDNA2 ISA): each nibble is moved to the top
+                    // and shifted back arithmetically to extend its sign.
+                    let k28 = self.s.m.i32(28);
+                    let mut sum = acc;
+                    for n in 0..8 {
+                        let up = self.s.m.i32(28 - 4 * n);
+                        let mut f = [xs[0], xs[1]];
+                        for x in &mut f {
+                            let t = self.s.m.bin(c, Bin::Shl, *x, up);
+                            *x = self.s.m.bin(c, Bin::AShr, t, k28);
+                        }
+                        let p = self.s.m.bin(c, Bin::Mul, f[0], f[1]);
+                        sum = self.s.m.bin(c, Bin::Add, sum, p);
+                    }
+                    return int(self, sum);
+                }
                 let i32_ty = self.s.t.i32;
                 let r = self.s.op(
                     c,
@@ -7007,7 +7496,7 @@ impl<'a> Lower<'a> {
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
-                        let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                        let m = self.mul_apart(a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
@@ -7022,7 +7511,7 @@ impl<'a> Lower<'a> {
                 let m = if name == "v_mad_legacy_f32" {
                     self.legacy_mul(a, bb)
                 } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
+                    self.mul_apart(a, bb)
                 };
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
@@ -7066,9 +7555,27 @@ impl<'a> Lower<'a> {
                     "v_sin_f32" => 13,
                     _ => 12,
                 };
+                // These three take a denormal away from zero where the host
+                // keeps it (an RTX 5080 on vkd3d-proton does).
+                let a = match op {
+                    22 | 27 | 28 => self.ftz(a),
+                    _ => a,
+                };
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
-                    22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
+                    // The console reads f32 denormals as zeros of their
+                    // sign. DXIL floor/ceil/fract need not do that: vkd3d on
+                    // NVIDIA keeps them (no FP32 denorm flush capability),
+                    // so flush on the bits first, as for max/min and the
+                    // floor conversions.
+                    22 => {
+                        let flushed = self.ftz(a);
+                        self.fract(flushed, 1.0, f32::from_bits(0x3F7F_FFFF))
+                    }
+                    27 | 28 => {
+                        let flushed = self.ftz(a);
+                        self.unary(op, flushed)
+                    }
                     _ => self.unary(op, a),
                 };
                 float(self, r)
@@ -7112,6 +7619,11 @@ impl<'a> Lower<'a> {
                     r = self.s.m.select(c, nan, sat, r);
                 }
                 int(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                let a = self.fsrc64(inst, 0)?;
+                let r = self.s.m.cast(c, Cast::FPTrunc, a, self.s.t.f32);
+                float(self, r)
             }
             "v_cvt_f32_u32" => {
                 // WARP can misround a full-width uitofp. Each 16-bit
@@ -7182,8 +7694,7 @@ impl<'a> Lower<'a> {
                         x = self.unary(6, x);
                     }
                     if v.neg >> i & 1 != 0 {
-                        let z = self.s.m.f32(0x8000_0000);
-                        x = self.s.m.bin(c, Bin::Sub, z, x);
+                        x = self.fneg(x);
                     }
                     xs.push(x);
                 }
@@ -7488,6 +7999,12 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn read_pair(&mut self, inst: &Inst, lo: Reg, hi: Reg) -> Result<(V, V), Why> {
+        let lo = self.i32_of(inst.read(lo).ok_or("an unread operand")?)?;
+        let hi = self.i32_of(inst.read(hi).ok_or("an unread operand")?)?;
+        Ok((lo, hi))
+    }
+
     /// A 64-bit source (a register pair; inline constants sign-extend).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -7501,8 +8018,7 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::INT64;
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
-            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
-            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            let (lo, hi) = l.read_pair(inst, r, r1)?;
             let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
             let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
             let k32 = l.s.m.int_const(i64t, 32);
@@ -7520,7 +8036,9 @@ impl<'a> Lower<'a> {
             }
             // A signed 64-bit operand sign-extends its 32-bit literal, as
             // the hardware does (LLVM's AMDGPU operand rules).
-            Operand::Literal(x) if inst.name().ends_with("_i64") => {
+            Operand::Literal(x)
+                if inst.name().ends_with("_i64") || inst.name() == "v_mad_i64_i32" =>
+            {
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             _ => {
@@ -7616,22 +8134,48 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// Widens an f16, explicitly preserving subnormal inputs for fused math.
+    fn widen_half(&mut self, h: V, fused: bool) -> V {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let normal = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        if !fused {
+            return normal;
+        }
+        // A half subnormal is an exactly representable normal f32.
+        // Build it from the bits so host half arithmetic cannot flush it.
+        let m = &mut self.s.m;
+        let (magnitude, sign_mask, min_normal, k16) =
+            (m.i32(0x7FFF), m.i32(0x8000), m.i32(0x0400), m.i32(16));
+        let fraction = m.bin(c, Bin::And, h, magnitude);
+        let tiny = m.cmp(c, pred::IULT, fraction, min_normal);
+        let sign = m.bin(c, Bin::And, h, sign_mask);
+        let sign = m.bin(c, Bin::Shl, sign, k16);
+        let fraction = m.cast(c, Cast::UiToFp, fraction, f32t);
+        let unit = m.f32(0x3380_0000); // 2^-24
+        let exact = m.bin(c, Bin::Mul, fraction, unit);
+        let exact = self.as_int(exact);
+        let exact = self.s.m.bin(c, Bin::Or, exact, sign);
+        let exact = self.as_float(exact);
+        self.s.m.select(c, tiny, exact, normal)
+    }
+
     /// An f16 source as an f32 (exact), with its abs/neg modifiers.
     fn half_fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_fsrc_for(inst, k, false)
+    }
+
+    fn half_fsrc_for(&mut self, inst: &Inst, k: usize, fused: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let h = self.half_src(inst, k)?;
-        let f32t = self.s.t.f32;
-        let mut f = self
-            .s
-            .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let mut f = self.widen_half(h, fused);
         if v.abs >> k & 1 != 0 {
             f = self.unary(6, f);
         }
         if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
+            f = self.fneg(f);
         }
         Ok(f)
     }
@@ -7699,6 +8243,7 @@ impl<'a> Lower<'a> {
             "v_max3_f16",
             "v_min3_f16",
             "v_med3_f16",
+            "v_div_fixup_f16",
         ];
         const FLOAT1: &[&str] = &[
             "v_rcp_f16",
@@ -7719,6 +8264,8 @@ impl<'a> Lower<'a> {
         const INT: &[&str] = &[
             "v_add_nc_u16",
             "v_sub_nc_u16",
+            "v_add_nc_i16",
+            "v_sub_nc_i16",
             "v_subrev_nc_u16",
             "v_mul_lo_u16",
             "v_lshlrev_b16",
@@ -7789,7 +8336,8 @@ impl<'a> Lower<'a> {
             return float_result(self, r);
         }
         if float3.contains(&name) {
-            let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
+            let fused = matches!(name, "v_fma_f16" | "v_fmac_f16");
+            let (a, b) = (self.half_fsrc_for(inst, 0, fused)?, self.half_fsrc_for(inst, 1, fused)?);
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -7804,12 +8352,11 @@ impl<'a> Lower<'a> {
                 };
                 let m = self.s.m.i32(0xFFFF);
                 let x = self.s.m.bin(c, Bin::And, x, m);
-                self.s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                self.widen_half(x, fused)
             } else {
-                self.half_fsrc(inst, 2)?
+                self.half_fsrc_for(inst, 2, fused)?
             };
-            if name == "v_fma_f16" && self.mode16 != Some(3) {
+            if fused {
                 if v.omod != 0 {
                     return Err("an output modifier on a 16-bit operation");
                 }
@@ -7817,9 +8364,7 @@ impl<'a> Lower<'a> {
                 return self.write_half(inst, half, guard);
             }
             let r = match name {
-                // shortcut: fused f16 multiply-adds as FMad in f32 (the
-                // product is exact; the sum rounds twice).
-                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
                     self.max_min(true, t, acc)
@@ -7828,6 +8373,7 @@ impl<'a> Lower<'a> {
                     let t = self.max_min(false, a, b);
                     self.max_min(false, t, acc)
                 }
+                "v_div_fixup_f16" => self.div_fixup(a, b, acc),
                 _ => self.med3(a, b, acc),
             };
             return float_result(self, r);
@@ -7883,8 +8429,9 @@ impl<'a> Lower<'a> {
             let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
             return self.write_half(inst, r, guard);
         }
-        // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // 16-bit integer results keep the low 16 bits after any saturation.
+        let signed_add_sub = matches!(name, "v_add_nc_i16" | "v_sub_nc_i16");
+        if (v.clamp && !signed_add_sub) || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -7921,6 +8468,30 @@ impl<'a> Lower<'a> {
                 match name {
                     "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
                     "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                    "v_add_nc_i16" | "v_sub_nc_i16" => {
+                        let op = if name == "v_add_nc_i16" {
+                            Bin::Add
+                        } else {
+                            Bin::Sub
+                        };
+                        let r = self.s.m.bin(c, op, a, b);
+                        if v.clamp {
+                            // The selects pick 16-bit patterns, never a clamped i32: NVIDIA
+                            // drivers fold a clamped i32 into a saturating 16-bit add whose
+                            // sign-extended result then drops write_half's 0xFFFF mask.
+                            let lo = self.s.m.i32(i32::from(i16::MIN) as u32);
+                            let hi = self.s.m.i32(i16::MAX as u32);
+                            let mask = self.s.m.i32(0xFFFF);
+                            let low = self.s.m.bin(c, Bin::And, r, mask);
+                            let below = self.s.m.cmp(c, pred::SLT, r, lo);
+                            let min = self.s.m.i32(0x8000);
+                            let x = self.s.m.select(c, below, min, low);
+                            let above = self.s.m.cmp(c, pred::SGT, r, hi);
+                            self.s.m.select(c, above, hi, x)
+                        } else {
+                            r
+                        }
+                    }
                     "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                     "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
                     "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
@@ -8026,6 +8597,57 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, r, m16))
     }
 
+    /// `v_div_fixup`'s special cases, on f32 values (an f16's are exact):
+    /// `q` is the quotient a division computed, `den` and `num` its
+    /// denominator and numerator. A NaN operand (numerator first) comes
+    /// back; 0/0 and inf/inf give NaN; x/0 and inf/x give a signed
+    /// infinity; 0/x and x/inf a signed zero; a quotient with an all-ones
+    /// exponent (NaN included, as gfx1036 hardware gives) a signed infinity;
+    /// anything else is `|q|` with the quotient's sign (the ISA's order of
+    /// checks).
+    fn div_fixup(&mut self, q: V, den: V, num: V) -> V {
+        let c = self.cur;
+        let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (ksign, kabs, kinf, kqnan, k0) = (
+            k(self, 0x8000_0000),
+            k(self, 0x7FFF_FFFF),
+            k(self, 0x7F80_0000),
+            k(self, 0x0040_0000),
+            k(self, 0),
+        );
+        let x = self.s.m.bin(c, Bin::Xor, ni, di);
+        let sign = self.s.m.bin(c, Bin::And, x, ksign);
+        let q_abs = self.s.m.bin(c, Bin::And, qi, kabs);
+        let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
+        let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
+        let d_nan = self.s.m.cmp(c, pred::IUGT, d_abs, kinf);
+        let n_nan = self.s.m.cmp(c, pred::IUGT, n_abs, kinf);
+        let d_inf = self.s.m.cmp(c, pred::EQ, d_abs, kinf);
+        let n_inf = self.s.m.cmp(c, pred::EQ, n_abs, kinf);
+        let d_zero = self.s.m.cmp(c, pred::EQ, d_abs, k0);
+        let n_zero = self.s.m.cmp(c, pred::EQ, n_abs, k0);
+        let both_zero = self.s.m.bin(c, Bin::And, d_zero, n_zero);
+        let both_inf = self.s.m.bin(c, Bin::And, d_inf, n_inf);
+        let invalid = self.s.m.bin(c, Bin::Or, both_zero, both_inf);
+        let to_inf = self.s.m.bin(c, Bin::Or, d_zero, n_inf);
+        let to_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
+        // From the last check to the first, so the first that holds wins.
+        let r = self.s.m.bin(c, Bin::Or, sign, q_abs);
+        let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
+        let q_overflow = self.s.m.cmp(c, pred::IUGE, q_abs, kinf);
+        let r = self.s.m.select(c, q_overflow, signed_inf, r);
+        let r = self.s.m.select(c, to_zero, sign, r);
+        let r = self.s.m.select(c, to_inf, signed_inf, r);
+        let default_nan = k(self, 0x7FC0_0000);
+        let r = self.s.m.select(c, invalid, default_nan, r);
+        let d_q = self.s.m.bin(c, Bin::Or, di, kqnan);
+        let r = self.s.m.select(c, d_nan, d_q, r);
+        let n_q = self.s.m.bin(c, Bin::Or, ni, kqnan);
+        let r = self.s.m.select(c, n_nan, n_q, r);
+        self.as_float(r)
+    }
+
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
     /// 16 bits: op_sel picks the half the low result reads, op_sel_hi the
     /// half the high result reads. Packed integer instructions see the f32
@@ -8064,7 +8686,10 @@ impl<'a> Lower<'a> {
             // shortcut: no constant operand seen; its high half is not known.
             return Err("a constant operand of v_pk_fmac_f16");
         }
-        let x = self.operand(inst, &op)?;
+        let x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => self.operand(inst, &op)?,
+        };
         let c = self.cur;
         let x = if high {
             let k16 = self.s.m.i32(16);
@@ -8110,8 +8735,7 @@ impl<'a> Lower<'a> {
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
                     let neg = if high { v.neg_hi } else { v.neg };
                     if neg >> k & 1 != 0 {
-                        let z = self.s.m.f32(0x8000_0000);
-                        f = self.s.m.bin(c, Bin::Sub, z, f);
+                        f = self.fneg(f);
                     }
                     xs.push(f);
                 } else {
@@ -8119,18 +8743,22 @@ impl<'a> Lower<'a> {
                 }
             }
             let r = if float {
-                let mut f = match op {
-                    "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
-                    "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
-                    "min_f16" => self.max_min(false, xs[0], xs[1]),
-                    "max_f16" => self.max_min(true, xs[0], xs[1]),
-                    // shortcut: FMad in f32, as v_fma_f16.
-                    _ => self.fmad(xs[0], xs[1], xs[2]),
-                };
-                if v.clamp {
-                    f = self.unary(7, f);
+                if matches!(op, "fma_f16" | "fmac_f16") && matches!(self.mode16, None | Some(0)) {
+                    self.fma_f16(xs[0], xs[1], xs[2], v.clamp)
+                } else {
+                    let mut f = match op {
+                        "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
+                        "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
+                        "min_f16" => self.max_min(false, xs[0], xs[1]),
+                        "max_f16" => self.max_min(true, xs[0], xs[1]),
+                        // Directed modes still use an f32 FMad.
+                        _ => self.fmad(xs[0], xs[1], xs[2]),
+                    };
+                    if v.clamp {
+                        f = self.unary(7, f);
+                    }
+                    self.narrow16(f)
                 }
-                self.narrow16(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
@@ -8212,6 +8840,29 @@ impl<'a> Lower<'a> {
                     _ => (Bin::Mul, a, b),
                 };
                 self.s.m.bin(c, op, a, b)
+            }
+            "v_add_nc_i32" | "v_sub_nc_i32" => {
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let add = name == "v_add_nc_i32";
+                let r = self.s.m.bin(c, if add { Bin::Add } else { Bin::Sub }, a, b);
+                if v.clamp {
+                    // Overflow changes the sign of a with equal operand signs
+                    // for addition, or opposite operand signs for subtraction.
+                    let ar = self.s.m.bin(c, Bin::Xor, a, r);
+                    let other = self.s.m.bin(c, Bin::Xor, b, if add { r } else { a });
+                    let bits = self.s.m.bin(c, Bin::And, ar, other);
+                    let zero = k(self, 0);
+                    let overflow = self.s.m.cmp(c, pred::SLT, bits, zero);
+                    let negative = self.s.m.cmp(c, pred::SLT, a, zero);
+                    let (lo, hi) = (k(self, i32::MIN as u32), k(self, i32::MAX as u32));
+                    let limit = self.s.m.select(c, negative, lo, hi);
+                    self.s.m.select(c, overflow, limit, r)
+                } else {
+                    r
+                }
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
@@ -8702,11 +9353,17 @@ impl<'a> Lower<'a> {
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 self.s.m.cmp(c, pred::NE, bit, zero)
             }
-            "f32" | "f16" => {
-                let (a, b) = if ty == "f16" {
-                    (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
-                } else {
-                    (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
+            "f32" | "f16" | "f64" => {
+                if ty == "f64" && matches!(op, "f" | "tru") {
+                    // Constant, so no doubles are built (WARP loses the device on a
+                    // double `fcmp false`).
+                    self.lane(inst, Some(op == "tru"));
+                    return Ok(());
+                }
+                let (a, b) = match ty {
+                    "f16" => (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?),
+                    "f64" => (self.fsrc64(inst, 0)?, self.fsrc64(inst, 1)?),
+                    _ => (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?),
                 };
                 if op == "lg" {
                     // Ordered and not equal, false for a NaN, as `olt | ogt`.
@@ -8917,7 +9574,7 @@ impl<'a> Lower<'a> {
             Some(pack2) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
-                let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
+                let half_f32 = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
                         packed_half(&l.s.inputs, attribute.row, h)
                     } else {
@@ -8927,23 +9584,22 @@ impl<'a> Lower<'a> {
                         return Ok(None);
                     };
                     let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
-                    Ok(Some(l.narrow16(f)))
+                    Ok(Some(l.as_float(x)))
                 };
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
+                    let f = half_f32(self, h + u8::from(attribute.high))?
                         .ok_or("a packed input half no element holds")?;
                     // omod and clamp are part of the f16 instruction; op_sel[3]
                     // picks the destination half.
-                    let lo = self.half_modifiers(inst, lo);
+                    let lo = self.half_modifiers(inst, f);
                     return self.write_half(inst, lo, None);
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let z = self.s.m.i32(0);
-                    let lo = half(self, h)?.unwrap_or(z);
-                    let hi = half(self, h + 1)?.unwrap_or(z);
+                    let lo = half_f32(self, h)?.map_or(z, |f| self.narrow16(f));
+                    let hi = half_f32(self, h + 1)?.map_or(z, |f| self.narrow16(f));
                     let k16 = self.s.m.i32(16);
                     let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
                     self.s.m.bin(c, Bin::Or, lo, hi)
@@ -8982,7 +9638,13 @@ impl<'a> Lower<'a> {
                         .iter()
                         .filter(|ph| atoms.contains(&Atom::Phi(ph.value)))
                         .filter_map(|ph| {
-                            Some((*st.masks.get(&ph.value)?, *st.masks.get(&ph.args[n])?))
+                            let joined = *st.masks.get(&ph.value)?;
+                            let incoming = st
+                                .phi_masks
+                                .get(&ph.value)
+                                .and_then(|v| v.get(n).copied())
+                                .or_else(|| st.masks.get(&ph.args[n]).copied())?;
+                            Some((joined, incoming))
                         })
                         .collect();
                     (all, to, links)
@@ -9092,30 +9754,20 @@ impl<'a> Lower<'a> {
         false
     }
 
-    /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 so the
-    /// half conversion rounds once (the order `write_f` uses).
-    fn half_modifiers(&mut self, inst: &Inst, h: V) -> V {
-        let Fields::Valu(v) = &inst.fields else {
-            return h;
-        };
-        if v.omod == 0 && !v.clamp {
-            return h;
+    /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 before a
+    /// single [`Self::narrow16`] conversion (honoring `self.mode16`).
+    fn half_modifiers(&mut self, inst: &Inst, mut f: V) -> V {
+        if let Fields::Valu(v) = &inst.fields {
+            if v.omod != 0 {
+                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                let k = self.s.m.f32(factor.to_bits());
+                f = self.s.m.bin(self.cur, Bin::Mul, f, k);
+            }
+            if v.clamp {
+                f = self.unary(7, f);
+            }
         }
-        let c = self.cur;
-        let f32t = self.s.t.f32;
-        let mut f = self
-            .s
-            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-        if v.omod != 0 {
-            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
-            let k = self.s.m.f32(factor.to_bits());
-            f = self.s.m.bin(c, Bin::Mul, f, k);
-        }
-        if v.clamp {
-            f = self.unary(7, f);
-        }
-        self.s
-            .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
+        self.narrow16(f)
     }
 
     /// An image instruction, its reads of texture views marked (module
@@ -9214,33 +9866,24 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first, after
-        // the offset, bias and compare value, which keep a VGPR each (an f16
-        // bias in its low half).
-        let extra = name
-            .strip_prefix("image_sample")
-            .or_else(|| name.strip_prefix("image_gather4"))
-            .map_or(0, |rest| {
-                rest.split('_')
-                    .filter(|t| matches!(*t, "o" | "b" | "c"))
-                    .count()
-            });
-        let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let packed = *a16 && k >= extra;
+        // Address component from VGPRs starting at `base`; when `half` is set,
+        // two 16-bit components pack per VGPR, low half first.
+        let addr_at = |l: &mut Self, base: usize, half: bool, k: usize| -> Result<V, Why> {
             let r = *regs
-                .get(if packed { extra + (k - extra) / 2 } else { k })
+                .get(base + if half { k / 2 } else { k })
                 .ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
-            if !packed {
+            if !half {
                 return Ok(x);
             }
             let c = l.cur;
-            let half = (k - extra) as u32 % 2;
+            let half = k as u32 % 2;
             let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
+        let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> { addr_at(l, 0, *a16, k) };
         let src = self
             .descriptors
             .get(&(site, false))
@@ -9428,7 +10071,12 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let (op, sample) = match name {
+        // `_g16`: the same sample with 16-bit gradients, two per VGPR (see
+        // `grad_regs`), whatever `a16` says of the coordinates.
+        let (form, g16) = name
+            .strip_suffix("_g16")
+            .map_or((name, false), |form| (form, true));
+        let (op, sample) = match form {
             "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
@@ -9518,25 +10166,34 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
+            // DXIL compares samples of every kind of texture but 3D.
+            if cmp && kind == 4 {
+                return Err("a comparison sample of a 3D image");
+            }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
-            // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
-            // signed (programmable offsets: gathers only).
-            let offset_word = name.ends_with("_o");
+            // Texel offsets (`_o`) come first as a whole dword: x in bits 0-5,
+            // y in 8-13, signed (programmable offsets: gathers only).
+            let offset_word = form.ends_with("_o");
             let first =
                 usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
-            // gradients (x then y) come before the coordinates.
+            // gradients (x then y) come before the coordinates, packed only
+            // when `_g16` is set (independently of `a16`).
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            // (A cube's are two per direction, on the face.)
-            let grads = match op {
-                63 if kind == 5 => 4,
-                63 => 2 * spatial,
-                _ => 0,
+            // (A cube's are two per direction, on the face.) VGPRs per
+            // direction: with `_g16` each direction starts a VGPR, an odd
+            // last gradient alone in its low half (LLVM's GFX10 assembler
+            // tests, `gfx10_asm_mimg.s`: 3D `image_sample_d_g16` takes 7).
+            let grad_dim = if kind == 5 { 2 } else { spatial };
+            let grad_regs = if op == 63 {
+                if g16 { grad_dim.div_ceil(2) } else { grad_dim }
+            } else {
+                0
             };
+            let coord_base = first + 2 * grad_regs;
             let mut cs = vec![fu; 4];
-            // With a16, sampling coordinates and LOD are f16.
-            let to_float = |l: &mut Self, x: V| {
-                if *a16 {
+            let to_float = |l: &mut Self, half: bool, x: V| {
+                if half {
                     let f = l.s.t.f32;
                     l.s.op(l.cur, "legacyF16ToF32", Attr::ReadNone, f, 131, &[x])
                 } else {
@@ -9547,8 +10204,8 @@ impl<'a> Lower<'a> {
             // there, e.g. an unwritten register).
             let read = if op == 81 { spatial } else { coords };
             for (k, slot) in cs.iter_mut().enumerate().take(read) {
-                let x = addr_val(self, first + grads + k)?;
-                *slot = to_float(self, x);
+                let x = addr_at(self, coord_base, *a16, k)?;
+                *slot = to_float(self, *a16, x);
             }
             if kind == 5 {
                 if *unorm || op == 81 {
@@ -9609,7 +10266,7 @@ impl<'a> Lower<'a> {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
                         // console's are 6-bit and may be computed.
-                        let w = addr_val(self, 0)?;
+                        let w = addr_at(self, 0, false, 0)?;
                         let w = self
                             .s
                             .m
@@ -9631,8 +10288,8 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
-                    let bias = to_float(self, bias);
+                    let bias = addr_at(self, usize::from(offset_word), false, 0)?;
+                    let bias = to_float(self, *a16, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
@@ -9656,8 +10313,8 @@ impl<'a> Lower<'a> {
                     // a biased sampler meets a binding clamp.
                     let mut g = [fu; 4];
                     for (k, x) in g.iter_mut().enumerate() {
-                        let v = addr_val(self, first + k)?;
-                        *x = to_float(self, v);
+                        let v = addr_at(self, first + (k / 2) * grad_regs, g16, k % 2)?;
+                        *x = to_float(self, g16, v);
                     }
                     let i32t = self.s.t.i32;
                     let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -9680,9 +10337,9 @@ impl<'a> Lower<'a> {
                     let half = self.s.m.f32(0.5f32.to_bits());
                     let l = self.unary(23, m);
                     let mut lod = self.s.m.bin(c, Bin::Mul, l, half);
-                    if name.ends_with("_cl") {
-                        let x = addr_val(self, first + grads + coords)?;
-                        let clamp = to_float(self, x);
+                    if form.ends_with("_cl") {
+                        let x = addr_at(self, coord_base, *a16, coords)?;
+                        let clamp = to_float(self, *a16, x);
                         lod = self.binary(35, lod, clamp);
                     }
                     args.extend(&os);
@@ -9697,23 +10354,19 @@ impl<'a> Lower<'a> {
                     )
                 }
                 63 => {
-                    // With a16 each direction's gradients start a VGPR.
-                    if *a16 && spatial % 2 == 1 {
-                        return Err("16-bit gradients of a 1D or 3D image");
-                    }
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_val(self, first + k)?;
-                        g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                        let x = addr_at(self, first, g16, k)?;
+                        g[k] = to_float(self, g16, x);
+                        let y = addr_at(self, first + grad_regs, g16, k)?;
+                        g[3 + k] = to_float(self, g16, y);
                     }
                     args.extend(&os);
                     args.extend(g);
                     // `_cl`: the least level of detail, after the coordinates.
-                    let clamp = if name.ends_with("_cl") {
-                        let x = addr_val(self, first + grads + coords)?;
-                        to_float(self, x)
+                    let clamp = if form.ends_with("_cl") {
+                        let x = addr_at(self, coord_base, *a16, coords)?;
+                        to_float(self, *a16, x)
                     } else {
                         fu
                     };
@@ -9728,7 +10381,7 @@ impl<'a> Lower<'a> {
                     )
                 }
                 64 | 65 => {
-                    let reference = addr_val(self, first - 1)?;
+                    let reference = addr_at(self, first - 1, false, 0)?;
                     let reference = self.as_float(reference);
                     args.extend(&os);
                     args.push(reference);
@@ -9743,8 +10396,8 @@ impl<'a> Lower<'a> {
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
-                        to_float(self, x)
+                        let x = addr_at(self, coord_base, *a16, coords)?;
+                        to_float(self, *a16, x)
                     } else {
                         self.s.m.f32(0)
                     };
@@ -9766,8 +10419,16 @@ impl<'a> Lower<'a> {
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
                     }
+                    // DXIL gathers from 2D textures, cubes and their arrays
+                    // (kinds 2, 5, 7, 9), with offsets only from the 2D ones.
+                    if !matches!(kind, 2 | 5 | 7 | 9) {
+                        return Err("a gather from a 1D or 3D image");
+                    }
+                    if offset_word && matches!(kind, 5 | 9) {
+                        return Err("a gather with offsets from a cube");
+                    }
                     if offset_word {
-                        let w = addr_val(self, 0)?;
+                        let w = addr_at(self, 0, false, 0)?;
                         for (k, at) in [(0, 26), (1, 18)] {
                             // Bits at..at+5 sign-extended: shift up, then down.
                             let left = self.s.m.i32(at);
@@ -9794,10 +10455,12 @@ impl<'a> Lower<'a> {
                 *slot = addr_val(self, k)?;
             }
             let mip = if name == "image_load_mip" {
+                // A UAV is one level of its resource; DXIL loads take none.
+                if uav {
+                    return Err("a load at a mip level from a UAV");
+                }
                 addr_val(self, coords)?
             } else if uav {
-                // Our declarations have four channels.
-                self.s.flags |= flags::TYPED_UAV_LOADS;
                 iu
             } else {
                 self.s.m.i32(0)
@@ -10215,7 +10878,7 @@ impl<'a> Lower<'a> {
             Some("format_xyz") => (true, 3),
             Some("format_xyzw") => (true, 4),
             Some("ubyte" | "sbyte" | "ushort" | "sshort") if !store => (false, 1),
-            Some("byte" | "short") if store => (false, 1),
+            Some("byte" | "short" | "byte_d16_hi" | "short_d16_hi") if store => (false, 1),
             _ => return Err(name),
         };
         // Loads or stores of a byte or a half: its width and whether signed.
@@ -10223,9 +10886,9 @@ impl<'a> Lower<'a> {
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
         {
-            Some("ubyte" | "byte") => Some((8, false)),
+            Some("ubyte" | "byte" | "byte_d16_hi") => Some((8, false)),
             Some("sbyte") => Some((8, true)),
-            Some("ushort" | "short") => Some((16, false)),
+            Some("ushort" | "short" | "short_d16_hi") => Some((16, false)),
             Some("sshort") => Some((16, true)),
             _ => None,
         };
@@ -10242,10 +10905,11 @@ impl<'a> Lower<'a> {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
         }
-        if !matches!(
+        let scalar_offset = !matches!(
             soffset,
             Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-        ) {
+        );
+        if scalar_offset {
             let so = self.operand(inst, soffset)?;
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
@@ -10266,19 +10930,25 @@ impl<'a> Lower<'a> {
         // A descriptor built around a root view has the stride the code puts
         // in dword 1 (bits 16-29) and no record limit (dword 2 is -1): an
         // index is a byte offset into the raw root view.
-        let index = match (src, index) {
-            (Source::Built { address, bits, words }, Some(ix))
-                if address.param < self.x.native.layout.len() && !typed =>
-            {
+        let (index, row_aligned_index) = match (src, index) {
+            (
+                Source::Built {
+                    address,
+                    bits,
+                    words,
+                },
+                Some(ix),
+            ) if address.param < self.x.native.layout.len() && !typed => {
                 if bits >> 30 != 0 || words[0] != u32::MAX {
                     return Err("a root view indexed with swizzling or a record limit");
                 }
-                let stride = self.s.m.i32(bits >> 16 & 0x3FFF);
-                let byte = self.s.m.bin(c, Bin::Mul, ix, stride);
+                let stride = bits >> 16 & 0x3FFF;
+                let stride_value = self.s.m.i32(stride);
+                let byte = self.s.m.bin(c, Bin::Mul, ix, stride_value);
                 off = self.s.m.bin(c, Bin::Add, off, byte);
-                None
+                (None, stride.is_multiple_of(16))
             }
-            (_, ix) => ix,
+            (_, ix) => (ix, true),
         };
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
@@ -10315,6 +10985,20 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            let immediate = !*offen && !scalar_offset && base == 0 && extra.is_none();
+            let first = u32::from(*offset % 16) / 4;
+            if immediate && row_aligned_index && offset.is_multiple_of(4) && first + count <= 4 {
+                // The only variable address term is a whole-row index. The
+                // immediate dwords all lie in one row, even if the byte address wraps.
+                let shift = self.s.m.i32(4);
+                let ri = self.s.m.bin(c, Bin::LShr, byte, shift);
+                let row = self.cbuffer_row(h, ri);
+                for k in 0..count {
+                    let x = self.s.m.extract(c, row, first + k);
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
@@ -10404,6 +11088,13 @@ impl<'a> Lower<'a> {
             }
             let d = data.as_ref().ok_or("buffer store data")?;
             let x = self.vgprs(inst, d, 1)?[0];
+            // `_d16_hi`: the field is taken from the VGPR's high half.
+            let x = if name.ends_with("_d16_hi") {
+                let k16 = self.s.m.i32(16);
+                self.s.m.bin(c, Bin::LShr, x, k16)
+            } else {
+                x
+            };
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
             let byte = self.s.m.bin(c, Bin::And, off, three);
@@ -10587,9 +11278,6 @@ impl<'a> Lower<'a> {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
             }
-            if uav {
-                self.s.flags |= flags::TYPED_UAV_LOADS;
-            }
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
             typed_h = Some(h);
             let index = index.unwrap_or(self.s.m.i32(0));
@@ -10708,8 +11396,7 @@ impl<'a> Lower<'a> {
             }
             let t = self.s.m.bool(true);
             let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+            self.emit_discard(c, kill);
         }
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
@@ -10910,18 +11597,34 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let z = self.s.m.i32(0);
         let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
-        for k in 0..3 {
+        // A 9-bit vertex index every 10 bits, as many as the topology's
+        // corners.
+        let n = self.s.mesh.and_then(|m| corners(m.topology)).unwrap_or(3);
+        let mut indices = Vec::new();
+        for k in 0..n {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
-            args.push(self.s.m.select(c, culled, z, i));
+            indices.push(self.s.m.select(c, culled, z, i));
         }
-        let void = self.s.t.void;
-        self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
+        let prim = self.mesh_thread();
+        self.emit_primitive(prim, &indices);
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// `dx.op.emitIndices` for primitive `prim` from its vertex `indices`
+    /// (the first two of a line, the first three of a triangle). DXIL takes
+    /// three either way: a line leaves the third undefined (the validator
+    /// takes that for a line topology).
+    fn emit_primitive(&mut self, prim: V, indices: &[V]) {
+        let n = self.s.mesh.and_then(|m| corners(m.topology)).unwrap_or(3) as usize;
+        let undef = self.s.m.undef(self.s.t.i32);
+        let mut args = vec![prim];
+        args.extend((0..3).map(|k| if k < n { indices[k] } else { undef }));
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "emitIndices", Attr::NoUnwind, void, 169, &args);
     }
 
     /// The per-vertex arbitrary row no mesh output entry names but one
@@ -10996,8 +11699,7 @@ impl<'a> Lower<'a> {
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
                     // A lane leaving without its final export was killed.
                     let t = self.s.m.bool(true);
-                    self.s
-                        .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                    self.emit_discard(self.cur, t);
                 }
                 Term::Ret
             }
@@ -11473,8 +12175,7 @@ impl<'a> Lower<'a> {
         let a = self.s.m.new_block();
         if self.s.pixel {
             let t = self.s.m.bool(true);
-            self.s
-                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+            self.emit_discard(a, t);
         }
         self.s.m.terminate(a, Term::Ret);
         self.abort = Some(a);
@@ -12055,100 +12756,15 @@ impl<'a> Lower<'a> {
         // The initial index is below this slot. The loop must pass it before exit.
         (slot < limit).then_some(())
     }
+}
 
-    fn fill_phis(&mut self) -> Result<(), Stop> {
-        let p = self.x.p;
-        let live = self.live_edges();
-        for (v, b, i) in std::mem::take(&mut self.data_phis) {
-            let phi = &p.blocks[b].phis[i];
-            let bit = phi.reg == Reg::Scc;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let arg = phi.args[n];
-                let read = live.contains(&(phi.value, n));
-                let x = match (self.vals.get(&arg).copied(), bit) {
-                    (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    // No lane from this edge reads it, or no lane comes
-                    // along it at all: any value will do.
-                    _ if read
-                        && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) =>
-                    {
-                        if bit {
-                            self.s.m.bool(false)
-                        } else {
-                            self.s.m.i32(0)
-                        }
-                    }
-                    // An input an unguarded counted `v_movreld` loop overwrites
-                    // before anything reads it (PR #457).
-                    (Some(Val::Missing("barycentrics read directly")), false)
-                        if read && self.overwritten_movreld_edge(b, phi, n).is_some() =>
-                    {
-                        self.s.m.undef(self.s.t.i32)
-                    }
-                    (Some(Val::Bit(_)), false) if read => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
-                    }
-                    // A lane mask joined with data at a join every lane
-                    // enters along one edge: the register holds the mask's
-                    // number there (console lanes, so exact).
-                    _ if read
-                        && !bit
-                        && self.mask_data == MaskData::Console
-                        && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg))
-                        && self.uniform_join(b) =>
-                    {
-                        self.mask_dword(arg).map_err(|w| Stop::Retry(phi.value, w))?
-                    }
-                    (Some(Val::Missing(why)), _) if read => {
-                        return Err(Stop::Retry(phi.value, why));
-                    }
-                    _ if read => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
-                    }
-                    _ if bit => self.s.m.bool(false),
-                    _ => self.s.m.i32(0),
-                };
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
-        }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
-            self.s.m.set_phi(phi, incoming);
-        }
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
-            let offset = p.blocks[b].offset;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let arg = phi.args[n];
-                // Console flow: every lane arrives by every edge, so a join
-                // also takes masks that are constants or built from scalars.
-                let other = self.console_cf.then(|| self.x.st.other.get(&arg)).flatten();
-                const UNTRACKED: Why = "a lane-mask join of an untracked mask";
-                // Data joined with masks where the wave takes one edge (the BVH
-                // walks pop masks from memory): with console lanes the lane's
-                // own bit of the number, as `Atom::Opaque`.
-                let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
-                let x = match (self.x.st.masks.get(&arg).or(other), self.vals.get(&arg)) {
-                    (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
-                    (None, Some(&Val::I32(word))) if number => {
-                        self.lane_bit(qb, word, None).map_err(|w| unsupported(offset, w))?
-                    }
-                    (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
-                        self.s.m.bool(false)
-                    }
-                    (None, _) => return Err(unsupported(offset, UNTRACKED)),
-                };
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
-        }
-        Ok(())
+/// Vertices per primitive of a mesh output topology (the console's and
+/// DXIL's numbering agree: 1 lines, 2 triangles); none for the others.
+fn corners(topology: u8) -> Option<u32> {
+    match topology {
+        1 => Some(2),
+        2 => Some(3),
+        _ => None,
     }
 }
 

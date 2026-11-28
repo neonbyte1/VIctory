@@ -167,6 +167,8 @@ impl Overlay {
                 w.base = match w.writes[i].1 {
                     Written::Value(v) => Some(low(v, w.bytes)),
                     Written::GpuTimestamp | Written::SystemTimestamp => None,
+                    // Host memory alone: title memory keeps what it held.
+                    Written::HostValue(_) | Written::HostTimestamp(_) => None,
                 };
                 w.writes.retain(|&(o, _)| o != owner);
                 w.refused = false;

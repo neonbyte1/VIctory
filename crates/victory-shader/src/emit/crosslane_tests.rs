@@ -299,6 +299,14 @@ fn ref_swizzle(offset: u16, exec: u32) -> [u32; 32] {
 }
 
 fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> HostShader {
+    build_wave32_cs_with_ballots(pattern, div, op_words).0
+}
+
+fn build_wave32_cs_with_ballots(
+    pattern: MaskPattern,
+    div: Divergence,
+    op_words: &[u32],
+) -> (HostShader, usize) {
     let mut w = Vec::new();
     w.push(s_mov_b32(1, 0x80)); // s1 = 0
     w.extend_from_slice(&s_load_dwordx4(4, 0));
@@ -442,7 +450,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    (shader, lowered.wave_ballot_calls)
 }
 
 fn wave32_hardware_info(host: &Host) -> Option<String> {
@@ -885,6 +893,44 @@ fn dpp8_and_dpp8fi_inactive_source_match_rdna2_on_gpu() {
         })
         .collect();
     check_cases("DPP8/DPP8FI", &items);
+}
+
+#[test]
+fn dpp8_in_one_block_shares_the_source_activity_ballot() {
+    let sel = [1, 0, 3, 2, 5, 4, 7, 6];
+    let pattern = MaskPattern::ThreeOfFour;
+    let (shader, ballots) = build_wave32_cs_with_ballots(
+        pattern,
+        Divergence::Guarded,
+        &[
+            v_mov_b32_dpp8(2, 1, sel, false),
+            v_add_nc_u32_dpp8(2, 2, 3, sel, false),
+        ]
+        .concat(),
+    );
+
+    let exec = pattern.mask();
+    let first = ref_dpp(
+        Dpp::Lanes {
+            sel: dpp8_word(0, sel) >> 8,
+            fi: false,
+        },
+        false,
+        exec,
+    );
+    if let Some((info, got)) = dispatch_wave32(&shader) {
+        let expected = std::array::from_fn(|lane| {
+            if exec >> lane & 1 == 0 {
+                return first[lane];
+            }
+            let src = lane ^ 1;
+            let value = if exec >> src & 1 != 0 { first[src] } else { 0 };
+            value.wrapping_add(lane_v3_rhs(lane as u32))
+        });
+        assert_eq!(got, expected, "DPP8 lane results on {info}");
+        eprintln!("DPP8 lane results match on {info}");
+    }
+    assert_eq!(ballots, 1, "waveActiveBallot call count");
 }
 
 #[test]

@@ -572,22 +572,26 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
 }
 
 /// The pages of `[start, end)` that are the runtime's GPU memory: a
-/// write-watched pool, or (with `views`) anything but plain committed memory
-/// and images (views, placeholders, nothing mapped yet). Decided for every
-/// region the range covers, and a page touching any other memory is left
-/// out: a range can run past its allocation (a 4 MiB window of memory
-/// outside buffers, `crate::shadow`), and when the first page alone decided,
-/// a window starting in free memory had the process heap's pages after it
-/// guarded; the heap's own code then faulted while holding its lock, and the
-/// guard handler waited for the guard lock, whose holder waited for the heap
-/// lock (the crate's tests hung).
+/// write-watched pool, or (with `views`) anything but plain committed memory,
+/// images and free memory (views, placeholders, reserved memory with nothing
+/// mapped yet). Decided for every region the range covers, and a page
+/// touching any other memory is left out: a range can run past its
+/// allocation (a 4 MiB window of memory outside buffers, `crate::shadow`),
+/// and when the first page alone decided, a window starting in free memory
+/// had the process heap's pages after it guarded; the heap's own code then
+/// faulted while holding its lock, and the guard handler waited for the
+/// guard lock, whose holder waited for the heap lock (the crate's tests
+/// hung). Free memory is left out for the same reason: a null address's
+/// window is free, and guarding it would guard whatever is allocated there
+/// later (under Wine the process heap lies in the first 4 MiB).
 ///
-/// shortcut: memory free or reserved when the range is tracked counts as the
+/// shortcut: memory reserved when the range is tracked counts as the
 /// runtime's; another allocator committing it before the first take would
 /// have it guarded.
 fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION,
+        VirtualQuery,
     };
     let watched = |at: usize, len: usize| {
         let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
@@ -611,7 +615,10 @@ fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
         }
         let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(end);
         let ours = watched(at, next - at)
-            || views && info.Type != MEM_IMAGE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+            || views
+                && info.State != MEM_FREE
+                && info.Type != MEM_IMAGE
+                && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
         (if ours { &mut runtime } else { &mut other }).extend(at / PAGE..next.div_ceil(PAGE));
         at = next;
     }
@@ -651,13 +658,26 @@ impl Drop for Tracked {
                 }
             }
         }
+        // A page also stays guarded for a tracker of a mapping showing the
+        // same memory (`guard_aliases`); its aliases need no guard any more
+        // once no tracker is left on any mapping.
         for page in free {
-            let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
-            if !watched_elsewhere {
-                open(&mut g, page);
+            let others = g.alias_of.get(&page).cloned().unwrap_or_default();
+            for p in std::iter::once(page).chain(others) {
+                if !watched(&g, p) {
+                    open(&mut g, p);
+                }
             }
         }
     }
+}
+
+/// Whether a tracker holds `page` or a page showing the same memory.
+fn watched(g: &Guards, page: usize) -> bool {
+    g.holders.contains_key(&page)
+        || g.alias_of
+            .get(&page)
+            .is_some_and(|others| others.iter().any(|o| g.holders.contains_key(o)))
 }
 
 /// Gives write access back to page `page` if we guarded it.
@@ -1575,6 +1595,18 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool, read: &mut Rea
     guarded
 }
 
+/// [`changed`] for the pages themselves only: a mapping that still shows the
+/// same physical pages shows what it did and is not marked. A remap needs
+/// this - what it showed is gone, the same pages are not (#2414). Lazy pages
+/// are resolved as in [`changed`].
+fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool, read: &mut Read, touch: Touch) -> bool {
+    let guarded = g.protected.range(first..last).next().is_some();
+    resolve_range(g, first, last, touch);
+    mark_changed(g, first, last, save, read);
+    open_guarded(g, first, last);
+    guarded
+}
+
 /// Gives write access back to the pages of `[first, last)` we guarded.
 fn open_guarded(g: &mut Guards, first: usize, last: usize) {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
@@ -1719,11 +1751,30 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// Advanced whenever the runtime maps or unmaps title memory: what callers
+/// cached about views of physical pages (that they are committed) holds
+/// only while it stands.
+static REMAP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn remap_epoch() -> u64 {
+    REMAP_EPOCH.load(Ordering::Acquire)
+}
+
+/// The runtime has finished unmapping title memory `[at, at + len)`.
+/// [`title_memory_remapped`] runs before the view goes away, so a refresh
+/// between the two can still find the range mapped and cache that under the
+/// epoch it started; advancing the epoch again once the view is gone makes
+/// such a cache entry stale.
+pub fn title_memory_unmapped(_at: usize, _len: usize) {
+    REMAP_EPOCH.fetch_add(1, Ordering::Release);
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     #[cfg(feature = "diagnostics")]
     let _site = at_site(Site::Remapped);
+    REMAP_EPOCH.fetch_add(1, Ordering::Release);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     crate::census::gone(at, len);
@@ -1731,7 +1782,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // What it showed is gone already: nothing to keep. A lazy page there
     // gets its copy's bytes first (the runtime reports an unmap before it
     // unmaps: the physical page keeps them for the views still showing it).
-    changed(&mut g, first, last, false, &mut None, Touch::Host);
+    // Only these pages are marked: a mapping that still shows the same
+    // physical pages shows what it did, and its tracker (armed for a marked
+    // write, say) keeps it (#2414).
+    changed_here(&mut g, first, last, false, &mut None, Touch::Host);
     // What it shows now is new: bytes read of those pages before are stale.
     note_opened(&g, first, last);
     // What it showed is not what it shows now: its links go, both ways.
@@ -2583,7 +2637,8 @@ impl Drop for Timed {
 pub(crate) mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
@@ -2614,9 +2669,15 @@ pub(crate) mod tests {
         }
     }
 
+    /// Gives back a [`pool`]'s memory but keeps its addresses, so that no
+    /// later allocation lands there. A test can leave a tracker of its pool
+    /// behind (a host copy or a texture's staging that something global
+    /// still holds), and its pages stay in the guard set; a pool another
+    /// test got at those addresses would count as guarded already and never
+    /// fault (shadow and watch tests failing now and then, run in parallel).
     pub(crate) fn free(p: usize) {
-        // SAFETY: an allocation of ours.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: an allocation of ours, decommitted whole; still reserved.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_DECOMMIT) };
     }
 
     /// Everything is changed at first; after taking, only what is written
@@ -2893,6 +2954,33 @@ pub(crate) mod tests {
         unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Free memory is not tracked: tracked, it would be guarded once
+    /// something is allocated there (under Wine the process heap, in the
+    /// window of a null address: its writes then fault into the handler
+    /// while a thread holds the guard lock).
+    #[test]
+    fn free_memory_is_not_tracked() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
+        // SAFETY: a reservation of ours, released at once: free memory.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) }
+            as usize;
+        assert_ne!(r, 0);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+        let tracked = track(r, 2 * PAGE, true).is_some();
+        // Other tests allocate meanwhile: only memory still free counts.
+        // SAFETY: plain data filled in by the query, of the right size.
+        let still_free = unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            VirtualQuery(r as *const _, &mut info, size_of_val(&info)) != 0
+                && info.State == MEM_FREE
+                && info.BaseAddress as usize + info.RegionSize >= r + 2 * PAGE
+        };
+        assert!(!(tracked && still_free), "free memory");
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as changed.
     #[test]
@@ -3104,6 +3192,22 @@ pub(crate) mod tests {
             "aliasing a busy page marks the tracked one"
         );
         drop(busy_c);
+    }
+
+    /// With no tracker left on either mapping, neither stays guarded.
+    #[test]
+    fn dropping_the_last_tracker_opens_both_mappings() {
+        let (a, b) = twin_views(1);
+        let t = track(b, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(b, b + PAGE), [(b, b + PAGE)]);
+        {
+            let g = guards();
+            assert!(g.protected.contains(&(a / PAGE)) && g.protected.contains(&(b / PAGE)));
+        }
+        drop(t);
+        let g = guards();
+        assert!(!g.protected.contains(&(a / PAGE)), "the alias is open again");
+        assert!(!g.protected.contains(&(b / PAGE)));
     }
 
     /// A write or mapping that runs past the end of the address space (a
@@ -4065,5 +4169,32 @@ pub(crate) mod tests {
         }
         drop(trackers);
         free(p);
+    }
+
+    /// A page the runtime remaps stops being current where it was mapped, but
+    /// a mapping that still shows the same physical page does not (#2414): its
+    /// tracker keeps what it had, so a marked copy-back there is not dropped
+    /// with "changed, nothing saved".
+    #[test]
+    fn remapping_one_mapping_leaves_the_other_unchanged() {
+        let a = pool(1);
+        let b = pool(1);
+        let Some(tracked) = track(a, PAGE, true) else {
+            free(a);
+            free(b);
+            return;
+        };
+        // Taken by a refresh, then armed for a marked write.
+        tracked.taken(&[a / PAGE]);
+        tracked.arm(a, a + PAGE);
+        // `b` shows the same physical page; the runtime remaps it.
+        title_memory_aliased(a, &[b]);
+        title_memory_remapped(b, PAGE);
+        assert!(
+            !tracked.changed(a / PAGE),
+            "the other mapping still shows what it did"
+        );
+        free(a);
+        free(b);
     }
 }

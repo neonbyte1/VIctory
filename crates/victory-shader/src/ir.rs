@@ -44,8 +44,8 @@ pub struct Program {
     pub wave64: bool,
     /// VGPRs v0 up to this exist; bounds M0-relative access.
     pub vgprs: u16,
-    /// In code order, then copies made to give every loop one entry; block 0
-    /// is the entry.
+    /// In code order, then copies made to give every loop one entry. Block 0
+    /// is the entry, which can be an empty block before the code.
     pub blocks: Vec<Block>,
     /// Registers read before any write, with their value on entry: what the
     /// hardware or a called fetch routine set up (user SGPRs, system values,
@@ -56,7 +56,7 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// Byte offset of the block's first machine instruction (shared by a
-    /// block and its copies).
+    /// block and its copies). Zero for an empty entry block.
     pub offset: usize,
     pub preds: Vec<usize>,
     pub phis: Vec<Phi>,
@@ -138,7 +138,18 @@ pub fn build_bounded(
     vgprs: u16,
     m0_max: &HashMap<usize, u8>,
 ) -> Result<Program, ShaderError> {
-    let list = gfx10::decode(code)?;
+    build_decoded(code, gfx10::decode(code)?, wave64, vgprs, m0_max)
+}
+
+/// [`build_bounded`] of instructions [`gfx10::decode`] already gave for
+/// `code`.
+pub fn build_decoded(
+    code: &[u8],
+    list: Vec<gfx10::Instruction>,
+    wave64: bool,
+    vgprs: u16,
+    m0_max: &HashMap<usize, u8>,
+) -> Result<Program, ShaderError> {
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
@@ -160,9 +171,17 @@ pub fn build_bounded(
     }
     leaders.sort_unstable();
     leaders.dedup();
+    // When the first instruction is a loop header, give SSA a separate
+    // entry edge to carry the initial register values into its phis.
+    let preheader = usize::from(
+        flows
+            .iter()
+            .any(|flow| matches!(flow, Flow::Jump(0) | Flow::Branch(0))),
+    );
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
+            .map(|b| b + preheader)
             .map_err(|_| isa(offset, "jump into a block"))
     };
 
@@ -176,11 +195,23 @@ pub fn build_bounded(
             exit: Exit::End,
         })
         .collect();
+    if preheader != 0 {
+        blocks.insert(
+            0,
+            Block {
+                offset: 0,
+                preds: Vec::new(),
+                phis: Vec::new(),
+                insts: Vec::new(),
+                exit: Exit::Jump(1),
+            },
+        );
+    }
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
     for ((machine, flow), next) in list.into_iter().zip(flows).zip(next_offsets) {
-        let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
+        let b = leaders.partition_point(|&l| l <= machine.offset) - 1 + preheader;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
@@ -220,12 +251,6 @@ pub fn build_bounded(
         }
     }
     link(&mut blocks);
-    if !blocks[0].preds.is_empty() {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "a branch to the program entry",
-        });
-    }
     split_irreducible(&mut blocks)?;
 
     let order = reverse_postorder(&blocks);
@@ -241,6 +266,9 @@ pub fn build_bounded(
     for &b in &order {
         current.fill(NONE);
         let block = &mut blocks[b];
+        // `members` goes up in register order, as does `outs`: one walk
+        // along a predecessor's `outs` finds every register.
+        let mut walk = 0;
         for reg in members(&live_in[b]) {
             current[index(reg)] = match block.preds[..] {
                 [] => {
@@ -249,7 +277,7 @@ pub fn build_bounded(
                     v
                 }
                 // A single predecessor comes earlier in reverse postorder.
-                [p] => lookup(&outs[p], reg),
+                [p] => lookup_from(&outs[p], &mut walk, reg),
                 _ => {
                     let value = new_value();
                     block.phis.push(Phi {
@@ -271,19 +299,24 @@ pub fn build_bounded(
                 current[index(*reg)] = *v;
             }
         }
-        outs[b] = members(&live_out[b])
-            .map(|reg| (reg, current[index(reg)]))
-            .collect();
+        let live = live_out[b].iter().map(|w| w.count_ones() as usize).sum();
+        let mut out = Vec::with_capacity(live);
+        out.extend(members(&live_out[b]).map(|reg| (reg, current[index(reg)])));
+        outs[b] = out;
     }
     for block in &mut blocks {
+        // The phis are in register order (they were pushed by `members`):
+        // one walk along each predecessor's `outs` serves them all.
         for phi in &mut block.phis {
-            phi.args = block
-                .preds
-                .iter()
-                .map(|&p| lookup(&outs[p], phi.reg))
-                .collect();
-            debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
+            phi.args = Vec::with_capacity(block.preds.len());
         }
+        for &p in &block.preds {
+            let mut walk = 0;
+            for phi in &mut block.phis {
+                phi.args.push(lookup_from(&outs[p], &mut walk, phi.reg));
+            }
+        }
+        debug_assert!(block.phis.iter().all(|phi| !phi.args.contains(&NONE)));
     }
     remove_trivial_phis(&mut blocks, values);
     Ok(Program {
@@ -344,9 +377,16 @@ fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
 }
 
 /// `outs` is sorted by register, and holds every register live out.
-fn lookup(outs: &[(Reg, Value)], reg: Reg) -> Value {
-    outs.binary_search_by_key(&reg, |&(r, _)| r)
-        .map_or(NONE, |i| outs[i].1)
+/// `at` is where the walk is along it: ask for registers in rising order
+/// and every one costs a step, not a search.
+fn lookup_from(outs: &[(Reg, Value)], at: &mut usize, reg: Reg) -> Value {
+    while outs.get(*at).is_some_and(|&(r, _)| r < reg) {
+        *at += 1;
+    }
+    match outs.get(*at) {
+        Some(&(r, v)) if r == reg => v,
+        _ => NONE,
+    }
 }
 
 pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
@@ -598,30 +638,57 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
             }
         }
     }
+    solve_liveness(blocks, order, &uses, &defs)
+}
+
+/// Backwards dataflow to the least fixed point. Only predecessors of a
+/// changed live-in set need revisiting; a changed live-out set alone does
+/// not affect them. Keep unreachable blocks at zero, as in the old sweep.
+fn solve_liveness(
+    blocks: &[Block],
+    order: &[usize],
+    uses: &[RegSet],
+    defs: &[RegSet],
+) -> (Vec<RegSet>, Vec<RegSet>) {
+    use std::collections::VecDeque;
+
+    let empty = [0; REGS.div_ceil(64)];
     let mut live_in = vec![empty; blocks.len()];
     let mut live_out = vec![empty; blocks.len()];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in order.iter().rev() {
-            let mut out = empty;
-            for s in blocks[b].exit.successors() {
-                for (o, i) in out.iter_mut().zip(&live_in[s]) {
-                    *o |= i;
+    let mut reachable = vec![false; blocks.len()];
+    for &b in order {
+        reachable[b] = true;
+    }
+    let mut queued = reachable.clone();
+    let mut work: VecDeque<usize> = order.iter().rev().copied().collect();
+    while let Some(b) = work.pop_front() {
+        queued[b] = false;
+        let mut out = empty;
+        for successor in blocks[b].exit.successors() {
+            for (o, i) in out.iter_mut().zip(&live_in[successor]) {
+                *o |= i;
+            }
+        }
+        let mut inn = empty;
+        for w in 0..inn.len() {
+            inn[w] = uses[b][w] | out[w] & !defs[b][w];
+        }
+        live_out[b] = out;
+        if inn != live_in[b] {
+            live_in[b] = inn;
+            for &p in &blocks[b].preds {
+                if reachable[p] && !queued[p] {
+                    queued[p] = true;
+                    work.push_back(p);
                 }
-            }
-            let mut inn = empty;
-            for w in 0..inn.len() {
-                inn[w] = uses[b][w] | out[w] & !defs[b][w];
-            }
-            if inn != live_in[b] || out != live_out[b] {
-                (live_in[b], live_out[b]) = (inn, out);
-                changed = true;
             }
         }
     }
     (live_in, live_out)
 }
+
+#[cfg(test)]
+mod liveness_tests;
 
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
@@ -1203,6 +1270,46 @@ mod tests {
         assert_eq!(add.read(Reg::S(0)), Some(phi.value));
         assert_eq!(b1.insts[1].read(Reg::S(0)), add.write(Reg::S(0)));
         assert_eq!(b2.insts[0].name(), "s_endpgm");
+    }
+
+    #[test]
+    fn loops_can_branch_to_offset_zero() {
+        let p = build_words(
+            &[
+                0x8000_8100, // 0: s_add_u32 s0, s0, 1
+                0xBF07_8400, // s_cmp_lg_u32 s0, 4
+                0xBF85_FFFD, // s_cbranch_scc1 -> 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [entry, header, end] = &p.blocks[..] else {
+            panic!("{:?}", p.blocks);
+        };
+        assert!(entry.preds.is_empty());
+        assert!(entry.insts.is_empty());
+        assert_eq!(entry.exit, Exit::Jump(1));
+        assert_eq!(header.offset, 0);
+        assert_eq!(header.preds, [0, 1]);
+        assert_eq!(
+            header.exit,
+            Exit::Branch {
+                taken: 1,
+                not_taken: 2,
+            }
+        );
+        assert_eq!(end.exit, Exit::End);
+        let [phi] = &header.phis[..] else {
+            panic!("{:?}", header.phis);
+        };
+        let add = &header.insts[0];
+        assert_eq!(phi.reg, Reg::S(0));
+        assert_eq!(
+            phi.args,
+            [input(&p, Reg::S(0)), add.write(Reg::S(0)).unwrap()]
+        );
+        assert_eq!(add.read(Reg::S(0)), Some(phi.value));
+        assert!(crate::structure::structure(&p).is_ok());
     }
 
     #[test]

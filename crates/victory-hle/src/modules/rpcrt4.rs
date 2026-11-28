@@ -81,13 +81,21 @@ fn random(bytes: &mut [u8; 16]) -> bool {
 }
 
 extern "system" fn UuidFromStringA(text: *const c_char, uuid: *mut Guid) -> i32 {
-    if text.is_null() || uuid.is_null() {
+    if uuid.is_null() {
         return INVALID_STRING_UUID;
     }
-    // SAFETY: a NUL-terminated string from the caller.
-    let bytes = unsafe { std::ffi::CStr::from_ptr(text.cast()) }.to_bytes();
-    match parse(bytes.iter().copied()) {
-        // SAFETY: the caller passes a GUID to fill.
+    if text.is_null() {
+        // SAFETY: checked non-null; a null string requests the nil UUID.
+        unsafe { uuid.write(Guid::new(0, 0, 0, [0; 8])) };
+        return OK;
+    }
+    let chars = (0..).map_while(|i| {
+        // SAFETY: `text` is NUL-terminated and `map_while` stops at the NUL byte.
+        let b = unsafe { *text.add(i) as u8 };
+        (b != 0).then_some(u32::from(b))
+    });
+    match parse(chars) {
+        // SAFETY: checked non-null; the caller passes a GUID to fill.
         Some(g) => unsafe {
             uuid.write(g);
             OK
@@ -97,20 +105,21 @@ extern "system" fn UuidFromStringA(text: *const c_char, uuid: *mut Guid) -> i32 
 }
 
 extern "system" fn UuidFromStringW(text: *const u16, uuid: *mut Guid) -> i32 {
-    if text.is_null() || uuid.is_null() {
+    if uuid.is_null() {
         return INVALID_STRING_UUID;
     }
-    let mut units = Vec::new();
-    // SAFETY: a NUL-terminated wide string from the caller.
-    unsafe {
-        let mut at = text;
-        while *at != 0 {
-            units.push(*at);
-            at = at.add(1);
-        }
+    if text.is_null() {
+        // SAFETY: checked non-null; a null string requests the nil UUID.
+        unsafe { uuid.write(Guid::new(0, 0, 0, [0; 8])) };
+        return OK;
     }
-    match parse(units.into_iter().map(|u| u as u32)) {
-        // SAFETY: the caller passes a GUID to fill.
+    let chars = (0..).map_while(|i| {
+        // SAFETY: `text` is NUL-terminated and `map_while` stops at the NUL unit.
+        let u = unsafe { *text.add(i) };
+        (u != 0).then_some(u32::from(u))
+    });
+    match parse(chars) {
+        // SAFETY: checked non-null; the caller passes a GUID to fill.
         Some(g) => unsafe {
             uuid.write(g);
             OK
@@ -131,8 +140,12 @@ extern "system" fn UuidToStringA(uuid: *const Guid, out: *mut *mut c_char) -> i3
     let mut bytes = Vec::with_capacity(37);
     bytes.extend_from_slice(&text);
     bytes.push(0);
+    let allocated = allocate(&bytes);
+    if allocated.is_null() {
+        return OUT_OF_MEMORY;
+    }
     // SAFETY: `out` is the caller's pointer variable.
-    unsafe { out.write(allocate(&bytes).cast()) };
+    unsafe { out.write(allocated.cast()) };
     OK
 }
 
@@ -148,8 +161,12 @@ extern "system" fn UuidToStringW(uuid: *const Guid, out: *mut *mut u16) -> i32 {
     let mut units: Vec<u16> = text.iter().map(|&b| u16::from(b)).collect();
     units.push(0);
     let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let allocated = allocate(&bytes);
+    if allocated.is_null() {
+        return OUT_OF_MEMORY;
+    }
     // SAFETY: `out` is the caller's pointer variable.
-    unsafe { out.write(allocate(&bytes).cast()) };
+    unsafe { out.write(allocated.cast()) };
     OK
 }
 
@@ -199,17 +216,18 @@ fn format(g: &Guid) -> [u8; 36] {
     text
 }
 
-/// A GUID from its text, with or without braces and the dashes in place.
+/// A GUID from its canonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` text, in
+/// either case; `UuidFromString` refuses braces, other dash placements and
+/// trailing characters.
 fn parse(mut chars: impl Iterator<Item = impl Into<u32>>) -> Option<Guid> {
     let mut digits = [0u8; 32];
     let mut n = 0;
-    for c in &mut chars {
-        let c = c.into();
-        if n == 32 {
-            // Only the closing brace may follow the last digit.
-            return (c == u32::from(b'}')).then(|| assemble(&digits));
-        }
-        if c == u32::from(b'-') || (n == 0 && c == u32::from(b'{')) {
+    for pos in 0..36 {
+        let c = chars.next()?.into();
+        if matches!(pos, 8 | 13 | 18 | 23) {
+            if c != u32::from(b'-') {
+                return None;
+            }
             continue;
         }
         let digit = match c {
@@ -221,7 +239,7 @@ fn parse(mut chars: impl Iterator<Item = impl Into<u32>>) -> Option<Guid> {
         digits[n] = digit as u8;
         n += 1;
     }
-    (n == 32).then(|| assemble(&digits))
+    chars.next().is_none().then(|| assemble(&digits))
 }
 
 fn assemble(digits: &[u8; 32]) -> Guid {
@@ -317,25 +335,30 @@ mod tests {
             "1234abcd-00ef-4a5b-8012-3456789abcde"
         );
         assert_eq!(parse(text.iter().copied()), Some(g));
-        // Upper case and braces are what `UuidFromString` also takes.
-        let upper: Vec<u8> = std::iter::once(b'{')
-            .chain(text.iter().map(|b| b.to_ascii_uppercase()))
-            .chain(std::iter::once(b'}'))
-            .collect();
+        let upper: Vec<u8> = text.iter().map(u8::to_ascii_uppercase).collect();
         assert_eq!(parse(upper.iter().copied()), Some(g));
     }
 
     #[test]
     fn garbage_is_refused() {
-        assert_eq!(parse(b"1234".iter().copied()), None);
-        assert_eq!(
-            parse(b"1234abcd-00ef-4a5b-8012-3456789abcde-".iter().copied()),
-            None
-        );
-        assert_eq!(
-            parse(b"1234abcd-00ef-4a5b-8012-3456789abcdeZ".iter().copied()),
-            None
-        );
+        for bad in [
+            "",
+            "1234",
+            "1234abcd-00ef-4a5b-8012-3456789abcde-",
+            "1234abcd-00ef-4a5b-8012-3456789abcdeZ",
+            "{1234abcd-00ef-4a5b-8012-3456789abcde}",
+            "{1234abcd-00ef-4a5b-8012-3456789abcde",
+            "1234abcd-00ef-4a5b-8012-3456789abcde}",
+            "{1234abcd-00ef-4a5b-8012-3456789abcde}x",
+            "(1234abcd-00ef-4a5b-8012-3456789abcde)",
+            "1234abcd00ef4a5b80123456789abcde",
+            "1234-abcd-00ef-4a5b-8012-3456789abcde",
+            "1234abcd--00ef-4a5b-8012-3456789abcde",
+            " 1234abcd-00ef-4a5b-8012-3456789abcde",
+            "1234abcd-00ef-4a5b-8012-3456789abcde ",
+        ] {
+            assert_eq!(parse(bad.bytes()), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -405,9 +428,92 @@ mod tests {
         let mut w = Guid::new(0, 0, 0, [0; 8]);
         assert_eq!(UuidFromStringW(wide.as_ptr(), &mut w), OK);
         assert_eq!(w, g);
+
+        // Invalid text leaves the output untouched.
         assert_eq!(
             UuidFromStringA(c"nope".as_ptr().cast(), &mut w),
             INVALID_STRING_UUID
         );
+        assert_eq!(w, g);
+
+        // A null string creates the nil UUID, as documented.
+        let nil = Guid::new(0, 0, 0, [0; 8]);
+        assert_eq!(UuidFromStringA(std::ptr::null(), &mut g), OK);
+        assert_eq!(g, nil);
+        assert_eq!(UuidFromStringW(std::ptr::null(), &mut w), OK);
+        assert_eq!(w, nil);
+
+        // A null output pointer is refused.
+        assert_eq!(
+            UuidFromStringA(std::ptr::null(), std::ptr::null_mut()),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(
+            UuidFromStringW(std::ptr::null(), std::ptr::null_mut()),
+            INVALID_STRING_UUID
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uuid_from_string_matches_the_host_runtime() {
+        type FromA = extern "system" fn(*const c_char, *mut Guid) -> i32;
+        type FromW = extern "system" fn(*const u16, *mut Guid) -> i32;
+        let host_a = crate::modules::files::host!("rpcrt4.dll", "UuidFromStringA": FromA);
+        let host_w = crate::modules::files::host!("rpcrt4.dll", "UuidFromStringW": FromW);
+        let sentinel = Guid::new(
+            0xaaaa_aaaa,
+            0xbbbb,
+            0xcccc,
+            [0xdd, 0xdd, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee],
+        );
+
+        let (mut ours, mut theirs) = (sentinel, sentinel);
+        assert_eq!(
+            (UuidFromStringA(std::ptr::null(), &mut ours), ours),
+            (host_a(std::ptr::null(), &mut theirs), theirs)
+        );
+        let (mut ours, mut theirs) = (sentinel, sentinel);
+        assert_eq!(
+            (UuidFromStringW(std::ptr::null(), &mut ours), ours),
+            (host_w(std::ptr::null(), &mut theirs), theirs)
+        );
+
+        for case in [
+            "00000000-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "1234abcd-00ef-4a5b-8012-3456789abcde",
+            "1234ABCD-00EF-4A5B-8012-3456789ABCDE",
+            "1234aBcD-00eF-4A5b-8012-3456789AbCdE",
+            "{1234abcd-00ef-4a5b-8012-3456789abcde}",
+            "{1234abcd-00ef-4a5b-8012-3456789abcde",
+            "1234abcd-00ef-4a5b-8012-3456789abcde}",
+            "{1234abcd-00ef-4a5b-8012-3456789abcde}x",
+            "(1234abcd-00ef-4a5b-8012-3456789abcde)",
+            "1234abcd00ef4a5b80123456789abcde",
+            "1234-abcd-00ef-4a5b-8012-3456789abcde",
+            "1234abcd--00ef-4a5b-8012-3456789abcde",
+            " 1234abcd-00ef-4a5b-8012-3456789abcde",
+            "1234abcd-00ef-4a5b-8012-3456789abcde ",
+            "1234abcd-00ef-4a5b-8012-3456789abcdeZ",
+            "1234",
+            "",
+        ] {
+            let narrow = std::ffi::CString::new(case).unwrap();
+            let (mut ours, mut theirs) = (sentinel, sentinel);
+            assert_eq!(
+                (UuidFromStringA(narrow.as_ptr(), &mut ours), ours),
+                (host_a(narrow.as_ptr(), &mut theirs), theirs),
+                "UuidFromStringA({case:?})"
+            );
+
+            let wide: Vec<u16> = case.encode_utf16().chain([0]).collect();
+            let (mut ours, mut theirs) = (sentinel, sentinel);
+            assert_eq!(
+                (UuidFromStringW(wide.as_ptr(), &mut ours), ours),
+                (host_w(wide.as_ptr(), &mut theirs), theirs),
+                "UuidFromStringW({case:?})"
+            );
+        }
     }
 }

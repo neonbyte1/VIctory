@@ -77,7 +77,9 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const DOUBLE_EXTENSIONS: u64 = 1 << 6;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// UAVs in a vertex, geometry or mesh program.
@@ -176,6 +178,11 @@ pub(crate) struct Shader {
     pub entry: usize,
     /// The `dx.op` operations called (names without overload).
     ops: std::collections::BTreeSet<String>,
+    /// The `dx.op.*` declarations made so far: name, signature, attributes,
+    /// the function and its opcode constant. A program repeats the same few
+    /// operations, and declaring one costs a `format!`, a signature type and
+    /// four hashed lookups.
+    op_decls: Vec<OpDecl>,
 }
 
 thread_local! {
@@ -190,6 +197,20 @@ thread_local! {
 /// properties do not allow names neither.
 pub(crate) fn last_summary() -> String {
     LAST.with(|l| l.borrow().clone())
+}
+
+/// The `dx.op` declarations kept: a program uses tens, and the scan of a
+/// declaration the cache dropped costs less than the declaration.
+const OP_DECLS: usize = 48;
+
+struct OpDecl {
+    name: String,
+    attr: Attr,
+    ret: Ty,
+    args: Vec<Ty>,
+    opcode: u32,
+    f: V,
+    code: V,
 }
 
 impl Shader {
@@ -255,6 +276,7 @@ impl Shader {
             main,
             entry,
             ops: std::collections::BTreeSet::new(),
+            op_decls: Vec::new(),
         }
     }
 
@@ -280,26 +302,65 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        let mut params = vec![self.t.i32];
-        params.extend(args.iter().map(|&a| self.m.type_of(a)));
-        let fty = self.m.func_ty(ret, params);
-        self.m.ptr(fty);
         self.ops
             .insert(name.split('.').next().unwrap_or(name).to_owned());
-        let f = self
-            .m
-            .function(&format!("dx.op.{name}"), fty, Some(attr), false);
-        let mut all = vec![self.m.i32(opcode)];
-        all.extend(args);
+        let declared = self.op_decls.iter().position(|d| {
+            d.name == name
+                && d.attr == attr
+                && d.ret == ret
+                && d.opcode == opcode
+                && d.args.len() == args.len()
+                && d.args
+                    .iter()
+                    .zip(args)
+                    .all(|(&t, &a)| t == self.m.type_of(a))
+        });
+        let (f, code) = match declared {
+            Some(i) => {
+                // The hot operations sit at the front, where the next scan
+                // starts.
+                self.op_decls[..=i].rotate_right(1);
+                (self.op_decls[0].f, self.op_decls[0].code)
+            }
+            None => {
+                let mut params = Vec::with_capacity(1 + args.len());
+                params.push(self.t.i32);
+                let types: Vec<Ty> = args.iter().map(|&a| self.m.type_of(a)).collect();
+                params.extend_from_slice(&types);
+                let fty = self.m.func_ty(ret, params);
+                self.m.ptr(fty);
+                let f = self
+                    .m
+                    .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+                let code = self.m.i32(opcode);
+                let decl = OpDecl {
+                    name: name.into(),
+                    attr,
+                    ret,
+                    args: types,
+                    opcode,
+                    f,
+                    code,
+                };
+                if self.op_decls.len() == OP_DECLS {
+                    self.op_decls.pop();
+                }
+                self.op_decls.insert(0, decl);
+                (f, code)
+            }
+        };
+        let mut all = Vec::with_capacity(1 + args.len());
+        all.push(code);
+        all.extend_from_slice(args);
         let choice = self
             .sampler_choices
             .iter()
             .copied()
             .find(|&(a, _, _)| args.contains(&a));
-        let r = self.m.call(block, f, all.clone());
         let Some((a, b, cond)) = choice else {
-            return r;
+            return self.m.call(block, f, all);
         };
+        let r = self.m.call(block, f, all.clone());
         for x in &mut all {
             if *x == a {
                 *x = b;
@@ -635,6 +696,8 @@ impl Shader {
             (flags::SAMPLER_HEAP, uses.sampler_heap),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
+            (flags::TYPED_UAV_LOADS, uses.typed_uav_loads),
+            (flags::ROVS, uses.rovs),
         ] {
             self.flags = if used { self.flags | flag } else { self.flags & !flag };
         }
@@ -801,12 +864,26 @@ impl Shader {
             }
             let mut samplers = None;
             if self.samplers > 0 {
-                let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
-                let p = self.m.ptr(ty);
-                let u = self.m.undef(p);
+                let mut plain = None;
+                let mut comparison = None;
                 let mut list = Vec::new();
                 for n in 0..self.samplers {
-                    let kind = (self.cmp_samplers >> n & 1) as u32;
+                    let is_cmp = self.cmp_samplers >> n & 1 != 0;
+                    let u = if is_cmp {
+                        *comparison.get_or_insert_with(|| {
+                            let ty = self
+                                .m
+                                .named_struct("struct.SamplerComparisonState", vec![self.t.i32]);
+                            let p = self.m.ptr(ty);
+                            self.m.undef(p)
+                        })
+                    } else {
+                        *plain.get_or_insert_with(|| {
+                            let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
+                            let p = self.m.ptr(ty);
+                            self.m.undef(p)
+                        })
+                    };
                     let ops = vec![
                         Some(i32c(&mut self, n)),
                         Some(self.m.md_value(u)),
@@ -815,7 +892,7 @@ impl Shader {
                         Some(i32c(&mut self, n)),
                         Some(i32c(&mut self, 1)),
                         // Sampler kind: 1 comparison.
-                        Some(i32c(&mut self, kind)),
+                        Some(i32c(&mut self, u32::from(is_cmp))),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
@@ -972,6 +1049,14 @@ impl Shader {
         self.m.named_md("dx.entryPoints", vec![entry]);
 
         self.m.single_latches();
+        // One instruction for one value (`bitcode::reuse`); the host's
+        // tables are read once per entry.
+        let tables: Vec<V> = [self.memory, self.view_addresses, self.view_marks]
+            .into_iter()
+            .flatten()
+            .chain(self.root_srvs.iter().filter(|r| r.0 == VIEW_STRIDES).map(|r| r.1))
+            .collect();
+        self.m.reuse(&tables);
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
@@ -983,8 +1068,14 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::DOUBLES != 0 {
+            features |= 0x1;
+        }
         if self.flags & flags::UAVS_EVERY_STAGE != 0 {
             features |= 0x4;
+        }
+        if self.flags & flags::DOUBLE_EXTENSIONS != 0 {
+            features |= 0x20;
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
@@ -1021,13 +1112,18 @@ impl Shader {
         } else {
             self.outputs.iter().any(|o| o.kind == 3)
         };
+        let mesh_shared = if self.lds.is_some() {
+            self.lds_dwords * 4
+        } else {
+            0
+        };
         let psv0 = container::psv(&Psv {
             stage: kind as u8,
             flag: flag && self.threads.is_none(),
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            mesh: self.mesh.map(|m| (m, mesh_shared)),
             gs: self.gs,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
@@ -1097,7 +1193,73 @@ impl Shader {
 #[cfg(all(test, windows))]
 mod tests {
     use super::super::bitcode::Term;
+    use super::super::validator::Validator;
     use super::*;
+    use crate::dxbc::{Container, FourCC};
+
+    fn check_uav_load_flags(texture: bool, rov: bool) {
+        let path = Validator::default_path();
+        let mut validator = path.as_deref().map(|path| Validator::load(Some(path)).unwrap());
+        for (store, read) in [(false, false), (true, false), (true, true)] {
+            let mut s = Shader::new(rov);
+            if !rov {
+                s.threads = Some([1, 1, 1]);
+            }
+            // Seed the flags lowering used to set before DCE could drop the load.
+            if !read {
+                s.flags |= flags::TYPED_UAV_LOADS;
+            }
+            if rov && !store {
+                s.flags |= flags::ROVS;
+            }
+            let b = s.entry;
+            let zero = s.m.i32(0);
+            let iu = s.m.undef(s.t.i32);
+            let kind = if texture { 2 } else { 10 };
+            let props0 = kind | 0x1000 | if rov { 0x2000 } else { 0 };
+            let h = s.heap_handle(b, zero, false, false, (props0, 0x409));
+            let (load, load_op, load_args) = if texture {
+                ("textureLoad.f32", 66, vec![h, iu, zero, zero, iu, iu, iu, iu])
+            } else {
+                ("bufferLoad.f32", 68, vec![h, zero, iu])
+            };
+            let r = s.op(b, load, Attr::ReadOnly, s.t.res_ret, load_op, &load_args);
+            if store {
+                // A store keeps the annotation alive even if it ignores the load.
+                let v = if read { s.m.extract(b, r, 0) } else { s.m.f32(0) };
+                let mask = s.m.i8(0xF);
+                let (name, op, args) = if texture {
+                    ("textureStore.f32", 67, vec![h, zero, zero, iu, v, v, v, v, mask])
+                } else {
+                    ("bufferStore.f32", 69, vec![h, zero, iu, v, v, v, v, mask])
+                };
+                s.op(b, name, Attr::NoUnwind, s.t.void, op, &args);
+            }
+            s.m.terminate(b, Term::Ret);
+            let case = format!("{load}, ROV={rov}, store={store}, read={read}");
+            assert_eq!(
+                s.m.written_calls(&format!("dx.op.{load}")).count(),
+                usize::from(read),
+                "{case}"
+            );
+            let mut dxil = s.finish();
+            let container = Container::parse(&dxil).unwrap();
+            let part = container.part(FourCC::SFI0).unwrap();
+            let features = u64::from_le_bytes(part.data.try_into().unwrap());
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut dxil).unwrap_or_else(|e| panic!("{case}: {e}"));
+            }
+            assert_eq!(features & 0x800 != 0, read, "{case}: typed UAV loads");
+            assert_eq!(features & 0x1000 != 0, rov && store, "{case}: ROVs");
+        }
+    }
+
+    #[test]
+    fn typed_uav_load_flags_follow_dce() {
+        check_uav_load_flags(false, false);
+        check_uav_load_flags(true, false);
+        check_uav_load_flags(true, true);
+    }
 
     /// A program that sets a bit through the write marks' UAV, or (`heap`)
     /// through a UAV indexed from the heap: a vertex (`pixel` false, no

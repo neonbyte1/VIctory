@@ -8,6 +8,7 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 
+use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 type Hresult = i32;
@@ -110,10 +111,12 @@ static BLOB_VTABLE: BlobVtable = BlobVtable {
 
 pub struct Validator {
     object: Object,
+    module: HMODULE,
 }
 
 // SAFETY: the validator object is free-threaded (DXC's validator has no
-// thread affinity); calls are serialised by `&mut self`.
+// thread affinity) and the module handle is process-wide; calls are
+// serialised by `&mut self`.
 unsafe impl Send for Validator {}
 
 impl Validator {
@@ -145,18 +148,26 @@ impl Validator {
         unsafe {
             let module = LoadLibraryW(name.as_ptr());
             if module.is_null() {
-                return Err(format!("cannot load {}", String::from_utf16_lossy(&name)));
+                return Err(format!(
+                    "cannot load {}",
+                    String::from_utf16_lossy(&name[..name.len() - 1])
+                ));
             }
-            let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
-                .ok_or("dxil.dll lacks DxcCreateInstance")?;
+            let Some(create) = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast()) else {
+                FreeLibrary(module);
+                return Err("dxil.dll lacks DxcCreateInstance".into());
+            };
             let create: CreateInstance = std::mem::transmute(create);
             let mut object = std::ptr::null_mut();
             let hr = create(&CLSID_DXC_VALIDATOR, &IID_IDXC_VALIDATOR, &mut object);
             if hr < 0 || object.is_null() {
+                release(object.cast());
+                FreeLibrary(module);
                 return Err(format!("DxcCreateInstance(validator) failed: {hr:#x}"));
             }
             Ok(Validator {
                 object: object.cast(),
+                module,
             })
         }
     }
@@ -182,12 +193,17 @@ impl Validator {
             ) -> Hresult = method(self.object, 3);
             let hr = validate(self.object, &mut blob, IN_PLACE_EDIT, &mut result);
             if hr < 0 || result.is_null() {
+                release(result);
                 return Err(format!("Validate failed: {hr:#x}"));
             }
             let mut status = 0;
             let get_status: unsafe extern "system" fn(Object, *mut Hresult) -> Hresult =
                 method(result, 3);
-            get_status(result, &mut status);
+            let status_hr = get_status(result, &mut status);
+            if status_hr < 0 {
+                release(result);
+                return Err(format!("GetStatus failed: {status_hr:#x}"));
+            }
             let mut text = String::new();
             if status < 0 {
                 let mut errors: Object = std::ptr::null_mut();
@@ -196,13 +212,16 @@ impl Validator {
                 if get_errors(result, &mut errors) >= 0 && !errors.is_null() {
                     let ptr: unsafe extern "system" fn(Object) -> *const u8 = method(errors, 3);
                     let len: unsafe extern "system" fn(Object) -> usize = method(errors, 4);
-                    let bytes = std::slice::from_raw_parts(ptr(errors), len(errors));
-                    text = String::from_utf8_lossy(bytes)
-                        .trim_end_matches('\0')
-                        .trim()
-                        .into();
-                    release(errors);
+                    let (p, n) = (ptr(errors), len(errors));
+                    if !p.is_null() && n > 0 {
+                        let bytes = std::slice::from_raw_parts(p, n);
+                        text = String::from_utf8_lossy(bytes)
+                            .trim_end_matches('\0')
+                            .trim()
+                            .into();
+                    }
                 }
+                release(errors);
                 if text.is_empty() {
                     text = format!("rejected ({status:#x})");
                 }
@@ -215,7 +234,98 @@ impl Validator {
 
 impl Drop for Validator {
     fn drop(&mut self) {
-        // SAFETY: we own one reference.
-        unsafe { release(self.object) };
+        // SAFETY: we own one reference to the validator object and, when loaded
+        // from a DLL, one module handle; release the object before unloading
+        // the DLL that implements its vtable.
+        unsafe {
+            release(self.object);
+            if !self.module.is_null() {
+                FreeLibrary(self.module);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_error_blob_falls_back_without_ub() {
+        const E_FAIL: Hresult = 0x8000_4005_u32 as i32;
+
+        #[repr(C)]
+        struct Fake {
+            vtbl: *const [*const (); 6],
+            out: Object,
+        }
+
+        unsafe extern "system" fn noop(_: Object) -> u32 {
+            0
+        }
+        unsafe extern "system" fn validate(
+            this: *mut Fake,
+            _: *mut Blob,
+            _: u32,
+            out: *mut Object,
+        ) -> Hresult {
+            // SAFETY: `this` and `out` are valid pointers from `Validator::validate`.
+            unsafe { *out = (*this).out };
+            0
+        }
+        unsafe extern "system" fn get_status(_: Object, out: *mut Hresult) -> Hresult {
+            // SAFETY: `out` is a valid stack pointer from `Validator::validate`.
+            unsafe { *out = E_FAIL };
+            0
+        }
+        unsafe extern "system" fn get_errors(this: *mut Fake, out: *mut Object) -> Hresult {
+            // SAFETY: `this` and `out` are valid pointers from `Validator::validate`.
+            unsafe { *out = (*this).out };
+            0
+        }
+
+        let val_vtbl = [
+            std::ptr::null(),
+            std::ptr::null(),
+            noop as *const (),
+            validate as *const (),
+            std::ptr::null(),
+            std::ptr::null(),
+        ];
+        let res_vtbl = [
+            std::ptr::null(),
+            std::ptr::null(),
+            noop as *const (),
+            get_status as *const (),
+            std::ptr::null(),
+            get_errors as *const (),
+        ];
+
+        let mut byte = 0u8;
+        for (data, len) in [
+            (std::ptr::null_mut(), 0),
+            (std::ptr::null_mut(), 16),
+            (&raw mut byte, 0),
+        ] {
+            let mut err_blob = Blob {
+                vtable: &BLOB_VTABLE,
+                data,
+                len,
+            };
+            let mut res = Fake {
+                vtbl: &res_vtbl,
+                out: (&raw mut err_blob).cast(),
+            };
+            let mut val = Fake {
+                vtbl: &val_vtbl,
+                out: (&raw mut res).cast(),
+            };
+            let mut validator = Validator {
+                object: (&raw mut val).cast(),
+                module: std::ptr::null_mut(),
+            };
+            let err = validator.validate(&mut [0u8; 4]).unwrap_err();
+            assert_eq!(err, format!("rejected ({E_FAIL:#x})"));
+        }
     }
 }

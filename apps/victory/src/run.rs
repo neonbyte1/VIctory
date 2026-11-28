@@ -78,7 +78,8 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = victory_loader::load(&prepared, &images)?;
+    let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
+    let image = victory_loader::load(&prepared, &images, &exe_name)?;
     // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
     drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
@@ -121,14 +122,11 @@ pub fn run(
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
         victory_gpu::pipeline::note_title_dll(name, dll.base(), dll.info().size_of_image as usize);
     }
-    let imported: Vec<&str> = image
-        .info()
-        .imports
+    let mapped: Vec<_> = dlls
         .iter()
-        .map(|m| m.dll.as_str())
+        .map(|(name, dll)| (name.as_str(), dll.info().imports.as_slice()))
         .collect();
-    let mapped: Vec<&str> = dlls.iter().map(|(name, _)| name.as_str()).collect();
-    let absent = absent_title_dlls(&imported, &mapped, &wanted);
+    let absent = absent_title_dlls(&image.info().imports, &mapped, &wanted);
     if !absent.is_empty() {
         let message = format!(
             "{} not in {}, and neither the host nor VIctory provides {}: the package is \
@@ -171,7 +169,6 @@ pub fn run(
     for (name, dll) in &dlls {
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
-    let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -198,6 +195,8 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    // Keep pipelines compiled and early-start keys recorded in the last save interval.
+    victory_gpu::pipeline::save_pipeline_cache();
     println!("title exited with {code}");
     Ok(code)
 }
@@ -281,8 +280,8 @@ fn watch(base: usize, size: usize) {
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
 /// each title+rva twice a second. A title that ends itself when its main
 /// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
-/// through slower frames with its tick flag poked. The address must be
-/// writable title data.
+/// through slower frames with its tick flag poked. Code pages work too:
+/// a site's `int3` can be nopped (`:0x90`).
 #[cfg(all(windows, feature = "diagnostics"))]
 fn poke(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_POKE") else {
@@ -298,8 +297,7 @@ fn poke(base: usize, size: usize) {
     std::thread::spawn(move || {
         loop {
             for &(rva, byte) in &pokes {
-                // SAFETY: a byte inside the mapped image, checked above.
-                unsafe { ((base + rva) as *mut u8).write_volatile(byte) };
+                victory_loader::write_title_byte(base + rva, byte);
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
@@ -312,19 +310,25 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
-/// The DLLs among `imported` (the main image's static imports) that must
-/// come from the title's folder (`wanted`) but were not mapped from it:
-/// none of their imports can be bound. Each named once, case ignored.
+/// The DLLs statically imported by the main image or a mapped title DLL that
+/// must come from the title's folder (`wanted`) but were not mapped from it.
+/// Each named once, case ignored.
 #[cfg(any(windows, test))]
 fn absent_title_dlls(
-    imported: &[&str],
-    mapped: &[&str],
+    main: &[victory_pe::ImportModule],
+    mapped: &[(&str, &[victory_pe::ImportModule])],
     wanted: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
+    let imported = main
+        .iter()
+        .chain(mapped.iter().flat_map(|(_, imports)| imports.iter()));
     let mut absent: Vec<String> = Vec::new();
-    for &dll in imported {
-        let known = |list: &[&str]| list.iter().any(|m| m.eq_ignore_ascii_case(dll));
-        if wanted(dll) && !known(mapped) && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll)) {
+    for module in imported {
+        let dll = module.dll.as_str();
+        if wanted(dll)
+            && !mapped.iter().any(|(name, _)| name.eq_ignore_ascii_case(dll))
+            && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll))
+        {
             absent.push(dll.to_owned());
         }
     }
@@ -463,35 +467,57 @@ impl LoaderLock {
 #[cfg(test)]
 mod absent_tests {
     use super::absent_title_dlls;
+    use victory_pe::ImportModule;
+
+    fn imports(dlls: &[&str]) -> Vec<ImportModule> {
+        dlls.iter()
+            .map(|&dll| ImportModule {
+                dll: dll.to_owned(),
+                entries: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn wanted(dll: &str) -> bool {
+        !["KERNEL32.dll", "d3d12_xs.dll"]
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(dll))
+    }
 
     #[test]
     fn title_dlls_missing_from_the_folder_are_named_once() {
         // The host provides kernel32, our runtime d3d12_xs; the rest are the
         // title's own (#930: the four DLLs beside the executable missing).
-        let wanted = |dll: &str| {
-            !["KERNEL32.dll", "d3d12_xs.dll"]
-                .iter()
-                .any(|h| h.eq_ignore_ascii_case(dll))
-        };
-        let imported = [
+        let imported = imports(&[
             "KERNEL32.dll",
             "d3d12_xs.dll",
             "XboxBvhBuilder.dll",
             "MSVCP140.dll",
             "Bink2Scarlett.dll",
             "xboxbvhbuilder.dll",
-        ];
-        let mapped = ["msvcp140.dll"];
+        ]);
         assert_eq!(
-            absent_title_dlls(&imported, &mapped, &wanted),
+            absent_title_dlls(&imported, &[("msvcp140.dll", &[])], &wanted),
             ["XboxBvhBuilder.dll", "Bink2Scarlett.dll"]
+        );
+    }
+
+    #[test]
+    fn missing_static_imports_of_mapped_title_dlls_are_named_once() {
+        let main = imports(&["A.dll"]);
+        let a = imports(&["B.dll", "MissingFromA.dll", "missingfromb.dll"]);
+        let b = imports(&["MissingFromB.dll", "KERNEL32.dll", "d3d12_xs.dll"]);
+        assert_eq!(
+            absent_title_dlls(&main, &[("b.dll", &b), ("a.dll", &a)], &wanted),
+            ["MissingFromB.dll", "MissingFromA.dll"]
         );
     }
 
     #[test]
     fn a_complete_package_has_nothing_absent() {
         let wanted = |dll: &str| dll.starts_with("Title");
-        assert!(absent_title_dlls(&["Title.dll", "Host.dll"], &["TITLE.DLL"], &wanted).is_empty());
+        let imported = imports(&["Title.dll", "Host.dll"]);
+        assert!(absent_title_dlls(&imported, &[("TITLE.DLL", &[])], &wanted).is_empty());
         assert!(absent_title_dlls(&[], &[], &wanted).is_empty());
     }
 }

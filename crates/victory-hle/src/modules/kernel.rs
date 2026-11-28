@@ -171,6 +171,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
             ordinal = name as usize,
             "GetProcAddress by ordinal"
         );
+        host::set_last_error(ERROR_PROC_NOT_FOUND);
         return std::ptr::null_mut();
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
@@ -179,6 +180,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -214,9 +216,13 @@ pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
     host::free_library(module)
 }
 
+/// Pseudo modules never receive thread notifications.
 /// Title images hear of thread starts and ends from us, not from the
 /// Windows loader (`victory_loader::disable_thread_calls`).
 pub extern "system" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
+    if registry().iter().any(|m| handle(m) == module) {
+        return 1;
+    }
     host::disable_thread_library_calls(module)
 }
 
@@ -243,6 +249,27 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 pub extern "C" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
     host::exit(code)
+}
+
+/// The kernel's `ExitProcess`: logged as [`exit`] is (it was bound to the
+/// host's, silently: a title that ended the process that way left no line
+/// saying so), then what Windows' does. The other threads end and the
+/// title images get `DLL_PROCESS_DETACH` (the loader's, as after `exit`'s
+/// functions), then the host's `ExitProcess` ends the process with the
+/// title's code. Not the CRT's `exit`: that runs the exit table on the
+/// calling thread while the title's other threads live, where an exit
+/// function waiting for a lock one of them holds hangs; Windows runs no
+/// exit table of the program here.
+pub extern "system" fn ExitProcess(code: u32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title ends the process");
+    end_process(code, host::detach_images, host::exit_process)
+}
+
+/// [`ExitProcess`]'s steps: the title images `detach`, then `exit` ends
+/// the process with `code`.
+fn end_process(code: u32, detach: fn(), exit: fn(u32) -> !) -> ! {
+    detach();
+    exit(code)
 }
 
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
@@ -305,8 +332,11 @@ fn handle(m: &HleModule) -> *mut c_void {
 /// mapped now.
 fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    // As the Windows loader does, a name without extension means a DLL.
-    let file = if file.contains('.') {
+    // As the Windows loader does, a name without extension means a DLL;
+    // trailing dots say it has none (and are not part of the name).
+    let file = if file.ends_with('.') {
+        file.trim_end_matches('.').to_owned()
+    } else if file.contains('.') {
         file.to_owned()
     } else {
         format!("{file}.dll")
@@ -360,6 +390,7 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -388,6 +419,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(OutputDebugStringA),
             hle_export!(OutputDebugStringW),
             hle_export!(exit),
+            hle_export!(ExitProcess),
             hle_export!(abort),
             hle_export!(terminate),
             hle_export!(_invalid_parameter_noinfo_noreturn),
@@ -492,6 +524,15 @@ mod host {
         unsafe { crt_abort() }
     }
 
+    pub(super) fn detach_images() {
+        victory_loader::detach_for_exit_process();
+    }
+
+    pub(super) fn exit_process(code: u32) -> ! {
+        // SAFETY: ends this process with the title's code.
+        unsafe { windows_sys::Win32::System::Threading::ExitProcess(code) }
+    }
+
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
@@ -588,6 +629,12 @@ mod host {
         std::process::abort()
     }
 
+    pub(super) fn detach_images() {}
+
+    pub(super) fn exit_process(code: u32) -> ! {
+        std::process::exit(code as i32)
+    }
+
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
     }
@@ -606,6 +653,31 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's `ExitProcess` detaches the title images before it ends
+    /// the process, and ends it with the title's code. Stand-ins record the
+    /// steps; the exit unwinds instead of ending the test process.
+    #[test]
+    fn a_title_exit_process_detaches_then_ends_with_its_code() {
+        static STEPS: std::sync::Mutex<Vec<Option<u32>>> = std::sync::Mutex::new(Vec::new());
+        fn detach() {
+            STEPS.lock().unwrap().push(None);
+        }
+        fn exit(code: u32) -> ! {
+            STEPS.lock().unwrap().push(Some(code));
+            std::panic::resume_unwind(Box::new(()))
+        }
+        assert!(std::panic::catch_unwind(|| end_process(0x8765_4321, detach, exit)).is_err());
+        assert_eq!(*STEPS.lock().unwrap(), [None, Some(0x8765_4321)]);
+    }
+
+    #[test]
+    fn disable_thread_library_calls_accepts_pseudo_modules() {
+        let module = GetModuleHandleA(c"xgameruntime.dll".as_ptr().cast());
+        assert!(!module.is_null());
+        assert_eq!(DisableThreadLibraryCalls(module), 1);
+        assert_eq!(DisableThreadLibraryCalls(std::ptr::null_mut()), 0);
+    }
 
     #[test]
     fn title_images_report_their_original_path() {
@@ -743,6 +815,23 @@ mod tests {
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
     }
 
+    /// Trailing dots mean the name has no extension: no `.dll` is added.
+    #[test]
+    fn a_module_name_with_a_trailing_dot_gets_no_dll_appended() {
+        let (bare, dll) = (0x7400_0000_0000usize, 0x7500_0000_0000usize);
+        runtime::set_image_path(bare, std::path::Path::new(r"C:\title\plain"));
+        runtime::set_image_path(dll, std::path::Path::new(r"C:\title\plain.dll"));
+        assert_eq!(GetModuleHandleW(w("plain.").as_ptr()) as usize, bare);
+        assert_eq!(
+            GetModuleHandleA(c"sub\\PLAIN.".as_ptr().cast()) as usize,
+            bare
+        );
+        assert_eq!(GetModuleHandleW(w("plain..").as_ptr()) as usize, bare);
+        assert_eq!(GetModuleHandleW(w("plain.dll..").as_ptr()) as usize, dll);
+        assert_eq!(GetModuleHandleW(w("plain").as_ptr()) as usize, dll);
+        assert_eq!(GetModuleHandleW(w("plain.dll").as_ptr()) as usize, dll);
+    }
+
     /// No buffer: nothing written, the error says it was too small.
     #[test]
     fn a_title_image_name_into_no_buffer() {
@@ -756,6 +845,40 @@ mod tests {
             // SAFETY: reads this thread's last error.
             let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             assert_eq!(last, ERROR_INSUFFICIENT_BUFFER);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_pseudo_module_exports_set_proc_not_found() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        assert!(!kernel32.is_null());
+        // SAFETY: clears and reads this thread's Win32 last-error slot.
+        let host_err = unsafe {
+            SetLastError(0);
+            assert!(GetProcAddress(kernel32, c"NoSuchHostExport".as_ptr().cast()).is_null());
+            GetLastError()
+        };
+        assert_eq!(host_err, ERROR_PROC_NOT_FOUND);
+
+        let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        assert!(!runtime.is_null());
+        assert!(!GetProcAddress(runtime, c"XGameRuntimeInitialize".as_ptr().cast()).is_null());
+
+        for missing in [
+            c"NoSuchPseudoExport".as_ptr().cast::<u8>(),
+            9999usize as *const u8,
+            std::ptr::null(),
+        ] {
+            // SAFETY: clears and reads this thread's Win32 last-error slot.
+            let err = unsafe {
+                SetLastError(0);
+                assert!(GetProcAddress(runtime, missing).is_null());
+                GetLastError()
+            };
+            assert_eq!(err, ERROR_PROC_NOT_FOUND);
         }
     }
 }

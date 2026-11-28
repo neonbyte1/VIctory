@@ -45,7 +45,54 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    DIR.get_or_init(|| {
+        sweep_staging(&dir, std::process::id(), STAGING_KEPT);
+        dir
+    });
+}
+
+/// How long another process's staging file is left alone: the folder is
+/// shared, and a running instance may be writing it.
+const STAGING_KEPT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Removes the staging files of cut writes (`write_atomically`) from `dir`:
+/// those of process `pid` now (no write of this run has started yet), other
+/// processes' once untouched for `kept`. A cut write leaves its file, and no
+/// later write reuses the name.
+fn sweep_staging(dir: &std::path::Path, pid: u32, kept: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(writer) = name.to_str().and_then(staging_pid) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let age = meta.modified().ok().and_then(|t| t.elapsed().ok());
+        if writer == pid || age.is_some_and(|age| age >= kept) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The process whose staging file `name` is (`<file>.tmp-<pid>-<n>` of a
+/// file this module writes), if it is one.
+fn staging_pid(name: &str) -> Option<u32> {
+    let rest = [LIBRARY_FILE, EARLY_FILE, PREBUILT_FILE]
+        .into_iter()
+        .find_map(|file| name.strip_prefix(file)?.strip_prefix(".tmp-"))?;
+    let (pid, n) = rest.split_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(pid) || !digits(n) {
+        return None;
+    }
+    pid.parse().ok()
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -129,8 +176,34 @@ impl Drop for Held<'_> {
 static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// The library of a WARP host: the hardware's refuses its pipelines and the
+/// other way round, so one file for both was emptied by every switch (#2637).
+const SOFTWARE_LIBRARY_FILE: &str = "host-pipelines-warp.bin";
+
+/// The library file of a host on the software adapter or on hardware.
+fn library_file(software: bool) -> &'static str {
+    if software { SOFTWARE_LIBRARY_FILE } else { LIBRARY_FILE }
+}
+
+/// The library file of this run's host.
+fn host_library_file() -> &'static str {
+    library_file(host_software())
+}
+
+/// The pre-build's list of a host on the software adapter or on hardware: it
+/// is tagged with its library's bytes, so one list for both was replaced by
+/// whichever pre-built last and refused by the other.
+fn prebuilt_file(software: bool) -> &'static str {
+    if software { SOFTWARE_PREBUILT_FILE } else { PREBUILT_FILE }
+}
+
+/// Whether this run's host is on the software adapter (WARP).
+fn host_software() -> bool {
+    crate::host::host().is_some_and(|h| h.software)
+}
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
+const SOFTWARE_PREBUILT_FILE: &str = "prebuilt-pipelines-warp.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 /// Title pipelines a presented image waited for in earlier runs, started
@@ -140,17 +213,18 @@ const FIRST_FILE: &str = "first-pipelines.txt";
 /// it hurries (those the first frames wait for), no more.
 const FIRST_MAX: usize = 64;
 
+static LIBRARY: OnceLock<Option<Shared>> = OnceLock::new();
+
 fn library() -> Option<&'static Shared> {
-    static LIBRARY: OnceLock<Option<Shared>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
+            let blob = read(host_library_file()).unwrap_or_default();
             let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
+            if let (Some(l), Some(list)) = (library.as_mut(), read(prebuilt_file(host_software())))
                 && !l._blob.is_empty()
             {
                 l.prebuilt = listed(&list, &tag);
@@ -209,7 +283,34 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
-    let library = make(&[]).ok()?;
+    // An empty library is asked for with a null blob. An empty Rust slice has
+    // a dangling, non-null pointer; Windows only looks at the length, but
+    // vkd3d-proton (Wine) refuses a non-null blob of length 0 with
+    // E_INVALIDARG, and no pipeline was ever kept there.
+    let empty = || -> windows::core::Result<ID3D12PipelineLibrary1> {
+        use windows::core::Interface;
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the method's own arguments; a null blob of length 0 makes
+        // an empty library.
+        unsafe {
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                Interface::as_raw(device),
+                std::ptr::null(),
+                0,
+                &ID3D12PipelineLibrary::IID,
+                &mut out,
+            )
+            .ok()?;
+            ID3D12PipelineLibrary::from_raw(out).cast()
+        }
+    };
+    let library = match empty() {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::info!(error = %e, "empty host pipeline library refused");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Vec::new(),
@@ -280,6 +381,12 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+pub(crate) struct PipelineState {
+    pub(crate) pso: ID3D12PipelineState,
+    /// The library contains this PSO under its name.
+    pub(crate) in_library: bool,
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored. A
 /// name asked for by several threads is loaded or made by one at a time
@@ -288,13 +395,13 @@ pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> windows::core::Result<PipelineState> {
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), true)));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return create().map(|pso| PipelineState { pso, in_library: false });
     };
     let _held = NAMES.hold(name);
     // Outside the lock: loads take up to seconds, and a save holds the lock
@@ -302,7 +409,7 @@ pub(crate) fn pipeline(
     // does, which is never dropped.
     if let Ok(pso) = load(&library.loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
+        return Ok(PipelineState { pso, in_library: true });
     }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
@@ -312,10 +419,11 @@ pub(crate) fn pipeline(
     let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    let in_library = unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok();
+    if in_library {
         l.added += 1;
     }
-    Ok(pso)
+    Ok(PipelineState { pso, in_library })
 }
 
 #[cfg(feature = "diagnostics")]
@@ -331,7 +439,11 @@ thread_local! {
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    if LIBRARY.get().is_none() && !USED_CHANGED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(library) = library() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -339,31 +451,32 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
+    let (blob, prebuilt, dirty) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let l = &mut *l;
+        let Some(dirty) = Dirty::take(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED) else {
             return;
-        }
+        };
         // SAFETY: a plain size query on a live library.
         let size = unsafe { l.library.GetSerializedSize() };
         let Some(mut bytes) = zeroed(size) else {
-            // Left for a later save: the pipelines stay counted as added.
+            // Left for a later save: the pending changes stay marked.
             tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
+            dirty.restore(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED);
             return;
         };
         // SAFETY: a buffer of the size the library asks for.
         let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
         match bytes {
             Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
+                (bytes, prebuilt, dirty)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
+                dirty.restore(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED);
                 return;
             }
         }
@@ -371,11 +484,11 @@ pub(crate) fn save(now: bool) {
     let used = used().as_ref().map(Used::list).unwrap_or_default();
     let first = first().as_ref().map(|f| f.list_at_most(FIRST_MAX)).unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| write_atomically(&dir.join(host_library_file()), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(FIRST_FILE), first.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
+            Some(list) => write_atomically(&dir.join(prebuilt_file(host_software())), list.as_bytes()),
             None => Ok(()),
         });
     let (created, distinct) = created();
@@ -393,7 +506,41 @@ pub(crate) fn save(now: bool) {
             shaders_translated,
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            tracing::warn!(error = %e, "host pipeline library not saved");
+            let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+            let l = &mut *l;
+            dirty.restore(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED);
+        }
+    }
+}
+
+/// What changed since the last save, taken by the save that writes it and
+/// given back if that save fails, so that the next one tries again.
+struct Dirty {
+    added: u64,
+    prebuilt_changed: bool,
+    used_changed: bool,
+}
+
+impl Dirty {
+    /// The marks, cleared; none if nothing changed.
+    fn take(added: &mut u64, prebuilt_changed: &mut bool, used_changed: &AtomicBool) -> Option<Dirty> {
+        let dirty = Dirty {
+            added: std::mem::take(added),
+            prebuilt_changed: std::mem::take(prebuilt_changed),
+            used_changed: used_changed.swap(false, Ordering::Relaxed),
+        };
+        (dirty.added != 0 || dirty.prebuilt_changed || dirty.used_changed).then_some(dirty)
+    }
+
+    /// The marks, back (with what changed meanwhile).
+    fn restore(self, added: &mut u64, prebuilt_changed: &mut bool, used_changed: &AtomicBool) {
+        *added += self.added;
+        *prebuilt_changed |= self.prebuilt_changed;
+        if self.used_changed {
+            used_changed.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -562,6 +709,118 @@ mod tests {
         assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
     }
 
+    /// A hardware pre-build and a WARP one in one cache folder each read back
+    /// their own list: neither replaces the other's (#2646 review).
+    #[test]
+    fn each_host_reads_back_its_own_prebuilt_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        let (hw, warp) = (keys(&["a", "b"]), keys(&["c"]));
+        std::fs::write(dir.path().join(prebuilt_file(false)), list("hw-tag", &hw)).unwrap();
+        std::fs::write(dir.path().join(prebuilt_file(true)), list("warp-tag", &warp)).unwrap();
+        let read = |software| std::fs::read(dir.path().join(prebuilt_file(software))).unwrap();
+        assert_eq!(listed(&read(false), "hw-tag"), hw);
+        assert_eq!(listed(&read(true), "warp-tag"), warp);
+        // a list read for another library's bytes is refused, as before
+        assert!(listed(&read(true), "hw-tag").is_empty());
+    }
+
+    /// A WARP host and a hardware one keep their libraries apart, so a run on
+    /// one does not empty the other's; the hardware file keeps its name (#2637).
+    #[test]
+    fn warp_and_hardware_hosts_keep_their_own_library() {
+        assert_eq!(library_file(false), "host-pipelines.bin");
+        assert_ne!(library_file(true), library_file(false));
+        assert!(library_file(true).ends_with(".bin"));
+        // the pre-build's list too: it names its library's bytes
+        assert_eq!(prebuilt_file(false), "prebuilt-pipelines.txt");
+        assert_ne!(prebuilt_file(true), prebuilt_file(false));
+        assert!(prebuilt_file(true).ends_with(".txt"));
+    }
+
+    /// Cache state is process-global, so use fresh WARP processes to save
+    /// and reload while the hardware library and its index hold marker bytes.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn warp_cache_save_and_reload_preserve_hardware_files() {
+        const STEP: &str = "VICTORY_TEST_WARP_CACHE_STEP";
+        const CACHE: &str = "VICTORY_TEST_WARP_CACHE_DIR";
+        const NAME: &str = "pipeline::library::tests::warp_cache_save_and_reload_preserve_hardware_files";
+        const KEY: &str = "synthetic-warp-cache-key";
+        const NO_LIBRARY: &str = "WARP pipeline libraries unavailable";
+        const HARDWARE_BLOB: &[u8] = b"synthetic bytes from a different adapter";
+        const HARDWARE_INDEX: &[u8] = b"hardware-tag\nsynthetic-hardware-key";
+
+        if let Ok(step) = std::env::var(STEP) {
+            use_pipeline_cache(PathBuf::from(std::env::var_os(CACHE).unwrap()));
+            if step == "save" {
+                if library().is_none() {
+                    println!("{NO_LIBRARY}");
+                    return;
+                }
+                note_prebuilt(KEY.to_owned());
+                save(true);
+            } else {
+                assert_eq!(step, "reload");
+                assert!(prebuilt(KEY), "WARP did not reload its tagged entry");
+            }
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let hardware = dir.path().join("host-pipelines.bin");
+        let hardware_index = dir.path().join("prebuilt-pipelines.txt");
+        let software = dir.path().join("host-pipelines-warp.bin");
+        let software_index = dir.path().join("prebuilt-pipelines-warp.txt");
+        std::fs::write(&hardware, HARDWARE_BLOB).unwrap();
+        std::fs::write(&hardware_index, HARDWARE_INDEX).unwrap();
+
+        let run = |step| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(STEP, step)
+                .env(CACHE, dir.path())
+                .env("VICTORY_D3D12_WARP", "1")
+                .env("VICTORY_D3D12_DEBUG", "0")
+                .env("VICTORY_D3D12_GBV", "0")
+                .output()
+                .unwrap()
+        };
+        let saved = run("save");
+        let message = String::from_utf8_lossy(&saved.stdout);
+        if saved.status.success() && message.contains(NO_LIBRARY) {
+            eprintln!("{NO_LIBRARY}; skipped");
+            return;
+        }
+        assert!(
+            saved.status.success(),
+            "{message}\n{}",
+            String::from_utf8_lossy(&saved.stderr),
+        );
+        let hardware_after = std::fs::read(&hardware).unwrap();
+        let hardware_index_after = std::fs::read(&hardware_index).unwrap();
+        println!(
+            "WARP save: hardware blob {} -> {} bytes, hardware index {} -> {} bytes",
+            HARDWARE_BLOB.len(),
+            hardware_after.len(),
+            HARDWARE_INDEX.len(),
+            hardware_index_after.len(),
+        );
+        assert!(hardware_after == HARDWARE_BLOB, "WARP save replaced the hardware file");
+        assert!(
+            hardware_index_after == HARDWARE_INDEX,
+            "WARP save replaced the hardware prebuilt list",
+        );
+        assert!(software.is_file() && software_index.is_file());
+        let reloaded = run("reload");
+        assert!(
+            reloaded.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&reloaded.stdout),
+            String::from_utf8_lossy(&reloaded.stderr),
+        );
+    }
+
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
@@ -631,6 +890,19 @@ mod tests {
         let again = Used::read(&list.join("\n"));
         assert!(used.now.iter().all(|k| again.before[k] < used.now.len()));
         assert!(again.before[&key(0)] < again.before[&key(1)]);
+    }
+
+    /// A save that fails gives its changes back for the next to write.
+    #[test]
+    fn a_failed_save_leaves_its_changes_to_the_next() {
+        let (mut added, mut prebuilt, used) = (3u64, true, AtomicBool::new(true));
+        let dirty = Dirty::take(&mut added, &mut prebuilt, &used).expect("changes");
+        assert_eq!((added, prebuilt, used.load(Ordering::Relaxed)), (0, false, false), "taken");
+        assert!(Dirty::take(&mut added, &mut prebuilt, &used).is_none(), "nothing more to save");
+        added = 2; // pipelines stored while the save wrote
+        dirty.restore(&mut added, &mut prebuilt, &used);
+        assert_eq!((added, prebuilt, used.load(Ordering::Relaxed)), (5, true, true));
+        assert!(Dirty::take(&mut added, &mut prebuilt, &used).is_some(), "the next save writes them");
     }
 
     /// The pre-build's list holds only for the library bytes it was
@@ -841,7 +1113,7 @@ mod tests {
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Made {}
         impl Made {
-            fn get(&self, made: bool) -> windows::core::Result<ID3D12PipelineState> {
+            fn get(&self, made: bool) -> windows::core::Result<PipelineState> {
                 let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     // SAFETY: a borrowed pointer the description never releases.
                     pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
@@ -885,6 +1157,49 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    /// Staging files of cut writes go: this process's at once, others'
+    /// once old; the files themselves and anything else stay.
+    #[test]
+    fn stale_staging_files_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - 2 * STAGING_KEPT;
+        let file = |name: &str, modified: Option<std::time::SystemTime>| {
+            let f = std::fs::File::create(dir.path().join(name)).unwrap();
+            if let Some(t) = modified {
+                f.set_modified(t).unwrap();
+            }
+        };
+        let gone = [
+            "host-pipelines.bin.tmp-7-0",
+            "early-pipelines.txt.tmp-7-3",
+            "host-pipelines.bin.tmp-8-1",
+            "prebuilt-pipelines.txt.tmp-9-12",
+        ];
+        let kept = [
+            "host-pipelines.bin",
+            "early-pipelines.txt",
+            "host-pipelines.bin.tmp-8-2", // another process's, recent
+            "host-pipelines.bin.tmp-7-x", // not a staging name
+            "host-pipelines.bin.tmp-7",   // not a staging name
+            "other.bin.tmp-7-0",          // not a file of ours
+        ];
+        file(gone[0], None);
+        file(gone[1], None);
+        file(gone[2], Some(old));
+        file(gone[3], Some(old));
+        for name in kept {
+            file(name, (!name.contains("tmp-8-2")).then_some(old));
+        }
+        std::fs::create_dir(dir.path().join("host-pipelines.bin.tmp-9-0")).unwrap();
+        sweep_staging(dir.path(), 7, STAGING_KEPT);
+        for name in gone {
+            assert!(!dir.path().join(name).exists(), "{name} swept");
+        }
+        for name in kept.into_iter().chain(["host-pipelines.bin.tmp-9-0"]) {
+            assert!(dir.path().join(name).exists(), "{name} kept");
+        }
     }
 
     #[test]

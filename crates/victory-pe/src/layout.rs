@@ -16,6 +16,8 @@ pub const FILE_HEADER_CHARACTERISTICS: usize = 18;
 
 /// `IMAGE_OPTIONAL_HEADER64::AddressOfEntryPoint` (u32).
 pub const OPT_ADDRESS_OF_ENTRY_POINT: usize = 16;
+/// `IMAGE_OPTIONAL_HEADER64::SizeOfImage` (u32).
+pub const OPT_SIZE_OF_IMAGE: usize = 56;
 /// `IMAGE_OPTIONAL_HEADER64::CheckSum` (u32).
 pub const OPT_CHECKSUM: usize = 64;
 /// `IMAGE_OPTIONAL_HEADER64::DllCharacteristics` (u16).
@@ -59,6 +61,20 @@ pub mod dll_flags {
     pub const WDM_DRIVER: u16 = 0x2000;
     pub const GUARD_CF: u16 = 0x4000;
     pub const TERMINAL_SERVER_AWARE: u16 = 0x8000;
+}
+
+/// `IMAGE_SECTION_HEADER::Characteristics` flags.
+pub mod section_flags {
+    pub const CNT_CODE: u32 = 0x0000_0020;
+    pub const CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+    pub const CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+    pub const MEM_DISCARDABLE: u32 = 0x0200_0000;
+    pub const MEM_NOT_CACHED: u32 = 0x0400_0000;
+    pub const MEM_NOT_PAGED: u32 = 0x0800_0000;
+    pub const MEM_SHARED: u32 = 0x1000_0000;
+    pub const MEM_EXECUTE: u32 = 0x2000_0000;
+    pub const MEM_READ: u32 = 0x4000_0000;
+    pub const MEM_WRITE: u32 = 0x8000_0000;
 }
 
 /// `IMAGE_OPTIONAL_HEADER64::Subsystem` values.
