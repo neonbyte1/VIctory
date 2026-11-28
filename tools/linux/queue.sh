@@ -97,7 +97,7 @@ while :; do
   env $envs VICTORY_EXE="$exe" VICTORY_CAPTURE_FRAMES="${VICTORY_CAPTURE_FRAMES:-1500,1700}" \
     "$S/capped.sh" "$S/run-game.sh" "$tag" "$dur" | grep -E '^(RESULT|RUN )'
   if [ -f "$VICTORY_RUNS_DIR/$tag/log.txt" ]; then
-    "$S/runstat.sh" "$tag" | sed 's/^/RUNQ done /'
+    "$S/runstat.sh" "$tag" 2>&1 | sed 's/^/RUNQ done /'
   else
     echo "RUNQ done $tag: no log (run did not start; check VICTORY_GAME_DIR/VICTORY_EXE)"
   fi
