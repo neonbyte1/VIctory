@@ -2938,4 +2938,216 @@ mod tests {
             assert_eq!(&out[0][..7], &[0x8000_0002, 0, 1, 0, 10, 0, 1]);
         }
     }
+
+    #[test]
+    fn valu_div_f32_sequence_executes_on_gpu() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x340E_0083, // v_lshlrev_b32 v7, 3, v0
+            0xE034_1000,
+            0x8002_0107, // buffer_load_dwordx2 v[1:2], v7, s[8:11], 0 offen
+            0xD56D_6A03,
+            0x0406_0502, // v_div_scale_f32 v3, vcc_lo, v2, v2, v1
+            0xD56D_1008,
+            0x0406_0501, // v_div_scale_f32 v8, s16, v1, v2, v1
+            0x7E08_5503, // v_rcp_f32 v4, v3
+            0xD54B_0005,
+            0x23CA_0903, // v_fma_f32 v5, -v3, v4, 1.0
+            0xD54B_0004,
+            0x0412_0905, // v_fma_f32 v4, v5, v4, v4
+            0x100A_0908, // v_mul_f32 v5, v8, v4
+            0xD54B_0006,
+            0x2422_0B03, // v_fma_f32 v6, -v3, v5, v8
+            0xD56F_0004,
+            0x0416_0906, // v_div_fmas_f32 v4, v6, v4, v5
+            0xD55F_0001,
+            0x0406_0504, // v_div_fixup_f32 v1, v4, v2, v1
+            0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+            0xE070_1000,
+            0x8003_0107, // buffer_store_dword v1, v7, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 9,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Srv,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [13, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                memory: l.memory,
+                memory_writes: l.memory_writes,
+                view_addresses: l.view_addresses,
+                heap: l.heap,
+                heap_writes: l.heap_writes,
+                view_marks: l.view_marks,
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let inputs: Vec<u32> = [
+                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
+                1e30, 1e38, 1e-40, 2e-40, 2e-34, 4.0, 1e30, 1e-5, 1e-20, 1e20, 0.1, 1e38,
+            ]
+            .into_iter()
+            .map(f32::to_bits)
+            .collect();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                        views: &[
+                            super::host::View::Buffer {
+                                data: &inputs,
+                                stride: super::host::Stride::Raw,
+                            },
+                            super::host::View::RawUav(64),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let got: Vec<f32> = out[0][..13].iter().copied().map(f32::from_bits).collect();
+            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
+            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
+            assert!(
+                (got[2] - 1e-35).abs() <= 1e-40,
+                "lane 2 got {:?} ({:#x})",
+                got[2],
+                out[0][2]
+            );
+            assert!(
+                (got[3] - 10.0).abs() < 1e-5,
+                "lane 3 got {:?} ({:#x})",
+                got[3],
+                out[0][3]
+            );
+            assert_eq!(out[0][4], 0xFFC0_0000);
+            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits());
+            assert!(
+                (got[6] - (-1.0)).abs() < 1e-6,
+                "lane 6 got {:?} ({:#x})",
+                got[6],
+                out[0][6]
+            );
+            assert!(
+                (got[7] - (1e30f32 / 1e38f32)).abs() < 1e-13,
+                "lane 7 got {:?} ({:#x})",
+                got[7],
+                out[0][7]
+            );
+            assert!(
+                (got[8] - 0.5).abs() < 1e-5,
+                "lane 8 got {:?} ({:#x})",
+                got[8],
+                out[0][8]
+            );
+            assert!(
+                (got[9] - (2e-34f32 / 4.0f32)).abs() <= 1e-39,
+                "lane 9 got {:?} ({:#x})",
+                got[9],
+                out[0][9]
+            );
+            assert!(
+                (got[10] - (1e30f32 / 1e-5f32)).abs() / (1e30f32 / 1e-5f32) < 1e-6,
+                "lane 10 got {:?} ({:#x})",
+                got[10],
+                out[0][10]
+            );
+            assert!(
+                (got[11] - (1e-20f32 / 1e20f32)).abs() <= 1e-39,
+                "lane 11 got {:?} ({:#x})",
+                got[11],
+                out[0][11]
+            );
+            assert!(
+                (got[12] - (0.1f32 / 1e38f32)).abs() <= 1e-38,
+                "lane 12 got {:?} ({:#x})",
+                got[12],
+                out[0][12]
+            );
+        }
+    }
 }

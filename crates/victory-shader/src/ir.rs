@@ -939,6 +939,7 @@ fn effects(
                         indexed(d, &mut r)?;
                     }
                 }
+                "v_div_fmas_f32" | "v_div_fmas_f64" => r.extend(mask(VCC)),
                 _ => {}
             }
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {

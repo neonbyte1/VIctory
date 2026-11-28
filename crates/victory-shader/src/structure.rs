@@ -1202,6 +1202,11 @@ impl<'a> Lanes<'a> {
                 {
                     self.mask(k);
                 }
+                if matches!(name, "v_div_fmas_f32" | "v_div_fmas_f64")
+                    && let Some(k) = self.key(|r| inst.read(r), VCC)
+                {
+                    self.mask(k);
+                }
                 if name.starts_with("v_cmpx") {
                     if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                         lane(self, k);
