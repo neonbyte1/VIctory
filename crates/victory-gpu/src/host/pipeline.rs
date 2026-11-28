@@ -519,6 +519,87 @@ pub(crate) mod tests {
         release(p, Some(a));
     }
 
+    /// While a submission's copy-back runs off the lock, a later preparing
+    /// that touches its copy waits for it even where no range in flight says
+    /// so (a page the title left alone, away from the declared range: its
+    /// copy is busy), and one touching another copy does not.
+    #[test]
+    fn a_preparing_touching_a_copy_going_back_waits_and_others_do_not() {
+        let Some(host) = host() else { return };
+        if !overlap() {
+            return; // VICTORY_GPU_OVERLAP=0
+        }
+        let _queues = crate::queue::tests::TITLE_QUEUES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _on = pipeline_for(true);
+        let page = crate::watch::PAGE;
+        let vram = |pages: usize| {
+            let p = crate::watch::tests::pool(pages);
+            let len = (pages * page) as u64;
+            crate::shadow::register(p, p as u64, len);
+            match crate::shadow::find(p as u64, len).filter(|c| c.vram_readback().is_some()) {
+                Some(copy) => Some((p, copy)),
+                None => {
+                    release(p, None);
+                    None
+                }
+            }
+        };
+        let Some((p, a)) = vram(2) else { return };
+        let Some((q, b)) = vram(1) else {
+            return release(p, Some(a));
+        };
+        // An unmarked declared range on the first page of `a`.
+        let writer = host.new_list().unwrap();
+        let (start, len) = a.range();
+        a.refresh(&writer, start, len);
+        a.gpu_writes(&writer, (p + 16) as u64, 4, false);
+        let (up, data) = host.upload_buffer(4).expect("an upload buffer");
+        // SAFETY: a mapped upload buffer of 4 bytes; an open list, live buffers.
+        unsafe {
+            data.cast::<u32>().write_volatile(0x8484_0004);
+            writer
+                .list
+                .CopyBufferRegion(&a.buffer, a.offset((p + 16) as u64), &up, 0, 4);
+        }
+        writer.keep(&up);
+        writer.close();
+        let held = Held::new();
+        host.submit(0, vec![std::sync::Arc::new(writer)]);
+        let owner = held
+            .stopped()
+            .expect("the completion thread stopped at the middle");
+        assert_eq!(crate::shadow::busy_owner(), Some(owner));
+        let refresh = |copy: &std::sync::Arc<crate::shadow::Shadow>, at: usize| {
+            let list = host.new_list().unwrap();
+            copy.refresh(&list, at as u64, page as u64);
+            list.close();
+            let started = Instant::now();
+            host.submit(0, vec![std::sync::Arc::new(list)]);
+            started.elapsed()
+        };
+        let other = refresh(&b, q);
+        assert!(
+            other < Duration::from_millis(250),
+            "another copy's refresh did not wait ({other:?})"
+        );
+        assert_eq!(crate::shadow::busy_owner(), Some(owner), "still busy");
+        let going = held.go_after(300);
+        let same = refresh(&a, p + page);
+        going.join().unwrap();
+        assert!(
+            same >= Duration::from_millis(250),
+            "the busy copy's second page waited for its copy-back ({same:?})"
+        );
+        assert_eq!(crate::shadow::busy_owner(), None, "settled");
+        host.complete_all();
+        assert_eq!(word(p + 16), 0x8484_0004);
+        drop(held);
+        release(q, Some(b));
+        release(p, Some(a));
+    }
+
     /// A submission's bottom-of-pipe write (its label) reaches title memory
     /// only after its marked page went back off the lock: a title thread
     /// that sees the label finds the page's new bytes, and while the
