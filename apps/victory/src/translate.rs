@@ -214,6 +214,15 @@ fn parse_pairs(value: &str) -> Result<Vec<(&str, &str)>> {
         .collect()
 }
 
+/// How many translate workers: `--jobs` when given, else
+/// `VICTORY_PIPELINE_THREADS` — these threads call the same driver
+/// compiler the run's pipeline workers do (translate cannot run with no
+/// worker, so 0 means one), else every logical processor.
+fn thread_count(jobs: Option<usize>) -> usize {
+    jobs.or_else(|| victory_gpu::pipeline::env_workers().map(|n| n.max(1)))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -259,8 +268,7 @@ pub fn run(
         );
     }
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = thread_count(jobs);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     let started = std::time::Instant::now();

@@ -379,12 +379,11 @@ fn wait_within(waits: &Waits, budget: Duration, p: &Pending, frame: u64) {
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Hands `p` to the workers (`workers()` of them), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let n = workers();
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -408,6 +407,37 @@ fn queue(p: Arc<Pending>, now: bool) {
     let (lock, work) = &QUEUES;
     lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
     work.notify_one();
+}
+
+/// `VICTORY_PIPELINE_THREADS` when it holds a count, else `None`: how many
+/// threads may compile pipelines at once, a knob for hosts whose driver
+/// compiler misbehaves under parallel calls (AMD RDNA4 crashes in amdxc64
+/// while pipelines compile in parallel; serialising the calls delays the
+/// crash rather than removing it — #2124 tracks the real fix). Callers
+/// that make pipelines on threads of their own (`victory translate` sizes
+/// its `--jobs` default by it) read the same value so one setting covers
+/// both.
+pub fn env_workers() -> Option<usize> {
+    let v = std::env::var("VICTORY_PIPELINE_THREADS").ok()?;
+    match v.parse() {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(value = %v, error = %e, "VICTORY_PIPELINE_THREADS not a number");
+            None
+        }
+    }
+}
+
+/// How many workers make pipelines: `VICTORY_PIPELINE_THREADS` when set
+/// (0 makes them on the calling thread, as when no worker starts), else
+/// half the logical processors, 2 to 8.
+fn workers() -> usize {
+    env_workers().unwrap_or_else(default_workers)
+}
+
+/// Half the logical processors, 2 to 8.
+fn default_workers() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
 }
 
 /// A worker: makes queued pipelines, those draws wait for first, and saves
