@@ -218,6 +218,14 @@ pub(crate) struct Module {
     pub chosen: HashMap<V, (V, V)>,
 }
 
+/// Summary of written `cbufferLoadLegacy.i32` calls and their extracts.
+#[cfg(test)]
+pub(crate) struct CbufStats {
+    pub blocks: usize,
+    pub loads: Vec<(usize, u32)>,
+    pub extracts: Vec<(usize, u32)>,
+}
+
 impl Module {
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
@@ -513,6 +521,38 @@ impl Module {
     }
     pub fn named_md(&mut self, name: &str, nodes: Vec<Md>) {
         self.named.push((name.into(), nodes));
+    }
+
+    /// Written `cbufferLoadLegacy.i32` calls and their extracts in `self`.
+    #[cfg(test)]
+    pub(crate) fn cbuf_load_stats(&self) -> CbufStats {
+        let plan = self.plan();
+        let mut load_ids = std::collections::HashSet::new();
+        let mut loads = Vec::new();
+        let mut extracts = Vec::new();
+        for (pos, &b) in plan.layout.iter().enumerate() {
+            for &i in &self.blocks[b].body {
+                if !plan.live[i as usize] {
+                    continue;
+                }
+                match &self.insts[i as usize].op {
+                    Op::Call(f, args) if self.funcs[*f as usize].name == "dx.op.cbufferLoadLegacy.i32" => {
+                        let row = self.int_value(args[2]).unwrap() as u32;
+                        load_ids.insert(i);
+                        loads.push((pos, row));
+                    }
+                    Op::Extract(V::Inst(src), lane) if load_ids.contains(src) => {
+                        extracts.push((pos, *lane));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        CbufStats {
+            blocks: plan.layout.len(),
+            loads,
+            extracts,
+        }
     }
 
     /// Whether body instruction `i` is written even if nothing reads it: it
