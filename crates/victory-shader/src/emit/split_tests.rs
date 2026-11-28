@@ -1338,3 +1338,153 @@ fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
         .collect();
     assert_eq!(out, want);
 }
+
+/// Lane `writer` of each console wave stores 1 + a dword only it loads
+/// (0) to its console wave's slot, and lane `reader` then loads the slot
+/// into its output; every other lane outputs 0. The console runs both in
+/// one wave, in program order: `reader` reads 1. Groups of `threads` (a
+/// multiple of 64), `groups` of them. The buffer holds the outputs, then a
+/// slot per console wave, then 64 dwords per console wave for the loads.
+fn uav_write_then_read(
+    writer: u32,
+    reader: u32,
+    threads: u32,
+    groups: u32,
+) -> (crate::NativeProgram, u32) {
+    let n = threads * groups;
+    let waves = n / 64;
+    let (slots, far) = (4 * n, 4 * (n + waves));
+    let lane = |k: u32| 128 + k;
+    let words = [
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF408_0101,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+        0x9308_FF01,
+        threads,     // s_mul_i32 s8, s1, threads
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40 (takes the console flow)
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x4A08_0008, // v_add_nc_u32 v4, s8, v0 (flat id in the dispatch)
+        0x2C0A_0886, // v_lshrrev_b32 v5, 6, v4 (console wave)
+        0x340E_0A88, // v_lshlrev_b32 v7, 8, v5
+        0x4A0E_0EFF,
+        far,         // v_add_nc_u32 v7, far, v7
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+        0x4A0A_0AFF,
+        slots,                      // v_add_nc_u32 v5, slots, v5
+        0x3602_00BF,                // v_and_b32 v1, 63, v0 (console lane)
+        0x7D84_0200 | lane(writer), // v_cmp_eq_u32 vcc, writer, v1
+        0xBE8A_246A,                // s_and_saveexec_b64 s[10:11], vcc
+        0xE030_1000,
+        0x8001_0607, // buffer_load_dword v6, v7, s[4:7], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x4A0C_0C81, // v_add_nc_u32 v6, 1, v6
+        0xE070_1000,
+        0x8001_0605,                // buffer_store_dword v6, v5, s[4:7], 0 offen
+        0x88FE_0A7E,                // s_or_b64 exec, exec, s[10:11]
+        0x7D84_0200 | lane(reader), // v_cmp_eq_u32 vcc, reader, v1
+        0xBE8A_246A,                // s_and_saveexec_b64 s[10:11], vcc
+        0xE030_1000,
+        0x8001_0205, // buffer_load_dword v2, v5, s[4:7], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x3406_0882, // v_lshlrev_b32 v3, 2, v4
+        0xE070_1000,
+        0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+        S_ENDPGM,
+    ];
+    let mut p = program(&[], threads);
+    p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    // (loaded and stored: the table's buffer is a UAV)
+    p.used = vec![crate::native::UsedResource {
+        kind: crate::native::ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    (p, n + 65 * waves)
+}
+
+/// A UAV dword one half of a console wave writes and the other half reads
+/// later, in the console flow on a host without 64-lane waves: one
+/// console wave to a group, and several (pair meetings). The writer's
+/// value waits on a load the other half skips, so the reading half gets
+/// there first unless something orders the halves' UAV accesses as the
+/// console's one wave does. Repeated dispatches of many groups.
+#[test]
+fn uav_writes_are_seen_by_the_other_half_in_program_order() {
+    let host = match Host::new(false) {
+        Ok(h) if !h.target().runs(64) && h.target().runs(32) => h,
+        Ok(_) => {
+            eprintln!("the hardware adapter runs 64-lane waves: no halves; skipped");
+            return;
+        }
+        Err(e) => {
+            eprintln!("no SM 6.6 hardware device ({e}); skipped");
+            return;
+        }
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (groups, runs) = (1024, 16);
+    let mut bad = Vec::new();
+    for (writer, reader) in [(5, 40), (40, 5)] {
+        for threads in [64, 128, 256] {
+            let (p, dwords) = uav_write_then_read(writer, reader, threads, groups);
+            let cs =
+                emit_for(&p, host.target()).unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+            assert_eq!(
+                wave_size(&cs.dxil),
+                Some(32),
+                "{threads} threads: in halves"
+            );
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+            let views = [View::RawUav(dwords)];
+            let n = (threads * groups) as usize;
+            let mut stale = 0;
+            for _ in 0..runs {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(data.clone()))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [groups, 1, 1],
+                        },
+                    )
+                    .unwrap()
+                    .remove(0);
+                for (t, &v) in out[..n].iter().enumerate() {
+                    let want = u32::from(t as u32 % 64 == reader);
+                    assert!(
+                        v == want || v == 0 && want == 1,
+                        "lane {t}: {v} (want {want})"
+                    );
+                    stale += usize::from(v != want);
+                }
+                // The writer's store landed in every console wave's slot:
+                // a stale read was early, not missing.
+                assert!(
+                    out[n..n + n / 64].iter().all(|&v| v == 1),
+                    "a slot not written"
+                );
+            }
+            let label = format!("lane {writer} writes, lane {reader} reads, {threads} threads");
+            eprintln!("{label}: {stale} of {} reads stale", runs * n / 64);
+            if stale > 0 {
+                bad.push(format!("{label}: {stale} stale"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("; "));
+}
