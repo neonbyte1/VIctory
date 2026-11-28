@@ -1142,6 +1142,7 @@ fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
     };
     // A placeholder an unmap left is mapped over as it is; if the title
     // has joined it with others since, the map fails and splits as before.
+    let mut physical = physical();
     let own = physical.take_holes(base, len) && lean();
     let mut view = MEMORY_MAPPED_VIEW_ADDRESS {
         Value: std::ptr::null_mut(),
