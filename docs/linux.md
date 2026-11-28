@@ -26,8 +26,12 @@ issue (see [asset-policy.md](asset-policy.md)).
 - `lspci` (pciutils) so `hidden.sh` can pick the GPU itself; otherwise set
   `VICTORY_VK_DEVICE` to your card's `vendor:device` (for example
   `10de:2b85`).
-- A **user systemd** (`systemd-run --user`) for the RAM cap, 34 GB of RAM
-  and about 30 GB of disk for build, caches and the game.
+- A **user systemd** (`systemd-run --user`) for the RAM cap, about 30 GB of
+  disk for build, caches and the game, and **RAM + swap of at least ~36 GB**:
+  a run in the world commits about 33 GB. With 32 GB of RAM, add swap (a
+  swapfile or zram of 8-16 GB), then set `VICTORY_MEM_MAX` below your RAM
+  (for example `30G`) and `VICTORY_SWAP_MAX` to the swap you allow (for
+  example `8G`); see `tools/linux/capped.sh`.
 
 Add the Windows target once; everything else is distribution packages.
 
@@ -45,17 +49,30 @@ prefix of its own under `target/`; `env.sh` is for building the game and
 measurement binaries by hand.
 
 **Wine prefix with vkd3d-proton.** Keep one prefix for the title, separate
-from your normal `~/.wine`:
+from your normal `~/.wine`. Our measurements use the **distribution's Wine
+(wine-11.22)** with the vkd3d-proton and DXVK DLLs taken from a GE-Proton
+release; GE-Proton's own Wine works too, with one more copy step (below).
 
 ```sh
-GE=$HOME/GE-Proton11-14                # an unpacked GE-Proton release
-export PATH=$GE/files/bin:$PATH        # its wine and wineserver, in this shell
+GE=$HOME/GE-Proton11-14-x86_64         # an unpacked GE-Proton release (the folder has the -x86_64 suffix)
 export WINEPREFIX=$HOME/victory-prefix
-wineboot -u
+wine wineboot -u                       # GE-Proton has no wineboot binary; `wine wineboot` works for both
 SYS=$WINEPREFIX/drive_c/windows/system32
-VKD3D=$GE/files/lib/wine/vkd3d-proton/x86_64-windows
-cp "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$SYS/"
+cp "$GE/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12.dll" \
+   "$GE/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll" "$SYS/"
+cp "$GE/files/lib/wine/dxvk/x86_64-windows/dxgi.dll" "$SYS/"   # the runs override dxgi to native
 ```
+
+**Only with GE-Proton's own Wine** (`export PATH=$GE/files/bin:$PATH`): its
+`d3dcompiler_47.dll` loads `wined3d.dll`, which needs vkd3d's own DLLs in the
+prefix, otherwise `victory.exe` fails to load with `status c0000135`:
+
+```sh
+cp "$GE"/files/lib/vkd3d/x86_64-windows/libvkd3d*.dll "$SYS/"
+```
+
+Check the prefix with `wine target/x86_64-pc-windows-msvc/diag/victory.exe config`
+before the first run.
 
 The scripts call plain `wine` and `wineserver` from `PATH`; they must be the
 pair from the Wine you built the prefix with (a system `wineserver` next to
