@@ -103,6 +103,17 @@ impl Source {
             s => vec![s],
         }
     }
+
+    /// Whether lanes may hold different descriptors.
+    fn per_lane(&self) -> bool {
+        match self {
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => true,
+            Source::Phi { args, .. } | Source::Select { args, .. } => {
+                args.iter().any(Source::per_lane)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1234,6 +1245,11 @@ impl<'a> Tracer<'a> {
         let words = self.words(inst, op)?;
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Read from the first active lane at the access, as a waterfall loop
+        // does (`track` proves the loop): the dwords each lane holds.
+        if let Some(lanes) = self.first_lanes(&words) {
+            return self.per_lane(&lanes, &mut Vec::new(), &mut known);
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1255,11 +1271,27 @@ impl<'a> Tracer<'a> {
             Term::Value(v) => self.first_lane_source(v),
             Term::Const(_) => None,
         };
-        if let Some(sources) = words.iter().map(read).collect::<Option<Vec<_>>>() {
-            // Read from the first active lane, as a waterfall loop does: the
-            // dwords each lane holds.
-            let lanes: Vec<Term> = sources.into_iter().map(Term::Value).collect();
-            return self.per_lane(&lanes, joins, known);
+        if let Some(lanes) = self.first_lanes(words) {
+            // Read from the first active lane where no waterfall loop at the
+            // access proves them each lane's own (picked or joined after the
+            // reads, or copied back to the VGPRs a loop reads): the dwords
+            // must be the same in every lane that runs the reads, any of
+            // which may be the first.
+            let block = |w: &Term| match *w {
+                Term::Value(v) => self.defs[v.0 as usize].map(|s| s.0),
+                Term::Const(_) => None,
+            };
+            let mut runs = match (self.lanes, block(&words[0])) {
+                (Some(l), Some(b)) if words.iter().all(|w| block(w) == Some(b)) => {
+                    vec![(l.reach[b], true)]
+                }
+                _ => Vec::new(),
+            };
+            let source = self.per_lane(&lanes, joins, &mut runs)?;
+            if source.per_lane() {
+                return Err("a descriptor read from the first lane outside a waterfall loop");
+            }
+            return Ok(source);
         }
         if words.iter().any(|w| read(w).is_some()) {
             return Err("a descriptor partly read from the first lane");
@@ -1642,6 +1674,18 @@ impl<'a> Tracer<'a> {
             return None;
         };
         inst.read(Reg::V(reg))
+    }
+
+    /// The VGPR values `words` read from the first active lane, when every
+    /// dword is a `v_readfirstlane_b32` result.
+    fn first_lanes(&self, words: &[Term]) -> Option<Vec<Term>> {
+        words
+            .iter()
+            .map(|w| match *w {
+                Term::Value(v) => self.first_lane_source(v).map(Term::Value),
+                Term::Const(_) => None,
+            })
+            .collect()
     }
 
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
@@ -4959,5 +5003,69 @@ pub(crate) mod tests {
         assert_eq!(run_mov(0xD581_0000, 8).scalar[0].1.param, 0);
         assert_eq!(run_mov(0xD581_8000, 8).scalar[0].1.param, MEMORY);
         assert_eq!(run_mov(0xD581_0000, 0x0800_0008).scalar[0].1.param, MEMORY);
+    }
+    #[test]
+    fn first_lane_reads_no_waterfall_loop_proves_are_not_each_lanes_own() {
+        // WATERFALL_FETCHED_WAVE32 with the loaded dwords read from the
+        // first lane and copied back before the loop: every lane holds the
+        // first lane's entry, not its own.
+        let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
+        let at = word_at(&words, 0xBF8C_0070) + 1;
+        // v_readfirstlane_b32 s(24+k), v(4+k), then v_mov_b32 v(4+k), s(24+k).
+        let reads = (0..8).map(|k| 0x7E30_0504 + (k << 17) + k);
+        let copies = (0..8).map(|k| 0x7E08_0218 + (k << 17) + k);
+        words.splice(at..at, reads.chain(copies));
+        assert_eq!(refusal(&words, false), NO_LOOP);
+        // Every lane holds the second buffer (0x20), lanes from 16 on the
+        // first (0) instead. Whatever s_cselect picks, the dwords read from
+        // the first lane are lane 0's, the second; the lanes that access
+        // them all hold the first.
+        let words: &[u32] = &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0602,
+            0xFA00_0000, // s_load_dwordx4 s[24:27], s[4:5], 0x0
+            0xF408_0702,
+            0xFA00_0020, // s_load_dwordx4 s[28:31], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E08_021C, // v_mov_b32 v4, s28
+            0x7E0A_021D, // v_mov_b32 v5, s29
+            0x7E0C_021E, // v_mov_b32 v6, s30
+            0x7E0E_021F, // v_mov_b32 v7, s31
+            0x7D86_0090, // v_cmp_le_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0x7E08_0218, // v_mov_b32 v4, s24
+            0x7E0A_0219, // v_mov_b32 v5, s25
+            0x7E0C_021A, // v_mov_b32 v6, s26
+            0x7E0E_021B, // v_mov_b32 v7, s27
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0x7E18_0504, // v_readfirstlane_b32 s12, v4
+            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x858C_1C0C, // s_cselect_b64 s[12:13], s[12:13], s[28:29]
+            0x858E_1E0E, // s_cselect_b64 s[14:15], s[14:15], s[30:31]
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF88_0002, // s_cbranch_execz -> end
+            0xE030_2000,
+            0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 idxen
+            0x887E_157E, // end: s_or_b32 exec_lo, exec_lo, s21
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 0, 1), param(Constants, 1, 1)];
+        let err = track(&p, &layout, HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a per-lane descriptor written where some lanes may keep the old one",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }
