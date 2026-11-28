@@ -3565,6 +3565,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        // One host texture takes the castable-format path: whether it ran
+        // shows in the texture's castable list, kept empty when a host has
+        // no enhanced-barrier creation or refuses the list.
         let slots = Slots::new(4);
         let read = compile_cs(READ);
         let _one = ALIASED.lock().unwrap_or_else(|e| e.into_inner());
@@ -3603,8 +3606,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
-            // One host texture only where the host took the castable formats.
-            let shared = shared && !a.castable.is_empty();
+            // SAFETY: a live resource.
+            let own = unsafe { a.texture.GetDesc() }.Format.0 as u32;
+            let shared = shared
+                && (crate::resource::family(own) == crate::resource::family(format)
+                    || a.castable
+                        .iter()
+                        .any(|&c| crate::resource::family(c) == crate::resource::family(format)));
             assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);

@@ -388,6 +388,16 @@ impl HostHeap {
         self.count
     }
 
+    /// The first slot [`pair`] hands out past the dynamic range, `None` on
+    /// a heap the host capped at its title and dynamic slots (pairs are
+    /// held dynamic slots there).
+    ///
+    /// [`pair`]: HostHeap::pair
+    #[cfg(test)]
+    pub(crate) fn pair_start(&self) -> Option<u32> {
+        (self.pairs_end > self.count + self.dynamic).then_some(self.count + self.dynamic)
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -2800,10 +2810,15 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // `HEAP_VIEWS`, `HEAP_SAMPLERS`) where the host gives a heap that
+        // large; a capped host (NVIDIA) takes the smaller dynamic range.
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let desc = heap.heap.GetDesc();
+            assert!(
+                desc.NumDescriptors >= victory_shader::emit::HEAP_VIEWS
+                    || desc.NumDescriptors == heap.count + heap.dynamic,
+            );
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }

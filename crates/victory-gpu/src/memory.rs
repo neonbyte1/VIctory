@@ -1102,7 +1102,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        // Past the dynamic slots where the heap has room for pairs there;
+        // a capped heap (NVIDIA) keeps them in held dynamic slots instead.
+        if let Some(start) = views.pair_start() {
+            assert!(pairs.0 >= start && pairs.1 >= start, "past the dynamic slots");
+        }
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {
