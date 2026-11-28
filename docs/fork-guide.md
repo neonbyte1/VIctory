@@ -120,6 +120,7 @@ Start with 1 and 2. Every later measurement depends on knowing what your machine
 ## 9. Labels and templates (agents keep them current)
 
 - **Every issue** gets exactly one `kind:` label (task, result, bug, survey, integration, hardware, coordination); the templates set it.
+- **`prio:`** on every task: `p0` drop everything (`main` crashes, regresses or draws wrong pictures); `p1` next (the biggest measured levers toward 33 ms, crashes on real cards); `p2` important, after p1; `p3` smaller levers and housekeeping; `p4` someday. Take the highest open priority first; anyone may propose a change of priority in the issue with a reason.
 - **`area:`, `gpu:`, `host:`** use upstream's names, so anything passed upstream keeps the same labels.
 - **`status:`** follows the work: `claimed` -> `measuring` -> `adopted` (in `main`) or `dropped` (reason in the issue). A number without an adjacent control gets `status: needs control` until one exists.
 - **`upstream:`** says where it went: `reported` (posted on an upstream PR/issue, link in the issue), `our PR`, or `not upstream`.
