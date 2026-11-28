@@ -560,6 +560,9 @@ impl Shadow {
         if (written.is_none() || delivered == n) && from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
         }
+        // So is the snapshot of declared ranges over the page: their
+        // copy-backs must not take the title's bytes for the GPU's.
+        self.sync_snapshot(from - start, host);
         delivered
     }
 
@@ -573,6 +576,20 @@ impl Shadow {
     /// [`Shadow::clean`] (none for memory that is not tracked: never clean).
     pub(crate) fn dirty_bit(&self) -> Option<u32> {
         self.tracked.as_ref().and_then(crate::watch::Tracked::bit)
+    }
+
+    /// Advances any snapshot segments covering `[offset, offset + data.len())`
+    /// to `data`, so a later declared copy-back neither takes those bytes for
+    /// the GPU's nor puts them back over a later title write.
+    fn sync_snapshot(&self, offset: usize, data: &[u8]) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let end = offset + data.len();
+        for (at, bytes) in before.0.iter_mut() {
+            let (s, e) = ((*at).max(offset), (*at + bytes.len()).min(end));
+            if s < e {
+                bytes[s - *at..e - *at].copy_from_slice(&data[s - offset..e - offset]);
+            }
+        }
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -1954,6 +1971,36 @@ pub(crate) mod tests {
         );
         assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
         copy.copy_back(p, PAGE + 16);
+        unregister(p, p as u64);
+    }
+
+    /// A marked copy-back advances the snapshot of the declared range over
+    /// the same page with the copy, so that range's copy-back does not put
+    /// the title's bytes it took back over a title write made since.
+    #[test]
+    fn a_declared_copy_back_after_a_marked_one_keeps_newer_title_writes() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        // SAFETY: bytes of our pool.
+        let write = |at: usize, v: u8| unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        copy.writing(p, PAGE, false);
+        // A shader writes byte 10; the title writes byte 40 meanwhile.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        write(40, 0x11);
+        assert!(copy.copy_back_marked(p) > 0);
+        // The title writes both bytes again before the declared copy-back.
+        write(10, 0x22);
+        write(40, 0x23);
+        assert_eq!(copy.copy_back(p, PAGE), 0);
+        assert_eq!([read(10), read(40)], [0x22, 0x23]);
         unregister(p, p as u64);
     }
 
