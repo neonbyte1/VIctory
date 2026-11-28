@@ -22,6 +22,8 @@ use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
@@ -1237,6 +1239,8 @@ fn into_destination(
     // milliseconds before failing: the title never looks at a request's
     // result, so a failed one is a model or texture left unwritten.
     if pages.contains(&0) {
+        #[cfg(test)]
+        LATE_DESTINATION.store(request.destination as usize, Ordering::SeqCst);
         for _ in 0..LATE_LIST_TRIES {
             std::thread::sleep(std::time::Duration::from_millis(1));
             snapshot(&mut pages);
@@ -1282,6 +1286,11 @@ static AUTO_SUBMITS: AtomicU32 = AtomicU32::new(0);
 const LATE_LIST_TRIES: u32 = 8;
 /// Page lists filled after their request started (written late).
 static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
+/// Tests: the destination whose copy found its page list empty and began
+/// waiting (`a_page_list_filled_after_its_request_starts`), so the fill can
+/// happen *while* it waits instead of on a fixed sleep that races the wait.
+#[cfg(test)]
+static LATE_DESTINATION: AtomicUsize = AtomicUsize::new(0);
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
 /// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
@@ -2022,7 +2031,18 @@ mod tests {
         );
         let number = page[0];
         let filler = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            // Fill the list once the copy has found it empty and begun
+            // waiting for it. A fixed sleep is late on a busy machine (the
+            // wait lasts 8 ms) and may be early on a quiet one, so it does
+            // not reliably reach the retry path at all.
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while LATE_DESTINATION.load(Ordering::SeqCst) != at {
+                assert!(
+                    std::time::Instant::now() < limit,
+                    "the copy never waited for the page list"
+                );
+                std::hint::spin_loop();
+            }
             // SAFETY: the leaked aligned list, alive for the whole test; paired
             // with the worker's atomic loads in `into_destination`.
             unsafe {
