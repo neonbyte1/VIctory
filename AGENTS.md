@@ -95,7 +95,7 @@ Merged PRs here are small and single-purpose.
 
 ## 2. Fork rules (neonbyte1/VIctory)
 
-Full guide: `~/VIctory_Shared_Contribution.md`. Fork issue #1 is the coordination channel.
+Full guide: [`docs/fork-guide.md`](docs/fork-guide.md). Fork issue #1 is the coordination channel.
 
 **Upstream first.** The fork is a staging area. Reviewing/testing other people's upstream PRs
 comes before our own work; answer reviews on our upstream PRs before starting new work; anything
@@ -121,8 +121,10 @@ cherry-pick or `Co-authored-by:`); no fork-only features. Other forks are read o
 - same scene and profile (prison yard, Series X, 2560x1440, ray tracing on), 420 s, warm cache,
   median of the last 30 `victory_gpu::host: ... ms/frame` lines (strip ANSI first).
 
-**GPU test gate:** run GPU tests under `flock /tmp/gpu-gate.lock <cmd>`, never during a game run.
-`[unverified: lock path is our convention, not in the repo or the guide]`
+**GPU test gate:** run GPU tests from a gate script (`/tmp/q<name>.sh`, so the game-run queue
+pauses for it) that first waits until `pgrep -f 'frozen[0-9]+\.sh'` is empty, then runs under
+`flock /tmp/gpu-gate.lock <cmd>`. Never during a game run; that includes `wineserver -k` on the
+game's prefix, which kills a running game.
 
 **Coordination:** claim before building (`CLAIM: <topic> - branch <name>` on fork issue #1, then
 `DONE:`/`DROPPED:` with a reason). Use the issue templates in `.github/ISSUE_TEMPLATE` (they set
@@ -139,5 +141,5 @@ length, median line, control line and VRAM.
 - Linux/Wine: `cargo xtask wine-test [--xwin <dir>] [--vkd3d-proton <dir>] [-- <cargo test args>]`
   (needs wine, clang-cl, lld-link, llvm-lib on `PATH` and an `xwin splat`; the vkd3d-proton
   folder supplies SM 6.6). Not in upstream `main` or fork `main`: use `stack/nvidia-wine` or
-  `xtask/wine-test` (upstream PR #3270); setup guide: `docs/linux-wine.md` on branch
+  `xtask/wine-test` (upstream PR #1218); setup guide: `docs/linux-wine.md` on branch
   `docs/linux-wine` (#3291).
