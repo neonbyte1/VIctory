@@ -391,6 +391,7 @@ fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+const SRC_SCC: u8 = 253;
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -1053,14 +1054,43 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// `v` written by `s_add_u32 x, src_scc` (or `s_add_u32 src_scc, x`), or
+    /// `s_mov_b32 v, src_scc` (implicitly `0 + src_scc`): the non-carry term.
+    fn add_scc(&self, v: Value) -> Option<Term> {
+        let inst = self.def(v)?;
+        if inst.writes.first()?.1 != v || inst.read(Reg::Scc).is_none() {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        match (inst.name(), src.as_slice()) {
+            ("s_mov_b32", [Operand::Const(SRC_SCC)]) => Some(Term::Const(0)),
+            ("s_add_u32", [x, c] | [c, x])
+                if matches!(c, Operand::Const(SRC_SCC))
+                    && !matches!(x, Operand::Const(SRC_SCC)) =>
+            {
+                self.term(inst, x)
+            }
+            _ => None,
+        }
+    }
+
     /// `hi` is `high` (0 for a table), possibly plus a carry.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
-        hi == want
-            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
-                |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
-            ))
-            || self.joined_on_taken_edges(hi) == Some(want)
+        if hi == want || self.joined_on_taken_edges(hi) == Some(want) {
+            return true;
+        }
+        let Term::Value(v) = hi else {
+            return false;
+        };
+        if self.add_scc(v) == Some(want) {
+            return true;
+        }
+        self.sop2(v, &["s_addc_u32"]).is_some_and(|(_, [a, b])| {
+            a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+        })
     }
 
     /// What phi `t` holds in every lane that reads it: the one value its
@@ -1081,12 +1111,15 @@ impl<'a> Tracer<'a> {
         taken.all(|x| x == first).then_some(first)
     }
 
-    /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
-    /// `v_add_co_ci_u32` with `high` as an operand.
+    /// `hi` adds something (with carry) to `high`: `s_addc_u32`,
+    /// `s_add_u32 ... src_scc`, or `v_add_co_ci_u32` with `high` as an operand.
     fn carried(&self, hi: Term, high: Value, known: &[(Bool, bool)], unguarded: &mut bool) -> bool {
         let Term::Value(v) = hi else { return false };
         if v == high {
             return true;
+        }
+        if let Some(x) = self.add_scc(v) {
+            return self.carried(x, high);
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
             return self.carried(a, high, known, unguarded)
@@ -2636,6 +2669,128 @@ pub(crate) mod tests {
             r.params.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
             [(0, 0)]
         );
+    }
+
+    #[test]
+    fn add_scc_carries_into_address_high_halves() {
+        // Table/heap addresses (`high = None`): `s_add_u32` with `src_scc` (in
+        // either operand order) and `s_mov_b32 hi, src_scc`.
+        for hi_inst in [
+            0x8007_FD80u32, // s_add_u32 s7, 0, src_scc
+            0x8007_80FD,    // s_add_u32 s7, src_scc, 0
+            0xBE87_03FD,    // s_mov_b32 s7, src_scc
+        ] {
+            let r = track_words(
+                &[
+                    0x8F01_8500, // s_lshl_b32 s1, s0, 5
+                    0x8006_0104, // s_add_u32 s6, s4, s1
+                    hi_inst,
+                    0xF408_0203,
+                    0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], null
+                    0xE070_1000,
+                    0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen
+                    S_ENDPGM,
+                ],
+                &[param(Constants, 0, 1), param(Table, 4, 1)],
+                HwStage::Cs,
+            );
+            let Address {
+                param: p,
+                offset,
+                dynamic,
+            } = r.scalar[0].1;
+            assert_eq!(r.scalar[0].0, (0, 3));
+            assert_eq!((p, offset), (1, 0));
+            assert!(dynamic.is_some());
+        }
+
+        // Root descriptor (`high = Some(base_hi)`): `s_add_u32 hi, base_hi, src_scc`.
+        let root = track_words(
+            &[
+                0x8F01_8500, // s_lshl_b32 s1, s0, 5
+                0x8006_0102, // s_add_u32 s6, s2, s1
+                0x8007_FD03, // s_add_u32 s7, s3, src_scc
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], null
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 1), param(Descriptor, 2, 2)],
+            HwStage::Cs,
+        );
+        let Address {
+            param: p,
+            offset,
+            dynamic,
+        } = root.scalar[0].1;
+        assert_eq!(root.scalar[0].0, (0, 3));
+        assert_eq!((p, offset), (1, 0));
+        assert!(dynamic.is_some());
+
+        // Code table (`s_getpc_b64` + `s_add_u32` + `src_scc`).
+        let code = track_words(
+            &[
+                0xBE86_1F00, // s_getpc_b64 s[6:7]
+                0x8006_9006, // s_add_u32 s6, s6, 16
+                0x8007_FD07, // s_add_u32 s7, s7, src_scc
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert_eq!(code.scalar, [((0, 3), at(CODE, 20))]);
+
+        // Adding another SGPR (not `src_scc`) to a descriptor heap's high half
+        // must still be refused.
+        let code_words: Vec<u8> = [
+            0x8F05_8500u32, // s_lshl_b32 s5, s0, 5
+            0x8006_0504,    // s_add_u32 s6, s4, s5
+            0x8007_0180,    // s_add_u32 s7, 0, s1
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], null
+            0xE070_1000,
+            0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code_words, false, 256).unwrap();
+        let err = track(
+            &p,
+            &[param(Constants, 0, 2), param(Table, 4, 1)],
+            HwStage::Cs,
+            lanes(&p).as_ref(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "an address into a descriptor heap with an untracked high half",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        // `s_mov_b32 hi, src_scc` on a root descriptor drops `base_hi`, so it
+        // must not track as the root descriptor (falls back to title memory).
+        let dropped = track_words(
+            &[
+                0xBE89_0303, // s_mov_b32 s9, s3 (keep base_hi live on entry)
+                0x8F01_8500, // s_lshl_b32 s1, s0, 5
+                0x8006_0102, // s_add_u32 s6, s2, s1
+                0xBE87_03FD, // s_mov_b32 s7, src_scc
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], null
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 1), param(Descriptor, 2, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(dropped.scalar, [((0, 4), at(MEMORY, 0))]);
     }
 
     #[test]

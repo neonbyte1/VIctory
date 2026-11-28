@@ -2234,7 +2234,7 @@ impl<'a> Lower<'a> {
             Operand::Const(239) if self.pops => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
-                .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
+                .ok_or("a special operand (vccz, execz, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
         }

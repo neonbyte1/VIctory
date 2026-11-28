@@ -1018,6 +1018,123 @@ fn v_fma_f16_rounds_once_and_preserves_other_half() {
     }
 }
 
+#[test]
+fn add_scc_carry_in_table_and_code_addresses_runs_on_host() {
+    // Load the UAV descriptor through `s_add_u32 lo, s4, 0` + `src_scc` in
+    // the high half (`s_add_u32 s7, 0/src_scc, src_scc/0` and `s_mov_b32 s7, src_scc`).
+    for (hi_inst, add_k) in [
+        (0x8007_FD80u32, 1u32), // s_add_u32 s7, 0, src_scc
+        (0x8007_80FD, 2),       // s_add_u32 s7, src_scc, 0
+        (0xBE87_03FD, 3),       // s_mov_b32 s7, src_scc
+    ] {
+        let shader = build_valu_cs(&[
+            0x8006_8004,                         // s_add_u32 s6, s4, 0
+            hi_inst,                             // s7 = 0 + SCC
+            0xF408_0203,                         // s_load_dwordx4 s[8:11], s[6:7], null
+            0xFA00_0000,                         // ^
+            0x25 << 25 | 1 << 9 | (128 + add_k), // v_add_nc_u32 v0, add_k, v1
+        ]);
+        run_cases(&shader, &[[10, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, 10 + add_k, "{backend}: {hi_inst:#010x}");
+        });
+    }
+
+    // `CODE` table: `s_getpc_b64 s[6:7]` + `s_add_u32 s6, s6, 32` + `s_add_u32 s7, s7, src_scc`.
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(&[
+        0xBE86_1F00,              // s_getpc_b64 s[6:7] (returns P + 4)
+        0x8006_A006,              // s_add_u32 s6, s6, 32 (points right after S_ENDPGM)
+        0x8007_FD07,              // s_add_u32 s7, s7, src_scc
+        0xF400_0303,              // s_load_dword s12, s[6:7], null
+        0xFA00_0000,              // ^
+        vop1(0x001, 0, sgpr(12)), // v_mov_b32 v0, s12
+    ]);
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    words.push(0xCAFE_BABE);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let (p, st) = range::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = st.unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .unwrap();
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 0xCAFE_BABE, "{backend}");
+    });
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exp = (bits >> 10) & 0x1F;
