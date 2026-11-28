@@ -1622,4 +1622,30 @@ mod tests {
             assert_eq!(wl_exec.read(Reg::S(EXEC + 1)), None);
         }
     }
+    #[test]
+    fn v_swaprel_b32_deduplicates_overlapping_vgpr_reads_and_writes() {
+        let code: Vec<u8> = [
+            0x7E02_D101_u32, // v_swaprel_b32 v1, v1
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build(&code, false, 4).unwrap();
+        let [swap, _] = &p.blocks[0].insts[..] else {
+            panic!()
+        };
+        let vgprs = |regs: &[(Reg, Value)]| -> Vec<u8> {
+            regs.iter()
+                .filter_map(|r| match r.0 {
+                    Reg::V(v) => Some(v),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(vgprs(&swap.reads), [1, 2, 3]);
+        assert_eq!(vgprs(&swap.writes), [1, 2, 3]);
+        assert!(swap.read(Reg::S(M0)).is_some());
+    }
 }
+

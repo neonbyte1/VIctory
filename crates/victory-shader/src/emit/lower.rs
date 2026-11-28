@@ -6818,6 +6818,63 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_swaprel_b32" => {
+                // M0[7:0] offsets SRC0, M0[23:16] offsets VDST. Both ranges
+                // can overlap (ir.rs marks sreg..vgprs and dreg..vgprs both
+                // read and written), so capture both source values first and
+                // emit one guarded write per touched VGPR.
+                let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                let (
+                    Some(&Operand::Vector { reg: sreg, .. }),
+                    Some(Operand::Vector { reg: dreg, .. }),
+                ) = (v.src.first(), v.dst)
+                else {
+                    return Err("v_swaprel_b32");
+                };
+                let mask = self.s.m.i32(0xFF);
+                let src_off = self.s.m.bin(c, Bin::And, m0, mask);
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::LShr, m0, k16);
+                let dst_off = self.s.m.bin(c, Bin::And, hi, mask);
+
+                let select_at = |l: &mut Self, base: u8, off: V| -> Result<V, Why> {
+                    let mut r = l.s.m.i32(0);
+                    for k in 0..=255u8.saturating_sub(base) {
+                        let Some(x) = inst.read(Reg::V(base + k)) else {
+                            break;
+                        };
+                        let x = l.i32_of(x)?;
+                        let kk = l.s.m.i32(u32::from(k));
+                        let is = l.s.m.cmp(c, pred::EQ, off, kk);
+                        r = l.s.m.select(c, is, x, r);
+                    }
+                    Ok(r)
+                };
+                let a = select_at(self, dreg, dst_off)?;
+                let b = select_at(self, sreg, src_off)?;
+                for r in dreg.min(sreg)..=255u8 {
+                    if inst.write(Reg::V(r)).is_none() {
+                        break;
+                    }
+                    let old = match inst.read(Reg::V(r)) {
+                        Some(o) => self.i32_of(o)?,
+                        None => self.s.m.i32(0),
+                    };
+                    let mut x = old;
+                    if r >= sreg {
+                        let kk = self.s.m.i32(u32::from(r - sreg));
+                        let is_s = self.s.m.cmp(c, pred::EQ, src_off, kk);
+                        x = self.s.m.select(c, is_s, a, x);
+                    }
+                    if r >= dreg {
+                        let kk = self.s.m.i32(u32::from(r - dreg));
+                        let is_d = self.s.m.cmp(c, pred::EQ, dst_off, kk);
+                        x = self.s.m.select(c, is_d, b, x);
+                    }
+                    self.write_placed(inst, Reg::V(r), x, guard);
+                }
+                Ok(())
+            }
             "v_ffbh_u32" | "v_ffbh_i32" => {
                 // Counted from the top bit, -1 when none (DXIL's too).
                 let a = s(self, 0)?;
