@@ -383,14 +383,19 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
-        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
+        && twin.copy(&list.list, depth, to_depth, &mut |texture, wanted, barriers| {
+            list.move_texture(texture, wanted, barriers);
+        })
     {
         list.need_rebind();
     }
     if side == DEPTH {
         return false;
     }
-    let barriers: Vec<_> = twin.planes.iter().filter_map(|p| list.move_texture(p, UNORDERED_ACCESS)).collect();
+    let mut barriers = Vec::new();
+    for plane in &twin.planes {
+        list.move_texture(plane, UNORDERED_ACCESS, &mut barriers);
+    }
     if !barriers.is_empty() {
         // SAFETY: an open list and live textures.
         unsafe { list.list.ResourceBarrier(&barriers) };
@@ -457,8 +462,9 @@ pub(crate) fn at_submission<'a>(uses: impl Iterator<Item = &'a Use>) -> Vec<(Arc
     copies
 }
 
-/// Moves a texture to a state for a copy: the barrier, if any.
-pub(crate) type Mover<'a> = dyn FnMut(&Arc<HostTexture>, u32) -> Option<D3D12_RESOURCE_BARRIER> + 'a;
+/// Appends the barriers that move a texture to the state for a copy.
+pub(crate) type Mover<'a> =
+    dyn FnMut(&Arc<HostTexture>, u32, &mut Vec<D3D12_RESOURCE_BARRIER>) + 'a;
 
 impl Twin {
     /// Records into `l` the copy of the newer side into the other: from
@@ -468,8 +474,11 @@ impl Twin {
     /// list's compute root signature and pipeline.
     pub(crate) fn copy(&self, l: &ID3D12GraphicsCommandList, depth: &Arc<HostTexture>, to_depth: bool, mv: &mut Mover) -> bool {
         let (src, dst) = if to_depth { (COPY_SOURCE, COPY_DEST) } else { (COPY_DEST, COPY_SOURCE) };
-        let mut barriers: Vec<_> = self.planes.iter().filter_map(|p| mv(p, src)).collect();
-        barriers.extend(mv(depth, dst));
+        let mut barriers = Vec::new();
+        for plane in &self.planes {
+            mv(plane, src, &mut barriers);
+        }
+        mv(depth, dst, &mut barriers);
         let at = |r: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the copy does not release.
             pResource: unsafe { std::mem::transmute_copy(r) },
@@ -999,9 +1008,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(route(&list, &depth, twin, UNORDERED_ACCESS));
         const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         assert!(!route(&list, &depth, twin, PIXEL_SHADER_RESOURCE));
-        if let Some(b) = list.move_texture(&depth, PIXEL_SHADER_RESOURCE) {
+        let mut barriers = Vec::new();
+        list.move_texture(&depth, PIXEL_SHADER_RESOURCE, &mut barriers);
+        if !barriers.is_empty() {
             // SAFETY: an open list and a live texture.
-            unsafe { list.list.ResourceBarrier(&[b]) };
+            unsafe { list.list.ResourceBarrier(&barriers) };
         }
         list.close();
         let recorded = issued();
@@ -1013,8 +1024,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut states = std::collections::HashMap::from([(key(&depth), DEPTH_WRITE), (key(&twin.planes[0]), 0)]);
         replay(&run, &mut states).unwrap();
         // What the list left is what the next prelude starts from.
-        assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
-        assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));
+        assert_eq!(states[&key(&depth)], depth.state(0));
+        assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state(0));
     }
 
     /// The converter builds with the system's compiler (Wine's too) and

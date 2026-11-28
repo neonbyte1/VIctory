@@ -173,12 +173,12 @@ fn placed_uav_dispatch_writes_its_texture() {
     view[10] = address as u32;
     view[11] = (address >> 32) as u32;
     let placed = crate::resource::texture_at(address, &resource).expect("placed texture");
-    let texture = crate::resource::host_resource(placed).expect("host texture");
+    let copy = crate::resource::host_copy(placed).expect("host texture");
     crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &view, handle);
 
     let expected = [1.0f32, 0.5, -0.25, 2.0];
     let list = host.new_list().unwrap();
-    crate::texture::upload(&list, placed, &texture);
+    crate::texture::upload(&list, placed, &copy);
     let mut state = crate::draw::State::default();
     state.set_pipeline(pipeline.0);
     state.set_heaps(&[views.0]);
@@ -190,9 +190,9 @@ fn placed_uav_dispatch_writes_its_texture() {
         crate::draw::dispatched() > dispatched,
         "dispatch did not record"
     );
-    crate::list::ensure_state(&list, placed, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+    crate::list::ensure_copy_state(&list, &copy, 0, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
     let (readback, footprint) =
-        crate::capture::read_back(&host.device, &list.list, &texture).unwrap();
+        crate::capture::read_back(&host.device, &list.list, &copy.texture).unwrap();
     list.close();
     host.execute(&[&list]);
 

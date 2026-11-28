@@ -274,7 +274,7 @@ pub(crate) fn uploads(
             if texture.host_written.load(Relaxed) {
                 continue;
             }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
+            if let Some(staging) = crate::texture::staging(r as This, &texture)
                 && staged.insert(Arc::as_ptr(&staging))
             {
                 work.push((staging, texture));
@@ -286,7 +286,7 @@ pub(crate) fn uploads(
     let mut readable = Vec::new();
     for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
         if let Some(upload) = upload {
-            readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
+            crate::texture::record_upload(list, copy, staging, &upload, &mut readable);
             recorded = true;
             #[cfg(feature = "diagnostics")]
             UPLOADED.fetch_add(1, Relaxed);

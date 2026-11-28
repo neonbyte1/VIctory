@@ -227,7 +227,7 @@ pub(crate) fn cached_staging_bytes() -> Option<(u64, usize)> {
     Some((chunk_bytes + large_bytes, read_bytes))
 }
 
-/// A host copy or resolve that `list` records writes `resource`: from the
+/// A host copy or resolve that `list` records writes `copy`: from the
 /// submission that runs `list` on, its host texture's contents are the
 /// host's, not title memory's, which stays as it was. Marked when that
 /// submission is made, not when `list` is recorded: a list recorded before
@@ -235,15 +235,9 @@ pub(crate) fn cached_staging_bytes() -> Option<(u64, usize)> {
 /// (submissions run in the order they are made, which need not be the
 /// order their lists were recorded in), and one run before it must still
 /// get its upload.
-pub(crate) fn host_writes(list: &HostList, resource: This) {
-    if let Some(copy) = crate::resource::host_copy(resource) {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
-    }
-}
-
-fn is_host_written(resource: This) -> bool {
-    crate::resource::host_copy(resource)
-        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
+pub(crate) fn host_writes(list: &HostList, copy: &Arc<crate::resource::HostTexture>) {
+    let copy = copy.clone();
+    list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -481,9 +475,9 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) -> bool {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let (Some(a), Some(b), Some(host)) = (
-        crate::resource::host_resource(from),
-        crate::resource::host_resource(to),
+    let (Some(source), Some(destination), Some(host)) = (
+        crate::resource::host_copy(from),
+        crate::resource::host_copy(to),
         host(),
     ) else {
         return false;
@@ -492,6 +486,7 @@ fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) 
     if !list.first_use(to as usize | 1) {
         return false;
     }
+    let (a, b) = (&source.texture, &destination.texture);
     // SAFETY: live resources.
     let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
     let Some(plan) = plans.get_or_compute(&host.device, &da, &db) else {
@@ -502,9 +497,10 @@ fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) 
         return false;
     };
     list.keep(&buffer);
-    crate::texture::host_writes(list, to);
-    crate::list::ensure_state(list, from, COPY_SOURCE);
-    crate::list::ensure_state(list, to, COPY_DEST);
+    host_writes(list, &destination);
+    const ALL: u32 = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    crate::list::ensure_copy_state(list, &source, ALL, COPY_SOURCE);
+    crate::list::ensure_copy_state(list, &destination, ALL, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the copy does not release.
         pResource: unsafe { std::mem::transmute_copy(r) },
@@ -557,12 +553,13 @@ fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) 
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
-pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+pub(crate) fn upload(list: &HostList, resource: This, copy: &Arc<crate::resource::HostTexture>) {
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
-    if is_host_written(resource) {
+    let texture = &copy.texture;
+    if copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
         #[cfg(feature = "diagnostics")]
         {
             static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
@@ -578,37 +575,39 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if !list.first_use(texture.as_raw() as usize) {
         return;
     }
-    let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource)) else {
+    let Some(staging) = staging(resource, copy) else {
         return;
     };
     // Each list recorded the copy before (run perf7: 149 textures uploaded
     // 3,195 times in a frame, 17 ms of GPU time), changed or not.
-    list.defer_texture(staging, copy);
+    list.defer_texture(staging, copy.clone());
 }
 
 /// Records into `list` the copy of `buffer` (laid out as `staging` says)
-/// into host texture `copy`. Returns the barrier that leaves it readable by
-/// shaders, for the caller to record with the others after every copy: one
-/// barrier per texture between the copies kept the GPU from overlapping
+/// into host texture `copy`. Appends the barriers that leave it readable by
+/// shaders, for the caller to record with the others after every copy:
+/// barriers between the copies kept the GPU from overlapping
 /// them (new shots copy hundreds of textures, run evict6).
-#[must_use]
 pub(crate) fn record_upload(
     list: &HostList,
     copy: &Arc<crate::resource::HostTexture>,
     staging: &Staging,
     (buffer, at, subresources): &Upload,
-) -> Option<D3D12_RESOURCE_BARRIER> {
+    readable: &mut Vec<D3D12_RESOURCE_BARRIER>,
+) {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-    if let Some(b) = list.move_texture(copy, COPY_DEST) {
+    let mut barriers = Vec::new();
+    list.move_texture(copy, COPY_DEST, &mut barriers);
+    if !barriers.is_empty() {
         // SAFETY: an open list; the barrier names a live texture.
-        unsafe { list.list.ResourceBarrier(&[b]) };
+        unsafe { list.list.ResourceBarrier(&barriers) };
     }
     copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    list.move_texture(copy, SHADER_RESOURCE)
+    list.move_texture(copy, SHADER_RESOURCE, readable);
 }
 
 /// The uploads [`record_upload`] recorded into `resource`'s host texture
@@ -1091,8 +1090,7 @@ fn committed_kind(at: *const u8, len: usize) -> Committed {
 
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
-pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    let copy = crate::resource::host_copy(resource)?;
+pub(crate) fn staging(resource: This, copy: &crate::resource::HostTexture) -> Option<Arc<Staging>> {
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {
         return Some(s.clone());
@@ -1111,7 +1109,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     }
     let host = host()?;
     // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
+    let d = unsafe { copy.texture.GetDesc() };
     let subresources_per_plane = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {

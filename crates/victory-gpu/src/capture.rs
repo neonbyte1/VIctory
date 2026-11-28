@@ -377,7 +377,6 @@ pub(crate) fn has_targets() -> bool {
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let buffers = std::mem::take(&mut *BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
     // Writers dumped once.
@@ -416,10 +415,8 @@ pub(crate) fn dump_targets(frame: u64) {
         if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
-        // Every submission has run; the dump's list moves it there and back.
-        let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}"), target, &d);
+        dump_one(host, copy, &format!("frame-{frame}"), target, &d);
     }
 }
 
@@ -427,7 +424,6 @@ pub(crate) fn dump_targets(frame: u64) {
 /// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
 /// then, to follow a frame pass by pass).
 pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
-    use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     let frame = crate::queue::presented() + 1;
     peek(&format!("frame-{frame}-s{sub:04}"));
@@ -441,9 +437,8 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
         if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
-        let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
+        dump_one(host, &copy, &format!("frame-{frame}-s{sub:04}"), target, &d);
         // A depth texture's writable twin (`crate::twin`): what unordered
         // views wrote, which reaches the depth texture at its next use.
         for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
@@ -451,7 +446,7 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
             let pd = unsafe { plane.texture.GetDesc() };
             let by = format!("{by}-twin{p}");
             let target = (i, *resource as crate::object::This, by.as_str());
-            dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
+            dump_one(host, plane, &format!("frame-{frame}-s{sub:04}"), target, &pd);
         }
     }
 }
@@ -581,30 +576,15 @@ pub(crate) fn read_indirect(
 
 fn dump_one(
     host: &crate::host::Host,
-    texture: &ID3D12Resource,
-    state: u32,
+    copy: &crate::resource::HostTexture,
     prefix: &str,
     (i, resource, by): (usize, crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
-    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
-    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    // SAFETY: an open list of ours and a live texture.
-    let read = unsafe {
-        if state != copy {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
-        }
-        let read = read_back(&host.device, &list.list, texture);
-        if state != copy {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
-        }
-        read
-    };
-    list.close();
-    host.execute(&[&list]);
+    let read = host.execute_texture_read(&list, copy, 0, |list| {
+        read_back(&host.device, list, &copy.texture)
+    });
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();

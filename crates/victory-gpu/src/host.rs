@@ -5,7 +5,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -20,6 +20,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
+
+mod states;
+pub(crate) use states::TextureStates;
+use states::RecordedTexture;
+
+use crate::resource::HostTexture;
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -598,8 +604,7 @@ pub(crate) mod tests {
             if ours {
                 list.set_ours();
             }
-            list.transition(textures[0], 0x40, None, |_, _, _, _| {});
-            assert_eq!(copy.last_used().0 != u64::MAX, stamped, "ours: {ours}");
+            crate::list::ensure_state(&list, textures[0], 0x40);            assert_eq!(copy.last_used().0 != u64::MAX, stamped, "ours: {ours}");
         }
     }
 
@@ -1028,13 +1033,10 @@ pub(crate) struct HostList {
     /// Read-back memory for what the list's query resolves write, reused
     /// after a reset.
     readback: Mutex<Readback>,
-    /// Host texture states the list assumes, by host copy: at its start and
-    /// at its end. Lists are recorded on many threads and run in submission
-    /// order, so the transitions from a texture's real state are made at
-    /// submission, in `prelude`. Holding the copies keeps every texture the
-    /// list names alive until it is reset, even if the title releases the
-    /// resource first.
-    states: Mutex<States>,
+    /// Initial and final states of the host subresources this list uses.
+    /// Lists are recorded on many threads and run in submission order,
+    /// so `prelude` reconciles the states at submission. These entries
+    /// also keep the textures alive until the list is reset.    states: Mutex<States>,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
@@ -1098,24 +1100,7 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<usize, TrackedTexture>;
-
-struct TrackedTexture {
-    first: u32,
-    last: u32,
-    copy: std::sync::Arc<crate::resource::HostTexture>,
-    /// Subresources temporarily in a different state from `last`.
-    mips: std::collections::BTreeMap<u32, u32>,
-}
-
-impl TrackedTexture {
-    fn unify(&mut self, mut record: impl FnMut(&ID3D12Resource, u32, u32, u32)) {
-        for (mip, before) in std::mem::take(&mut self.mips) {
-            record(&self.copy.texture, mip, before, self.last);
-        }
-    }
-}
-
+type States = std::collections::HashMap<usize, RecordedTexture>;
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
@@ -1469,7 +1454,45 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.execute_locked(runs, submitted);
+    }
+
+    /// Records and executes a standalone host read, restoring the source's states.
+    /// Keep the submission lock from the state snapshot through execution.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) fn execute_texture_read<T>(
+        &self,
+        list: &HostList,
+        source: &HostTexture,
+        subresource: u32,
+        record: impl FnOnce(&ID3D12GraphicsCommandList) -> T,
+    ) -> T {
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut forward = Vec::new();
+        let mut back = Vec::new();
+        temporary_barriers(
+            source,
+            subresource,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            &mut forward,
+            &mut back,
+        );
+        let barriers = |barriers: &[D3D12_RESOURCE_BARRIER]| {
+            if !barriers.is_empty() {
+                // SAFETY: an open list and a live source.
+                unsafe { list.list.ResourceBarrier(barriers) };
+            }
+        };
+        barriers(&forward);
+        let result = record(&list.list);
+        barriers(&back);
+        list.close();
+        self.execute_locked(&[list], submitted);
+        result
+    }
+
+    fn execute_locked(&self, runs: &[&HostList], mut submitted: MutexGuard<'_, u64>) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -2259,108 +2282,61 @@ impl HostList {
         }
     }
 
-    /// Records the state changes required by a texture use. The first use
-    /// sets the uniform state chosen by the submission prelude.
-    /// A depth texture with a writable twin (`crate::twin`) has the side
-    /// the use needs brought up to date first; unordered access moves the
-    /// twin, not the depth texture.
-    pub(crate) fn transition(
+    /// Moves host subresources to `wanted` in this list, emitting inline
+    /// barriers for states that are already known and need to change.
+    /// A depth texture with a writable twin is routed to the side the use needs.    pub(crate) fn transition(
         &self,
-        resource: crate::object::This,
+        copy: &Arc<HostTexture>,
+        subresource: u32,
         wanted: u32,
-        mips: Option<std::ops::Range<u32>>,
-        mut record: impl FnMut(&ID3D12Resource, u32, u32, u32),
-    ) {
-        let Some(copy) = crate::resource::host_copy(resource) else {
-            return;
-        };
-        if let Some(Some(twin)) = copy.twin.get()
-            && crate::twin::route(self, &copy, twin, wanted)
+        emit: impl FnMut(&ID3D12Resource, u32, u32, u32),
+    ) {        if let Some(Some(twin)) = copy.twin.get()
+            && crate::twin::route(self, copy, twin, wanted)
         {
             return;
         }
+        self.track(copy, subresource, wanted, emit);    }
+
+    fn track(
+        &self,
+        copy: &Arc<HostTexture>,
+        subresource: u32,
+        wanted: u32,
+        emit: impl FnMut(&ID3D12Resource, u32, u32, u32),
+    ) {
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let state = states
-            .entry(std::sync::Arc::as_ptr(&copy) as usize)
+        states
+            .entry(Arc::as_ptr(copy) as usize)
             .or_insert_with(|| {
                 copy.note_used();
                 if !self.ours.load(Ordering::Relaxed) {
                     copy.stamp();
                 }
-                TrackedTexture {
-                    first: wanted,
-                    last: wanted,
-                    copy,
-                    mips: Default::default(),
-                }
-            });
-        if let Some(mips) = mips {
-            for mip in mips {
-                let before = if wanted == state.last {
-                    state.mips.remove(&mip)
-                } else {
-                    state.mips.insert(mip, wanted)
-                }
-                .unwrap_or(state.last);
-                if before != wanted {
-                    record(&state.copy.texture, mip, before, wanted);
-                }
-            }
-        } else {
-            state.unify(&mut record);
-            let before = std::mem::replace(&mut state.last, wanted);
-            if before != wanted {
-                record(
-                    &state.copy.texture,
-                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    before,
-                    wanted,
-                );
-            }
-        }
-    }
+                RecordedTexture::new(copy.clone())
+            })
+            .record(subresource, wanted, emit);    }
 
-    /// The list's state for host texture `copy` becomes `wanted` (a legal
-    /// one): the state it leaves, if that is a change. Nothing for the
-    /// list's first use (its prelude moves the texture there).
-    fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                copy.note_used();
-                if !self.ours.load(Ordering::Relaxed) {
-                    copy.stamp();
-                }
-                v.insert(TrackedTexture {
-                    first: wanted,
-                    last: wanted,
-                    copy: copy.clone(),
-                    mips: Default::default(),
-                });
-                None
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().last, wanted);
-                (before != wanted).then_some(before)
-            }
-        }
-    }
-
-    /// [`HostList::transition`] for a host texture of ours (a twin's
-    /// plane), without twins: the barrier to record, if one is needed.
+    /// Appends barriers for a texture without routing to its twin.
     pub(crate) fn move_texture(
         &self,
-        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        copy: &Arc<HostTexture>,
         wanted: u32,
-    ) -> Option<D3D12_RESOURCE_BARRIER> {
-        let wanted = legal_state(&copy.texture, wanted);
-        let before = self.track(copy, wanted)?;
-        Some(transition(
-            &copy.texture,
-            D3D12_RESOURCE_STATES(before as i32),
-            D3D12_RESOURCE_STATES(wanted as i32),
-        ))
+        barriers: &mut Vec<D3D12_RESOURCE_BARRIER>,
+    ) {
+        self.track(
+            copy,
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            wanted,
+            |texture, index, before, after| {
+                barriers.push(transition_subresource(
+                    texture,
+                    index,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATES(after as i32),
+                ));
+            },
+        );
     }
 
     /// A use of the depth texture `depth` (with a twin) needing `side`
@@ -2419,9 +2395,16 @@ impl HostList {
         self.rebind.swap(false, Ordering::Relaxed)
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
+    #[cfg(test)]
+    pub(crate) fn recorded_state(&self, copy: &Arc<HostTexture>, subresource: u32) -> Option<u32> {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .get(&(Arc::as_ptr(copy) as usize))
+            .and_then(|state| state.last(subresource))
+    }
+
+    /// Reconciles each used subresource with the list's starting state, then
+    /// records the states the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         // Depth textures and their twins first, from their real states and
         // back: the side each first use needs, made newer.
@@ -2429,32 +2412,24 @@ impl HostList {
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        // The copies start from the real states, then the list's moves from
-        // them; only after both do they become the states the list leaves.
-        let moves = || -> Vec<D3D12_RESOURCE_BARRIER> {
-            states
-                .values()
-                .filter_map(|state| {
-                    let real = state.copy.state.load(Ordering::Relaxed);
-                    (real != state.first).then(|| {
-                        transition(
-                            &state.copy.texture,
-                            D3D12_RESOURCE_STATES(real as i32),
-                            D3D12_RESOURCE_STATES(state.first as i32),
-                        )
-                    })
-                })
-                .collect()
-        };
-        let left = || {
-            for state in states.values() {
-                state.copy.state.store(state.last, Ordering::Relaxed);
+        let reconcile = |barriers: &mut Vec<_>| {
+            for recorded in states.values() {
+                recorded.reconcile(|index, before, after| {
+                    barriers.push(transition_subresource(
+                        &recorded.copy.texture,
+                        index,
+                        D3D12_RESOURCE_STATES(before as i32),
+                        D3D12_RESOURCE_STATES(after as i32),
+                    ));
+                });
             }
         };
-        if copies.is_empty() && states.values().all(|state| state.copy.state.load(Ordering::Relaxed) == state.first) {
-            left();
-            return None;
-        }
+        let mut barriers = Vec::new();
+        if copies.is_empty() {
+            reconcile(&mut barriers);
+            if barriers.is_empty() {
+                return None;
+            }        }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
@@ -2465,31 +2440,30 @@ impl HostList {
                     let Some(Some(twin)) = depth.twin.get() else { continue };
                     // From each texture's real state to the copy's and back.
                     let mut back = Vec::new();
-                    twin.copy(list, depth, *to_depth, &mut |t, wanted| {
-                        let real = t.state.load(Ordering::Relaxed);
-                        let wanted = legal_state(&t.texture, wanted);
-                        (real != wanted).then(|| {
-                            let there = transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32));
-                            back.push(transition(
-                                &t.texture,
-                                D3D12_RESOURCE_STATES(wanted as i32),
-                                D3D12_RESOURCE_STATES(real as i32),
-                            ));
-                            there
-                        })
+                    twin.copy(list, depth, *to_depth, &mut |texture, wanted, forward| {
+                        let wanted = legal_state(&texture.texture, wanted);
+                        temporary_barriers(
+                            texture,
+                            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            D3D12_RESOURCE_STATES(wanted as i32),
+                            forward,
+                            &mut back,
+                        );
                     });
                     if !back.is_empty() {
                         list.ResourceBarrier(&back);
                     }
                 }
-                let barriers = moves();
+                if !copies.is_empty() {
+                    // Twin copies restore the committed states the list starts from.
+                    reconcile(&mut barriers);
+                }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
                 list.Close()
             })
         };
-        left();
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
@@ -3899,12 +3873,10 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows one or more `planes` (each a live host texture and its current
-    /// host state, kept in that state), compositing planes 1.. on top of
-    /// plane 0 when multiple planes are presented, as frame `frame` (saved if
-    /// captures are on). `None` if nothing was shown; else, in diagnostics
-    /// builds, whether the frame was black.
-    pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+    /// Presents the planes in order, restoring the states of their subresources.
+    /// Returns `None` if nothing was shown. In diagnostics builds it reports
+    /// whether the frame was black and saves the frame when capture is enabled.
+    pub(crate) fn present(&self, planes: &[&HostTexture], frame: u64) -> Option<bool> {
         self.present_with_compositor(
             planes,
             frame,
@@ -3916,7 +3888,7 @@ impl Host {
 
     fn present_with_compositor(
         &self,
-        planes: &[(&ID3D12Resource, u32)],
+        planes: &[&HostTexture],
         frame: u64,
         create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
         #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
@@ -3924,7 +3896,7 @@ impl Host {
             &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         ),
     ) -> Option<bool> {
-        let &(primary, _) = planes.first()?;
+        let primary = &planes.first()?.texture;
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
         let Some(format) = swap_format(primary_desc.Format) else {
@@ -3956,9 +3928,9 @@ impl Host {
             planes
         };
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
-        for &(tex, _) in &planes[1..] {
+        for plane in &planes[1..] {
             // SAFETY: live resource.
-            let d = unsafe { tex.GetDesc() };
+            let d = unsafe { plane.texture.GetDesc() };
             width = width.max(d.Width as u32);
             height = height.max(d.Height);
         }
@@ -4013,14 +3985,21 @@ impl Host {
                 return None;
             };
             p.copy.reset();
+            // Hold the submission lock from the state snapshots through execution.
+            let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
             let list = &p.copy.list;
             let (capture, probe) = if planes.len() == 1 {
-                let (texture, state) = planes[0];
-                let state = D3D12_RESOURCE_STATES(state as i32);
+                let source = planes[0];
+                let texture = &source.texture;
                 let mut before = Vec::with_capacity(2);
-                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                    before.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
-                }
+                let mut after = Vec::with_capacity(2);
+                temporary_barriers(
+                    source,
+                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    &mut before,
+                    &mut after,
+                );
                 before.push(transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
@@ -4055,10 +4034,6 @@ impl Host {
                     let _ = frame;
                     (None::<()>, None::<()>)
                 };
-                let mut after = Vec::with_capacity(2);
-                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                    after.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
-                }
                 after.push(transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -4088,7 +4063,8 @@ impl Host {
                 let count = planes.len().min(MAX_PLANES as usize);
                 let mut before = Vec::with_capacity(count + 1);
                 let mut after = Vec::with_capacity(count);
-                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
+                for (i, &plane) in planes[..count].iter().enumerate() {
+                    let tex = &plane.texture;
                     let d = tex.GetDesc();
                     let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
                     let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -4111,22 +4087,18 @@ impl Host {
                         }),
                         handle,
                     );
-                    let state = D3D12_RESOURCE_STATES(state as i32);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                        && planes[..i]
-                            .iter()
-                            .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
+                    if planes[..i]
+                        .iter()
+                        .all(|earlier| earlier.texture.as_raw() != tex.as_raw())
                     {
-                        before.push(transition(
-                            tex,
-                            state,
+                        // The SRV samples only mip 0 of plane 0.
+                        temporary_barriers(
+                            plane,
+                            0,
                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                        ));
-                        after.push(transition(
-                            tex,
-                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                            state,
-                        ));
+                            &mut before,
+                            &mut after,
+                        );
                     }
                 }
                 before.push(transition(
@@ -4197,7 +4169,7 @@ impl Host {
                 (capture, probe)
             };
             p.copy.close();
-            self.execute(&[&p.copy]);
+            self.execute_locked(&[&p.copy], submitted);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 // Tests inspect the completed copy before flip-discard Present
@@ -4559,17 +4531,29 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     text
 }
 
+/// Moves a texture from its committed states and prepares the reverse barriers.
+fn temporary_barriers(
+    source: &HostTexture,
+    subresource: u32,
+    wanted: D3D12_RESOURCE_STATES,
+    forward: &mut Vec<D3D12_RESOURCE_BARRIER>,
+    back: &mut Vec<D3D12_RESOURCE_BARRIER>,
+) {
+    source.visit_states(subresource, |index, state| {
+        let before = D3D12_RESOURCE_STATES(state as i32);
+        if before != wanted {
+            forward.push(transition_subresource(&source.texture, index, before, wanted));
+            back.push(transition_subresource(&source.texture, index, wanted, before));
+        }
+    });
+}
+
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> D3D12_RESOURCE_BARRIER {
-    transition_subresource(
-        resource,
-        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-        before,
-        after,
-    )
+    transition_subresource(resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after)
 }
 
 /// Mip indices directly address the first plane of these color targets.
@@ -5071,7 +5055,8 @@ mod present_plane_tests {
             return;
         };
         let list = host.new_list().unwrap();
-        let make_plane = |width, height, color: &[f32; 4]| {
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let make_plane = |width, height, mips, color: &[f32; 4]| {
             let mut texture = None;
             // SAFETY: live device, valid render target description, and an open list.
             unsafe {
@@ -5087,7 +5072,7 @@ mod present_plane_tests {
                             Width: width,
                             Height: height,
                             DepthOrArraySize: 1,
-                            MipLevels: 1,
+                            MipLevels: mips,
                             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
                             SampleDesc: DXGI_SAMPLE_DESC {
                                 Count: 1,
@@ -5104,16 +5089,17 @@ mod present_plane_tests {
                 let texture = texture.unwrap();
                 list.list
                     .ClearRenderTargetView(host.rtv(Some(&texture), None), color, None);
-                texture
+                Arc::new(HostTexture::new(texture, state, Vec::new()))
             }
         };
-        let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let scene = make_plane(32, 32, 1, &[1.0, 0.0, 0.0, 1.0]);
+        let overlay = make_plane(64, 64, 2, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let copy_dest = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        crate::list::ensure_copy_state(&list, &overlay, 1, copy_dest);
         list.close();
         host.execute(&[&list]);
-        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
         assert!(
-            host.present(&[(&scene, state)], 1).is_some(),
+            host.present(&[&scene], 1).is_some(),
             "single-plane control"
         );
         let first_pixel =
@@ -5137,7 +5123,7 @@ mod present_plane_tests {
         let mut attempted = false;
         let mut fallback = None;
         let shown = host.present_with_compositor(
-            &[(&scene, state), (&overlay, state)],
+            &[&scene, &overlay],
             2,
             |_, _| {
                 attempted = true;
@@ -5159,9 +5145,10 @@ mod present_plane_tests {
         drop(presentation);
 
         let mut composite = None;
+        tests::issued();
         assert!(
             host.present_with_compositor(
-                &[(&scene, state), (&overlay, state)],
+                &[&scene, &overlay],
                 3,
                 Compositor::new,
                 |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
@@ -5171,6 +5158,15 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+        assert_eq!([overlay.state(0), overlay.state(1)], [state, copy_dest]);
+        let sampled = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+        let transitions: Vec<_> = tests::issued()
+            .into_iter()
+            .filter_map(|(resource, before, after)| {
+                (resource == overlay.texture.as_raw() as usize).then_some((before, after))
+            })
+            .collect();
+        assert_eq!(transitions, [(state, sampled), (sampled, state)]);
     }
 }
 

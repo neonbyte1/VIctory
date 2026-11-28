@@ -575,43 +575,58 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
-/// The barrier on host resources, or `None` if it names a resource the host
-/// GPU does not have (buffers so far).
+/// Appends the host barriers for this title barrier.
 #[cfg(windows)]
-fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
+fn host_barrier(list: &crate::host::HostList, b: &Barrier, out: &mut Vec<Barrier>) {
     use windows::core::Interface;
     // The list names the resource until it is reset: the title may release it
     // before the list runs.
     let host = |r: This| {
-        crate::resource::host_resource(r).map(|h| {
-            list.keep(&h);
-            h.as_raw().cast_const().cast()
-        })
+        if r.is_null() {
+            Some(r)
+        } else {
+            crate::resource::host_resource(r).map(|h| {
+                list.keep(&h);
+                h.as_raw().cast_const().cast()
+            })
+        }
     };
     match b.kind {
-        1 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            second: if b.second == 0 {
-                0
-            } else {
-                host(b.second as This)? as u64
-            },
-            ..*b
-        }),
-        2 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            ..*b
-        }),
-        _ => None,
-    }
+        0 => {
+            // A split barrier's first half: its second half transitions.
+            const BEGIN_ONLY: u32 = 1;
+            if b.flags & BEGIN_ONLY != 0 {
+                return;
+            }
+            let Some(copy) = crate::resource::host_copy(b.first) else {
+                return;
+            };
+            let wanted = crate::host::texture_state(b.last as u32);
+            if copy.twin.get().is_some_and(Option::is_some) {
+                // Routing a twin may record copies that depend on prior barriers.
+                emit_barriers(list, out);
+                out.clear();
+            }
+            list.transition(&copy, b.second as u32, wanted, |texture, index, before, after| {
+                out.push(Barrier {
+                    kind: 0,
+                    flags: 0,
+                    first: texture.as_raw().cast_const().cast(),
+                    second: u64::from(index) | (u64::from(before) << 32),
+                    last: u64::from(after),
+                });
+            });
+        }
+        1 | 2 => {
+            let Some(first) = host(b.first) else { return };
+            let mut translated = Barrier { first, ..*b };
+            if b.kind == 1 {
+                let Some(second) = host(b.second as This) else { return };
+                translated.second = second as u64;
+            }
+            out.push(translated);
+        }
+        _ => {}    }
 }
 
 /// An unordered access barrier on every resource: earlier shader writes
@@ -634,33 +649,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("barrier kinds {:?}", barriers.iter().map(|b| b.kind).collect::<Vec<_>>()));
-        use windows::core::Interface;
         let mut host = Vec::new();
         for b in barriers {
-            if b.kind == 0 {
-                // A split barrier transitions on its second half.
-                const BEGIN_ONLY: u32 = 1;
-                if b.flags & BEGIN_ONLY == 0 {
-                    let state = crate::host::texture_state(b.last as u32);
-                    list.transition(
-                        b.first,
-                        state,
-                        color_mip(b.first, b.second as u32),
-                        |texture, mip, before, after| {
-                            host.push(Barrier {
-                                kind: 0,
-                                flags: 0,
-                                first: texture.as_raw().cast_const().cast(),
-                                second: u64::from(mip) | (u64::from(before) << 32),
-                                last: u64::from(after),
-                            });
-                        },
-                    );
-                }
-            } else if let Some(b) = host_barrier(list, b) {
-                host.push(b);
-            }
-        }
+            host_barrier(list, b, &mut host);        }
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
@@ -668,41 +659,66 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }) {
             host.push(UAV_BARRIER);
         }
-        if !host.is_empty() {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-            const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
-            // SAFETY: the same layout; borrowed resource pointers, never
-            // released through this slice.
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
-                )
-            };
-            // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
-        }
+        emit_barriers(list, &host);
     }
     0
+}
+
+#[cfg(windows)]
+fn emit_barriers(list: &crate::host::HostList, barriers: &[Barrier]) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+    if !barriers.is_empty() {
+        // SAFETY: same layout; the borrowed resource pointers are never
+        // released through this slice. The list is open and resources are live.
+        unsafe {
+            let host = std::slice::from_raw_parts(
+                barriers.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+                barriers.len(),
+            );
+            list.list.ResourceBarrier(host);
+        }
+    }
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
-    ensure_mips(list, resource, state, None);
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    ensure_subresource_state(list, resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state);
 }
 
-/// The selected mip of a regular 2D color target. Other resources retain
-/// the existing whole-resource tracking.
+/// Moves a single host subresource, or the whole texture, to `state`.
 #[cfg(windows)]
-fn color_mip(resource: This, mip: u32) -> Option<std::ops::Range<u32>> {
-    if mip == u32::MAX {
-        return None;
-    }
-    let texture = crate::resource::host_resource(resource)?;
-    (mip < crate::host::color_mip_count(&texture)?).then(|| mip..mip + 1)
+pub(crate) fn ensure_subresource_state(
+    list: &crate::host::HostList,
+    resource: This,
+    subresource: u32,
+    state: u32,
+) {
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    ensure_copy_state(list, &copy, subresource, state);
 }
 
+/// Transitions the same host copy the caller will use for the command.
+#[cfg(windows)]
+pub(crate) fn ensure_copy_state(
+    list: &crate::host::HostList,
+    copy: &std::sync::Arc<crate::resource::HostTexture>,
+    subresource: u32,
+    state: u32,
+) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES;
+    list.transition(copy, subresource, state, |texture, index, before, after| {
+        let barrier = crate::host::transition_subresource(
+            texture,
+            index,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(after as i32),
+/// Moves the selected mips, or the whole texture when `None`, of a title
+/// texture's host copy to `state` (`#559`'s view-based mip ranges).
 #[cfg(windows)]
 pub(crate) fn ensure_mips(
     list: &crate::host::HostList,
@@ -710,13 +726,17 @@ pub(crate) fn ensure_mips(
     state: u32,
     mips: Option<std::ops::Range<u32>>,
 ) {
-    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    list.transition(resource, state, mips, |texture, mip, before, after| {
-        let barrier = crate::host::transition_subresource(
-            texture,
-            mip,
-            State(before as i32),
-            State(after as i32),
+    let Some(mips) = mips else {
+        ensure_state(list, resource, state);
+        return;
+    };
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    for mip in mips {
+        ensure_copy_state(list, &copy, mip, state);
+    }
+}
         );
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
@@ -764,23 +784,24 @@ extern "system" fn copy_buffer_region(
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES as ALL;
         let Some(list) = host_list(this) else {
             return;
         };
         if let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
+            crate::resource::host_copy(dst),
+            crate::resource::host_copy(src),
         ) {
-            if crate::texture::title_written(&from) {
+            if crate::texture::title_written(&from.texture) {
                 crate::texture::upload(list, src, &from);
             }
-            ensure_state(list, dst, COPY_DEST);
-            ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_writes(list, dst);
+            ensure_copy_state(list, &to, ALL, COPY_DEST);
+            ensure_copy_state(list, &from, ALL, COPY_SOURCE);
+            crate::texture::host_writes(list, &to);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(&to, &from) };
+            unsafe { list.list.CopyResource(&to.texture, &from.texture) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -804,6 +825,14 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+#[cfg(windows)]
+impl CopyLocation {
+    fn subresource(&self) -> u32 {
+        // The subresource index is the first 32 bits of the union.
+        self.footprint.offset as u32
+    }
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -831,14 +860,14 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        let Some(to) = crate::resource::host_copy(dst.resource) else {
             if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
                 read_back(list, &dst, [x, y, z], &src, source_box);
             }
             return;
         };
         let mut from = src;
-        let _upload; // keeps the source alive while this call records it
+        let _upload; // keeps the staging buffer alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
@@ -863,25 +892,30 @@ extern "system" fn copy_texture_region(
             }
             _upload = buffer;
         } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
+            let source = if src.resource == dst.resource {
+                Some(to.clone())
+            } else {
+                crate::resource::host_copy(src.resource)
+            };
+            let Some(source) = source else {
                 return;
             };
-            if crate::texture::title_written(&texture) {
-                crate::texture::upload(list, src.resource, &texture);
+            if crate::texture::title_written(&source.texture) {
+                crate::texture::upload(list, src.resource, &source);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
-            from.resource = texture.as_raw().cast_const().cast();
+            ensure_copy_state(list, &source, src.subresource(), COPY_SOURCE);
+            from.resource = source.texture.as_raw().cast_const().cast();
         }
-        ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_writes(list, dst.resource);
+        ensure_copy_state(list, &to, dst.subresource(), COPY_DEST);
+        crate::texture::host_writes(list, &to);
         let mut to_location = dst;
-        to_location.resource = to.as_raw().cast_const().cast();
+        to_location.resource = to.texture.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
                 // SAFETY: a live texture; the box is the title's or null.
-                let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
+                let (d, b) = unsafe { (to.texture.GetDesc(), host_box.map(|b| *b)) };
                 format!(
                     "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
                     dst.resource,
@@ -944,16 +978,17 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
             return;
         }};
     }
-    let (Some(host), Some(texture)) = (crate::host::host(), crate::resource::host_resource(src.resource)) else {
+    let (Some(host), Some(copy)) = (crate::host::host(), crate::resource::host_copy(src.resource)) else {
         refused!("no host texture");
     };
+    let texture = &copy.texture;
     // SAFETY: the title's box (same layout as the host's) or null; a live texture.
     let (b, desc) = unsafe { (source_box.cast::<D3D12_BOX>().as_ref(), texture.GetDesc()) };
     let size = match b {
         Some(b) => [b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top), b.back.saturating_sub(b.front)],
         None => {
             // A subresource index shares the footprint's first dword.
-            let mip = src.footprint.offset as u32 % u32::from(desc.MipLevels.max(1));
+            let mip = src.subresource() % u32::from(desc.MipLevels.max(1));
             let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(desc.DepthOrArraySize) } else { 1 };
             [((desc.Width >> mip) as u32).max(1), (desc.Height >> mip).max(1), (depth >> mip).max(1)]
         }
@@ -975,10 +1010,10 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
         return;
     };
-    if crate::texture::title_written(&texture) {
-        crate::texture::upload(list, src.resource, &texture);
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, &copy);
     }
-    ensure_state(list, src.resource, COPY_SOURCE);
+    ensure_copy_state(list, &copy, src.subresource(), COPY_SOURCE);
     let (mut to, mut from) = (*dst, *src);
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint.offset = 0;
@@ -993,7 +1028,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
                 desc.Width,
                 desc.Height,
                 desc.Format.0,
-                src.footprint.offset as u32,
+                src.subresource(),
                 dst.resource,
                 dst.footprint.offset
             )
@@ -1055,8 +1090,8 @@ extern "system" fn resolve(
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
+            crate::resource::host_copy(dst),
+            crate::resource::host_copy(src),
         )
     {
         use windows::Win32::Graphics::Direct3D12::{
@@ -1066,14 +1101,13 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        ensure_state(list, dst, RESOLVE_DEST);
-        ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_writes(list, dst);
+        ensure_copy_state(list, &to, dst_sub, RESOLVE_DEST);
+        ensure_copy_state(list, &from, src_sub, RESOLVE_SOURCE);
+        crate::texture::host_writes(list, &to);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
-        unsafe {
-            let format = DXGI_FORMAT(format as i32);
+        unsafe {            let format = DXGI_FORMAT(format as i32);
             if let Some(rect) = resolve_region(to.GetDesc(), dst_sub, from.GetDesc(), src_sub) {
                 if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                     // The console clips a larger source to the destination.
@@ -1091,8 +1125,7 @@ extern "system" fn resolve(
                 }
             } else {
                 list.list
-                    .ResolveSubresource(&to, dst_sub, &from, src_sub, format);
-            }
+                    .ResolveSubresource(&to.texture, dst_sub, &from.texture, src_sub, format);            }
         }
     }
     #[cfg(not(windows))]
@@ -1144,12 +1177,13 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES as ALL;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
             return;
         };
-        let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(record.resource),
+        let (Some(copy), Some(host)) = (
+            crate::resource::host_copy(record.resource),
             crate::host::host(),
         ) else {
             return;
@@ -1164,13 +1198,10 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let desc = record.desc();
-        let rtv = host.rtv(Some(&texture), desc.as_ref());
-        ensure_mips(
-            list,
-            record.resource,
-            RENDER_TARGET,
-            crate::descriptor::rtv_mips(&texture, desc.as_ref()),
-        );
+        let subresource = crate::descriptor::rtv_mips(&copy.texture, desc.as_ref())
+            .map_or(ALL, |mips| mips.start);
+        ensure_copy_state(list, &copy, subresource, RENDER_TARGET);
+        let rtv = host.rtv(Some(&copy.texture), desc.as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list.ClearRenderTargetView(rtv, color, rects);

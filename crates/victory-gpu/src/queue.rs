@@ -567,46 +567,26 @@ extern "system" fn present(
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
-        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
-        use windows::core::Interface;
-
-        const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
-        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
-            Vec::with_capacity(slice.len());
+        let mut resources = Vec::with_capacity(slice.len());
         for plane in slice {
             if plane.count == 0 || plane.resources.is_null() {
                 continue;
             }
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
-            if let Some(texture) = crate::resource::host_resource(resource) {
-                // Distinct title resources may refer to one host texture.
-                // Keep its original state for every plane and restore it once.
-                let prior = resources.iter().find_map(|(_, earlier, state, _)| {
-                    (earlier.as_raw() == texture.as_raw()).then_some(*state)
-                });
-                let state = prior.unwrap_or_else(|| {
-                    crate::resource::host_transition(resource, COPY_SOURCE)
-                        .map_or(COPY_SOURCE, |(_, before)| before)
-                });
-                resources.push((resource, texture, state, prior.is_none()));
+            if let Some(texture) = crate::resource::host_copy(resource) {
+                resources.push((resource, texture));
             }
         }
         if !resources.is_empty() {
-            let sources: Vec<(&_, u32)> = resources
-                .iter()
-                .map(|(_, tex, state, _)| (tex, *state))
-                .collect();
-            let shown = host.present(&sources, frame);
-            for &(resource, _, state, first) in &resources {
-                if first {
-                    crate::resource::host_transition(resource, state);
-                }
-            }
+            let sources: Vec<_> = resources.iter().map(|(_, texture)| texture.as_ref()).collect();
             #[cfg(feature = "diagnostics")]
-            blinks(frame, resources[0].0, resources[0].2, shown, draw_trace);
+            let state = sources[0].state(0);
+            let shown = host.present(&sources, frame);
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resources[0].0, state, shown, draw_trace);
             #[cfg(not(feature = "diagnostics"))]
             let _ = shown;
         }
@@ -898,7 +878,7 @@ mod tests {
         }
         list.close();
         host.execute(&[&list]);
-        assert_eq!(primary.state.load(Ordering::Relaxed), TARGET);
+        assert_eq!(primary.state(0), TARGET);
 
         let planes = resources.each_ref().map(|resource| Plane {
             token: 0,
@@ -907,7 +887,7 @@ mod tests {
             _rest: [0; 6],
         });
         assert_eq!(present(null, 2, planes.as_ptr(), null.cast()), S_OK);
-        let restored = primary.state.load(Ordering::Relaxed);
+        let restored = primary.state(0);
         let release = |resource| slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
         for resource in resources {
             assert_eq!(release(resource), 0);

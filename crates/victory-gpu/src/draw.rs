@@ -2068,34 +2068,34 @@ fn readable_for_draw(
                 crate::texture::alias_copy(list, a, *resource as This);
             }
             let host_tex = crate::resource::host_resource(*resource as This);
-            if let Some(ref t) = host_tex
-                && crate::texture::title_written(t)
-            {
-                crate::texture::upload(list, *resource as This, t);
-            }
             // Keep the same read bits the depth target will request at draw time.
             let samples_depth =
                 host_tex.as_ref().is_some_and(|t| read_only_depth == Some(t.as_raw() as usize));
-            let state = if samples_depth {
-                DEPTH_READ | SHADER_RESOURCE
-            } else {
-                SHADER_RESOURCE
-            };
-            let mips = match (&host_tex, desc.as_ref()) {
-                (Some(t), Some(d)) => crate::descriptor::host::srv_mips(t, d),
-                _ => None,
-            };
-            crate::list::ensure_mips(list, *resource as This, state, mips);
-            #[cfg(feature = "diagnostics")]
-            if let Some(ref t) = host_tex {
-                // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                if d.Flags.0 & 7 == 0 {
-                    tracing::debug!(
-                        resource = format_args!("{resource:#x}"),
-                        ?d,
-                        "a shader reads a texture the title fills"
-                    );
+            if let Some(copy) = crate::resource::host_copy(*resource as This) {
+                if crate::texture::title_written(&copy.texture) {
+                    crate::texture::upload(list, *resource as This, &copy);
+                }
+                let state = if samples_depth {
+                    DEPTH_READ | SHADER_RESOURCE
+                } else {
+                    SHADER_RESOURCE
+                };
+                // A view of one mip moves only that subresource.
+                let mips = desc
+                    .as_ref()
+                    .and_then(|d| crate::descriptor::host::srv_mips(&copy.texture, d));
+                crate::list::ensure_mips(list, *resource as This, state, mips);
+                #[cfg(feature = "diagnostics")]
+                {
+                    // SAFETY: a live resource.
+                    let d = unsafe { copy.texture.GetDesc() };
+                    if d.Flags.0 & 7 == 0 {
+                        tracing::debug!(
+                            resource = format_args!("{resource:#x}"),
+                            ?d,
+                            "a shader reads a texture the title fills"
+                        );
+                    }
                 }
             }
             samples_depth
@@ -3690,7 +3690,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // A list recorded after it, holding a host copy into the texture
         // (its mark; what it copies is the host's business), runs first.
         let copying = host.new_list().unwrap();
-        crate::texture::host_writes(&copying, object);
+        crate::texture::host_writes(&copying, &crate::resource::host_copy(object).unwrap());
         copying.close();
         host.execute(&[&copying]);
         host.execute(&[&late]);
@@ -3994,8 +3994,16 @@ void main(uint3 id : SV_DispatchThreadID) {
             list.list.CopyTextureRegion(&to(f[0]), 0, 0, 0, &at(&copy.texture, 0), None);
             list.list.CopyTextureRegion(&to(f[1]), 0, 0, 0, &at(&copy.texture, 1), None);
         }
+        // Leave the planes in different states and the twin newer. The next
+        // list must copy the twin back before reconciling its starting states.
+        crate::list::ensure_subresource_state(&list, depth, 1, 0x20);
+        for v in &planes {
+            readable(&list, &used(ResourceType::Uav), v, false);
+        }
+        run(&list, &slots, &write, 0, None, (8, 8));
         list.close();
         host.execute(&[&list]);
+        assert_eq!([copy.state(0), copy.state(1)], [0x800, 0x20]);
         // The title's float for 16-bit value u (its 1/65535 is 0x37800080).
         let float = |u: u32| (u as f32 * f32::from_bits(0x3780_0080)).to_bits();
         for (x, y) in [(0usize, 0usize), (5, 0), (63, 2), (17, 40), (63, 63)] {
@@ -4039,18 +4047,19 @@ void main(uint3 id : SV_DispatchThreadID) {
         readable(&list, &used(ResourceType::Uav), &planes[0], false);
         let twin = copy.twin.get().and_then(Option::as_ref).expect("a twin");
         let mut g = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+        let mut barriers = Vec::new();
         for (p, plane) in twin.planes.iter().enumerate() {
             // SAFETY: a live resource.
             let pd = unsafe { plane.texture.GetDesc() };
             // SAFETY: an output for one subresource.
             unsafe { host.device.GetCopyableFootprints(&pd, 0, 1, f[p].Offset, Some(&mut g[p]), None, None, None) };
-            if let Some(b) = list.move_texture(plane, 0x800) {
-                // SAFETY: an open list.
-                unsafe { list.list.ResourceBarrier(&[b]) };
-            }
+            list.move_texture(plane, 0x800, &mut barriers);
         }
         // SAFETY: an open list, the twin's planes in the copy source state.
         unsafe {
+            if !barriers.is_empty() {
+                list.list.ResourceBarrier(&barriers);
+            }
             list.list.CopyTextureRegion(&to(g[0]), 0, 0, 0, &at(&twin.planes[0].texture, 0), None);
             list.list.CopyTextureRegion(&to(g[1]), 0, 0, 0, &at(&twin.planes[1].texture, 0), None);
         }
@@ -4508,9 +4517,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Uav), &uav1, false);
         let tex1 = crate::resource::texture_at(va1, &tex1_res).unwrap();
-        let mut before_state = None;
-        list.transition(tex1, 0x8, None, |_, _, before, _| before_state = Some(before));
-        assert_eq!(before_state, None, "placed UAV moved to UNORDERED_ACCESS");
+        let copy = crate::resource::host_copy(tex1).unwrap();
+        assert_eq!(
+            list.recorded_state(&copy, 0),
+            Some(0x8),
+            "placed UAV moved to UNORDERED_ACCESS"
+        );
         run(&list, &slots, &write, 0, None, (1, 1));
 
         readable(&list, &used(ResourceType::Srv), &srv1, false);
