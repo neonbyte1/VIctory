@@ -134,6 +134,10 @@ pub(crate) struct State {
     fixed: Fixed,
     /// Host-computed compute dispatch spread constants `[row, asked_x]`.
     dispatch_spread: [u32; 2],
+    /// The X thread count of a `DispatchX` that gives thread counts, for a
+    /// program with the thread-count guard (`USER_DISPATCH_THREADS_X`); 0
+    /// (no limit) otherwise.
+    dispatch_threads_x: u32,
     /// The host GPU address of the clamped record an indirect dispatch with
     /// the plain signature reads its spread words from (root SRV
     /// `DISPATCH_RECORD`; `crate::indirect::Plain::Signature`), 0 when
@@ -290,6 +294,18 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
         roots.resize(slot + 1, Root::None);
     }
     roots[slot] = root;
+}
+
+fn dispatch_counts(
+    flags: Option<u32>,
+    guarded: bool,
+    threads: Option<[u32; 3]>,
+    counts: [u32; 3],
+) -> ([u32; 3], bool) {
+    let Some(size) = threads.filter(|_| guarded && flags.is_some_and(|f| f & 0x20 != 0)) else {
+        return (counts, false);
+    };
+    (std::array::from_fn(|i| counts[i].div_ceil(size[i])), true)
 }
 
 impl State {
@@ -567,6 +583,8 @@ impl State {
             (Some(Root::Constants(c)), RootType::Constants) => {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
+            // The real X thread count is set just before the dispatch.
+            (_, RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)) => 0,
             _ => {
                 once!(
                     slot,
@@ -954,6 +972,11 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.slot == victory_shader::emit::DISPATCH_SLOT => {
                             self.dispatch_spread[usize::from(u.dword != 0)]
+                        }
+                        None if u.root
+                            == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X) =>
+                        {
+                            self.dispatch_threads_x
                         }
                         None if is_root_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
@@ -1373,8 +1396,8 @@ impl State {
         true
     }
 
-    /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    /// Runs a dispatch on the host; `flags` are `DispatchX`'s.
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
         crate::indirect::end_window(list);
         if x == 0 || y == 0 || z == 0 {
             return;
@@ -1414,6 +1437,20 @@ impl State {
             crate::pipeline::not_dispatched(self.pipeline as This, "a graphics pipeline");
             return;
         }
+        // `DispatchX` with flag 0x20 gives thread counts: a program with the
+        // thread-count guard (its word's `dword` is the group's X width) runs
+        // the groups that hold them.
+        let width = p.stages.first().and_then(|s| {
+            let word =
+                s.translated().host.user_data.iter().find(|u| {
+                    u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
+                });
+            word.map(|u| u.dword)
+        });
+        let counts = [x, y, z];
+        let ([x, y, z], converted) =
+            dispatch_counts(flags, width.is_some(), width.map(|w| [w, 1, 1]), counts);
+        let threads_x = if converted { counts[0] } else { 0 };
         let can_spread = p.stages.first().is_some_and(|s| {
             s.translated()
                 .host
@@ -1431,8 +1468,10 @@ impl State {
             );
         }
         self.dispatch_spread = [row, asked];
+        self.dispatch_threads_x = threads_x;
         let bound = self.bind(list, p, true);
         self.dispatch_spread = [0, 0];
+        self.dispatch_threads_x = 0;
         if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::not_dispatched(self.pipeline as This, NOT_RUN.with(|w| w.get()));
@@ -3038,6 +3077,25 @@ fn expand_title_rects(from: usize, to: usize, n: usize, stride: usize, elements:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_x_counts_are_groups_without_a_partial_dispatch_guard() {
+        let sizes = Some([64, 1, 1]);
+        let counts = [129, 1, 1];
+        assert_eq!(
+            dispatch_counts(Some(0x20), true, sizes, counts),
+            ([3, 1, 1], true)
+        );
+        assert_eq!(
+            dispatch_counts(Some(0x20), false, sizes, counts),
+            (counts, false)
+        );
+        assert_eq!(dispatch_counts(None, true, sizes, counts), (counts, false));
+        assert_eq!(
+            dispatch_counts(Some(0x20), true, None, counts),
+            (counts, false)
+        );
+    }
 
     mod structured_clear;
 

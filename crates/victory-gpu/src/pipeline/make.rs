@@ -961,10 +961,10 @@ mod tests {
         let mut state = crate::draw::State::default();
         state.set_pipeline(title);
         let zero_demands = [(0, 1, 1), (1, 0, 1), (1, 1, 0)].map(|(x, y, z)| {
-            state.dispatch(&list, x, y, z);
+            state.dispatch(&list, x, y, z, None);
             pending.used.load(Ordering::Relaxed)
         });
-        state.dispatch(&list, 1, 1, 1);
+        state.dispatch(&list, 1, 1, 1, None);
         let nonempty_demand = pending.used.load(Ordering::Relaxed);
         list.close();
         slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);

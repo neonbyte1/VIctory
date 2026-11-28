@@ -267,9 +267,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
-    VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_RAW_OFFSET_BITS, VIEW_RAW_OFFSET_SHIFT,
-    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
-    null_buffer_view, set_view_heap_limit, view_heap_limit,
+    USER_DISPATCH_THREADS_X, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_RAW_OFFSET_BITS,
+    VIEW_RAW_OFFSET_SHIFT, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES,
+    VIEW_WRITE_BITS, VIEW_WRITES, null_buffer_view, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^14.
@@ -843,11 +843,20 @@ fn lowered(
         waterfall: !res.waterfall.compares.is_empty(),
         killing,
     };
-    Ok(match lower::lower(&parts(st, res, false, false)) {
+    // The ray-structure builder's Box32/16 rehydration kernels encode one
+    // header per active thread of the group; their last group can be short.
+    // The caller's dispatch knows the actual thread count.
+    let box_rehydration = matches!(
+        u128::from_be_bytes(c.digest),
+        0xba30_5538_e28d_414c_af39_a51a_4bc2_f308 | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
+    ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
+    let thread_limit = box_rehydration;
+    let lower = |parts| lower::lower_with_thread_limit(&parts, thread_limit);
+    Ok(match lower(parts(st, res, false, false)) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
             let console = structure::structure_console(p);
             let lowered = match &console {
-                Ok(console) => lower::lower(&parts(console, res, true, false)),
+                Ok(console) => lower(parts(console, res, true, false)),
                 Err(e) => Err(ShaderError::Unsupported {
                     offset: 0,
                     what: match e {
@@ -871,7 +880,7 @@ fn lowered(
                 // What the console flow cannot lower keeps the per-lane form
                 // where that translates; else the console flow's reason.
                 Err(e) => {
-                    let l = lower::lower(&parts(st, res, false, true)).map_err(|_| e)?;
+                    let l = lower(parts(st, res, false, true)).map_err(|_| e)?;
                     let form = form(&l, Flow::PerLaneFallback, res, false);
                     (l, form)
                 }
@@ -883,7 +892,7 @@ fn lowered(
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            let l = lower::lower(&parts(&st, &res, false, false))?;
+            let l = lower(parts(&st, &res, false, false))?;
             let form = form(&l, Flow::PerLane, &res, true);
             (l, form)
         }

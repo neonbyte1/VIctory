@@ -26,6 +26,7 @@ mod bvh;
 mod code_table;
 mod dot2;
 mod marks;
+mod partial;
 mod phi;
 mod uav_order;
 
@@ -382,6 +383,26 @@ enum Stop {
 const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_thread_limit(parts, false)
+}
+
+/// [`lower`], with a partial dispatch's thread-count guard when `partial`
+/// (`partial::THREAD_LIMIT_BARRIER`: not where the host form has a group
+/// barrier).
+pub(super) fn lower_with_thread_limit(
+    parts: &Parts,
+    partial: bool,
+) -> Result<Lowered, ShaderError> {
+    match lower_guarded(parts, partial) {
+        Err(ShaderError::Unsupported {
+            what: partial::THREAD_LIMIT_BARRIER,
+            ..
+        }) => lower_guarded(parts, false),
+        result => result,
+    }
+}
+
+fn lower_guarded(parts: &Parts, partial: bool) -> Result<Lowered, ShaderError> {
     // A numeric MODE read cannot supply the per-lane masks used by EXEC
     // and VCC branches, including inside whole-wave sections.
     if let Some(inst) = parts.p.blocks.iter().flat_map(|b| &b.insts).find(|inst| {
@@ -395,19 +416,23 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             what: "a hardware register read into EXEC or VCC",
         });
     }
-    match lower_program(parts, false) {
+    match lower_program(parts, false, partial) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
+        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true, partial),
         result => result,
     }
 }
 
-fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
+fn lower_program(
+    parts: &Parts,
+    numeric_selects: bool,
+    partial: bool,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects).run() {
+        match Lower::new(parts, &bad, numeric_selects).run(partial) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -2214,7 +2239,7 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
         if self.wants_console_flow && !self.x.console_cf && !self.x.per_lane_only {
             return Err(unsupported(0, CONSOLE_FLOW));
         }
@@ -2285,7 +2310,10 @@ impl<'a> Lower<'a> {
         self.find_sections();
         self.inputs()?;
         if self.x.native.stage == HwStage::Cs && !self.counters.contains_key(&order[0]) {
-            self.cs_spread_prologue();
+            let group = self.cs_spread_prologue();
+            if partial {
+                self.partial_dispatch_prologue(group);
+            }
             self.block[order[0]] = Some(self.cur);
         }
         if let Some(mesh) = self.s.mesh {
@@ -2361,6 +2389,9 @@ impl<'a> Lower<'a> {
                 0,
                 "a value used before the meeting of the halves that makes it",
             ));
+        }
+        if self.thread_limited() && self.s.m.has_function("dx.op.barrier") {
+            return Err(unsupported(0, partial::THREAD_LIMIT_BARRIER));
         }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -2604,7 +2635,8 @@ impl<'a> Lower<'a> {
     /// first two words of root SRV [`super::DISPATCH_RECORD`] when the user
     /// data's row is [`super::FROM_DISPATCH_RECORD`] (an indirect dispatch
     /// whose command signature sets no constants), else the user data's.
-    fn cs_spread_prologue(&mut self) {
+    /// Returns the group's X id after the remap.
+    fn cs_spread_prologue(&mut self) -> V {
         let base = self
             .x
             .native
@@ -2662,6 +2694,7 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(ret, Term::Ret);
         self.s.m.terminate(e, Term::CondBr(keep, body, ret));
         self.cur = body;
+        eff_x
     }
 
     /// The spread words (`row`, `asked`) of a program translated with

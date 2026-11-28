@@ -324,7 +324,6 @@ impl Module {
         }
     }
 
-    #[cfg(test)]
     pub fn has_function(&self, name: &str) -> bool {
         self.func_ids.contains_key(name)
     }

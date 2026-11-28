@@ -85,6 +85,12 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// marks"), after the written pages in the same bitmap: one bit per
 /// resource-heap index, [`HEAP_VIEWS`] of them.
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+/// `RootType::Other` code of the user-data dword the host computes: the
+/// actual X thread count of a one-dimensional partial dispatch. Zero keeps
+/// every thread of every dispatched group active; otherwise threads whose
+/// global X index is at or past it do nothing. The metadata `dword` holds
+/// the group's X width.
+pub const USER_DISPATCH_THREADS_X: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

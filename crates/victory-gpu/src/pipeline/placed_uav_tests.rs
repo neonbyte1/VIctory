@@ -189,7 +189,7 @@ fn placed_uav_dispatch_writes_its_texture() {
     state.set_constants(true, 0, &expected.map(f32::to_bits), 0);
     state.set_table(true, 1, handle);
     let dispatched = crate::draw::dispatched();
-    state.dispatch(&list, 1, 1, 1);
+    state.dispatch(&list, 1, 1, 1, None);
     assert!(
         crate::draw::dispatched() > dispatched,
         "dispatch did not record"
@@ -381,7 +381,7 @@ fn direct_and_indirect_dispatch_write_each_group_once() {
         state.set_pipeline(pipeline.0);
         state.set_heaps(&[views.0]);
         state.set_table(true, 0, handle);
-        state.dispatch(&list, requested[0], requested[1], requested[2]);
+        state.dispatch(&list, requested[0], requested[1], requested[2], None);
         // Bind the same PSO and root signature through ExecuteIndirect, but write
         // to a second buffer so the two results can be checked independently.
         state.set_table(true, 0, handle + 32);
@@ -589,7 +589,7 @@ fn check_spread_modes(cases: &[[u32; 3]], modes: &[SpreadMode]) {
                 TEST_SWITCHES.set(Some((windows, mode)));
                 let before = crate::draw::PLAIN_DISPATCHES.get();
                 if direct {
-                    state.dispatch(&list, requested[0], requested[1], requested[2]);
+                    state.dispatch(&list, requested[0], requested[1], requested[2], None);
                 } else {
                     assert!(state.execute_indirect(&list, (2, 12, 1), (arg_data as u64, 12), None));
                 }
