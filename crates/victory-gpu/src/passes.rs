@@ -18,7 +18,10 @@
 //! by kind of command, by how the programs were lowered
 //! (`victory_shader::emit::Form`, worked out by lowering each program once
 //! more on a thread of its own) and for the acceleration-structure builder,
-//! then the 25 programs that took most.
+//! then the 25 programs that took most, each with its commands per frame by
+//! kind, its mean and longest single command and its form, and up to 10
+//! more whose longest single command took over a millisecond (a dispatch
+//! of seconds that runs once in a while).
 //!
 //! A timestamp waits for the commands before it to finish (the host GPU
 //! writes it at the bottom of the pipe): commands of one list overlap less
@@ -106,6 +109,8 @@ pub(crate) struct Key {
     class: Class,
     builder: bool,
     program: Option<PassProgram>,
+    /// A dispatch's or mesh dispatch's groups (else zeros).
+    groups: [u32; 3],
 }
 
 impl Key {
@@ -114,6 +119,7 @@ impl Key {
             class,
             builder: false,
             program: None,
+            groups: [0; 3],
         }
     }
 
@@ -124,9 +130,15 @@ impl Key {
                 class,
                 builder,
                 program: Some(program),
+                groups: [0; 3],
             },
             None => Key::class(class),
         }
+    }
+
+    /// The same, of a dispatch of `groups`.
+    pub(crate) fn groups(self, groups: [u32; 3]) -> Key {
+        Key { groups, ..self }
     }
 }
 
@@ -195,6 +207,8 @@ struct Window {
 struct Row {
     ticks: u64,
     count: u64,
+    /// The longest one command took, and its groups.
+    longest: (u64, [u32; 3]),
     program: Option<PassProgram>,
 }
 
@@ -252,10 +266,15 @@ impl Window {
                 .or_insert_with(|| Row {
                     ticks: 0,
                     count: 0,
+                    longest: (0, [0; 3]),
                     program: key.program.clone(),
                 });
-            row.ticks += pair[1].saturating_sub(pair[0]);
+            let ticks = pair[1].saturating_sub(pair[0]);
+            row.ticks += ticks;
             row.count += 1;
+            if ticks > row.longest.0 {
+                row.longest = (ticks, key.groups);
+            }
             self.commands += 1;
         }
     }
@@ -346,6 +365,7 @@ fn program_form(shaders: &[Arc<Shader>], forms: &Forms) -> String {
 struct Program {
     ticks: u64,
     count: u64,
+    longest: (u64, [u32; 3]),
     builder: bool,
     by: BTreeMap<Class, u64>,
     shaders: Vec<Arc<Shader>>,
@@ -361,7 +381,9 @@ pub(crate) fn log(frames: f64, frequency: u64) {
         return;
     }
     let timed = (frames / every().max(1) as f64).max(1.0);
-    let ms = |ticks: u64| ticks as f64 * 1e3 / frequency.max(1) as f64 / timed;
+    // Of one command, then per timed frame.
+    let once = |ticks: u64| ticks as f64 * 1e3 / frequency.max(1) as f64;
+    let ms = |ticks: u64| once(ticks) / timed;
     let per = |n: u64| n as f64 / timed;
     tracing::info!(
         "GPU passes (one frame in {}, {timed:.1} timed): lists {:.2} ms/frame from first stamp to last \
@@ -378,12 +400,12 @@ pub(crate) fn log(frames: f64, frequency: u64) {
         per(w.untimed),
         w.collecting.as_secs_f64() * 1e3 / timed,
     );
-    let mut classes: BTreeMap<Class, (u64, u64)> = BTreeMap::new();
+    let mut classes: BTreeMap<Class, (u64, u64, u64)> = BTreeMap::new();
     let mut builder = (0, 0);
     let mut programs: HashMap<String, Program> = HashMap::new();
     for ((class, is_builder, _), row) in &w.rows {
         let c = classes.entry(*class).or_default();
-        (c.0, c.1) = (c.0 + row.ticks, c.1 + row.count);
+        *c = (c.0 + row.ticks, c.1 + row.count, c.2.max(row.longest.0));
         if *is_builder {
             (builder.0, builder.1) = (builder.0 + row.ticks, builder.1 + row.count);
         }
@@ -398,6 +420,9 @@ pub(crate) fn log(frames: f64, frequency: u64) {
         let p = programs.entry(name).or_default();
         p.ticks += row.ticks;
         p.count += row.count;
+        if row.longest.0 > p.longest.0 {
+            p.longest = row.longest;
+        }
         p.builder |= *is_builder;
         *p.by.entry(*class).or_default() += row.count;
         if p.shaders.is_empty() {
@@ -408,14 +433,15 @@ pub(crate) fn log(frames: f64, frequency: u64) {
         }
     }
     let mut classes: Vec<_> = classes.into_iter().collect();
-    classes.sort_by_key(|(_, (ticks, _))| std::cmp::Reverse(*ticks));
-    for (class, (ticks, n)) in classes {
+    classes.sort_by_key(|(_, (ticks, ..))| std::cmp::Reverse(*ticks));
+    for (class, (ticks, n, longest)) in classes {
         tracing::info!(
-            "  GPU passes kind {}: {:.2} ms/frame, {:.1}/frame, {:.1} us each",
+            "  GPU passes kind {}: {:.2} ms/frame, {:.1}/frame, {:.1} us each, longest {:.3} ms",
             class.name(),
             ms(ticks),
             per(n),
             ms(ticks) * 1e3 / per(n).max(1e-9),
+            once(longest),
         );
     }
     if builder.1 > 0 {
@@ -451,21 +477,40 @@ pub(crate) fn log(frames: f64, frequency: u64) {
             per(n)
         );
     }
-    programs.sort_by_key(|(_, p, _)| std::cmp::Reverse(p.ticks));
-    for (i, (name, p, form)) in programs.iter().take(25).enumerate() {
+    let line = |what: &str, i: usize, (name, p, form): &(String, Program, String)| {
         let by: Vec<String> =
             p.by.iter()
                 .map(|(class, n)| format!("{} {:.1}", class.name(), per(*n)))
                 .collect();
         tracing::info!(
-            "  GPU passes program {}: {:.2} ms/frame, {:.1}/frame ({}), {:.1} us each, {form}{}: {name}",
+            "  GPU passes {what} {}: {:.2} ms/frame, {:.1}/frame ({}), {:.1} us each, longest {:.3} ms{}, {form}{}: {name}",
             i + 1,
             ms(p.ticks),
             per(p.count),
             by.join(", "),
             ms(p.ticks) * 1e3 / per(p.count).max(1e-9),
+            once(p.longest.0),
+            match p.longest.1 {
+                [0, 0, 0] => String::new(),
+                [x, y, z] => format!(" ({x}x{y}x{z} groups)"),
+            },
             if p.builder { ", BVH builder" } else { "" },
         );
+    };
+    programs.sort_by_key(|(_, p, _)| std::cmp::Reverse(p.ticks));
+    for (i, program) in programs.iter().take(25).enumerate() {
+        line("program", i, program);
+    }
+    // Single long commands (a rare dispatch of seconds) by the longest.
+    let mut rest: Vec<_> = programs.iter().skip(25).collect();
+    rest.sort_by_key(|(_, p, _)| std::cmp::Reverse(p.longest.0));
+    for (i, program) in rest
+        .into_iter()
+        .take_while(|(_, p, _)| once(p.longest.0) >= 1.0)
+        .take(10)
+        .enumerate()
+    {
+        line("longest command, below the 25", i, program);
     }
 }
 

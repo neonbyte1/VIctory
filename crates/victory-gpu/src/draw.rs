@@ -1443,7 +1443,10 @@ impl State {
         crate::feeds::ran([], 0);
         #[cfg(feature = "diagnostics")]
         list.note_pass(
-            || self.pass_key(crate::passes::Class::Dispatch),
+            || {
+                self.pass_key(crate::passes::Class::Dispatch)
+                    .groups([x, y, z])
+            },
             || self.op_text(format!("dispatch {x}x{y}x{z}"), true),
         );
         #[cfg(feature = "diagnostics")]
@@ -1568,7 +1571,7 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_pass(
-                        || self.pass_key(crate::passes::Class::Mesh),
+                        || self.pass_key(crate::passes::Class::Mesh).groups([x, y, z]),
                         || self.op_text(format!("mesh {x}x{y}x{z}"), false),
                     );
                     // SAFETY: an open list with everything set.

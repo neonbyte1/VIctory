@@ -19,7 +19,7 @@ fn the_switch_says_how_often() {
 fn each_command_is_charged_to_its_stamp_and_the_next() {
     let keys = [
         Key::class(Class::ListStart),
-        Key::class(Class::Dispatch),
+        Key::class(Class::Dispatch).groups([18, 1, 1]),
         Key::class(Class::Copy),
         Key::class(Class::Dispatch),
     ];
@@ -55,6 +55,11 @@ fn each_command_is_charged_to_its_stamp_and_the_next() {
     let row = |c| w.rows.get(&(c, false, 0)).map(|r| (r.ticks, r.count));
     assert_eq!(row(Class::ListStart), Some((30, 1)));
     assert_eq!(row(Class::Dispatch), Some((500, 2)));
+    assert_eq!(
+        w.rows.get(&(Class::Dispatch, false, 0)).map(|r| r.longest),
+        Some((300, [18, 1, 1])),
+        "the longest single dispatch"
+    );
     assert_eq!(row(Class::Copy), Some((10, 1)));
     assert_eq!(row(Class::OurList), Some((50, 1)));
     assert_eq!(
