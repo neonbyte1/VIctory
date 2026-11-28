@@ -35,7 +35,9 @@ impl Lower<'_> {
             let prefix = self.s.m.bin(c, Bin::LShr, y, shift);
             p = self.s.m.bin(c, Bin::Or, p, prefix);
         }
-        let lz = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[p]);
+        let lz = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[p]);
         // normal: 11 bits after the leading one and the round bit
         let k14 = self.s.m.i32(14);
         let e = self.s.m.bin(c, Bin::Sub, k14, lz);

@@ -88,7 +88,14 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
             for col in 0..e.cols {
                 let v = (e.usage >> col & 1 != 0).then(|| {
                     let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.i32(k)];
-                    s.op(b, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args)
+                    s.op(
+                        b,
+                        &format!("loadInput{suffix}"),
+                        Attr::ReadNone,
+                        ty,
+                        4,
+                        &args,
+                    )
                 });
                 comps.push(v);
             }
@@ -100,7 +107,9 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     let position = elements
         .iter()
         .position(|e| e.kind == 3 && e.comp == 9 && e.usage & 0b11 == 0b11)
-        .ok_or(ShaderError::Malformed("a rectangle list without a position"))?;
+        .ok_or(ShaderError::Malformed(
+            "a rectangle list without a position",
+        ))?;
     let edge = |s: &mut Shader, i: usize, j: usize| -> [V; 2] {
         let take = |c: &[Vec<Option<V>>]| {
             let [x, y] = [c[position][0], c[position][1]];
@@ -192,7 +201,14 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
                         continue;
                     };
                     let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), v];
-                    s.op(b, &format!("storeOutput{suffix}"), Attr::NoUnwind, s.t.void, 5, &args);
+                    s.op(
+                        b,
+                        &format!("storeOutput{suffix}"),
+                        Attr::NoUnwind,
+                        s.t.void,
+                        5,
+                        &args,
+                    );
                 }
             }
             let stream = [s.m.i8(0)];
@@ -220,7 +236,11 @@ mod rule_tests {
         assert_eq!(right_angle([tl, bl, br]), 1);
         assert_eq!(right_angle([tl, bl, tr]), 0);
         assert_eq!(right_angle([bl, tr, tl]), 2);
-        assert_eq!(right_angle([[0.0, 0.0], [3.0, 1.0], [1.0, 0.0]]), 2, "obtuse at v2");
+        assert_eq!(
+            right_angle([[0.0, 0.0], [3.0, 1.0], [1.0, 0.0]]),
+            2,
+            "obtuse at v2"
+        );
         assert_eq!(right_angle([tl, tl, tl]), 1, "a point");
         assert_eq!(right_angle([tl, [f32::NAN, 0.0], br]), 1);
     }
@@ -303,13 +323,22 @@ mod tests {
         let b = s.entry;
         let (inputs, outputs) = if pixel {
             (
-                vec![element("SV_Position", 3, 4, 0, 4), element("TEXCOORD", 0, 2, 1, 2)],
+                vec![
+                    element("SV_Position", 3, 4, 0, 4),
+                    element("TEXCOORD", 0, 2, 1, 2),
+                ],
                 vec![element("SV_Target", 16, 0, 0, 4)],
             )
         } else {
             (
-                vec![element("POSITION", 0, 0, 0, 4), element("TEXCOORD", 0, 0, 1, 2)],
-                vec![element("SV_Position", 3, 0, 0, 4), element("TEXCOORD", 0, 0, 1, 2)],
+                vec![
+                    element("POSITION", 0, 0, 0, 4),
+                    element("TEXCOORD", 0, 0, 1, 2),
+                ],
+                vec![
+                    element("SV_Position", 3, 0, 0, 4),
+                    element("TEXCOORD", 0, 0, 1, 2),
+                ],
             )
         };
         let load = |s: &mut Shader, id: u32, col: u8| {
@@ -349,16 +378,26 @@ mod tests {
     fn rectangles_get_their_fourth_corner() {
         let (vs, ps) = (shader(false), shader(true));
         let gs = super::rectangle_gs(&vs).unwrap();
-        if let Ok(mut v) =
-            super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
-        {
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
             for c in [&vs, &gs, &ps] {
                 v.validate(&mut c.clone()).unwrap();
             }
         }
         let corner = |x: f32, y: f32| [x, y, 0.5, 1.0, x, y];
-        let (tl, bl, br, tr) = (corner(-0.5, 0.5), corner(-0.5, -0.5), corner(0.5, -0.5), corner(0.5, 0.5));
-        let orders = [[tl, bl, br], [tl, bl, tr], [bl, tr, tl], [tl, corner(0.0, 0.0), br]];
+        let (tl, bl, br, tr) = (
+            corner(-0.5, 0.5),
+            corner(-0.5, -0.5),
+            corner(0.5, -0.5),
+            corner(0.5, 0.5),
+        );
+        let orders = [
+            [tl, bl, br],
+            [tl, bl, tr],
+            [bl, tr, tl],
+            [tl, corner(0.0, 0.0), br],
+        ];
         let _one = super::super::valu_tests::ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -384,7 +423,10 @@ mod tests {
                     let inside = n < 3 && u.abs() < 0.5 && v.abs() < 0.5;
                     let want = if inside { [u, v, 1.0, 1.0] } else { [0.0; 4] };
                     let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
-                    assert!(near, "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}");
+                    assert!(
+                        near,
+                        "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}"
+                    );
                 }
             }
         }
@@ -520,7 +562,8 @@ mod tests {
         let interps: Vec<u8> = (0..10).map(|i| psv[els_at + 16 * i + 13]).collect();
         assert_eq!(interps, [0, 0, 0, 0, 0, 4, 2, 2, 1, 1]);
 
-        let corner = |[x, y]: [f32; 2], flat_f: f32, flat_u: f32| [x, y, 0.5, 1.0, x, y, flat_f, flat_u];
+        let corner =
+            |[x, y]: [f32; 2], flat_f: f32, flat_u: f32| [x, y, 0.5, 1.0, x, y, flat_f, flat_u];
         let (tl, bl, br, tr) = ([-0.5, 0.5], [-0.5, -0.5], [0.5, -0.5], [0.5, 0.5]);
         let orders = [
             ([tl, bl, br], [0.25, 3.0]),
@@ -553,7 +596,10 @@ mod tests {
                     let (u, v) = ((x + 0.5) / 16.0 - 1.0, 1.0 - (y + 0.5) / 16.0);
                     let inside = u.abs() < 0.5 && v.abs() < 0.5;
                     if !inside {
-                        assert!(t.iter().all(|a| a.abs() < 1e-4), "outside ({x}, {y}): {t:?}");
+                        assert!(
+                            t.iter().all(|a| a.abs() < 1e-4),
+                            "outside ({x}, {y}): {t:?}"
+                        );
                         continue;
                     }
                     let flat = if n == 0 || u < v - 1e-4 {
@@ -567,14 +613,20 @@ mod tests {
                                 .iter()
                                 .zip(&t[2..])
                                 .all(|(a, b)| (a - b).abs() < 1e-4)
-                                || second_flat.iter().zip(&t[2..]).all(|(a, b)| (a - b).abs() < 1e-4),
+                                || second_flat
+                                    .iter()
+                                    .zip(&t[2..])
+                                    .all(|(a, b)| (a - b).abs() < 1e-4),
                             "diagonal ({x}, {y}): {t:?}"
                         );
                         [t[2], t[3]]
                     };
                     let want = [u, v, flat[0], flat[1]];
                     let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
-                    assert!(near, "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}");
+                    assert!(
+                        near,
+                        "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}"
+                    );
                 }
             }
         }

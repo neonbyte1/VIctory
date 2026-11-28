@@ -1,4 +1,4 @@
-﻿//! Views shaders reach through the resource heap itself (decision 0007,
+//! Views shaders reach through the resource heap itself (decision 0007,
 //! "Heap-indexed views"). Grand Theft Auto VI is largely bindless: its
 //! shaders load descriptors at indices they take from root constants or
 //! memory (`HostShader::heap`), so no draw names the views it reads. Every
@@ -62,7 +62,6 @@ enum Seen {
     /// console bytes.
     Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64)),
 }
-
 
 /// Kinds of views left without a host view, for the census.
 #[cfg(feature = "diagnostics")]
@@ -148,11 +147,20 @@ impl Inner {
     }
 
     fn count(&mut self, index: u32, seen: &Seen, add: bool) {
-        let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
+        let step = |n: &mut u32| {
+            if add {
+                *n += 1
+            } else {
+                *n = n.saturating_sub(1)
+            }
+        };
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
-                let e = self.ranges.entry(key).or_insert_with(|| (0, shadow.clone()));
+                let e = self
+                    .ranges
+                    .entry(key)
+                    .or_insert_with(|| (0, shadow.clone()));
                 let was = e.0;
                 step(&mut e.0);
                 let now = e.0;
@@ -168,7 +176,9 @@ impl Inner {
                     tally(&mut ends.1, key.1, now > 0);
                     tally(&mut ends.2, key.2, now > 0);
                     let hull = match (ends.1.keys().next(), ends.2.keys().next_back()) {
-                        (Some(&from), Some(&to)) => Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit())),
+                        (Some(&from), Some(&to)) => {
+                            Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit()))
+                        }
                         _ => None,
                     };
                     match hull {
@@ -195,14 +205,19 @@ impl Inner {
             Seen::Left(_) => {}
         }
     }
-
 }
 
 impl Viewed {
     /// Title slot `index` now holds `view` (none: no view), made on the
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
-        let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
+        let seen = view.and_then(|v| {
+            if made {
+                seen(v)
+            } else {
+                Some(Seen::Left(left_kind(v)))
+            }
+        });
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.replace(index, seen);
     }
@@ -211,7 +226,13 @@ impl Viewed {
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
     fn ranges(&self) -> Vec<Hull> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hulls
+            .values()
+            .cloned()
+            .collect()
     }
 }
 
@@ -228,7 +249,13 @@ fn seen(view: &View) -> Option<Seen> {
     let (shadow, address, len) = match *view {
         View::Constant(address, size) => {
             let len = u64::from(size);
-            ((len > 0).then(|| crate::shadow::find(address, len)).flatten()?, address, len)
+            (
+                (len > 0)
+                    .then(|| crate::shadow::find(address, len))
+                    .flatten()?,
+                address,
+                len,
+            )
         }
         _ => crate::descriptor::host::view_copy(view)?,
     };
@@ -244,7 +271,11 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
     match view {
         View::Placed(_, resource, desc) if resource[0] != 1 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            (2, address, crate::resource::placed_size(resource).unwrap_or(0))
+            (
+                2,
+                address,
+                crate::resource::placed_size(resource).unwrap_or(0),
+            )
         }
         View::Unordered(..) | View::Placed(true, ..) => (1, 0, 0),
         View::Shader(..) | View::Placed(false, ..) | View::Constant(..) => (0, 0, 0),
@@ -276,7 +307,10 @@ fn texture_range(r: usize) -> Option<(usize, usize)> {
 /// reach the texture's memory only then.
 pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
-    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+    textures: &[(
+        Arc<crate::texture::Staging>,
+        Arc<crate::resource::HostTexture>,
+    )],
     settle: &mut dyn FnMut(u64, crate::host::Settled),
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder {
@@ -294,9 +328,13 @@ pub(crate) fn uploads(
     // cached watch::DIRTY bit without taking Resource::host or Staging locks,
     // and staging creation happens outside each heap's lock so title threads
     // writing descriptors are not stalled.
-    let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
+    let mut work: Vec<(
+        Arc<crate::texture::Staging>,
+        Arc<crate::resource::HostTexture>,
+    )> = Vec::new();
     let mut staged_set: Option<std::collections::HashSet<*const crate::texture::Staging>> = None;
-    let mut push_unique = |staging: Arc<crate::texture::Staging>, copy: Arc<crate::resource::HostTexture>| {
+    let mut push_unique = |staging: Arc<crate::texture::Staging>,
+                           copy: Arc<crate::resource::HostTexture>| {
         let ptr = Arc::as_ptr(&staging);
         if let Some(set) = staged_set.as_mut() {
             if set.insert(ptr) {
@@ -307,7 +345,8 @@ pub(crate) fn uploads(
                 work.push((staging, copy));
             }
         } else {
-            let mut set: std::collections::HashSet<_> = work.iter().map(|(s, _)| Arc::as_ptr(s)).collect();
+            let mut set: std::collections::HashSet<_> =
+                work.iter().map(|(s, _)| Arc::as_ptr(s)).collect();
             if set.insert(ptr) {
                 work.push((staging, copy));
             }
@@ -318,11 +357,17 @@ pub(crate) fn uploads(
     // completes: a texture over them is brought up anyway, after a settle,
     // whether its memory changed yet or not.
     let flying = crate::shadow::flight_now();
-    let crosses = |(start, end): (usize, usize)| flying.as_ref().is_some_and(|f| f.crossing(start, end, 0).is_some());
+    let crosses = |(start, end): (usize, usize)| {
+        flying
+            .as_ref()
+            .is_some_and(|f| f.crossing(start, end, 0).is_some())
+    };
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded), or its memory has not changed.
-        if copy.host_written.load(Relaxed) || !staging.maybe_changed() && !crosses(staging.title_range()) {
+        if copy.host_written.load(Relaxed)
+            || !staging.maybe_changed() && !crosses(staging.title_range())
+        {
             continue;
         }
         push_unique(staging.clone(), copy.clone());
@@ -335,10 +380,15 @@ pub(crate) fn uploads(
         for viewed in heaps {
             let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
             for (&r, entry) in inner.textures.iter_mut() {
-                let clean = entry.dirty.is_some_and(|bit| crate::watch::clean_bit(Some(bit)));
+                let clean = entry
+                    .dirty
+                    .is_some_and(|bit| crate::watch::clean_bit(Some(bit)));
                 let crossed = (clean || entry.epoch == epoch)
                     && flying.is_some()
-                    && entry.range.get_or_insert_with(|| texture_range(r)).is_some_and(crosses);
+                    && entry
+                        .range
+                        .get_or_insert_with(|| texture_range(r))
+                        .is_some_and(crosses);
                 if (clean || entry.epoch == epoch) && !crossed {
                     continue;
                 }
@@ -355,7 +405,8 @@ pub(crate) fn uploads(
                 // the submission that read it, which can see bytes one refresh
                 // old (a slot the title rewrites is made fresh anyway); upload on
                 // the mark itself if that shows.
-                let (bit, copy) = crate::resource::bindless_upload_check(r as This, presented, crossed);
+                let (bit, copy) =
+                    crate::resource::bindless_upload_check(r as This, presented, crossed);
                 if entry.dirty.is_none() && bit.is_some() {
                     entry.dirty = bit;
                 }
@@ -401,11 +452,15 @@ pub(crate) fn uploads(
         settle(owner, crate::host::Settled::Texture);
     }
     let uploads = crate::texture::refresh_all(&work);
-    let ready: Vec<(&Arc<crate::texture::Staging>, &Arc<crate::resource::HostTexture>, &crate::texture::Upload)> =
-        work.iter()
-            .zip(uploads.iter())
-            .filter_map(|((staging, copy), upload)| upload.as_ref().map(|u| (staging, copy, u)))
-            .collect();
+    let ready: Vec<(
+        &Arc<crate::texture::Staging>,
+        &Arc<crate::resource::HostTexture>,
+        &crate::texture::Upload,
+    )> = work
+        .iter()
+        .zip(uploads.iter())
+        .filter_map(|((staging, copy), upload)| upload.as_ref().map(|u| (staging, copy, u)))
+        .collect();
     if ready.is_empty() {
         return None;
     }
@@ -477,14 +532,23 @@ impl Drop for Uploads {
 /// was clean.
 pub(crate) fn refresh(viewed: &Viewed, add: impl FnMut(&Arc<Shadow>, usize, usize, bool)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    let entries = inner.hulls.values().map(|(shadow, address, len, uav, bit)| {
-        let (address, len) = if *uav && shadow.marked() {
-            shadow.page_range(*address, *len)
-        } else {
-            (*address, *len)
-        };
-        (shadow, Arc::as_ptr(shadow) as usize, address as usize, len as usize, *bit)
-    });
+    let entries = inner
+        .hulls
+        .values()
+        .map(|(shadow, address, len, uav, bit)| {
+            let (address, len) = if *uav && shadow.marked() {
+                shadow.page_range(*address, *len)
+            } else {
+                (*address, *len)
+            };
+            (
+                shadow,
+                Arc::as_ptr(shadow) as usize,
+                address as usize,
+                len as usize,
+                *bit,
+            )
+        });
     crate::shadow::refresh_where_needed(entries, add);
 }
 
@@ -577,7 +641,11 @@ pub(crate) fn log(frames: f64) {
             c.dedup();
             c.len()
         };
-        let left: Vec<String> = KINDS.iter().zip(left).map(|(k, n)| format!("{k} {n}")).collect();
+        let left: Vec<String> = KINDS
+            .iter()
+            .zip(left)
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect();
         let all = crate::shadow::all();
         let all_bytes: u64 = all.iter().map(|s| s.range().1).sum();
         tracing::info!(
@@ -612,7 +680,10 @@ mod tests {
     /// [`uploads`] with no submission in flight to settle.
     fn uploads_now(
         heaps: &[Arc<Viewed>],
-        textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+        textures: &[(
+            Arc<crate::texture::Staging>,
+            Arc<crate::resource::HostTexture>,
+        )],
     ) -> Option<Uploads> {
         uploads(heaps, textures, &mut crate::host::nothing_in_flight)
     }
@@ -639,7 +710,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 1),
         ];
         let device = &crate::host::host().unwrap().device;
-        crate::compute::compute(device, s!("heap"), SOURCE, 0, &[crate::compute::table(&ranges)]).unwrap()
+        crate::compute::compute(
+            device,
+            s!("heap"),
+            SOURCE,
+            0,
+            &[crate::compute::table(&ranges)],
+        )
+        .unwrap()
     }
 
     /// A title resource from a description in the console's layout (56
@@ -647,8 +725,20 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// samples, layout, flags).
     fn resource(dimension: u32, width: u64, height: u32, format: u32, layout: u32) -> This {
         let desc: [u32; 14] = [
-            dimension, 0, 0, 0, width as u32, (width >> 32) as u32, height, 1 | 1 << 16, format, 1, 0,
-            layout, 0, 0,
+            dimension,
+            0,
+            0,
+            0,
+            width as u32,
+            (width >> 32) as u32,
+            height,
+            1 | 1 << 16,
+            format,
+            1,
+            0,
+            layout,
+            0,
+            0,
         ];
         let properties = [1u32, 0, 0, 0, 0];
         let mut out = std::ptr::null();
@@ -674,10 +764,29 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// A title resource at `address` (title memory of its own), as the
     /// title places buffers and textures in its heaps.
-    fn resource_at(address: usize, dimension: u32, width: u64, height: u32, format: u32, layout: u32) -> This {
+    fn resource_at(
+        address: usize,
+        dimension: u32,
+        width: u64,
+        height: u32,
+        format: u32,
+        layout: u32,
+    ) -> This {
         let desc: [u32; 14] = [
-            dimension, 0, 0, 0, width as u32, (width >> 32) as u32, height, 1 | 1 << 16, format, 1, 0,
-            layout, 0, 0,
+            dimension,
+            0,
+            0,
+            0,
+            width as u32,
+            (width >> 32) as u32,
+            height,
+            1 | 1 << 16,
+            format,
+            1,
+            0,
+            layout,
+            0,
+            0,
         ];
         let mut out = std::ptr::null();
         let iid = crate::object::guid(
@@ -718,7 +827,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             let seen = range.map(|(from, len)| Seen::Buffer(copy.clone(), at + from, len, false));
             inner.replace(slot, seen);
         };
-        let hull = || viewed.ranges().iter().map(|h| (h.1 - at, h.2)).collect::<Vec<_>>();
+        let hull = || {
+            viewed
+                .ranges()
+                .iter()
+                .map(|h| (h.1 - at, h.2))
+                .collect::<Vec<_>>()
+        };
         set(0, Some((0x100, 0x100)));
         set(1, Some((0x800, 0x200)));
         set(2, Some((0x100, 0x100)));
@@ -845,7 +960,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let write = |base: u32, texel: u8| {
             let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
             let (tex_bytes, tex_desc) = crate::resource::texture_memory(tex).unwrap();
-            let size = crate::resource::texture_layout(&tex_desc).unwrap().planes[0].layout.size as usize;
+            let size = crate::resource::texture_layout(&tex_desc).unwrap().planes[0]
+                .layout
+                .size as usize;
             // SAFETY: the resources' own memory, 256 bytes and the texture's.
             unsafe {
                 let words = std::slice::from_raw_parts_mut(src_bytes.cast::<u32>(), 64);
@@ -868,7 +985,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let tex = resource_at(a + PAGE_BYTES, 3, 4, 1, 28, LINEAR);
         let dst = resource(1, 256, 1, 0, 1);
         let (_, tex_desc) = crate::resource::texture_memory(tex).unwrap();
-        let size = crate::resource::texture_layout(&tex_desc).unwrap().planes[0].layout.size as usize;
+        let size = crate::resource::texture_layout(&tex_desc).unwrap().planes[0]
+            .layout
+            .size as usize;
         let write = |base: u32, texel: u8| {
             // SAFETY: the second view of the buffer's and the texture's pages.
             unsafe {
@@ -901,7 +1020,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             0x4f49,
             [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
         );
-        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
         let title_heap = crate::descriptor::heap(heap);
         let slot = |i: u64| title_heap.start + 32 * i;
         // Raw views of 64 dwords: format R32_TYPELESS, buffer dimension,
@@ -916,13 +1038,17 @@ void main(uint3 id : SV_DispatchThreadID) {
         let list = host.new_list().unwrap();
         let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
         let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
-        for (round, (base, texel)) in [(1000u32, 0x40u8), (5000, 0x10), (9000, 0x22)].into_iter().enumerate() {
+        for (round, (base, texel)) in [(1000u32, 0x40u8), (5000, 0x10), (9000, 0x22)]
+            .into_iter()
+            .enumerate()
+        {
             if round > 0 {
                 list.reset();
             }
             // SAFETY: an open list, live objects of ours.
             unsafe {
-                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list
+                    .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
                 list.list.SetComputeRootSignature(&root);
                 list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
                 list.list.SetPipelineState(&pso);
@@ -935,7 +1061,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             host.execute(&[&list]);
             let words = out.read_host(dst_bytes as u64, 64);
             for (i, &v) in words.iter().enumerate() {
-                assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
+                assert_eq!(
+                    v,
+                    base + i as u32 + u32::from(texel),
+                    "round {round}, dword {i}"
+                );
             }
         }
     }
@@ -959,25 +1089,44 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: 64x64 RGBA8 linear = 16 KiB inside our 64 KiB pool page.
         unsafe { std::ptr::write_bytes(pool as *mut u8, 0x11, 64 * 64 * 4) };
         copy.stamp();
-        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "initial upload");
+        assert!(
+            uploads_now(std::slice::from_ref(&viewed), &[]).is_some(),
+            "initial upload"
+        );
         assert_eq!(crate::texture::uploads(tex), 1);
 
         // Second submission while clean populates the cached dirty bit in `viewed`
         // and skips recording an upload list.
-        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_none(), "clean skips list");
+        assert!(
+            uploads_now(std::slice::from_ref(&viewed), &[]).is_none(),
+            "clean skips list"
+        );
         assert_eq!(crate::texture::uploads(tex), 1);
         assert!(
-            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.dirty).is_some(),
+            viewed
+                .inner
+                .lock()
+                .unwrap()
+                .textures
+                .get(&(tex as usize))
+                .and_then(|e| e.dirty)
+                .is_some(),
             "dirty bit cached in Viewed"
         );
         // Third submission hits the lock-free cached-bit fast path.
-        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_none(), "cached clean skips");
+        assert!(
+            uploads_now(std::slice::from_ref(&viewed), &[]).is_none(),
+            "cached clean skips"
+        );
         assert_eq!(crate::texture::uploads(tex), 1);
 
         // Writing the guarded page flips the watch bit back to dirty -> re-upload.
         // SAFETY: as above; write-fault handler opens the page and marks dirty.
         unsafe { std::ptr::write_bytes(pool as *mut u8, 0x22, 64 * 64 * 4) };
-        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "dirty re-uploads");
+        assert!(
+            uploads_now(std::slice::from_ref(&viewed), &[]).is_some(),
+            "dirty re-uploads"
+        );
         assert_eq!(crate::texture::uploads(tex), 2);
 
         // Evicting the host texture clears the cached bit so a recreated host
@@ -985,14 +1134,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(copy);
         assert!(crate::resource::give_up_now(tex), "evicted");
         assert!(
-            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.dirty).is_none(),
+            viewed
+                .inner
+                .lock()
+                .unwrap()
+                .textures
+                .get(&(tex as usize))
+                .and_then(|e| e.dirty)
+                .is_none(),
             "cached dirty bit cleared on eviction"
         );
         let copy2 = crate::resource::host_copy(tex).expect("recreated host texture");
         copy2.stamp();
         // SAFETY: as above.
         unsafe { std::ptr::write_bytes(pool as *mut u8, 0x33, 64 * 64 * 4) };
-        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "recreated uploads");
+        assert!(
+            uploads_now(std::slice::from_ref(&viewed), &[]).is_some(),
+            "recreated uploads"
+        );
         assert_eq!(crate::texture::uploads(tex), 1);
 
         drop(copy2);
@@ -1011,7 +1170,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let tex = resource(3, 16, 16, 28, LINEAR);
         let copy = crate::resource::host_copy(tex).expect("host texture");
         let (mem, desc_meta) = crate::resource::texture_memory(tex).unwrap();
-        let size = crate::resource::texture_layout(&desc_meta).unwrap().planes[0].layout.size as usize;
+        let size = crate::resource::texture_layout(&desc_meta).unwrap().planes[0]
+            .layout
+            .size as usize;
         let viewed = Arc::new(Viewed::default());
         register(&viewed);
         let mut desc = [0u32; 10];
@@ -1021,16 +1182,32 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: committed texture memory of `size` bytes.
         unsafe { std::ptr::write_bytes(mem.cast_mut(), 0x41, size) };
         copy.stamp();
-        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "initial untracked upload");
-        assert_eq!(crate::texture::uploads(tex), 1);
-        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_none(), "unchanged hash skips");
         assert!(
-            viewed.inner.lock().unwrap().textures.get(&(tex as usize)).and_then(|e| e.dirty).is_none(),
+            uploads_now(std::slice::from_ref(&viewed), &[]).is_some(),
+            "initial untracked upload"
+        );
+        assert_eq!(crate::texture::uploads(tex), 1);
+        assert!(
+            uploads_now(std::slice::from_ref(&viewed), &[]).is_none(),
+            "unchanged hash skips"
+        );
+        assert!(
+            viewed
+                .inner
+                .lock()
+                .unwrap()
+                .textures
+                .get(&(tex as usize))
+                .and_then(|e| e.dirty)
+                .is_none(),
             "untracked texture has no cached dirty bit"
         );
         // SAFETY: as above.
         unsafe { std::ptr::write_bytes(mem.cast_mut(), 0x52, size) };
-        assert!(uploads_now(std::slice::from_ref(&viewed), &[]).is_some(), "changed untracked re-uploads");
+        assert!(
+            uploads_now(std::slice::from_ref(&viewed), &[]).is_some(),
+            "changed untracked re-uploads"
+        );
         assert_eq!(crate::texture::uploads(tex), 2);
 
         drop(copy);

@@ -66,7 +66,12 @@ fn build() -> &'static [u8; 32] {
             );
         }
         crate::descriptor::host::probe_view_limit();
-        key(victory_shader::SOURCE_HASH, ENCODING, limit, victory_shader::emit::view_heap_limit())
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            victory_shader::emit::view_heap_limit(),
+        )
     })
 }
 
@@ -119,9 +124,15 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
         target,
         pair_meetings,
     };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &host_key(build(), target, pair_meetings), container, translate),
+        Some(cache) => cached(
+            cache,
+            &host_key(build(), target, pair_meetings),
+            container,
+            translate,
+        ),
         None => (translate(container), false),
     }
 }
@@ -566,11 +577,23 @@ mod tests {
             lanes_min: 32,
             lanes_max: 64,
         };
-        assert_eq!(host_key(&build, nvidia, false), host_key(&build, nvidia, false));
-        assert_ne!(host_key(&build, nvidia, false), host_key(&build, rdna, false));
-        assert_ne!(host_key(&build, nvidia, false), host_key(&[8; 32], nvidia, false));
+        assert_eq!(
+            host_key(&build, nvidia, false),
+            host_key(&build, nvidia, false)
+        );
+        assert_ne!(
+            host_key(&build, nvidia, false),
+            host_key(&build, rdna, false)
+        );
+        assert_ne!(
+            host_key(&build, nvidia, false),
+            host_key(&[8; 32], nvidia, false)
+        );
         // Pair meetings change the translation of the builder's programs.
-        assert_ne!(host_key(&build, nvidia, false), host_key(&build, nvidia, true));
+        assert_ne!(
+            host_key(&build, nvidia, false),
+            host_key(&build, nvidia, true)
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

@@ -1,0 +1,16 @@
+# Fork only: main is rustfmt-clean, keep it that way.
+name: fmt
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check

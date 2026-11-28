@@ -48,7 +48,10 @@ fn copy_list(host: &Host, label: &str) -> (HostList, *mut u32) {
     for (i, offset) in [0, 4].into_iter().enumerate() {
         list.note_op(|| format!("copy [fixture {label}-{i}]"));
         // SAFETY: the resources are live and stay in upload and readback states.
-        unsafe { list.list.CopyBufferRegion(&readback, offset, &upload, offset, 4) };
+        unsafe {
+            list.list
+                .CopyBufferRegion(&readback, offset, &upload, offset, 4)
+        };
     }
     list.close();
     (list, output.cast())

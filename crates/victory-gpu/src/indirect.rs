@@ -42,7 +42,9 @@ uint3 mesh_groups(uint3 g) {
     };
 }
 
-const SOURCE: &str = concat!(mesh_groups!(), r#"
+const SOURCE: &str = concat!(
+    mesh_groups!(),
+    r#"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint spread; };
 // The title's records, read only; the clamped ones go to the list's own.
 // In words: the caller refuses addresses and strides not multiples of 4.
@@ -161,7 +163,8 @@ void main(uint lane : SV_GroupIndex) {
         budget[0] = BUDGET - left;
     }
 }
-"#);
+"#
+);
 
 // As `crate::compute` takes it (Wine's compiler as well as Microsoft's): no
 // `RootSignature` attribute ([`batch_clamp`] makes it: the batch (b0), the
@@ -363,13 +366,22 @@ fn clamp() -> Option<&'static Clamp> {
 fn make() -> windows::core::Result<Clamp> {
     use D3D12_ROOT_PARAMETER_TYPE_SRV as SRV;
     use D3D12_ROOT_PARAMETER_TYPE_UAV as UAV;
-    let params = [constants(0, 4), root_view(SRV, 0, 0), root_view(UAV, 1, 0), root_view(UAV, 0, 0)];
+    let params = [
+        constants(0, 4),
+        root_view(SRV, 0, 0),
+        root_view(UAV, 1, 0),
+        root_view(UAV, 0, 0),
+    ];
     make_with(SOURCE, s!("argument clamp"), &params)
 }
 
 /// A clamp pipeline of `source` (named `name` in compiler messages) and
 /// its root signature of `params` (`crate::compute`).
-fn make_with(source: &str, name: PCSTR, params: &[D3D12_ROOT_PARAMETER]) -> windows::core::Result<Clamp> {
+fn make_with(
+    source: &str,
+    name: PCSTR,
+    params: &[D3D12_ROOT_PARAMETER],
+) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let (root, pso) = compute(device, name, source, 0, params)?;
     Ok(Clamp { root, pso })
@@ -382,7 +394,13 @@ fn batch_clamp() -> Option<&'static Clamp> {
     BATCH
         .get_or_init(|| {
             // As [`HoistedClamps::record_prelude`] binds them.
-            let params = [constants(0, 4), root_view(SRV, 0, 0), root_view(SRV, 1, 0), root_view(UAV, 0, 0), root_view(UAV, 1, 0)];
+            let params = [
+                constants(0, 4),
+                root_view(SRV, 0, 0),
+                root_view(SRV, 1, 0),
+                root_view(UAV, 0, 0),
+                root_view(UAV, 1, 0),
+            ];
             match make_with(BATCH_SOURCE, s!("batch clamp"), &params) {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -519,7 +537,11 @@ impl HoistedClamps {
     }
 
     fn ensure_upload(&mut self, needed_jobs: usize) -> bool {
-        if self.upload.as_ref().is_some_and(|u| u.capacity >= needed_jobs) {
+        if self
+            .upload
+            .as_ref()
+            .is_some_and(|u| u.capacity >= needed_jobs)
+        {
             return true;
         }
         let Some(host) = host() else {
@@ -570,9 +592,16 @@ impl HoistedClamps {
         }
         let (dst, dst_at) = self.alloc_room(len)?;
         // SAFETY: live D3D12 buffers.
-        let (buf_gpu, dst_gpu) = unsafe { (src_buf.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+        let (buf_gpu, dst_gpu) =
+            unsafe { (src_buf.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
         let (src_gpu, src_offset) = match gpu.checked_sub(buf_gpu) {
-            Some(rel) if rel.checked_add(len).is_some_and(|e| e <= u64::from(u32::MAX)) => (buf_gpu, rel as u32),
+            Some(rel)
+                if rel
+                    .checked_add(len)
+                    .is_some_and(|e| e <= u64::from(u32::MAX)) =>
+            {
+                (buf_gpu, rel as u32)
+            }
             _ => (gpu, 0),
         };
         self.keep_once(src_buf);
@@ -747,7 +776,11 @@ pub(crate) fn bound(
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(
+                &out,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
         ]);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ClampBarrierCalls, 2);
@@ -758,10 +791,18 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
         // One group walks every record.
-        list.crumbed(Crumb::Dispatch, Some("indirect argument clamp (ours)"), || l.Dispatch(records.min(1), 1, 1));
+        list.crumbed(
+            Crumb::Dispatch,
+            Some("indirect argument clamp (ours)"),
+            || l.Dispatch(records.min(1), 1, 1),
+        );
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+            transition(
+                &out,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            ),
         ]);
     }
     Some(out)
@@ -834,7 +875,8 @@ pub(crate) fn windows_on() -> bool {
 /// It needs the clamp windows ([`windows_on`]): without them there is no
 /// window for an execution to join.
 pub(crate) fn gaps_on() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switch::on_unless_zero("VICTORY_GPU_GAPS"));
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::switch::on_unless_zero("VICTORY_GPU_GAPS"));
     *ON
 }
 
@@ -903,7 +945,13 @@ pub(crate) enum Alone {
 /// [`gaps_on`]): `dispatch` an indirect dispatch, `stores` its shaders may
 /// store, `spread` its groups are spread (only the single clamp writes
 /// that layout).
-pub(crate) fn alone(windows: bool, gaps: bool, dispatch: bool, stores: bool, spread: bool) -> Option<Alone> {
+pub(crate) fn alone(
+    windows: bool,
+    gaps: bool,
+    dispatch: bool,
+    stores: bool,
+    spread: bool,
+) -> Option<Alone> {
     if !windows {
         Some(Alone::NoWindows)
     } else if spread {
@@ -939,7 +987,8 @@ pub(crate) fn count_alone(alone: Option<Alone>) {
 /// row of its own (`clamp`, `clamp window`), not to the command before.
 #[cfg(feature = "diagnostics")]
 fn note_clamp(list: &HostList, what: &'static str) {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switch::on("VICTORY_TIMED_CLAMP"));
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::switch::on("VICTORY_TIMED_CLAMP"));
     if *ON {
         list.note_op(|| what.to_owned());
     }
@@ -960,7 +1009,9 @@ const TABLE_BYTES: u64 = 16 + 32 * WINDOW_ENTRIES as u64;
 // As `crate::compute` takes it: no `RootSignature` attribute
 // ([`window_clamp`] makes it: t0 to t4, the budget u1, `dest` u0), and the
 // budget a structured buffer of `uint`.
-const WINDOW_SOURCE: &str = concat!(mesh_groups!(), r#"
+const WINDOW_SOURCE: &str = concat!(
+    mesh_groups!(),
+    r#"
 // The host copies records are read from, only read.
 ByteAddressBuffer a0 : register(t0);
 ByteAddressBuffer a1 : register(t1);
@@ -1063,7 +1114,8 @@ void main(uint lane : SV_GroupIndex) {
         budget[0] = BUDGET - left;
     }
 }
-"#);
+"#
+);
 
 fn window_clamp() -> Option<&'static Clamp> {
     use D3D12_ROOT_PARAMETER_TYPE_SRV as SRV;
@@ -1170,7 +1222,10 @@ pub(crate) fn windowed(
     }
     let mut window = list.clamp_window();
     let mut opened = false;
-    let fits = window.open.as_ref().is_some_and(|o| o.fits(source, bytes, records));
+    let fits = window
+        .open
+        .as_ref()
+        .is_some_and(|o| o.fits(source, bytes, records));
     let takes = fits && window.open.as_ref().is_some_and(|o| o.run.takes());
     #[cfg(feature = "diagnostics")]
     if fits && !takes {
@@ -1183,7 +1238,14 @@ pub(crate) fn windowed(
             done(list, &old.out);
         }
         let mut sources = vec![source];
-        sources.extend(window.recent.iter().copied().filter(|&s| s != source).take(WINDOW_SOURCES - 1));
+        sources.extend(
+            window
+                .recent
+                .iter()
+                .copied()
+                .filter(|&s| s != source)
+                .take(WINDOW_SOURCES - 1),
+        );
         window.recent.clone_from(&sources);
         OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
         window.open = Some(open(list, sources)?);
@@ -1194,7 +1256,16 @@ pub(crate) fn windowed(
     let at = o.bytes;
     if records > 0 {
         let index = o.sources.iter().position(|&s| s == source)? as u32;
-        let entry = [o.records, records, kind, stride, index, offset as u32, at as u32, 0];
+        let entry = [
+            o.records,
+            records,
+            kind,
+            stride,
+            index,
+            offset as u32,
+            at as u32,
+            0,
+        ];
         // SAFETY: the table's words lie in the list's upload memory, alive
         // until it is reset; the GPU reads them only once the list runs.
         unsafe {
@@ -1235,7 +1306,10 @@ impl Open {
 #[cfg(test)]
 fn joins(list: &HostList, source: u64, (_, stride, records): (u32, u32, u32)) -> bool {
     let bytes = u64::from(stride) * u64::from(records.max(1));
-    list.clamp_window().open.as_ref().is_some_and(|o| o.fits(source, bytes, records) && o.run.takes())
+    list.clamp_window()
+        .open
+        .as_ref()
+        .is_some_and(|o| o.fits(source, bytes, records) && o.run.takes())
 }
 
 /// Records a window's pass in `list`, reading records from `sources`.
@@ -1254,7 +1328,11 @@ fn open(list: &HostList, sources: Vec<u64>) -> Option<Open> {
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(
+                &out,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
         ]);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ClampBarrierCalls, 2);
@@ -1269,10 +1347,22 @@ fn open(list: &HostList, sources: Vec<u64>) -> Option<Open> {
         l.Dispatch(1, 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+            transition(
+                &out,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            ),
         ]);
     }
-    Some(Open { out, table: table as usize, sources, draws: 0, records: 0, bytes: 0, run: Run::default() })
+    Some(Open {
+        out,
+        table: table as usize,
+        sources,
+        draws: 0,
+        records: 0,
+        bytes: 0,
+        run: Run::default(),
+    })
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -1324,11 +1414,27 @@ mod tests {
             let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
             // SAFETY: the source and names live through the call; out pointers ours.
             let compiled = unsafe {
-                D3DCompile(source.as_ptr().cast(), source.len(), name, None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    name,
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
             };
-            let text = errors.as_ref().map(|e| String::from_utf8_lossy(crate::compute::bytes(e)).into_owned());
+            let text = errors
+                .as_ref()
+                .map(|e| String::from_utf8_lossy(crate::compute::bytes(e)).into_owned());
             // SAFETY: a static name.
-            assert!(compiled.is_ok() && code.is_some(), "{}: {text:?}", unsafe { name.display() });
+            assert!(compiled.is_ok() && code.is_some(), "{}: {text:?}", unsafe {
+                name.display()
+            });
         }
     }
 
@@ -1338,13 +1444,22 @@ mod tests {
     fn every_word(kind: u32, per: usize, title: &[u32]) -> Option<(Vec<u32>, u32)> {
         let host = super::host()?;
         let records = (title.len() / per) as u32;
-        let (buffer, data) = host.shared_buffer(std::mem::size_of_val(title) as u64).unwrap();
+        let (buffer, data) = host
+            .shared_buffer(std::mem::size_of_val(title) as u64)
+            .unwrap();
         let list = host.new_list().unwrap();
         // SAFETY: our mapped buffer, written before the list runs; the
         // list's argument buffer read after it has.
         unsafe {
-            data.cast::<u32>().copy_from_nonoverlapping(title.as_ptr(), title.len());
-            let out = super::bound(&list, buffer.GetGPUVirtualAddress(), (kind, per as u32 * 4, records), false).unwrap();
+            data.cast::<u32>()
+                .copy_from_nonoverlapping(title.as_ptr(), title.len());
+            let out = super::bound(
+                &list,
+                buffer.GetGPUVirtualAddress(),
+                (kind, per as u32 * 4, records),
+                false,
+            )
+            .unwrap();
             super::done(&list, &out);
             list.close();
             host.execute(&[&list]);
@@ -1370,12 +1485,26 @@ mod tests {
         assert_eq!(draws, (vec![MANY, 4, 11, 13, 3, 2, 1, 9], (1 << 26) + 6));
         // Indexed: index count, instances, first index, base vertex, first
         // instance.
-        let indexed = every_word(1, 5, &[10, 3, 100, -16i32 as u32, 7, u32::MAX, u32::MAX, 1, 2, 3]).unwrap();
-        assert_eq!(indexed, (vec![10, 3, 100, -16i32 as u32, 7, MANY, 4, 1, 2, 3], (1 << 26) + 30));
+        let indexed = every_word(
+            1,
+            5,
+            &[10, 3, 100, -16i32 as u32, 7, u32::MAX, u32::MAX, 1, 2, 3],
+        )
+        .unwrap();
+        assert_eq!(
+            indexed,
+            (
+                vec![10, 3, 100, -16i32 as u32, 7, MANY, 4, 1, 2, 3],
+                (1 << 26) + 30
+            )
+        );
         // Dispatches: each dimension bounded, and a dispatch of more than
         // 2^20 groups none.
         let dispatches = every_word(2, 3, &[3, 2, 1, 65_536, 17, 2, 70_000, 7, 2]).unwrap();
-        assert_eq!(dispatches, (vec![3, 2, 1, 0, 0, 0, 65_535, 7, 2], (6 + 65_535 * 14) * 64));
+        assert_eq!(
+            dispatches,
+            (vec![3, 2, 1, 0, 0, 0, 65_535, 7, 2], (6 + 65_535 * 14) * 64)
+        );
         // Mesh dispatches: one-dimensional.
         let meshes = every_word(10, 3, &[70_000, 7, 2, 5, 0, 3]).unwrap();
         assert_eq!(meshes, (vec![65_535, 1, 1, 5, 0, 1], 65_535 * 128));
@@ -1423,12 +1552,20 @@ mod tests {
             list.close();
             host.execute(&[&list]);
             for at in 0..all {
-                assert_eq!(data.add(at).read_volatile(), words[at % words.len()], "the title's copy as written");
+                assert_eq!(
+                    data.add(at).read_volatile(),
+                    words[at % words.len()],
+                    "the title's copy as written"
+                );
             }
             let mut out_data = std::ptr::null_mut();
             out?.Map(0, None, Some(&mut out_data)).unwrap();
             let word = |at: usize| out_data.cast::<u32>().add(at).read_volatile();
-            Some((0..records as usize).map(|i| (i * per..(i + 1) * per).map(word).collect()).collect())
+            Some(
+                (0..records as usize)
+                    .map(|i| (i * per..(i + 1) * per).map(word).collect())
+                    .collect(),
+            )
         }
     }
 
@@ -1440,9 +1577,18 @@ mod tests {
             return; // no host GPU here
         };
         assert_eq!(draws, [[1 << 24, 2, 7, 9]; 2]);
-        assert_eq!(clamped(1, &[5, 3, 7, 9, 11], 2, 1).unwrap(), [[5, 3, 7, 9, 11]; 2]);
-        assert_eq!(clamped(2, &[70_000, 2, 1], 2, 1).unwrap(), [[65_535, 2, 1]; 2]);
-        assert_eq!(clamped(10, &[70_000, 2, 3], 2, 1).unwrap(), [[65_535, 1, 1]; 2]);
+        assert_eq!(
+            clamped(1, &[5, 3, 7, 9, 11], 2, 1).unwrap(),
+            [[5, 3, 7, 9, 11]; 2]
+        );
+        assert_eq!(
+            clamped(2, &[70_000, 2, 1], 2, 1).unwrap(),
+            [[65_535, 2, 1]; 2]
+        );
+        assert_eq!(
+            clamped(10, &[70_000, 2, 3], 2, 1).unwrap(),
+            [[65_535, 1, 1]; 2]
+        );
     }
 
     /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
@@ -1522,9 +1668,15 @@ mod tests {
             let mut run = issued();
             run.extend(order.iter().flat_map(|&i| recorded[i].1.clone()));
             let mut states: std::collections::HashMap<usize, u32> =
-                [key(&title), key(&recorded[0].0), key(&recorded[1].0)].into_iter().map(|k| (k, 0)).collect();
+                [key(&title), key(&recorded[0].0), key(&recorded[1].0)]
+                    .into_iter()
+                    .map(|k| (k, 0))
+                    .collect();
             replay(&run, &mut states).unwrap();
-            assert!(run.iter().all(|t| t.0 != key(&title)), "the title's copy is never transitioned");
+            assert!(
+                run.iter().all(|t| t.0 != key(&title)),
+                "the title's copy is never transitioned"
+            );
             assert!(states.values().all(|&s| s == 0), "all common again");
             for (out, _) in &recorded {
                 let mut p = std::ptr::null_mut();
@@ -1535,8 +1687,12 @@ mod tests {
                 };
                 assert_eq!(clamped, [65_535, 1, 1]);
             }
-            // SAFETY: as above.
-            assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
+            assert_eq!(
+                // SAFETY: as above.
+                unsafe { data.cast::<[u32; 3]>().read_volatile() },
+                [70_000, 1, 1],
+                "the title's copy as written"
+            );
         }
     }
 
@@ -1583,7 +1739,9 @@ void main() { title.Store(at, value); }
     /// each draw clamped on its own or (`window`) in windows, and runs it:
     /// the words of each draw's clamped records. `None` without a host GPU.
     fn run(init: &[Vec<u32>], steps: &[Step], window: bool) -> Option<Vec<Vec<u32>>> {
-        use super::{D3D12_RESOURCE_STATE_COMMON as COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE as COPY_SOURCE};
+        use super::{
+            D3D12_RESOURCE_STATE_COMMON as COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE as COPY_SOURCE,
+        };
         use super::{D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT as ARGUMENTS, transition};
         let host = super::host()?;
         let titles: Vec<_> = init
@@ -1603,7 +1761,10 @@ void main() { title.Store(at, value); }
         let writer = super::make_with(
             WRITE,
             super::s!("write"),
-            &[super::constants(0, 2), super::root_view(super::D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0)],
+            &[
+                super::constants(0, 2),
+                super::root_view(super::D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0),
+            ],
         )
         .unwrap();
         let list = host.new_list().unwrap();
@@ -1617,18 +1778,21 @@ void main() { title.Store(at, value); }
             if let (Some(out), false) = (out.as_ref(), draws.is_empty()) {
                 // SAFETY: an open list, live buffers.
                 unsafe {
-                    list.list.ResourceBarrier(&[transition(out, COMMON, COPY_SOURCE)]);
+                    list.list
+                        .ResourceBarrier(&[transition(out, COMMON, COPY_SOURCE)]);
                     for &(at, len, to) in draws.iter() {
                         list.list.CopyBufferRegion(&results, to, out, at, len);
                     }
-                    list.list.ResourceBarrier(&[transition(out, COPY_SOURCE, COMMON)]);
+                    list.list
+                        .ResourceBarrier(&[transition(out, COPY_SOURCE, COMMON)]);
                 }
             }
             draws.clear();
         };
         for &step in steps {
             match step {
-                Step::Draw(buffer, offset, kind, records) | Step::Stores(buffer, offset, kind, records) => {
+                Step::Draw(buffer, offset, kind, records)
+                | Step::Stores(buffer, offset, kind, records) => {
                     let spec = (kind, stride(kind), records);
                     let len = u64::from(stride(kind)) * u64::from(records.max(1));
                     let source = titles[buffer].1;
@@ -1637,16 +1801,20 @@ void main() { title.Store(at, value); }
                             flush(&mut pending);
                         }
                         let stores = matches!(step, Step::Stores(..));
-                        let (out, at, _) = super::windowed(&list, source, offset, spec, stores).expect("a window");
+                        let (out, at, _) =
+                            super::windowed(&list, source, offset, spec, stores).expect("a window");
                         pending.0.push((at, len, at_results));
                         pending.1 = Some(out);
                     } else {
                         let out = super::bound(&list, source + offset, spec, false).unwrap();
                         // SAFETY: an open list, live buffers.
                         unsafe {
-                            list.list.ResourceBarrier(&[transition(&out, ARGUMENTS, COPY_SOURCE)]);
-                            list.list.CopyBufferRegion(&results, at_results, &out, 0, len);
-                            list.list.ResourceBarrier(&[transition(&out, COPY_SOURCE, ARGUMENTS)]);
+                            list.list
+                                .ResourceBarrier(&[transition(&out, ARGUMENTS, COPY_SOURCE)]);
+                            list.list
+                                .CopyBufferRegion(&results, at_results, &out, 0, len);
+                            list.list
+                                .ResourceBarrier(&[transition(&out, COPY_SOURCE, ARGUMENTS)]);
                         }
                         super::done(&list, &out);
                     }
@@ -1664,8 +1832,10 @@ void main() { title.Store(at, value); }
                     unsafe {
                         list.list.SetComputeRootSignature(&writer.root);
                         list.list.SetPipelineState(&writer.pso);
-                        list.list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
-                        list.list.SetComputeRootUnorderedAccessView(1, titles[buffer].1);
+                        list.list
+                            .SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                        list.list
+                            .SetComputeRootUnorderedAccessView(1, titles[buffer].1);
                         list.list.Dispatch(1, 1, 1);
                     }
                 }
@@ -1711,11 +1881,19 @@ void main() { title.Store(at, value); }
     fn windows_clamp_as_single_clamps_do() {
         let mut a = Vec::new();
         for i in 0..400u32 {
-            a.extend(if i % 7 == 3 { [u32::MAX; 3] } else { [100 + i, 1 + i % 3, i % 2] });
+            a.extend(if i % 7 == 3 {
+                [u32::MAX; 3]
+            } else {
+                [100 + i, 1 + i % 3, i % 2]
+            });
         }
         let draws = a.len() as u64 * 4;
         for i in 0..40u32 {
-            a.extend(if i % 9 == 4 { [u32::MAX; 4] } else { [3 * i + 1, 2, i, 0] });
+            a.extend(if i % 9 == 4 {
+                [u32::MAX; 4]
+            } else {
+                [3 * i + 1, 2, i, 0]
+            });
         }
         let indexed = a.len() as u64 * 4;
         for i in 0..40u32 {
@@ -1738,8 +1916,15 @@ void main() { title.Store(at, value); }
         let Some(out) = same(&[a, b], &steps) else {
             return; // no host GPU here
         };
-        let ran = out.iter().filter(|r| r.first().is_some_and(|&w| w != 0)).count();
-        assert!(ran > 50 && ran + 50 < out.len(), "the budget ran out in the middle: {ran} of {} ran", out.len());
+        let ran = out
+            .iter()
+            .filter(|r| r.first().is_some_and(|&w| w != 0))
+            .count();
+        assert!(
+            ran > 50 && ran + 50 < out.len(),
+            "the budget ran out in the middle: {ran} of {} ran",
+            out.len()
+        );
         assert_eq!(out[0], [100, 1, 0], "a record as it is");
     }
 
@@ -1749,7 +1934,15 @@ void main() { title.Store(at, value); }
     /// rule, whatever that rule is, word for word.
     #[test]
     fn windowed_mesh_grids_are_the_single_clamps() {
-        let a: Vec<u32> = [[3, 2, 4], [2, 3, 5], [65_535, 1, 1], [257, 256, 1], [3, 0, 4], [1, 1, 1]].concat();
+        let a: Vec<u32> = [
+            [3, 2, 4],
+            [2, 3, 5],
+            [65_535, 1, 1],
+            [257, 256, 1],
+            [3, 0, 4],
+            [1, 1, 1],
+        ]
+        .concat();
         let steps: Vec<Step> = (0..6).map(|i| Step::Draw(0, 12 * i, 10, 1)).collect();
         let Some(out) = same(&[a], &steps) else {
             return; // no host GPU here
@@ -1770,8 +1963,15 @@ void main() { title.Store(at, value); }
         let Some(out) = same(&[a], &steps) else {
             return; // no host GPU here
         };
-        assert_eq!(out.iter().take(20).filter(|r| r[0] != 0).count(), 16, "16 garbage records fit");
-        assert!(out[20..].iter().all(|r| r[0] == 0), "the spent budget empties the window");
+        assert_eq!(
+            out.iter().take(20).filter(|r| r[0] != 0).count(),
+            16,
+            "16 garbage records fit"
+        );
+        assert!(
+            out[20..].iter().all(|r| r[0] == 0),
+            "the spent budget empties the window"
+        );
     }
 
     /// A shader writing a record between two draws ends the window: the
@@ -1781,7 +1981,13 @@ void main() { title.Store(at, value); }
     fn a_store_ends_the_window() {
         let a = [5, 1, 1].repeat(4);
         let steps = |write: fn(usize, u64, u32) -> Step| {
-            vec![Step::Draw(0, 0, 10, 1), Step::Draw(0, 12, 10, 1), write(0, 24, 9), Step::Draw(0, 24, 10, 1), Step::Draw(0, 36, 10, 1)]
+            vec![
+                Step::Draw(0, 0, 10, 1),
+                Step::Draw(0, 12, 10, 1),
+                write(0, 24, 9),
+                Step::Draw(0, 24, 10, 1),
+                Step::Draw(0, 36, 10, 1),
+            ]
         };
         let Some(out) = same(std::slice::from_ref(&a), &steps(Step::Write)) else {
             return; // no host GPU here
@@ -1789,7 +1995,11 @@ void main() { title.Store(at, value); }
         assert_eq!(out[2], [9, 1, 1], "the record as written");
         assert_eq!(out[3], [5, 1, 1]);
         let unended = run(&[a], &steps(Step::WriteUnended), true).unwrap();
-        assert_eq!(unended[2], [5, 1, 1], "a window over the store clamps the record from before it");
+        assert_eq!(
+            unended[2],
+            [5, 1, 1],
+            "a window over the store clamps the record from before it"
+        );
     }
 
     /// Indirect dispatches in windows (`VICTORY_GPU_GAPS`): their records
@@ -1825,8 +2035,15 @@ void main() { title.Store(at, value); }
         assert_eq!(out[0], [65_535, 2, 1], "x past 65,535");
         assert_eq!(out[1], [0, 0, 0], "too many groups");
         assert_eq!(out[2], [5, 4, 5], "a record as it is");
-        let ran = out.iter().filter(|r| r.first().is_some_and(|&w| w != 0)).count();
-        assert!(ran + 10 < out.len(), "the budget ran out: {ran} of {} ran", out.len());
+        let ran = out
+            .iter()
+            .filter(|r| r.first().is_some_and(|&w| w != 0))
+            .count();
+        assert!(
+            ran + 10 < out.len(),
+            "the budget ran out: {ran} of {} ran",
+            out.len()
+        );
     }
 
     /// After an execution that may store, a barrier ends what the window
@@ -1846,9 +2063,17 @@ void main() { title.Store(at, value); }
         let Some(out) = same(std::slice::from_ref(&a), &steps(true)) else {
             return; // no host GPU here
         };
-        assert_eq!(out[1], [9, 1, 1], "the record as written before the barrier");
+        assert_eq!(
+            out[1],
+            [9, 1, 1],
+            "the record as written before the barrier"
+        );
         let joined = run(&[a], &steps(false), true).unwrap();
-        assert_eq!(joined[1], [5, 1, 1], "no barrier: one window, clamped before the store");
+        assert_eq!(
+            joined[1],
+            [5, 1, 1],
+            "no barrier: one window, clamped before the store"
+        );
     }
 
     /// What a window may take after executions that may store (CPU only).
@@ -1870,12 +2095,27 @@ void main() { title.Store(at, value); }
     fn only_gaps_send_dispatches_and_stores_to_windows() {
         use super::{Alone, alone};
         // (windows, gaps, dispatch, stores, spread)
-        assert_eq!(alone(false, true, true, true, false), Some(Alone::NoWindows));
-        assert_eq!(alone(true, false, false, false, false), None, "a draw that does not store");
+        assert_eq!(
+            alone(false, true, true, true, false),
+            Some(Alone::NoWindows)
+        );
+        assert_eq!(
+            alone(true, false, false, false, false),
+            None,
+            "a draw that does not store"
+        );
         assert_eq!(alone(true, false, true, true, false), Some(Alone::Dispatch));
         assert_eq!(alone(true, false, false, true, false), Some(Alone::Stores));
-        assert_eq!(alone(true, true, true, true, false), None, "a dispatch with gaps");
-        assert_eq!(alone(true, true, false, true, false), None, "a storing draw with gaps");
+        assert_eq!(
+            alone(true, true, true, true, false),
+            None,
+            "a dispatch with gaps"
+        );
+        assert_eq!(
+            alone(true, true, false, true, false),
+            None,
+            "a storing draw with gaps"
+        );
         assert_eq!(alone(true, true, true, true, true), Some(Alone::Spread));
         assert_eq!(alone(true, false, true, true, true), Some(Alone::Spread));
     }
@@ -1922,7 +2162,10 @@ void main() { title.Store(at, value); }
                 let (out, _, opened) = super::windowed(l, gpu, 0, (10, 12, 1), false).unwrap();
                 assert!(opened);
                 let (again, at, opened) = super::windowed(l, gpu, 12, (10, 12, 1), false).unwrap();
-                assert!(!opened && at == 12 && again.as_raw() == out.as_raw(), "the second draw joins");
+                assert!(
+                    !opened && at == 12 && again.as_raw() == out.as_raw(),
+                    "the second draw joins"
+                );
                 l.close();
                 (out, issued())
             })
@@ -1933,7 +2176,10 @@ void main() { title.Store(at, value); }
         run.extend(recorded[0].1.clone());
         let key = |r: &super::ID3D12Resource| r.as_raw() as usize;
         let mut states: std::collections::HashMap<usize, u32> =
-            [key(&recorded[0].0), key(&recorded[1].0)].into_iter().map(|k| (k, 0)).collect();
+            [key(&recorded[0].0), key(&recorded[1].0)]
+                .into_iter()
+                .map(|k| (k, 0))
+                .collect();
         replay(&run, &mut states).unwrap();
         assert!(states.values().all(|&s| s == 0), "all common again");
         for (out, _) in &recorded {
@@ -2156,7 +2402,13 @@ void main() { title.Store(at, value); }
         let mut rb_offsets = Vec::with_capacity(specs.len());
         let mut rb_cur = 0u64;
         for s in &specs {
-            let out = super::bound(&list_inline, base_gpu + s.off, (s.kind, s.stride, s.records), false).unwrap();
+            let out = super::bound(
+                &list_inline,
+                base_gpu + s.off,
+                (s.kind, s.stride, s.records),
+                false,
+            )
+            .unwrap();
             let bytes = u64::from(s.stride * s.records);
             // SAFETY: open list; `out` is in `INDIRECT_ARGUMENT` after `bound`.
             unsafe {
@@ -2165,7 +2417,9 @@ void main() { title.Store(at, value); }
                     super::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                     super::D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
-                list_inline.list.CopyBufferRegion(&rb_inline, rb_cur, &out, 0, bytes);
+                list_inline
+                    .list
+                    .CopyBufferRegion(&rb_inline, rb_cur, &out, 0, bytes);
                 list_inline.list.ResourceBarrier(&[super::transition(
                     &out,
                     super::D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -2180,19 +2434,30 @@ void main() { title.Store(at, value); }
         host.execute(&[&list_inline]);
 
         // SAFETY: GPU completed; verify title copy untouched and outputs identical.
-        let after_src = unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), SRC_BYTES).to_vec() };
-        assert_eq!(after_src, initial, "title argument buffer must never be modified");
+        let after_src =
+            unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), SRC_BYTES).to_vec() };
+        assert_eq!(
+            after_src, initial,
+            "title argument buffer must never be modified"
+        );
 
         let mut tail_kept = 0usize;
         let mut tail_zeroed = 0usize;
-        for (idx, ((dst, at), (rb_off, bytes))) in hoisted_locs.iter().zip(rb_offsets.iter()).enumerate() {
+        for (idx, ((dst, at), (rb_off, bytes))) in
+            hoisted_locs.iter().zip(rb_offsets.iter()).enumerate()
+        {
             let got = read_words(dst, *at, *bytes / 4);
             // SAFETY: within mapped `rb_inline`.
             let expected = unsafe {
                 let p = rb_ptr.add(*rb_off as usize).cast::<u32>();
-                (0..*bytes / 4).map(|i| p.add(i).read_volatile()).collect::<Vec<_>>()
+                (0..*bytes / 4)
+                    .map(|i| p.add(i).read_volatile())
+                    .collect::<Vec<_>>()
             };
-            assert_eq!(got, expected, "job {idx} hoisted output must match inline bound()");
+            assert_eq!(
+                got, expected,
+                "job {idx} hoisted output must match inline bound()"
+            );
             if idx >= 76 {
                 if got[0] == 1_000_000 {
                     tail_kept += 1;
@@ -2202,7 +2467,10 @@ void main() { title.Store(at, value); }
                 }
             }
         }
-        assert!(tail_kept > 0 && tail_zeroed > 0, "tail must cross BUDGET mid-wave");
+        assert!(
+            tail_kept > 0 && tail_zeroed > 0,
+            "tail must cross BUDGET mid-wave"
+        );
     }
 
     /// Multiple source buffers and >256 KiB chunk rollover preserve strict
@@ -2236,7 +2504,11 @@ void main() { title.Store(at, value); }
         for cycle in 0..2u32 {
             let mut probes = Vec::new();
             for i in 0..4u32 {
-                let (s, g) = if i % 2 == 0 { (&src_a, gpu_a) } else { (&src_b, gpu_b) };
+                let (s, g) = if i % 2 == 0 {
+                    (&src_a, gpu_a)
+                } else {
+                    (&src_b, gpu_b)
+                };
                 probes.push(super::hoist(&list, s, g + 32, (1, 20, 1)).unwrap());
             }
             // Spill across 256 KiB chunk boundary (8,192 * 32B = 256 KiB).
@@ -2248,9 +2520,16 @@ void main() { title.Store(at, value); }
                     spilled = true;
                 }
             }
-            assert!(spilled, "must span at least two 256 KiB hoisted scratch chunks");
+            assert!(
+                spilled,
+                "must span at least two 256 KiB hoisted scratch chunks"
+            );
             for i in 0..6u32 {
-                let (s, g) = if i % 2 == 0 { (&src_a, gpu_a) } else { (&src_b, gpu_b) };
+                let (s, g) = if i % 2 == 0 {
+                    (&src_a, gpu_a)
+                } else {
+                    (&src_b, gpu_b)
+                };
                 probes.push(super::hoist(&list, s, g + 32, (1, 20, 1)).unwrap());
             }
             list.close();
@@ -2259,7 +2538,11 @@ void main() { title.Store(at, value); }
             for (idx, (dst, at)) in probes.iter().enumerate() {
                 let w = read_words(dst, *at, 5);
                 if idx < 8 {
-                    assert_eq!((w[0], w[1]), (1 << 22, 4), "cycle {cycle} probe {idx} must fit");
+                    assert_eq!(
+                        (w[0], w[1]),
+                        (1 << 22, 4),
+                        "cycle {cycle} probe {idx} must fit"
+                    );
                 } else {
                     assert_eq!(w[0], 0, "cycle {cycle} probe {idx} must zero past BUDGET");
                 }
@@ -2310,14 +2593,23 @@ void main() { title.Store(at, value); }
                 let mut run = issued();
                 run.extend_from_slice(&recorded[i].2);
                 replay(&run, &mut states).unwrap();
-                assert!(run.iter().all(|t| t.0 != key(&title)), "title copy must never be transitioned");
+                assert!(
+                    run.iter().all(|t| t.0 != key(&title)),
+                    "title copy must never be transitioned"
+                );
             }
-            assert!(states.values().all(|&s| s == 0), "all buffers must return to COMMON");
+            assert!(
+                states.values().all(|&s| s == 0),
+                "all buffers must return to COMMON"
+            );
             for (out, at, _) in &recorded {
                 assert_eq!(read_words(out, *at, 3), vec![65_535, 1, 1]);
             }
-            // SAFETY: mapped title buffer untouched.
-            assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1]);
+            assert_eq!(
+                // SAFETY: mapped title buffer untouched.
+                unsafe { data.cast::<[u32; 3]>().read_volatile() },
+                [70_000, 1, 1]
+            );
         }
     }
 
@@ -2364,9 +2656,12 @@ void main() {
     dst.Store3(0, uint3(90000, 1, 1));
 }
 "#;
-        let writer =
-            super::make_with(WRITER, super::s!("writer"), &[super::root_view(super::D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0)])
-                .unwrap();
+        let writer = super::make_with(
+            WRITER,
+            super::s!("writer"),
+            &[super::root_view(super::D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0)],
+        )
+        .unwrap();
         let (src, ptr) = host.shared_buffer(256).unwrap();
         // SAFETY: mapped buffer; live buffer.
         let gpu = unsafe {
@@ -2406,7 +2701,9 @@ void main() {
         let list_hoisted = host.new_list().unwrap();
         const DRAWS: usize = 9_000;
         const STRIDE: u32 = 20;
-        let (src, ptr) = host.shared_buffer((DRAWS * STRIDE as usize) as u64).unwrap();
+        let (src, ptr) = host
+            .shared_buffer((DRAWS * STRIDE as usize) as u64)
+            .unwrap();
         // SAFETY: mapped buffer; live buffer.
         let base_gpu = unsafe {
             for i in 0..DRAWS {
@@ -2422,7 +2719,13 @@ void main() {
 
         let run_inline = || {
             for i in 0..DRAWS {
-                let out = super::bound(&list_inline, base_gpu + (i * STRIDE as usize) as u64, (1, STRIDE, 1), false).unwrap();
+                let out = super::bound(
+                    &list_inline,
+                    base_gpu + (i * STRIDE as usize) as u64,
+                    (1, STRIDE, 1),
+                    false,
+                )
+                .unwrap();
                 super::done(&list_inline, &out);
             }
             list_inline.close();
@@ -2431,7 +2734,13 @@ void main() {
         };
         let run_hoisted = || {
             for i in 0..DRAWS {
-                let _ = super::hoist(&list_hoisted, &src, base_gpu + (i * STRIDE as usize) as u64, (1, STRIDE, 1)).unwrap();
+                let _ = super::hoist(
+                    &list_hoisted,
+                    &src,
+                    base_gpu + (i * STRIDE as usize) as u64,
+                    (1, STRIDE, 1),
+                )
+                .unwrap();
             }
             list_hoisted.close();
             host.execute(&[&list_hoisted]);

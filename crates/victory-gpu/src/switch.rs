@@ -57,10 +57,16 @@ mod tests {
     #[test]
     fn a_default_on_switch_is_on_unless_zero() {
         use super::value_is_on_unless_zero;
-        assert!(value_is_on_unless_zero(None), "unset: the feature the fork ships");
+        assert!(
+            value_is_on_unless_zero(None),
+            "unset: the feature the fork ships"
+        );
         assert!(!value_is_on_unless_zero(Some(OsStr::new("0"))));
         for value in ["", "1", "true", "00", " 0", "0 "] {
-            assert!(value_is_on_unless_zero(Some(OsStr::new(value))), "{value:?}");
+            assert!(
+                value_is_on_unless_zero(Some(OsStr::new(value))),
+                "{value:?}"
+            );
         }
     }
 }

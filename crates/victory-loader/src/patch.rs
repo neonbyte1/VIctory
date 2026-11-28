@@ -73,7 +73,11 @@ fn planned<'a>(patches: &'a [Patch], module: &str, size: usize) -> Vec<&'a Patch
     patches
         .iter()
         .filter(|p| p.module.eq_ignore_ascii_case(module))
-        .filter(|p| p.rva.checked_add(p.bytes.len()).is_some_and(|end| end <= size))
+        .filter(|p| {
+            p.rva
+                .checked_add(p.bytes.len())
+                .is_some_and(|end| end <= size)
+        })
         .collect()
 }
 
@@ -128,7 +132,12 @@ pub(crate) fn apply(base: usize, size: usize, module: &str) {
         // keep the pages executable while writable, like the TLS
         // redirection.
         if unsafe {
-            VirtualProtect(at as *const c_void, len, PAGE_EXECUTE_READWRITE, &mut protection)
+            VirtualProtect(
+                at as *const c_void,
+                len,
+                PAGE_EXECUTE_READWRITE,
+                &mut protection,
+            )
         } == 0
         {
             tracing::warn!(
@@ -143,7 +152,10 @@ pub(crate) fn apply(base: usize, size: usize, module: &str) {
         // SAFETY: in-bounds of the mapped image, made writable above; the
         // slice starts at the patch's rva, which is where `write` puts the
         // bytes.
-        let old = write(unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) }, patch);
+        let old = write(
+            unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) },
+            patch,
+        );
         drop(restore);
         // SAFETY: flushing the code this patch wrote, like the TLS
         // redirection.
@@ -187,7 +199,9 @@ mod tests {
         // Missing fields, a bad rva (including the `+` `from_str_radix`
         // would accept), odd-length and empty byte runs, a non-hex byte and
         // an empty module name are all dropped.
-        let patches = parse("game.exe:10, game.exe:zz:90, game.exe:+10:90, game.exe:0x+10:90, game.exe:10:9, game.exe:10:0x, game.exe:10:9g, :10:90");
+        let patches = parse(
+            "game.exe:10, game.exe:zz:90, game.exe:+10:90, game.exe:0x+10:90, game.exe:10:9, game.exe:10:0x, game.exe:10:9g, :10:90",
+        );
         assert!(patches.is_empty(), "{patches:?}");
         // One good entry survives among them.
         let patches = parse("game.exe:zz:90,game.exe:10:9091");

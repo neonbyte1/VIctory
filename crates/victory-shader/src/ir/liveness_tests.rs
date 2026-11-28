@@ -90,8 +90,14 @@ fn check(exits: Vec<Exit>, uses: Vec<RegSet>, defs: Vec<RegSet>) {
 fn duplicate_edges_and_unreachable_predecessors() {
     check(
         vec![
-            Exit::Branch { taken: 1, not_taken: 1 },
-            Exit::Branch { taken: 1, not_taken: 2 },
+            Exit::Branch {
+                taken: 1,
+                not_taken: 1,
+            },
+            Exit::Branch {
+                taken: 1,
+                not_taken: 2,
+            },
             Exit::End,
             Exit::Jump(1),
             Exit::Jump(4),
@@ -120,13 +126,22 @@ fn generated_control_flow_matches_path_oracle() {
             let forward = (b + 1).min(n - 1);
             let exit = match seed % 6 {
                 0 if b + 1 < n => Exit::Jump(forward),
-                1 if b + 1 < n => Exit::Branch { taken: forward, not_taken: random },
-                2 if b + 1 < n => Exit::Branch { taken: forward, not_taken: forward },
+                1 if b + 1 < n => Exit::Branch {
+                    taken: forward,
+                    not_taken: random,
+                },
+                2 if b + 1 < n => Exit::Branch {
+                    taken: forward,
+                    not_taken: forward,
+                },
                 3 => Exit::Jump(random),
                 _ => match next() % 4 {
                     0 => Exit::End,
                     1 => Exit::Jump(random),
-                    _ => Exit::Branch { taken: random, not_taken: (next() % n as u64) as usize },
+                    _ => Exit::Branch {
+                        taken: random,
+                        not_taken: (next() % n as u64) as usize,
+                    },
                 },
             };
             exits.push(exit);

@@ -95,9 +95,7 @@ fn root_wide(root: &Path) -> Vec<u16> {
     };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
-    let min_len = if wide.starts_with(&VERBATIM)
-        && wide.get(5).copied() == Some(u16::from(b':'))
-    {
+    let min_len = if wide.starts_with(&VERBATIM) && wide.get(5).copied() == Some(u16::from(b':')) {
         7
     } else {
         3
@@ -480,8 +478,19 @@ pub extern "system" fn GetDiskFreeSpaceExW(
 fn volume_root(host: &[u16]) -> Option<Vec<u16>> {
     let host = host.strip_suffix(&[0]).unwrap_or(host);
     let bs = u16::from(b'\\');
-    if let Some(unc) = host.strip_prefix(&[bs, bs, u16::from(b'?'), bs, u16::from(b'U'), u16::from(b'N'), u16::from(b'C'), bs]) {
-        let mut parts = unc.split(|c| SEPARATORS.contains(c)).filter(|p| !p.is_empty());
+    if let Some(unc) = host.strip_prefix(&[
+        bs,
+        bs,
+        u16::from(b'?'),
+        bs,
+        u16::from(b'U'),
+        u16::from(b'N'),
+        u16::from(b'C'),
+        bs,
+    ]) {
+        let mut parts = unc
+            .split(|c| SEPARATORS.contains(c))
+            .filter(|p| !p.is_empty());
         let (server, share) = (parts.next()?, parts.next()?);
         let mut out = VERBATIM.to_vec();
         out.extend("UNC\\".encode_utf16());
@@ -501,7 +510,9 @@ fn volume_root(host: &[u16]) -> Option<Vec<u16>> {
         return Some(out);
     }
     if let Some(unc) = host.strip_prefix(&[bs, bs]) {
-        let mut parts = unc.split(|c| SEPARATORS.contains(c)).filter(|p| !p.is_empty());
+        let mut parts = unc
+            .split(|c| SEPARATORS.contains(c))
+            .filter(|p| !p.is_empty());
         let (server, share) = (parts.next()?, parts.next()?);
         let mut out = vec![bs, bs];
         out.extend_from_slice(server);
@@ -856,7 +867,10 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-        assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
+        assert_ne!(
+            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
+            0
+        );
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
@@ -1092,16 +1106,31 @@ mod tests {
 
         // 1. Verbatim drive root (`\\?\C:\`) keeps its trailing backslash.
         let v = mount(Path::new(r"\\?\C:\")).unwrap();
-        assert_eq!(decode(translate(&w(&format!(r"{v}:\"))).unwrap()), r"\\?\C:\");
-        assert_eq!(decode(translate(&w(&format!(r"\\?\{v}:\a.txt"))).unwrap()), r"\\?\C:\a.txt");
-        assert_eq!(decode(translate(&w(&format!("{v}:/sub/../b.txt"))).unwrap()), r"\\?\C:\b.txt");
+        assert_eq!(
+            decode(translate(&w(&format!(r"{v}:\"))).unwrap()),
+            r"\\?\C:\"
+        );
+        assert_eq!(
+            decode(translate(&w(&format!(r"\\?\{v}:\a.txt"))).unwrap()),
+            r"\\?\C:\a.txt"
+        );
+        assert_eq!(
+            decode(translate(&w(&format!("{v}:/sub/../b.txt"))).unwrap()),
+            r"\\?\C:\b.txt"
+        );
 
         // 2. Plain drive root (`C:\`) does not double separators.
         let u = mount(Path::new(r"C:\")).unwrap();
         assert_eq!(decode(translate(&w(&format!(r"{u}:\"))).unwrap()), r"C:\");
         assert_eq!(decode(translate(&w(&format!("{u}:"))).unwrap()), r"C:\");
-        assert_eq!(decode(translate(&w(&format!(r"{u}:\foo"))).unwrap()), r"C:\foo");
-        assert_eq!(decode(translate(&w(&format!(r"\\?\{u}:\foo"))).unwrap()), r"\\?\C:\foo");
+        assert_eq!(
+            decode(translate(&w(&format!(r"{u}:\foo"))).unwrap()),
+            r"C:\foo"
+        );
+        assert_eq!(
+            decode(translate(&w(&format!(r"\\?\{u}:\foo"))).unwrap()),
+            r"\\?\C:\foo"
+        );
 
         // 3. UNC host root (`\\server\share\dir`) translates `\\?\` paths to `\\?\UNC\...`.
         let unc = mount(Path::new(r"\\server\share\dir")).unwrap();
@@ -1123,7 +1152,10 @@ mod tests {
         check(r"C:\folder\file.dat", r"C:\");
         check(r"\\?\C:\folder\file.dat", r"\\?\C:\");
         check(r"\\server\share\dir\file.dat", r"\\server\share\");
-        check(r"\\?\UNC\server\share\dir\file.dat", r"\\?\UNC\server\share\");
+        check(
+            r"\\?\UNC\server\share\dir\file.dat",
+            r"\\?\UNC\server\share\",
+        );
     }
 
     #[test]

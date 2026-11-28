@@ -55,9 +55,9 @@ impl Reused {
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
-            let list: ID3D12GraphicsCommandList =
-                dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
-                    .map_err(err)?;
+            let list: ID3D12GraphicsCommandList = dev
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                .map_err(err)?;
             list.Close().map_err(err)?;
             Ok(Reused {
                 queue: dev
@@ -277,7 +277,11 @@ fn create_device(warp: bool, adapter: Option<IDXGIAdapter1>) -> Result<ID3D12Dev
         // does not take is an error in the debug layer.
         let mut o19 = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
         let reported = device
-            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, (&raw mut o19).cast(), size_of_val(&o19) as u32)
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut o19).cast(),
+                size_of_val(&o19) as u32,
+            )
             .ok()
             .map(|()| o19.MaxViewDescriptorHeapSize)
             .filter(|&n| n >= PORTABLE_VIEWS);
@@ -892,7 +896,11 @@ impl Host {
                 BytecodeLength: ps.len(),
             },
             GS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+                pShaderBytecode: if gs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    gs.as_ptr().cast()
+                },
                 BytecodeLength: gs.len(),
             },
             SampleMask: u32::MAX,
@@ -1780,7 +1788,11 @@ impl Host {
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => {
-                        let words = if data.is_empty() { &[0u32][..] } else { data.as_slice() };
+                        let words = if data.is_empty() {
+                            &[0u32][..]
+                        } else {
+                            data.as_slice()
+                        };
                         list.SetGraphicsRoot32BitConstants(
                             *param,
                             words.len() as u32,
@@ -1798,7 +1810,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } | Root::Uav(_) | Root::UavData(_) => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) | Root::UavData(_) => {
+                        return Err("root views in a draw".into());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -2251,21 +2265,48 @@ pub enum View<'a> {
 #[cfg(test)]
 pub fn view_strides(views: &[View]) -> Vec<u32> {
     let kind = |f: DXGI_FORMAT| match f {
-        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R32G32_UINT
-        | DXGI_FORMAT_R10G10B10A2_UINT | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R16G16_UINT
-        | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
-        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R32G32_SINT
-        | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_SINT
-        | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
+        DXGI_FORMAT_R32G32B32A32_UINT
+        | DXGI_FORMAT_R16G16B16A16_UINT
+        | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R10G10B10A2_UINT
+        | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R16G16_UINT
+        | DXGI_FORMAT_R32_UINT
+        | DXGI_FORMAT_R8G8_UINT
+        | DXGI_FORMAT_R16_UINT
+        | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
+        DXGI_FORMAT_R32G32B32A32_SINT
+        | DXGI_FORMAT_R16G16B16A16_SINT
+        | DXGI_FORMAT_R32G32_SINT
+        | DXGI_FORMAT_R8G8B8A8_SINT
+        | DXGI_FORMAT_R16G16_SINT
+        | DXGI_FORMAT_R32_SINT
+        | DXGI_FORMAT_R8G8_SINT
+        | DXGI_FORMAT_R16_SINT
+        | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
         _ => 0,
     };
     views
         .iter()
         .map(|v| match *v {
-            View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
-            View::Buffer { stride: Stride::Typed, .. } => 16,
-            View::Buffer { stride: Stride::Structured(n) | Stride::PcStructured(n), .. } => n,
-            View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
+            View::Buffer {
+                stride: Stride::Raw,
+                ..
+            }
+            | View::RawUav(_) => 4,
+            View::Buffer {
+                stride: Stride::Typed,
+                ..
+            } => 16,
+            View::Buffer {
+                stride: Stride::Structured(n) | Stride::PcStructured(n),
+                ..
+            } => n,
+            View::Buffer {
+                stride: Stride::Format(f, n),
+                ..
+            }
+            | View::TypedUav(f, _, n) => n | kind(f),
             View::HalfUav(_) => 8,
             _ => 0,
         })
@@ -2560,14 +2601,7 @@ impl Host {
                             at_face.Anonymous.SubresourceIndex = face as u32;
                             let mut source = footprint(&upload, w, h);
                             source.Anonymous.PlacedFootprint.Footprint.Depth = d;
-                            list.CopyTextureRegion(
-                                &at_face,
-                                0,
-                                0,
-                                0,
-                                &source,
-                                None,
-                            );
+                            list.CopyTextureRegion(&at_face, 0, 0, 0, &source, None);
                             keep.push(upload);
                         }
                         list.ResourceBarrier(&[transition(
@@ -2630,7 +2664,8 @@ impl Host {
                         keep.push(tex);
                     }
                     View::RedTexture(w, h, texels) => {
-                        let desc = texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R32_FLOAT);
+                        let desc =
+                            texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R32_FLOAT);
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
@@ -2688,9 +2723,12 @@ impl Host {
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
-                            View::TypedUav(format, e, bytes) => {
-                                ((e * bytes).div_ceil(4), format, e, D3D12_BUFFER_UAV_FLAG_NONE)
-                            }
+                            View::TypedUav(format, e, bytes) => (
+                                (e * bytes).div_ceil(4),
+                                format,
+                                e,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
@@ -2965,7 +3003,11 @@ impl Host {
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => {
-                        let words = if data.is_empty() { &[0u32][..] } else { data.as_slice() };
+                        let words = if data.is_empty() {
+                            &[0u32][..]
+                        } else {
+                            data.as_slice()
+                        };
                         list.SetComputeRoot32BitConstants(
                             *param,
                             words.len() as u32,

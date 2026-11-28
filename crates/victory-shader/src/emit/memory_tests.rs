@@ -176,8 +176,15 @@ fn program() -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
-    assert_eq!(memory, 11, "every access through the pointer is title memory");
+    let memory = res
+        .scalar
+        .iter()
+        .filter(|s| s.1.param == resource::MEMORY)
+        .count();
+    assert_eq!(
+        memory, 11,
+        "every access through the pointer is title memory"
+    );
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         native: &native,
@@ -196,7 +203,10 @@ fn program() -> HostShader {
     })
     .expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
-    assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
+    assert!(
+        l.root_uavs.is_empty(),
+        "the root UAV is read as title memory"
+    );
     let shader = HostShader {
         wave_size: l.wave_size,
         stage: HwStage::Cs,
@@ -215,7 +225,8 @@ fn program() -> HostShader {
         view_marks: l.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
     }
     shader
 }
@@ -247,7 +258,12 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     memory[3] = (pointer >> 32) as u32;
     // The next page (no copy) and another 256 MiB region (no block).
     let (next, far) = (TITLE + 0x1_0010, 0x55_0000_0040u64);
-    memory[4..8].copy_from_slice(&[next as u32, (next >> 32) as u32, far as u32, (far >> 32) as u32]);
+    memory[4..8].copy_from_slice(&[
+        next as u32,
+        (next >> 32) as u32,
+        far as u32,
+        (far >> 32) as u32,
+    ]);
     memory[0x40] = 0x2222_2222;
     // The root UAV's address, and what it loads there.
     let root_uav = TITLE + 0x200;
@@ -289,9 +305,21 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                     &Dispatch {
                         roots: vec![
                             (0, Root::Constants(ud)),
-                            (1, Root::View { srv: true, data: page_table(1, 3) }),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: page_table(1, 3),
+                                },
+                            ),
                             (2, Root::Uav(2 * 4096 / 32)),
-                            (3, Root::View { srv: true, data: view_addresses.clone() }),
+                            (
+                                3,
+                                Root::View {
+                                    srv: true,
+                                    data: view_addresses.clone(),
+                                },
+                            ),
                         ],
                         views: &[
                             View::RawUav(9),
@@ -307,11 +335,25 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, image[0], image[1], image[2]],
+                [
+                    0x1111_1111,
+                    0x2222_2222,
+                    0x2222_2222,
+                    0,
+                    0,
+                    0x3333_3333,
+                    image[0],
+                    image[1],
+                    image[2]
+                ],
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
-            assert_eq!(out[1][(0x200 + 0x20) / 4], value, "{label}: the root UAV store");
+            assert_eq!(
+                out[1][(0x200 + 0x20) / 4],
+                value,
+                "{label}: the root UAV store"
+            );
             let floats = [f32::from_bits(out[1][0x20]), f32::from_bits(out[1][0x21])];
             let want = [operand.min(1.0), operand.max(-1.0)];
             assert_eq!(floats, want, "{label}: float min and max");
@@ -321,7 +363,11 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
             let marked: Vec<usize> = (0..out[2].len() * 32)
                 .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
                 .collect();
-            assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1], "{label}: pages");
+            assert_eq!(
+                marked,
+                [(far >> 28) as usize, entry, entry + 1],
+                "{label}: pages"
+            );
         }
         ran += 1;
     }
@@ -391,9 +437,16 @@ fn global_store_barrier_shader(wave32: bool) -> HostShader {
         version: (1, 0),
         parts: vec![],
     };
-    let mut shader =
-        super::emit(&container, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
-            .expect("emit");
+    let mut shader = super::emit(
+        &container,
+        &native,
+        &p,
+        &st,
+        &io,
+        &res,
+        crate::emit::Target::ANY,
+    )
+    .expect("emit");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil)
             .expect("DXIL validation failed");
@@ -582,9 +635,21 @@ fn global_atomic_fmin_and_fmax_ignore_nan_operands() {
                     &Dispatch {
                         roots: vec![
                             (0, Root::Constants(ud)),
-                            (1, Root::View { srv: true, data: page_table(1, 3) }),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: page_table(1, 3),
+                                },
+                            ),
                             (2, Root::Uav(2 * 4096 / 32)),
-                            (3, Root::View { srv: true, data: view_addresses.clone() }),
+                            (
+                                3,
+                                Root::View {
+                                    srv: true,
+                                    data: view_addresses.clone(),
+                                },
+                            ),
                         ],
                         views: &[
                             View::RawUav(9),
@@ -627,7 +692,10 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     }
     /// MUBUF `op` (offen) of `vdata` at `vaddr` through `s[srsrc:srsrc+3]`.
     const fn mubuf(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
-        [0x38 << 26 | op << 18 | 1 << 12, 0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32]
+        [
+            0x38 << 26 | op << 18 | 1 << 12,
+            0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
     }
     const V_LSHLREV_B32: u32 = 0x1A;
     let mut w = vec![
@@ -716,14 +784,20 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         view_marks: false,
     })
     .expect("lower");
-    assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
+    assert!(
+        l.root_srvs.is_empty() && !l.memory,
+        "no root descriptor, no title memory"
+    );
     let marks: Vec<(u32, u32)> = l
         .user_data
         .iter()
         .filter(|u| u.root == RootType::Descriptor)
         .map(|u| (u.index, u.dword))
         .collect();
-    assert_eq!(marks, [(6, super::ROOT_SRV_VIEW), (7, super::ROOT_VIEW_OFFSET)]);
+    assert_eq!(
+        marks,
+        [(6, super::ROOT_SRV_VIEW), (7, super::ROOT_VIEW_OFFSET)]
+    );
     let shader = HostShader {
         wave_size: l.wave_size,
         stage: HwStage::Cs,
@@ -742,7 +816,8 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         view_marks: l.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -777,7 +852,9 @@ fn root_views_read_their_copy_and_zeros_past_it() {
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: {e}"));
-        let want: Vec<u32> = (0..32).map(|lane| if lane < 16 { 0x1000 + 4 + 16 * lane } else { 0 }).collect();
+        let want: Vec<u32> = (0..32)
+            .map(|lane| if lane < 16 { 0x1000 + 4 + 16 * lane } else { 0 })
+            .collect();
         assert_eq!(out[0], want, "{label}");
         ran += 1;
     }
@@ -836,7 +913,10 @@ fn writes_through_views_mark_their_pages() {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
-        layout: vec![param(RootType::Constants, 0, 4, 0), param(RootType::Table, 4, 1, 1)],
+        layout: vec![
+            param(RootType::Constants, 0, 4, 0),
+            param(RootType::Table, 4, 1, 1),
+        ],
         used: (0..3).map(uav).collect(),
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1,
@@ -883,7 +963,8 @@ fn writes_through_views_mark_their_pages() {
         view_marks: l.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -899,11 +980,12 @@ fn writes_through_views_mark_their_pages() {
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         let mut ud = vec![0u32; shader.user_data_dwords() as usize];
         for u in &shader.user_data {
-            ud[u.index as usize] = if u.root == RootType::Constants && u.slot != super::DISPATCH_SLOT {
-                value
-            } else {
-                0
-            };
+            ud[u.index as usize] =
+                if u.root == RootType::Constants && u.slot != super::DISPATCH_SLOT {
+                    value
+                } else {
+                    0
+                };
         }
         let out = host
             .dispatch(
@@ -912,7 +994,13 @@ fn writes_through_views_mark_their_pages() {
                 &Dispatch {
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: marks.clone() }),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: marks.clone(),
+                            },
+                        ),
                         (2, Root::Uav(8)),
                     ],
                     views: &[View::RawUav(8), View::RawUav(8), View::RawUav(8)],
@@ -921,7 +1009,11 @@ fn writes_through_views_mark_their_pages() {
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: {e}"));
-        assert_eq!(out[0], [value, 0, 0, value, value, value, value, 0], "{label}: view 0");
+        assert_eq!(
+            out[0],
+            [value, 0, 0, value, value, value, value, 0],
+            "{label}: view 0"
+        );
         assert_eq!(out[1][1], value, "{label}: view 1");
         assert_eq!(out[2][2], value, "{label}: the atomic");
         let marked: Vec<usize> = (0..out[3].len() * 32)
@@ -1036,7 +1128,8 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         view_marks: l.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -1059,7 +1152,13 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
                 &Dispatch {
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE; 4] }),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: vec![super::VIEW_MARK_NONE; 4],
+                            },
+                        ),
                         (2, Root::Uav(words)),
                     ],
                     views: &[View::Texture(1, 1, &texel), View::Texture(1, 1, &texel)],
@@ -1069,8 +1168,14 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             )
             .unwrap_or_else(|e| panic!("{label}: {e}"));
         let bits = &out[0];
-        let marked: Vec<usize> = (0..bits.len() * 32).filter(|&b| bits[b / 32] >> (b % 32) & 1 != 0).collect();
-        assert_eq!(marked, [super::VIEW_READS as usize + 1], "{label}: the slot read");
+        let marked: Vec<usize> = (0..bits.len() * 32)
+            .filter(|&b| bits[b / 32] >> (b % 32) & 1 != 0)
+            .collect();
+        assert_eq!(
+            marked,
+            [super::VIEW_READS as usize + 1],
+            "{label}: the slot read"
+        );
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -1779,8 +1884,18 @@ fn code_table_buffer_loads_read_zeros_out_of_range() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-enum BcConst { Int(i64), Agg(Vec<u32>) }
-enum BcInst { Bin(u64, u32, u32), Cast(u64, u32), Cmp(u64, u32, u32), Extract(u32, u64), Call(String, Vec<u32>), Other }
+enum BcConst {
+    Int(i64),
+    Agg(Vec<u32>),
+}
+enum BcInst {
+    Bin(u64, u32, u32),
+    Cast(u64, u32),
+    Cmp(u64, u32, u32),
+    Extract(u32, u64),
+    Call(String, Vec<u32>),
+    Other,
+}
 
 /// Decoded instructions and conditional branches of `main` from a DXIL container.
 struct Bc {
@@ -1797,27 +1912,48 @@ impl Bc {
         assert_eq!(&bc[..4], b"BC\xC0\xDE");
         let mut pos = 32usize;
         let read = |p: &mut usize, n: u32| -> u64 {
-            (0..n).fold(0u64, |v, i| { let b = (bc[*p / 8] >> (*p % 8)) & 1; *p += 1; v | u64::from(b) << i })
+            (0..n).fold(0u64, |v, i| {
+                let b = (bc[*p / 8] >> (*p % 8)) & 1;
+                *p += 1;
+                v | u64::from(b) << i
+            })
         };
         let vbr = |p: &mut usize, w: u32| -> u64 {
             let (mut v, mut sh) = (0u64, 0u32);
             loop {
                 let x = read(p, w);
                 v |= (x & ((1 << (w - 1)) - 1)) << sh;
-                if x >> (w - 1) == 0 { return v; }
+                if x >> (w - 1) == 0 {
+                    return v;
+                }
                 sh += w - 1;
             }
         };
-        let (mut stack, mut void_ty, mut ty_void) = (Vec::<(u64, u32)>::new(), None, HashMap::<u32, bool>::new());
-        let (mut ty_n, mut globals, mut funcs, mut const_n, mut next_id, mut blk) = (0u32, 0u32, 0u32, 0u32, 0u32, 0usize);
-        let (mut consts, mut names, mut insts, mut cond_brs) = (HashMap::new(), HashMap::<u32, String>::new(), HashMap::new(), Vec::new());
+        let (mut stack, mut void_ty, mut ty_void) =
+            (Vec::<(u64, u32)>::new(), None, HashMap::<u32, bool>::new());
+        let (mut ty_n, mut globals, mut funcs, mut const_n, mut next_id, mut blk) =
+            (0u32, 0u32, 0u32, 0u32, 0u32, 0usize);
+        let (mut consts, mut names, mut insts, mut cond_brs) = (
+            HashMap::new(),
+            HashMap::<u32, String>::new(),
+            HashMap::new(),
+            Vec::new(),
+        );
         while pos < bc.len() * 8 {
             match read(&mut pos, stack.last().map_or(2, |s| s.1)) {
-                0 => { pos = pos.next_multiple_of(32); stack.pop(); if stack.is_empty() { break; } }
+                0 => {
+                    pos = pos.next_multiple_of(32);
+                    stack.pop();
+                    if stack.is_empty() {
+                        break;
+                    }
+                }
                 1 => {
                     let (id, nw) = (vbr(&mut pos, 8), vbr(&mut pos, 4) as u32);
                     pos = pos.next_multiple_of(32) + 32;
-                    if id == 12 { (next_id, blk) = (globals + funcs + const_n, 0); }
+                    if id == 12 {
+                        (next_id, blk) = (globals + funcs + const_n, 0);
+                    }
                     stack.push((id, nw));
                 }
                 3 => {
@@ -1825,22 +1961,55 @@ impl Bc {
                     let ops: Vec<u64> = (0..n).map(|_| vbr(&mut pos, 6)).collect();
                     match stack.last().map(|s| s.0) {
                         Some(17) if code != 1 && code != 19 => {
-                            if code == 2 { void_ty = Some(ty_n); }
-                            else if code == 21 { ty_void.insert(ty_n, Some(ops[1] as u32) == void_ty); }
+                            if code == 2 {
+                                void_ty = Some(ty_n);
+                            } else if code == 21 {
+                                ty_void.insert(ty_n, Some(ops[1] as u32) == void_ty);
+                            }
                             ty_n += 1;
                         }
-                        Some(8) if code == 7 || code == 8 => if code == 7 { globals += 1 } else { funcs += 1 },
+                        Some(8) if code == 7 || code == 8 => {
+                            if code == 7 {
+                                globals += 1
+                            } else {
+                                funcs += 1
+                            }
+                        }
                         Some(11) if code != 1 => {
                             let id = globals + funcs + const_n;
-                            if code == 4 { let m = (ops[0] >> 1) as i64; consts.insert(id, BcConst::Int(if ops[0] & 1 == 0 { m } else { m.wrapping_neg() })); }
-                            else if code == 7 { consts.insert(id, BcConst::Agg(ops.iter().map(|&o| o as u32).collect())); }
+                            if code == 4 {
+                                let m = (ops[0] >> 1) as i64;
+                                consts.insert(
+                                    id,
+                                    BcConst::Int(if ops[0] & 1 == 0 {
+                                        m
+                                    } else {
+                                        m.wrapping_neg()
+                                    }),
+                                );
+                            } else if code == 7 {
+                                consts.insert(
+                                    id,
+                                    BcConst::Agg(ops.iter().map(|&o| o as u32).collect()),
+                                );
+                            }
                             const_n += 1;
                         }
-                        Some(14) if code == 1 => { names.insert(ops[0] as u32, ops[1..].iter().map(|&c| c as u8 as char).collect()); }
+                        Some(14) if code == 1 => {
+                            names.insert(
+                                ops[0] as u32,
+                                ops[1..].iter().map(|&c| c as u8 as char).collect(),
+                            );
+                        }
                         Some(12) if code != 1 => {
                             let rel = |r: u64| next_id - r as u32;
                             match code {
-                                10 | 11 => { if code == 11 && ops.len() == 3 { cond_brs.push((blk, ops[0] as usize, rel(ops[2]))); } blk += 1; }
+                                10 | 11 => {
+                                    if code == 11 && ops.len() == 3 {
+                                        cond_brs.push((blk, ops[0] as usize, rel(ops[2])));
+                                    }
+                                    blk += 1;
+                                }
                                 44 => {}
                                 34 if ty_void.get(&(ops[2] as u32)).copied().unwrap_or(false) => {}
                                 _ => {
@@ -1849,7 +2018,10 @@ impl Bc {
                                         3 => BcInst::Cast(ops[2], rel(ops[0])),
                                         26 => BcInst::Extract(rel(ops[0]), ops[1]),
                                         28 => BcInst::Cmp(ops[2], rel(ops[0]), rel(ops[1])),
-                                        34 => BcInst::Call(names.get(&rel(ops[3])).cloned().unwrap_or_default(), ops[4..].iter().map(|&r| rel(r)).collect()),
+                                        34 => BcInst::Call(
+                                            names.get(&rel(ops[3])).cloned().unwrap_or_default(),
+                                            ops[4..].iter().map(|&r| rel(r)).collect(),
+                                        ),
                                         _ => BcInst::Other,
                                     };
                                     insts.insert(next_id, (blk, inst));
@@ -1863,54 +2035,133 @@ impl Bc {
                 other => panic!("unexpected bitcode abbrev {other}"),
             }
         }
-        Self { consts, insts, cond_brs }
+        Self {
+            consts,
+            insts,
+            cond_brs,
+        }
     }
 
-    fn int(&self, id: u32) -> Option<i64> { match self.consts.get(&id) { Some(BcConst::Int(v)) => Some(*v), _ => None } }
+    fn int(&self, id: u32) -> Option<i64> {
+        match self.consts.get(&id) {
+            Some(BcConst::Int(v)) => Some(*v),
+            _ => None,
+        }
+    }
 
     fn binding(&self, h: u32) -> Option<(i64, i64, i64)> {
-        let (_, BcInst::Call(name, args)) = self.insts.get(&h)? else { return None };
-        let inner = if name == "dx.op.annotateHandle" { args[1] } else { h };
-        let (_, BcInst::Call(name, args)) = self.insts.get(&inner)? else { return None };
-        let BcConst::Agg(f) = (name == "dx.op.createHandleFromBinding").then(|| self.consts.get(&args[1]))?? else { return None };
+        let (_, BcInst::Call(name, args)) = self.insts.get(&h)? else {
+            return None;
+        };
+        let inner = if name == "dx.op.annotateHandle" {
+            args[1]
+        } else {
+            h
+        };
+        let (_, BcInst::Call(name, args)) = self.insts.get(&inner)? else {
+            return None;
+        };
+        let BcConst::Agg(f) =
+            (name == "dx.op.createHandleFromBinding").then(|| self.consts.get(&args[1]))??
+        else {
+            return None;
+        };
         Some((self.int(f[0])?, self.int(f[2])?, self.int(f[3])?))
     }
 
     fn calls_on(&self, op: &str, bind: (i64, i64, i64)) -> Vec<(usize, &[u32])> {
-        self.insts.values().filter_map(|(b, i)| match i {
-            BcInst::Call(n, a) if n == op && self.binding(a[1]) == Some(bind) => Some((*b, a.as_slice())),
-            _ => None,
-        }).collect()
+        self.insts
+            .values()
+            .filter_map(|(b, i)| match i {
+                BcInst::Call(n, a) if n == op && self.binding(a[1]) == Some(bind) => {
+                    Some((*b, a.as_slice()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn assert_guarded_dirty_or(&self, blk: usize, args: &[u32], bitmap: (i64, i64, i64)) -> usize {
-        assert_eq!((self.binding(args[1]), self.int(args[2])), (Some(bitmap), Some(2)));
+        assert_eq!(
+            (self.binding(args[1]), self.int(args[2])),
+            (Some(bitmap), Some(2))
+        );
         let (word, bit) = (args[3], args[6]);
-        let &(test_blk, _, cond) = self.cond_brs.iter().find(|&&(_, then, _)| then == blk).expect("dirty atomic must be branched");
-        let (_, BcInst::Cmp(32, a, b)) = self.insts[&cond] else { panic!("guard must be icmp eq 0") };
-        let set = if self.int(b) == Some(0) { a } else { assert_eq!(self.int(a), Some(0)); b };
-        let (_, BcInst::Bin(10, x, y)) = self.insts[&set] else { panic!("test must mask word with bit") };
-        let old = if y == bit { x } else { assert_eq!(x, bit); y };
-        let (_, BcInst::Cast(11, ext)) = self.insts[&old] else { panic!("expected bitcast") };
-        let (_, BcInst::Extract(load, 0)) = self.insts[&ext] else { panic!("expected extract 0") };
-        let (load_blk, BcInst::Call(ref name, ref la)) = self.insts[&load] else { panic!("expected rawBufferLoad") };
-        assert_eq!((load_blk, name.as_str(), self.binding(la[1]), la[2]), (test_blk, "dx.op.rawBufferLoad.f32", Some(bitmap), word));
-        assert_eq!((self.int(la[4]), self.int(la[5]), self.insts[&word].0, self.insts[&bit].0), (Some(1), Some(4), test_blk, test_blk));
+        let &(test_blk, _, cond) = self
+            .cond_brs
+            .iter()
+            .find(|&&(_, then, _)| then == blk)
+            .expect("dirty atomic must be branched");
+        let (_, BcInst::Cmp(32, a, b)) = self.insts[&cond] else {
+            panic!("guard must be icmp eq 0")
+        };
+        let set = if self.int(b) == Some(0) {
+            a
+        } else {
+            assert_eq!(self.int(a), Some(0));
+            b
+        };
+        let (_, BcInst::Bin(10, x, y)) = self.insts[&set] else {
+            panic!("test must mask word with bit")
+        };
+        let old = if y == bit {
+            x
+        } else {
+            assert_eq!(x, bit);
+            y
+        };
+        let (_, BcInst::Cast(11, ext)) = self.insts[&old] else {
+            panic!("expected bitcast")
+        };
+        let (_, BcInst::Extract(load, 0)) = self.insts[&ext] else {
+            panic!("expected extract 0")
+        };
+        let (load_blk, BcInst::Call(ref name, ref la)) = self.insts[&load] else {
+            panic!("expected rawBufferLoad")
+        };
+        assert_eq!(
+            (load_blk, name.as_str(), self.binding(la[1]), la[2]),
+            (test_blk, "dx.op.rawBufferLoad.f32", Some(bitmap), word)
+        );
+        assert_eq!(
+            (
+                self.int(la[4]),
+                self.int(la[5]),
+                self.insts[&word].0,
+                self.insts[&bit].0
+            ),
+            (Some(1), Some(4), test_blk, test_blk)
+        );
         test_blk
     }
 
     fn gated_by_ne(&self, blk: usize, word: u32) -> bool {
-        let Some((_, BcInst::Bin(7, sh, _))) = self.insts.get(&word) else { return false };
-        let Some((_, BcInst::Bin(8, n, _))) = self.insts.get(sh) else { return false };
+        let Some((_, BcInst::Bin(7, sh, _))) = self.insts.get(&word) else {
+            return false;
+        };
+        let Some((_, BcInst::Bin(8, n, _))) = self.insts.get(sh) else {
+            return false;
+        };
         self.cond_brs.iter().any(|&(_, t, c)| t == blk && matches!(self.insts.get(&c), Some((_, BcInst::Cmp(33, a, b))) if a == n || b == n))
     }
 
-    fn verify_dirty_marks(&self, bitmap: (i64, i64, i64), want_atomics: usize, want_ne: Option<usize>) {
+    fn verify_dirty_marks(
+        &self,
+        bitmap: (i64, i64, i64),
+        want_atomics: usize,
+        want_ne: Option<usize>,
+    ) {
         let atomics = self.calls_on("dx.op.atomicBinOp.i32", bitmap);
         assert_eq!(atomics.len(), want_atomics);
-        let ne = atomics.iter().filter(|&&(b, a)| self.gated_by_ne(self.assert_guarded_dirty_or(b, a, bitmap), a[3])).count();
+        let ne = atomics
+            .iter()
+            .filter(|&&(b, a)| self.gated_by_ne(self.assert_guarded_dirty_or(b, a, bitmap), a[3]))
+            .count();
         if let Some(expected_ne) = want_ne {
-            assert_eq!(ne, expected_ne, "2nd marks must check n != bits[0] before loading bitmap");
+            assert_eq!(
+                ne, expected_ne,
+                "2nd marks must check n != bits[0] before loading bitmap"
+            );
         }
     }
 }
@@ -1921,14 +2172,41 @@ impl Bc {
 #[test]
 fn memory_entry_caches_null_coalesces_loads_and_guards_dirty_atomics() {
     let shader = program();
-    let sfi0 = crate::dxbc::Container::parse(&shader.dxil).expect("dxbc").part(crate::dxbc::FourCC::SFI0).expect("SFI0").data;
-    assert_eq!(u64::from_le_bytes(sfi0.try_into().unwrap()) & 0x4000, 0, "no WAVE_OPS");
+    let sfi0 = crate::dxbc::Container::parse(&shader.dxil)
+        .expect("dxbc")
+        .part(crate::dxbc::FourCC::SFI0)
+        .expect("SFI0")
+        .data;
+    assert_eq!(
+        u64::from_le_bytes(sfi0.try_into().unwrap()) & 0x4000,
+        0,
+        "no WAVE_OPS"
+    );
     let bc = Bc::parse(&shader.dxil);
     let pt_loads = bc.calls_on("dx.op.rawBufferLoad.f32", (0, 2, 0));
-    assert_eq!(pt_loads.iter().filter(|(_, a)| bc.int(a[2]) == Some(4096 * 4)).map(|(b, _)| *b).collect::<Vec<_>>(), [0]);
-    assert_eq!(pt_loads.iter().filter(|(_, a)| (bc.int(a[4]), bc.int(a[5])) == (Some(3), Some(8))).count(), 13);
+    assert_eq!(
+        pt_loads
+            .iter()
+            .filter(|(_, a)| bc.int(a[2]) == Some(4096 * 4))
+            .map(|(b, _)| *b)
+            .collect::<Vec<_>>(),
+        [0]
+    );
+    assert_eq!(
+        pt_loads
+            .iter()
+            .filter(|(_, a)| (bc.int(a[4]), bc.int(a[5])) == (Some(3), Some(8)))
+            .count(),
+        13
+    );
     // 1 hoisted memory_null + 13 primary memory_page L1 loads + 4 straddling-write L1 loads.
-    assert_eq!(pt_loads.iter().filter(|(_, a)| bc.int(a[4]) == Some(1)).count(), 18);
+    assert_eq!(
+        pt_loads
+            .iter()
+            .filter(|(_, a)| bc.int(a[4]) == Some(1))
+            .count(),
+        18
+    );
     bc.verify_dirty_marks((0, 2, 1), 17, None);
 }
 
@@ -1939,15 +2217,43 @@ fn memory_entry_caches_null_coalesces_loads_and_guards_dirty_atomics() {
 #[test]
 fn dirty_mark_width_and_branch_hoisting() {
     let mut val = validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
-    for (view_mark, bytes, in_branch) in [(false, 1, false), (false, 4, true), (true, 1, false), (true, 4, false)] {
+    for (view_mark, bytes, in_branch) in [
+        (false, 1, false),
+        (false, 4, true),
+        (true, 1, false),
+        (true, 4, false),
+    ] {
         let dxil = lower::synthetic_mark_dxil(view_mark, bytes, in_branch);
-        if let Some(v) = val.as_mut() { v.validate(&mut dxil.clone()).expect("DXIL validation failed"); }
+        if let Some(v) = val.as_mut() {
+            v.validate(&mut dxil.clone())
+                .expect("DXIL validation failed");
+        }
         let bc = Bc::parse(&dxil);
-        let (table, bitmap) = if view_mark { ((2, 2, 0), (1, 2, 1)) } else { ((0, 2, 0), (0, 2, 1)) };
+        let (table, bitmap) = if view_mark {
+            ((2, 2, 0), (1, 2, 1))
+        } else {
+            ((0, 2, 0), (0, 2, 1))
+        };
         let t_loads = bc.calls_on("dx.op.rawBufferLoad.f32", table);
-        assert_eq!(t_loads.iter().filter(|(_, a)| (bc.int(a[4]), bc.int(a[5])) == (Some(3), Some(8))).count(), 1);
-        if view_mark { assert_eq!(t_loads.len(), 1); }
-        else { assert_eq!(t_loads.iter().filter(|(_, a)| bc.int(a[2]) == Some(4096 * 4)).map(|(b, _)| *b).collect::<Vec<_>>(), [0]); }
+        assert_eq!(
+            t_loads
+                .iter()
+                .filter(|(_, a)| (bc.int(a[4]), bc.int(a[5])) == (Some(3), Some(8)))
+                .count(),
+            1
+        );
+        if view_mark {
+            assert_eq!(t_loads.len(), 1);
+        } else {
+            assert_eq!(
+                t_loads
+                    .iter()
+                    .filter(|(_, a)| bc.int(a[2]) == Some(4096 * 4))
+                    .map(|(b, _)| *b)
+                    .collect::<Vec<_>>(),
+                [0]
+            );
+        }
         let want = if bytes <= 1 { 1 } else { 2 };
         assert_eq!(bc.calls_on("dx.op.rawBufferLoad.f32", bitmap).len(), want);
         bc.verify_dirty_marks(bitmap, want, view_mark.then_some(usize::from(bytes > 1)));

@@ -34,10 +34,7 @@ pub(super) fn mask_uses_console_lanes(
             };
             if !matches!(
                 i.name(),
-                "v_cndmask_b32"
-                    | "v_add_co_ci_u32"
-                    | "v_sub_co_ci_u32"
-                    | "v_subrev_co_ci_u32"
+                "v_cndmask_b32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32"
             ) {
                 return None;
             }
@@ -433,7 +430,10 @@ mod tests {
             S_ENDPGM,
         ];
         let lowered = lowers_cs(&words, true, 1).unwrap();
-        assert!(lowered.wave_ops, "expected WAVE_OPS for Wave64 console_lanes");
+        assert!(
+            lowered.wave_ops,
+            "expected WAVE_OPS for Wave64 console_lanes"
+        );
         validate_dxil(&lowered.dxil);
     }
 

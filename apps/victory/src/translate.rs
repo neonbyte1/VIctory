@@ -397,32 +397,35 @@ pub fn run(
         print_counts(&t.counted);
     }
     if !pairs.is_empty() {
-    let host = Host::new(false).map_err(anyhow::Error::msg)?;
-    let kept = lock(&kept);
-    let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-    for (v, p) in pairs {
-        let made = match (find(v), find(p)) {
-            // A mesh pair is named the same way the census names it
-            // everywhere else: the host without mesh shaders says so
-            // instead of failing to make the pipeline with an error that
-            // reads like the shaders' fault.
-            (Some((_, vs)), Some((_, ps))) => {
-                let made = if vs.stage == HwStage::Ms {
-                    if host.mesh_shaders() {
-                        host.mesh_pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let kept = lock(&kept);
+        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
+        for (v, p) in pairs {
+            let made = match (find(v), find(p)) {
+                // A mesh pair is named the same way the census names it
+                // everywhere else: the host without mesh shaders says so
+                // instead of failing to make the pipeline with an error that
+                // reads like the shaders' fault.
+                (Some((_, vs)), Some((_, ps))) => {
+                    let made = if vs.stage == HwStage::Ms {
+                        if host.mesh_shaders() {
+                            host.mesh_pipeline(vs, ps)
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        } else {
+                            Err("the host has no mesh shaders".to_owned())
+                        }
                     } else {
-                        Err("the host has no mesh shaders".to_owned())
-                    }
-                } else {
-                    host.pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
-                };
-                made.map(|()| "pipeline created".to_owned()).unwrap_or_else(|e| e)
-            }
-            _ => "not emitted".to_owned(),
-        };
-        println!("pair {v} + {p}: {made}");
+                        host.pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+                    };
+                    made.map(|()| "pipeline created".to_owned())
+                        .unwrap_or_else(|e| e)
+                }
+                _ => "not emitted".to_owned(),
+            };
+            println!("pair {v} + {p}: {made}");
+        }
     }
-}
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
@@ -1066,7 +1069,17 @@ mod tests {
         // SAFETY: no other test in this binary touches the environment.
         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, false, Some(1), None, false).unwrap_err();
+        let err = super::run(
+            vec![missing],
+            false,
+            false,
+            false,
+            false,
+            Some(1),
+            None,
+            false,
+        )
+        .unwrap_err();
         // SAFETY: as above; unset so a later test's `run` is not refused.
         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(

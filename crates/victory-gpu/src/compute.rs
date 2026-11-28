@@ -19,7 +19,11 @@ pub(crate) fn constants(register: u32, count: u32) -> D3D12_ROOT_PARAMETER {
     D3D12_ROOT_PARAMETER {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
         Anonymous: D3D12_ROOT_PARAMETER_0 {
-            Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: register, RegisterSpace: 0, Num32BitValues: count },
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+                Num32BitValues: count,
+            },
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     }
@@ -27,11 +31,18 @@ pub(crate) fn constants(register: u32, count: u32) -> D3D12_ROOT_PARAMETER {
 
 /// A root view of `kind` (constant, shader resource or unordered view) at
 /// `register` of `space`.
-pub(crate) fn root_view(kind: D3D12_ROOT_PARAMETER_TYPE, register: u32, space: u32) -> D3D12_ROOT_PARAMETER {
+pub(crate) fn root_view(
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    register: u32,
+    space: u32,
+) -> D3D12_ROOT_PARAMETER {
     D3D12_ROOT_PARAMETER {
         ParameterType: kind,
         Anonymous: D3D12_ROOT_PARAMETER_0 {
-            Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: register, RegisterSpace: space },
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: register,
+                RegisterSpace: space,
+            },
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     }
@@ -56,7 +67,12 @@ pub(crate) fn table(ranges: &[D3D12_DESCRIPTOR_RANGE]) -> D3D12_ROOT_PARAMETER {
 /// `count` views of `kind` from `register` of `space` (`u32::MAX`:
 /// unbounded), after the table's ranges before.
 #[cfg(test)]
-pub(crate) fn range(kind: D3D12_DESCRIPTOR_RANGE_TYPE, register: u32, space: u32, count: u32) -> D3D12_DESCRIPTOR_RANGE {
+pub(crate) fn range(
+    kind: D3D12_DESCRIPTOR_RANGE_TYPE,
+    register: u32,
+    space: u32,
+    count: u32,
+) -> D3D12_DESCRIPTOR_RANGE {
     D3D12_DESCRIPTOR_RANGE {
         RangeType: kind,
         NumDescriptors: count,
@@ -69,18 +85,44 @@ pub(crate) fn range(kind: D3D12_DESCRIPTOR_RANGE_TYPE, register: u32, space: u32
 /// The bytes of a blob, alive as long as it is.
 pub(crate) fn bytes(blob: &ID3DBlob) -> &[u8] {
     // SAFETY: the blob's own buffer, borrowed for as long as the blob.
-    unsafe { std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()) }
+    unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    }
 }
 
 /// `source` compiled at `entry` for `target`; the compiler's messages, if
 /// it fails, are logged under `name`.
-pub(crate) fn compile(source: &str, name: PCSTR, entry: PCSTR, target: PCSTR, flags: u32) -> windows::core::Result<ID3DBlob> {
+pub(crate) fn compile(
+    source: &str,
+    name: PCSTR,
+    entry: PCSTR,
+    target: PCSTR,
+    flags: u32,
+) -> windows::core::Result<ID3DBlob> {
     let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
     // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe { D3DCompile(source.as_ptr().cast(), source.len(), name, None, None, entry, target, flags, 0, &mut code, Some(&mut errors)) };
+    let compiled = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            name,
+            None,
+            None,
+            entry,
+            target,
+            flags,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
     if let (Err(_), Some(errors)) = (&compiled, errors) {
-        // SAFETY: a name the caller keeps, terminated.
-        tracing::warn!("{}: {}", unsafe { name.display() }, String::from_utf8_lossy(bytes(&errors)).trim_end());
+        tracing::warn!(
+            "{}: {}",
+            // SAFETY: a name the caller keeps, terminated.
+            unsafe { name.display() },
+            String::from_utf8_lossy(bytes(&errors)).trim_end()
+        );
     }
     compiled?;
     code.ok_or_else(windows::core::Error::empty)
@@ -88,7 +130,11 @@ pub(crate) fn compile(source: &str, name: PCSTR, entry: PCSTR, target: PCSTR, fl
 
 /// A root signature of `params`, serialized here (version 1.0: views and
 /// their data may change until execution).
-pub(crate) fn root_signature(device: &ID3D12Device, params: &[D3D12_ROOT_PARAMETER], flags: D3D12_ROOT_SIGNATURE_FLAGS) -> windows::core::Result<ID3D12RootSignature> {
+pub(crate) fn root_signature(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER],
+    flags: D3D12_ROOT_SIGNATURE_FLAGS,
+) -> windows::core::Result<ID3D12RootSignature> {
     let desc = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: params.len() as u32,
         pParameters: params.as_ptr(),
@@ -101,9 +147,17 @@ pub(crate) fn root_signature(device: &ID3D12Device, params: &[D3D12_ROOT_PARAMET
     // are the caller's); out pointers ours; the blob is read whole before
     // it is released.
     unsafe {
-        if let Err(e) = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &mut blob, Some(&mut errors)) {
+        if let Err(e) = D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1_0,
+            &mut blob,
+            Some(&mut errors),
+        ) {
             if let Some(errors) = errors {
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(bytes(&errors)).trim_end());
+                tracing::warn!(
+                    "root signature: {}",
+                    String::from_utf8_lossy(bytes(&errors)).trim_end()
+                );
             }
             return Err(e);
         }
@@ -112,14 +166,29 @@ pub(crate) fn root_signature(device: &ID3D12Device, params: &[D3D12_ROOT_PARAMET
 }
 
 /// A compute shader (`main`) and its root signature of `params`.
-pub(crate) fn compute(device: &ID3D12Device, name: PCSTR, source: &str, flags: u32, params: &[D3D12_ROOT_PARAMETER]) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
-    let code = compile(source, name, windows::core::s!("main"), windows::core::s!("cs_5_1"), flags)?;
+pub(crate) fn compute(
+    device: &ID3D12Device,
+    name: PCSTR,
+    source: &str,
+    flags: u32,
+    params: &[D3D12_ROOT_PARAMETER],
+) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+    let code = compile(
+        source,
+        name,
+        windows::core::s!("main"),
+        windows::core::s!("cs_5_1"),
+        flags,
+    )?;
     let root = root_signature(device, params, D3D12_ROOT_SIGNATURE_FLAG_NONE)?;
     let code = bytes(&code);
     let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         // SAFETY: a borrowed pointer the description never releases.
         pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+        CS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: code.as_ptr().cast(),
+            BytecodeLength: code.len(),
+        },
         ..Default::default()
     };
     // SAFETY: the description points at live code and a live root signature.

@@ -249,7 +249,9 @@ fn pump(held: &mut Holding, why: Why) {
     if held.is_empty() {
         return;
     }
-    let Some(host) = crate::host::host() else { return };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
     // With early release, waits read the values of bottom-of-pipe writes in
     // flight over title memory (`crate::early`).
     let early = crate::early::on();
@@ -257,7 +259,11 @@ fn pump(held: &mut Holding, why: Why) {
     let read: &dyn Fn(u64, u8) -> Option<u64> = if early { &overlaid } else { &read_value };
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
-        tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
+        tracing::warn!(
+            queue = kind(queue),
+            ?waits,
+            "held work runs without its waits after {VALVE:?} (safety valve)"
+        );
     }
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
@@ -297,10 +303,14 @@ fn pump(held: &mut Holding, why: Why) {
     }
     static TIMER: std::sync::Once = std::sync::Once::new();
     TIMER.call_once(|| {
-        let _ = std::thread::Builder::new().name("victory held work".into()).spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            pump_held_if_free(Why::Timer);
-        });
+        let _ = std::thread::Builder::new()
+            .name("victory held work".into())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    pump_held_if_free(Why::Timer);
+                }
+            });
     });
 }
 
@@ -308,7 +318,11 @@ fn pump(held: &mut Holding, why: Why) {
 #[cfg(windows)]
 fn read_value(address: u64, bytes: u8) -> Option<u64> {
     let mut value = [0u8; 8];
-    crate::host::read_into(address as *const u8, &mut value[..usize::from(bytes.min(8))]).then(|| u64::from_le_bytes(value))
+    crate::host::read_into(
+        address as *const u8,
+        &mut value[..usize::from(bytes.min(8))],
+    )
+    .then(|| u64::from_le_bytes(value))
 }
 
 /// A queue's type, for logs (0 graphics, 2 compute, 3 copy). Titles do not
@@ -344,7 +358,10 @@ struct Account {
 #[cfg(windows)]
 fn account() -> std::sync::MutexGuard<'static, Account> {
     static ACCOUNT: std::sync::OnceLock<std::sync::Mutex<Account>> = std::sync::OnceLock::new();
-    ACCOUNT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+    ACCOUNT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// The frame line of held work: what waited, how long and what released it,
@@ -391,18 +408,43 @@ fn account_frame(frame: u64) {
     tracing::debug!(
         frame,
         "held work released this frame (queue type, ms, by): {:?}",
-        a.released.iter().map(|(k, d, w)| (k, d.as_secs_f64() * 1e3, w)).collect::<Vec<_>>()
+        a.released
+            .iter()
+            .map(|(k, d, w)| (k, d.as_secs_f64() * 1e3, w))
+            .collect::<Vec<_>>()
     );
     for (queue, items, waited, unmet) in &blocked {
         let level_warn = blocked.len() > 1;
         let unmet: Vec<String> = unmet
             .iter()
-            .map(|w| format!("{:#x} cmp {} {:#x} (is {:?})", w.address, w.comparison, w.reference, read_value(w.address, w.bytes)))
+            .map(|w| {
+                format!(
+                    "{:#x} cmp {} {:#x} (is {:?})",
+                    w.address,
+                    w.comparison,
+                    w.reference,
+                    read_value(w.address, w.bytes)
+                )
+            })
             .collect();
         if level_warn {
-            tracing::warn!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "two or more queues hold work at the present");
+            tracing::warn!(
+                frame,
+                queue = kind(*queue),
+                items,
+                waited_ms = waited.as_millis(),
+                ?unmet,
+                "two or more queues hold work at the present"
+            );
         } else {
-            tracing::info!(frame, queue = kind(*queue), items, waited_ms = waited.as_millis(), ?unmet, "a queue holds work at the present");
+            tracing::info!(
+                frame,
+                queue = kind(*queue),
+                items,
+                waited_ms = waited.as_millis(),
+                ?unmet,
+                "a queue holds work at the present"
+            );
         }
     }
     if a.forced > 0 || a.unknown > 0 || a.unreadable > 0 || a.mappings > 0 {
@@ -843,7 +885,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
@@ -940,7 +984,9 @@ pub(crate) mod tests {
         };
         record(&mut state);
         assert!(
-            crate::draw::take_frame().iter().any(|draw| draw.starts_with(marker)),
+            crate::draw::take_frame()
+                .iter()
+                .any(|draw| draw.starts_with(marker)),
             "the draw entered the trace"
         );
         record(&mut state);
@@ -1150,22 +1196,35 @@ pub(crate) mod tests {
     #[cfg(windows)]
     #[test]
     fn page_mappings_wait_for_a_running_submission() {
-        let Some(host) = crate::host::host() else { return };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
         crate::resource::use_page_mapper(|_, _, _| true);
         let running = host.hold_submissions();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mapping = {
             let done = done.clone();
             std::thread::spawn(move || {
-                let range = PageRange { kind: 3, start: 0, count: 1 };
-                let batch = PageBatch { destination: 0x10000, count: 1, ranges: &range };
+                let range = PageRange {
+                    kind: 3,
+                    start: 0,
+                    count: 1,
+                };
+                let batch = PageBatch {
+                    destination: 0x10000,
+                    count: 1,
+                    ranges: &range,
+                };
                 let null = std::ptr::null();
                 assert_eq!(copy_page_mappings(null, 1, &batch, 0x20000, 1, 0), S_OK);
                 done.store(true, std::sync::atomic::Ordering::SeqCst);
             })
         };
         std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "mapped under a running submission");
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "mapped under a running submission"
+        );
         drop(running);
         mapping.join().unwrap();
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));

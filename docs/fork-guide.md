@@ -15,7 +15,8 @@ Welcome. This is how we work from this fork towards upstream (`Marvisak/VIctory`
 3. **Check upstream for duplicates first** (`gh pr list -R Marvisak/VIctory --search "<keywords>" --state all`). If someone already has the fix, test and report on their PR instead of opening our own.
 4. **AI use is disclosed** at the end of each post or PR, for example: `_AI-assisted (<tool>); measured on my machine, no game data shared._`
 5. **Upstream PRs go from your own account**, from a branch on this fork. Keep the original author when you take someone's commit (cherry-pick, or `Co-authored-by:`).
-6. **Format only what you changed.** CI runs `cargo xtask policy` and strict clippy (`-D warnings`, default and `--all-features`, `--all-targets`); run them before pushing. CI doesn't run rustfmt and the tree isn't rustfmt-clean, so check only your changed lines (`rustfmt --edition 2024 --check <files>`), never reformat unrelated code.
+6. **Formatting is required.** The fork's `main` is rustfmt-clean, and `.github/workflows/fmt.yml` fails any push or PR that isn't: run `cargo fmt --all` before committing on the fork. Upstream's tree isn't rustfmt-clean and its CI doesn't run rustfmt, so a PR to `Marvisak/VIctory` formats only the code it adds or changes, never unrelated lines. CI also runs `cargo xtask policy` and strict clippy (`-D warnings`, default and `--all-features`, `--all-targets`); run them before pushing.
+   Merging an upstream PR into the fork: upstream's code isn't formatted, so format the incoming side first (`git switch -c tmp/<pr> <pr-head> && cargo fmt --all && git commit -am fmt`), merge `tmp/<pr>`, then run `cargo fmt --all` on the result. The merge commit still names `#N`; only real conflicts remain.
 7. **Never claim a speed-up without an adjacent control** (see section 5).
 
 ## 2. Branches on the fork

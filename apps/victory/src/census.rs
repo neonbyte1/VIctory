@@ -688,10 +688,7 @@ mod tests {
         let exe = build_pe(
             false,
             &[],
-            &[(
-                "titlelib.DLL",
-                &[Sym::Name("FooInit"), Sym::Ordinal(3)],
-            )],
+            &[("titlelib.DLL", &[Sym::Name("FooInit"), Sym::Ordinal(3)])],
         );
         let exe_path = root.join("game.exe");
         std::fs::write(&exe_path, exe).unwrap();

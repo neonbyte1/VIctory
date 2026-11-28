@@ -143,7 +143,9 @@ impl<S> Held<S> {
         let now = Instant::now();
         match self.queues.iter_mut().find(|(q, _)| *q == queue) {
             Some((_, items)) => items.push_back((item, now, true)),
-            None => self.queues.push((queue, VecDeque::from([(item, now, true)]))),
+            None => self
+                .queues
+                .push((queue, VecDeque::from([(item, now, true)]))),
         }
     }
 
@@ -233,13 +235,20 @@ impl<S> Held<S> {
 
     /// The queues still holding work: (queue, items, how long the head
     /// waited, the head's waits that do not hold).
-    pub(crate) fn blocked(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Vec<(usize, usize, Duration, Vec<ValueWait>)> {
+    pub(crate) fn blocked(
+        &self,
+        read: &dyn Fn(u64, u8) -> Option<u64>,
+    ) -> Vec<(usize, usize, Duration, Vec<ValueWait>)> {
         self.queues
             .iter()
             .filter_map(|(q, items)| {
                 let (head, since, _) = items.front()?;
                 let unmet = match head {
-                    Item::Segment(_, waits) => waits.iter().filter(|w| w.holds(read) == Some(false)).copied().collect(),
+                    Item::Segment(_, waits) => waits
+                        .iter()
+                        .filter(|w| w.holds(read) == Some(false))
+                        .copied()
+                        .collect(),
                     _ => Vec::new(),
                 };
                 Some((*q, items.len(), since.elapsed(), unmet))
@@ -254,7 +263,9 @@ impl<S> Held<S> {
 
     /// Whether `queue` holds anything.
     pub(crate) fn holds_work(&self, queue: usize) -> bool {
-        self.queues.iter().any(|(q, items)| *q == queue && !items.is_empty())
+        self.queues
+            .iter()
+            .any(|(q, items)| *q == queue && !items.is_empty())
     }
 
     /// Releases work held longer than `limit` at the heads of blocked
@@ -304,12 +315,24 @@ mod tests {
     }
 
     fn ge(address: u64, reference: u64) -> ValueWait {
-        ValueWait { address, bytes: 8, comparison: GREATER_EQUAL, reference, mask: u64::MAX }
+        ValueWait {
+            address,
+            bytes: 8,
+            comparison: GREATER_EQUAL,
+            reference,
+            mask: u64::MAX,
+        }
     }
 
     fn pump(held: &mut Held<&'static str>, fake: &RefCell<Fake>) -> Pumped {
         let memory = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
-        let read = |a: u64, b| fake.borrow().pending.get(&a).copied().or_else(|| memory(a, b));
+        let read = |a: u64, b| {
+            fake.borrow()
+                .pending
+                .get(&a)
+                .copied()
+                .or_else(|| memory(a, b))
+        };
         let fence = |f: usize| *fake.borrow().fences.get(&f).unwrap_or(&0);
         let mut run = |q: usize, segments: Vec<&'static str>| {
             let mut f = fake.borrow_mut();
@@ -346,15 +369,28 @@ mod tests {
     /// for 1).
     #[test]
     fn with_early_release_a_wait_reads_what_earlier_segments_of_its_queue_will_write() {
-        let fake = RefCell::new(Fake { early: true, ..Fake::default() });
+        let fake = RefCell::new(Fake {
+            early: true,
+            ..Fake::default()
+        });
         fake.borrow_mut().memory.insert(0x100, 1);
         fake.borrow_mut().writes.insert("reset", vec![(0x100, 0)]);
-        let eq = ValueWait { address: 0x100, bytes: 8, comparison: EQUAL, reference: 1, mask: u64::MAX };
+        let eq = ValueWait {
+            address: 0x100,
+            bytes: 8,
+            comparison: EQUAL,
+            reference: 1,
+            mask: u64::MAX,
+        };
         let mut held = Held::default();
         held.push(1, Item::Segment("reset", vec![]));
         held.push(1, Item::Segment("after", vec![eq]));
         let p = pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q1: reset"], "the wait reads the 0 in flight");
+        assert_eq!(
+            fake.borrow().log,
+            ["q1: reset"],
+            "the wait reads the 0 in flight"
+        );
         assert_eq!((p.pieces, p.early), (1, 0));
         fake.borrow_mut().complete();
         pump(&mut held, &fake);
@@ -371,7 +407,10 @@ mod tests {
     /// completes; a segment with no waits joins the piece before it.
     #[test]
     fn with_early_release_a_wait_runs_behind_its_writer_in_flight() {
-        let fake = RefCell::new(Fake { early: true, ..Fake::default() });
+        let fake = RefCell::new(Fake {
+            early: true,
+            ..Fake::default()
+        });
         fake.borrow_mut().writes.insert("draw", vec![(0x100, 7)]);
         let mut held = Held::default();
         held.push(2, Item::Segment("depth", vec![ge(0x100, 7)]));
@@ -380,7 +419,11 @@ mod tests {
         let p = pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q1: draw", "q2: depth more"]);
         assert_eq!((p.pieces, p.segments, p.early), (2, 3, 1));
-        assert_eq!(fake.borrow().memory.get(&0x100), None, "not in memory before it completes");
+        assert_eq!(
+            fake.borrow().memory.get(&0x100),
+            None,
+            "not in memory before it completes"
+        );
         fake.borrow_mut().complete();
         assert_eq!(fake.borrow().memory.get(&0x100), Some(&7));
     }
@@ -388,8 +431,23 @@ mod tests {
     #[test]
     fn comparisons_test_the_masked_value() {
         let read = |_, _| Some(0x1_0000_0005);
-        let w = |comparison, reference| ValueWait { address: 8, bytes: 4, comparison, reference, mask: 0xffff_ffff };
-        let expect = [(NEVER, false), (LESS, false), (EQUAL, true), (LESS_EQUAL, true), (GREATER, false), (NOT_EQUAL, false), (GREATER_EQUAL, true), (ALWAYS, true)];
+        let w = |comparison, reference| ValueWait {
+            address: 8,
+            bytes: 4,
+            comparison,
+            reference,
+            mask: 0xffff_ffff,
+        };
+        let expect = [
+            (NEVER, false),
+            (LESS, false),
+            (EQUAL, true),
+            (LESS_EQUAL, true),
+            (GREATER, false),
+            (NOT_EQUAL, false),
+            (GREATER_EQUAL, true),
+            (ALWAYS, true),
+        ];
         for (cmp, holds) in expect {
             assert_eq!(w(cmp, 5).holds(&read), Some(holds), "comparison {cmp}");
         }
@@ -409,7 +467,11 @@ mod tests {
         let mut held = Held::default();
         held.push(2, Item::Segment("depth", vec![ge(0x100, 7)]));
         let p = pump(&mut held, &fake);
-        assert_eq!((p.pieces, p.segments), (0, 0), "held: the value is not there");
+        assert_eq!(
+            (p.pieces, p.segments),
+            (0, 0),
+            "held: the value is not there"
+        );
         assert!(held.holds_work(2));
         held.push(1, Item::Segment("draw", vec![]));
         let p = pump(&mut held, &fake);
@@ -453,7 +515,10 @@ mod tests {
         held.push(1, Item::Segment("g1", vec![ge(0x10, 1)]));
         held.push(1, Item::Segment("g2", vec![ge(0x30, 1)]));
         pump(&mut held, &fake);
-        assert_eq!(fake.borrow().log, ["q1: g0", "q2: c1", "q1: g1", "q2: c2", "q1: g2"]);
+        assert_eq!(
+            fake.borrow().log,
+            ["q1: g0", "q2: c1", "q1: g1", "q2: c2", "q1: g2"]
+        );
         assert!(held.blocked(&|_, _| Some(0)).is_empty());
     }
 
@@ -555,7 +620,10 @@ mod tests {
         let read = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
         let blocked = held.blocked(&read);
         assert_eq!(blocked.len(), 1);
-        assert_eq!((blocked[0].0, blocked[0].1, blocked[0].3.clone()), (2, 2, vec![ge(0x100, 2)]));
+        assert_eq!(
+            (blocked[0].0, blocked[0].1, blocked[0].3.clone()),
+            (2, 2, vec![ge(0x100, 2)])
+        );
         fake.borrow_mut().memory.insert(0x100, 2);
         let p = pump(&mut held, &fake);
         assert_eq!(p.waited.len(), 1);
@@ -566,7 +634,13 @@ mod tests {
     fn unknown_comparisons_are_counted_and_do_not_hold_work() {
         let fake = RefCell::new(Fake::default());
         let mut held = Held::default();
-        let odd = ValueWait { address: 0x100, bytes: 4, comparison: 12, reference: 1, mask: 0xffff_ffff };
+        let odd = ValueWait {
+            address: 0x100,
+            bytes: 4,
+            comparison: 12,
+            reference: 1,
+            mask: 0xffff_ffff,
+        };
         held.push(2, Item::Segment("odd", vec![odd]));
         let p = pump(&mut held, &fake);
         assert_eq!((p.segments, p.unknown), (1, 1));

@@ -794,7 +794,10 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
 
 fn run_cases(cfg: Config, batches: usize) {
     let shader = build(cfg);
-    assert!(!cfg.high || !cfg.memory, "the 64-bit offset is the root descriptor path");
+    assert!(
+        !cfg.high || !cfg.memory,
+        "the 64-bit offset is the root descriptor path"
+    );
     // A program with the BVH instruction reads its root SRV as title
     // memory too.
     assert!(shader.memory);
@@ -838,8 +841,7 @@ fn run_cases(cfg: Config, batches: usize) {
             let high_at = if cfg.high { HIGH as u32 / 4 } else { 0 };
             let mut data = vec![0u32; LANES * 16 + LANES * 32 + high_at as usize];
             for (n, (w, ty, ray)) in cases.iter().enumerate() {
-                let ptr = (nodes + 128 * n as u32) >> 3 | ty
-                    | if cfg.high { 1 << 29 } else { 0 };
+                let ptr = (nodes + 128 * n as u32) >> 3 | ty | if cfg.high { 1 << 29 } else { 0 };
                 let r = &mut data[16 * n..16 * n + 12];
                 r[0] = ptr;
                 r[1] = ray.extent.to_bits();
@@ -871,10 +873,20 @@ fn run_cases(cfg: Config, batches: usize) {
                 };
                 data[at..at + 28].copy_from_slice(w);
             }
-            let table = if cfg.high { page_table_high(1, 3) } else { page_table(1, 3) };
+            let table = if cfg.high {
+                page_table_high(1, 3)
+            } else {
+                page_table(1, 3)
+            };
             let roots = vec![
                 (0, Root::Constants(ud.clone())),
-                (1, Root::View { srv: true, data: table }),
+                (
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: table,
+                    },
+                ),
                 (2, Root::Uav(2 * 4096 / 32)),
             ];
             let views = [

@@ -304,7 +304,10 @@ fn heap_direct_image_load_and_store_keeps_view_read_marks() {
     let ls = lower_marks(&load_and_store);
     validate_dxil(&ls.dxil);
     assert_eq!(ls.heap_props, vec![(0x1002, 0x409)]);
-    assert!(ls.view_marks, "heap-direct image_load on a UAV must keep view_marks");
+    assert!(
+        ls.view_marks,
+        "heap-direct image_load on a UAV must keep view_marks"
+    );
 
     // Store-only on a heap-direct 2D image does not emit a read mark.
     let store_only = [
@@ -325,5 +328,8 @@ fn heap_direct_image_load_and_store_keeps_view_read_marks() {
     let so = lower_marks(&store_only);
     validate_dxil(&so.dxil);
     assert_eq!(so.heap_props, vec![(0x1002, 0x409)]);
-    assert!(!so.view_marks, "store-only image UAV should not set view_marks");
+    assert!(
+        !so.view_marks,
+        "store-only image UAV should not set view_marks"
+    );
 }

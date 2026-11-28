@@ -279,7 +279,13 @@ extern "system" fn register_port(
     callback: Option<PortCallback>,
     out: *mut u64,
 ) -> HRESULT {
-    register(queue, Event::Port, context, callback.map(Callback::Port), out)
+    register(
+        queue,
+        Event::Port,
+        context,
+        callback.map(Callback::Port),
+        out,
+    )
 }
 
 extern "system" fn unregister_port(_: This, token: u64, wait: bool) -> bool {
@@ -293,7 +299,13 @@ extern "system" fn register_hint(
     callback: Option<HintCallback>,
     out: *mut u64,
 ) -> HRESULT {
-    register(queue, Event::Hint, context, callback.map(Callback::Hint), out)
+    register(
+        queue,
+        Event::Hint,
+        context,
+        callback.map(Callback::Hint),
+        out,
+    )
 }
 
 extern "system" fn unregister_hint(_: This, token: u64, wait: bool) -> bool {
@@ -460,8 +472,12 @@ mod tests {
         assert!(!xasync::XTaskQueueDispatch(queue, xasync::COMPLETION, 0));
         assert_eq!(observed.ports, [UDP_PORT]);
         assert_eq!(observed.hints, [OFFLINE]);
-        assert!(method::<Unregister>(&OBJECT, 0x38)(&OBJECT, port_token, false));
-        assert!(method::<Unregister>(&OBJECT, 0x88)(&OBJECT, hint_token, true));
+        assert!(method::<Unregister>(&OBJECT, 0x38)(
+            &OBJECT, port_token, false
+        ));
+        assert!(method::<Unregister>(&OBJECT, 0x88)(
+            &OBJECT, hint_token, true
+        ));
         xasync::XTaskQueueCloseHandle(queue);
     }
 
@@ -538,7 +554,11 @@ mod tests {
         );
         assert_ne!(probe.token, 0);
         assert_eq!(probe.result, Some((probe.token, false)));
-        assert!(method::<Unregister>(&OBJECT, 0x38)(&OBJECT, probe.token, true));
+        assert!(method::<Unregister>(&OBJECT, 0x38)(
+            &OBJECT,
+            probe.token,
+            true
+        ));
         xasync::XTaskQueueCloseHandle(queue);
     }
 }

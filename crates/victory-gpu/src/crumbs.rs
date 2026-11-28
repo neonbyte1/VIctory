@@ -41,7 +41,11 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| {
         let on = crate::switch::on("VICTORY_GPU_BREADCRUMBS");
         if on {
-            tracing::info!(slots = SLOTS, stuck_after_ms = STUCK_AFTER.as_millis() as u64, "GPU breadcrumbs on");
+            tracing::info!(
+                slots = SLOTS,
+                stuck_after_ms = STUCK_AFTER.as_millis() as u64,
+                "GPU breadcrumbs on"
+            );
         }
         on
     })
@@ -92,8 +96,14 @@ impl Trail {
     /// A trail for list `id` (`list` its host list on `device`), empty with
     /// breadcrumbs off or without the buffer.
     pub(crate) fn new(id: u64, list: &ID3D12GraphicsCommandList, device: &ID3D12Device) -> Trail {
-        let list = (on() && init(device).is_some()).then(|| list.cast().ok()).flatten();
-        Trail { list, slot: id % SLOTS, ..Trail::default() }
+        let list = (on() && init(device).is_some())
+            .then(|| list.cast().ok())
+            .flatten();
+        Trail {
+            list,
+            slot: id % SLOTS,
+            ..Trail::default()
+        }
     }
 
     /// Notes the pipeline bound from now on.
@@ -110,15 +120,30 @@ impl Trail {
         let (list, buffer) = (self.list.as_ref()?, buffer()?);
         let id = next_id();
         let what = what.map(Arc::from).or_else(|| self.pipeline.clone());
-        self.entries.push(Entry { id, kind, frame: crate::queue::presented(), what });
-        write(list, buffer.va + self.slot * SLOT_BYTES, id, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN);
+        self.entries.push(Entry {
+            id,
+            kind,
+            frame: crate::queue::presented(),
+            what,
+        });
+        write(
+            list,
+            buffer.va + self.slot * SLOT_BYTES,
+            id,
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
+        );
         Some(id)
     }
 
     /// The "finished" write of command `id`, recorded after it.
     pub(crate) fn finish(&self, id: u32) {
         if let (Some(list), Some(buffer)) = (&self.list, buffer()) {
-            write(list, buffer.va + self.slot * SLOT_BYTES + 4, id, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT);
+            write(
+                list,
+                buffer.va + self.slot * SLOT_BYTES + 4,
+                id,
+                D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+            );
         }
     }
 
@@ -129,8 +154,16 @@ impl Trail {
     }
 }
 
-fn write(list: &ID3D12GraphicsCommandList2, address: u64, value: u32, mode: D3D12_WRITEBUFFERIMMEDIATE_MODE) {
-    let parameter = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: address, Value: value };
+fn write(
+    list: &ID3D12GraphicsCommandList2,
+    address: u64,
+    value: u32,
+    mode: D3D12_WRITEBUFFERIMMEDIATE_MODE,
+) {
+    let parameter = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        Dest: address,
+        Value: value,
+    };
     // SAFETY: an open list; the address is inside our buffer, which stays
     // in the copy destination state (a read-back buffer's only state).
     unsafe { list.WriteBufferImmediate(1, &parameter, Some(&mode)) };
@@ -165,7 +198,12 @@ impl Buffer {
         let at = (slot % SLOTS) as usize * 2;
         // SAFETY: inside the mapping, which is never unmapped; the GPU may
         // write it at any time, so each word is read once, volatile.
-        unsafe { (self.mapped.add(at).read_volatile(), self.mapped.add(at + 1).read_volatile()) }
+        unsafe {
+            (
+                self.mapped.add(at).read_volatile(),
+                self.mapped.add(at + 1).read_volatile(),
+            )
+        }
     }
 }
 
@@ -191,23 +229,36 @@ pub(crate) fn init(device: &ID3D12Device) -> Option<&'static Buffer> {
 }
 
 fn make(device: &ID3D12Device) -> windows::core::Result<Buffer> {
-    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let readback = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: SLOTS * SLOT_BYTES,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
     };
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
     // SAFETY: the query writes its own structure of the given size.
     unsafe {
-        device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, (&raw mut options).cast(), size_of_val(&options) as u32)?;
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS3,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )?;
     }
-    if !options.WriteBufferImmediateSupportFlags.contains(D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT) {
+    if !options
+        .WriteBufferImmediateSupportFlags
+        .contains(D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT)
+    {
         return Err(windows::core::Error::new(
             windows::Win32::Foundation::E_NOTIMPL,
             "no WriteBufferImmediate on direct lists",
@@ -226,12 +277,24 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Buffer> {
             None,
             &mut resource,
         )?;
-        let resource = resource.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+        let resource = resource
+            .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
         resource.SetName(windows::core::w!("victory GPU breadcrumbs"))?;
-        resource.Map(0, Some(&D3D12_RANGE { Begin: 0, End: (SLOTS * SLOT_BYTES) as usize }), Some(&mut mapped))?;
+        resource.Map(
+            0,
+            Some(&D3D12_RANGE {
+                Begin: 0,
+                End: (SLOTS * SLOT_BYTES) as usize,
+            }),
+            Some(&mut mapped),
+        )?;
         std::ptr::write_bytes(mapped.cast::<u8>(), 0, (SLOTS * SLOT_BYTES) as usize);
         let va = resource.GetGPUVirtualAddress();
-        Ok(Buffer { _resource: resource, va, mapped: mapped.cast_const().cast() })
+        Ok(Buffer {
+            _resource: resource,
+            va,
+            mapped: mapped.cast_const().cast(),
+        })
     }
 }
 
@@ -266,14 +329,24 @@ pub(crate) fn progress(ids: &[u32], started: u32, finished: u32) -> Progress {
     // `finished` past our last id is not ours: another list sharing the
     // slot (slots repeat every `SLOTS` ids) or ids that wrapped wrote it,
     // and nothing of this list is known to have finished.
-    let first = if finished >= first && finished < last { ids.partition_point(|&id| id <= finished) } else { 0 };
+    let first = if finished >= first && finished < last {
+        ids.partition_point(|&id| id <= finished)
+    } else {
+        0
+    };
     let in_flight = ids[first..].partition_point(|&id| id <= started);
     Progress::Stuck { first, in_flight }
 }
 
 /// One command, short.
 pub(crate) fn describe(e: &Entry) -> String {
-    let what: String = e.what.as_deref().unwrap_or("no pipeline").chars().take(200).collect();
+    let what: String = e
+        .what
+        .as_deref()
+        .unwrap_or("no pipeline")
+        .chars()
+        .take(200)
+        .collect();
     format!("#{} {} {what} frame {}", e.id, e.kind.text(), e.frame)
 }
 
@@ -298,7 +371,13 @@ pub(crate) fn lines(text: &str) -> Vec<String> {
 
 /// One list's report line(s), or `None` when it is done, empty or never
 /// started (those are summed up by the caller).
-pub(crate) fn report_list(list_id: u64, at: usize, of: usize, trail: &Trail, why: &str) -> (Progress, Option<String>) {
+pub(crate) fn report_list(
+    list_id: u64,
+    at: usize,
+    of: usize,
+    trail: &Trail,
+    why: &str,
+) -> (Progress, Option<String>) {
     let Some(buffer) = buffer() else {
         return (Progress::Empty, None);
     };
@@ -309,7 +388,10 @@ pub(crate) fn report_list(list_id: u64, at: usize, of: usize, trail: &Trail, why
         return (p, None);
     };
     let stuck = &trail.entries[first];
-    let before: Vec<String> = trail.entries[first.saturating_sub(3)..first].iter().map(describe).collect();
+    let before: Vec<String> = trail.entries[first.saturating_sub(3)..first]
+        .iter()
+        .map(describe)
+        .collect();
     let text = format!(
         "GPU breadcrumbs ({why}, submission {}): list {list_id} ({} of {of}) started #{started} finished #{finished} of {} commands; \
          first not finished: {} (command {} of the list, {in_flight} started); before it: [{}]",
@@ -346,13 +428,25 @@ mod tests {
 
     #[test]
     fn first_command_hung() {
-        assert_eq!(progress(&[10, 12, 15], 10, 3), Progress::Stuck { first: 0, in_flight: 1 });
+        assert_eq!(
+            progress(&[10, 12, 15], 10, 3),
+            Progress::Stuck {
+                first: 0,
+                in_flight: 1
+            }
+        );
     }
 
     #[test]
     fn middle_command_hung_with_the_next_started() {
         // 10 finished, 12 and 15 started: 12 is the first not finished.
-        assert_eq!(progress(&[10, 12, 15], 15, 10), Progress::Stuck { first: 1, in_flight: 2 });
+        assert_eq!(
+            progress(&[10, 12, 15], 15, 10),
+            Progress::Stuck {
+                first: 1,
+                in_flight: 2
+            }
+        );
     }
 
     /// A `finished` past the list's last id came from another list sharing
@@ -361,8 +455,20 @@ mod tests {
     /// entries and panicked in `report_list` (fuzeofficlal on #2310).
     #[test]
     fn a_finished_word_past_the_last_id_is_not_ours() {
-        assert_eq!(progress(&[10, 12, 15], 10, 20), Progress::Stuck { first: 0, in_flight: 1 });
-        assert_eq!(progress(&[1, 2], 1, 3), Progress::Stuck { first: 0, in_flight: 1 });
+        assert_eq!(
+            progress(&[10, 12, 15], 10, 20),
+            Progress::Stuck {
+                first: 0,
+                in_flight: 1
+            }
+        );
+        assert_eq!(
+            progress(&[1, 2], 1, 3),
+            Progress::Stuck {
+                first: 0,
+                in_flight: 1
+            }
+        );
     }
 
     #[test]
@@ -375,11 +481,19 @@ mod tests {
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
         for (i, &id) in ids.iter().enumerate() {
             let kind = [Kind::Dispatch, Kind::Draw, Kind::Copy, Kind::Indirect][i];
-            trail.entries.push(Entry { id, kind, frame: 7, what: Some("[compute 72f552f4553fb5f9]".into()) });
+            trail.entries.push(Entry {
+                id,
+                kind,
+                frame: 7,
+                what: Some("[compute 72f552f4553fb5f9]".into()),
+            });
         }
         let found = trail.entries.iter().find(|e| e.id == ids[2]).unwrap();
         assert_eq!(found.kind, Kind::Copy);
-        assert_eq!(describe(found), format!("#{} copy [compute 72f552f4553fb5f9] frame 7", ids[2]));
+        assert_eq!(
+            describe(found),
+            format!("#{} copy [compute 72f552f4553fb5f9] frame 7", ids[2])
+        );
         trail.clear();
         assert!(trail.entries.is_empty());
     }
@@ -405,7 +519,11 @@ mod tests {
         };
         let list = host.new_list().unwrap();
         // The list's trail, on even with the switch off.
-        let mut trail = Trail { list: list.list.cast().ok(), slot: 4321, ..Trail::default() };
+        let mut trail = Trail {
+            list: list.list.cast().ok(),
+            slot: 4321,
+            ..Trail::default()
+        };
         let a = trail.start(Kind::Clear, Some("first")).unwrap();
         trail.finish(a);
         let b = trail.start(Kind::Copy, Some("second")).unwrap();
@@ -416,7 +534,13 @@ mod tests {
         let (started, finished) = buffer.read(4321);
         assert_eq!((started, finished), (c, b));
         let ids: Vec<u32> = trail.entries.iter().map(|e| e.id).collect();
-        assert_eq!(progress(&ids, started, finished), Progress::Stuck { first: 2, in_flight: 1 });
+        assert_eq!(
+            progress(&ids, started, finished),
+            Progress::Stuck {
+                first: 2,
+                in_flight: 1
+            }
+        );
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

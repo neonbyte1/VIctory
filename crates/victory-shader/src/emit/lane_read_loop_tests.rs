@@ -249,13 +249,13 @@ fn break_program(wave: u32) -> crate::NativeProgram {
         0xBE82_0300, // s_mov_b32 s2, s0
         0xBE83_0380, // s_mov_b32 s3, 0
         0xF408_0101,
-        0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0xBE89_0380, // s_mov_b32 s9, 0
-        0x7E04_0280, // v_mov_b32 v2, 0
-        0x3602_0083, // v_and_b32 v1, 3, v0
-        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
-        b(0xBE8C_047E, 0xBE8C_037E), // s_mov_b64 s[12:13], exec
+        0xFA00_0000,                   // s_load_dwordx4 s[4:7], s[2:3], null
+        0xBF8C_C07F,                   // s_waitcnt lgkmcnt(0)
+        0xBE89_0380,                   // s_mov_b32 s9, 0
+        0x7E04_0280,                   // v_mov_b32 v2, 0
+        0x3602_0083,                   // v_and_b32 v1, 3, v0
+        0x4A02_0281,                   // v_add_nc_u32 v1, 1, v1
+        b(0xBE8C_047E, 0xBE8C_037E),   // s_mov_b64 s[12:13], exec
         0x7DA8_0000 | k(wave * 3 / 4), // v_cmpx_gt_u32 exec, 3/4 wave, v0
         0xBF88_000A,                   // s_cbranch_execz end
         b(0xBE90_047E, 0xBE90_037E),   // s_mov_b64 s[16:17], exec
@@ -335,7 +335,11 @@ fn lanes_leave_a_loop_by_a_saved_mask_in_the_console_flow() {
             if bad.is_empty() {
                 eprintln!("{name}: wave{wave} exact");
             } else {
-                eprintln!("{name}: wave{wave}: {} lanes wrong: {}", bad.len(), bad.join(", "));
+                eprintln!(
+                    "{name}: wave{wave}: {} lanes wrong: {}",
+                    bad.len(),
+                    bad.join(", ")
+                );
                 wrong.push(format!("{name} wave{wave}"));
             }
         }

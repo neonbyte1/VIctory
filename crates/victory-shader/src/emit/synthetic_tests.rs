@@ -897,7 +897,15 @@ fn relative_moves_in_waterfall_loops_reach_each_lane_s_element() {
         View::RawUav(12 * 32),
     ];
     let want: Vec<u32> = (0..12u32)
-        .flat_map(|k| (0..32u32).map(move |lane| if (lane >> 1).min(11) == k { 1 << lane | 0x8000_0000 } else { 0 }))
+        .flat_map(|k| {
+            (0..32u32).map(move |lane| {
+                if (lane >> 1).min(11) == k {
+                    1 << lane | 0x8000_0000
+                } else {
+                    0
+                }
+            })
+        })
         .collect();
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -1503,11 +1511,13 @@ fn cs_spread_prologue_remaps_group_ids_and_bounds_groups() {
     let words = [
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
-        0xF408_0102, 0xFA00_0000, // s_load_dwordx4 s[4:7], s[4:5], 0
+        0xF408_0102,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[4:5], 0
         0x7E02_0201, // v_mov_b32 v1, s1
         0x3400_0282, // v_lshlrev_b32 v0, 2, v1
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0xE070_1000, 0x8001_0100, // buffer_store_dword v1, v0, s[4:7], 0 offen
+        0xE070_1000,
+        0x8001_0100, // buffer_store_dword v1, v0, s[4:7], 0 offen
         0xBF81_0000, // s_endpgm
     ];
     let shader = build_spread_cs(&words).expect("lower");
@@ -1529,7 +1539,9 @@ fn cs_spread_prologue_remaps_group_ids_and_bounds_groups() {
         }
         let host = match Host::new(warp) {
             Ok(host) => host,
-            Err(e) if force_warp => panic!("could not create the requested SM 6.6 WARP device: {e}"),
+            Err(e) if force_warp => {
+                panic!("could not create the requested SM 6.6 WARP device: {e}")
+            }
             Err(e) => {
                 eprintln!("no SM 6.6 {label} device ({e}), skipped");
                 continue;

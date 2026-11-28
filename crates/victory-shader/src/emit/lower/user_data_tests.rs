@@ -1,5 +1,7 @@
 use super::*;
-use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo, UsedResource};
+use crate::native::{
+    ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo, UsedResource,
+};
 use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -55,7 +57,6 @@ fn lower_with(
     })
 }
 
-
 #[test]
 fn user_data_cbv_rows_and_dwords_are_cached_in_entry_block() {
     // 1) Direct user SGPRs s0..s7 (8 dwords across CBV rows 0 and 1):
@@ -77,7 +78,7 @@ fn user_data_cbv_rows_and_dwords_are_cached_in_entry_block() {
         0x8008_0308,    // s_add_u32 s8, s8, s3 (repeat)
         0x7E02_0208,    // v_mov_b32 v1, s8
         0xD834_0000,
-        0x0000_0100,    // ds_write_b32 v0, v1
+        0x0000_0100, // ds_write_b32 v0, v1
         S_ENDPGM,
     ];
     // 2) Spilled root-signature loads via s[0:1] (8 dwords at indices
@@ -86,31 +87,31 @@ fn user_data_cbv_rows_and_dwords_are_cached_in_entry_block() {
     // re-read the same dwords through `user_at` directly.
     let spilled_words = [
         0xF408_0100u32,
-        0xFA00_0000,    // s_load_dwordx4 s[4:7], s[0:1], 0x0 (indices 16..20)
-        0x8014_0504,    // s_add_u32 s20, s4, s5
-        0x8014_0614,    // s_add_u32 s20, s20, s6
-        0x8014_0714,    // s_add_u32 s20, s20, s7
-        0xBF06_8004,    // s_cmp_eq_u32 s4, 0
-        0xBF85_0013,    // s_cbranch_scc1 -> s_endpgm
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0x0 (indices 16..20)
+        0x8014_0504, // s_add_u32 s20, s4, s5
+        0x8014_0614, // s_add_u32 s20, s20, s6
+        0x8014_0714, // s_add_u32 s20, s20, s7
+        0xBF06_8004, // s_cmp_eq_u32 s4, 0
+        0xBF85_0013, // s_cbranch_scc1 -> s_endpgm
         0xF408_0200,
-        0xFA00_0010,    // s_load_dwordx4 s[8:11], s[0:1], 0x10 (indices 20..24)
+        0xFA00_0010, // s_load_dwordx4 s[8:11], s[0:1], 0x10 (indices 20..24)
         0xF408_0300,
-        0xFA00_0000,    // s_load_dwordx4 s[12:15], s[0:1], 0x0 (repeat 16..20)
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[0:1], 0x0 (repeat 16..20)
         0xF404_0400,
-        0xFA00_0014,    // s_load_dwordx2 s[16:17], s[0:1], 0x14 (repeat 21..23)
-        0x8014_0814,    // s_add_u32 s20, s20, s8
-        0x8014_0914,    // s_add_u32 s20, s20, s9
-        0x8014_0A14,    // s_add_u32 s20, s20, s10
-        0x8014_0B14,    // s_add_u32 s20, s20, s11
-        0x8014_0C14,    // s_add_u32 s20, s20, s12
-        0x8014_0D14,    // s_add_u32 s20, s20, s13
-        0x8014_0E14,    // s_add_u32 s20, s20, s14
-        0x8014_0F14,    // s_add_u32 s20, s20, s15
-        0x8014_1014,    // s_add_u32 s20, s20, s16
-        0x8014_1114,    // s_add_u32 s20, s20, s17
-        0x7E02_0214,    // v_mov_b32 v1, s20
+        0xFA00_0014, // s_load_dwordx2 s[16:17], s[0:1], 0x14 (repeat 21..23)
+        0x8014_0814, // s_add_u32 s20, s20, s8
+        0x8014_0914, // s_add_u32 s20, s20, s9
+        0x8014_0A14, // s_add_u32 s20, s20, s10
+        0x8014_0B14, // s_add_u32 s20, s20, s11
+        0x8014_0C14, // s_add_u32 s20, s20, s12
+        0x8014_0D14, // s_add_u32 s20, s20, s13
+        0x8014_0E14, // s_add_u32 s20, s20, s14
+        0x8014_0F14, // s_add_u32 s20, s20, s15
+        0x8014_1014, // s_add_u32 s20, s20, s16
+        0x8014_1114, // s_add_u32 s20, s20, s17
+        0x7E02_0214, // v_mov_b32 v1, s20
         0xD834_0000,
-        0x0000_0100,    // ds_write_b32 v0, v1
+        0x0000_0100, // ds_write_b32 v0, v1
         S_ENDPGM,
     ];
 
@@ -124,7 +125,11 @@ fn user_data_cbv_rows_and_dwords_are_cached_in_entry_block() {
         }];
         // Where our stack's compute prologue reads the dispatch pair from:
         // the dword above the layout's last (module notes, "group spread").
-        let dispatch_at = layout.iter().map(|p| u32::from(p.user_data) + p.sgprs).max().unwrap();
+        let dispatch_at = layout
+            .iter()
+            .map(|p| u32::from(p.user_data) + p.sgprs)
+            .max()
+            .unwrap();
         let emitted = lower_with(words, layout, vec![]).unwrap();
         // Every compute program we lower also reads the dispatch pair (the
         // row the host spreads groups with, and how many it asked for) at
@@ -158,7 +163,11 @@ fn user_data_cbv_rows_and_dwords_are_cached_in_entry_block() {
         let dispatch_row = dispatch_at / 4;
         assert_eq!(
             stats.loads,
-            vec![(0, dispatch_row), (0, expected_rows[0]), (0, expected_rows[1])],
+            vec![
+                (0, dispatch_row),
+                (0, expected_rows[0]),
+                (0, expected_rows[1])
+            ],
             "{label}: expected 3 entry-block cbufferLoadLegacy.i32 calls (the dispatch row, then the program's 2)"
         );
         assert_eq!(

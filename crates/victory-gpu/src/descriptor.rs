@@ -125,7 +125,8 @@ impl Heap {
     /// (`crate::draw`), for the title's slots past the host's.
     #[cfg(windows)]
     pub(crate) fn capped(&self) -> bool {
-        self.host().is_some_and(|host| host.count() < self.desc.count)
+        self.host()
+            .is_some_and(|host| host.count() < self.desc.count)
     }
 }
 
@@ -210,19 +211,36 @@ struct PageJob {
 /// slots the host heap has: one job a 64 KiB page, in order (a page two
 /// runs touch is synced twice, harmlessly).
 #[cfg(windows)]
-fn page_jobs(heap: usize, start: u64, step: u64, count: u32, runs: &[(usize, usize)]) -> Vec<PageJob> {
+fn page_jobs(
+    heap: usize,
+    start: u64,
+    step: u64,
+    count: u32,
+    runs: &[(usize, usize)],
+) -> Vec<PageJob> {
     let mut jobs: Vec<PageJob> = Vec::new();
     let page_size = crate::watch::PAGE;
     for &(from, to) in runs {
         for page in (from & !(page_size - 1)..to).step_by(page_size) {
             let (page, end) = (page.max(from), (page + page_size).min(to));
-            let (first, last) =
-                ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-            let (first, last) = (first.min(u64::from(count)) as u32, last.min(u64::from(count)) as u32);
+            let (first, last) = (
+                (page as u64 - start) / step,
+                (end as u64 - start).div_ceil(step),
+            );
+            let (first, last) = (
+                first.min(u64::from(count)) as u32,
+                last.min(u64::from(count)) as u32,
+            );
             if first >= last {
                 continue;
             }
-            jobs.push(PageJob { heap, start, step, first, last });
+            jobs.push(PageJob {
+                heap,
+                start,
+                step,
+                first,
+                last,
+            });
         }
     }
     jobs
@@ -309,7 +327,12 @@ pub(crate) fn make_read(slots: &[u32]) {
             .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
             .filter(|heap| heap.desc.kind == VIEWS_KIND)
             .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
-            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
+            .flat_map(|(heap, host)| {
+                slots
+                    .iter()
+                    .filter(|&&i| i < heap.desc.count)
+                    .filter_map(|&i| host.unmade_placed(i))
+            })
             .collect()
     };
     #[cfg(test)]
@@ -341,7 +364,11 @@ pub(crate) fn make_read(slots: &[u32]) {
                 continue;
             }
             increment(heap.desc.kind).map(|step| {
-                let mine = slots.iter().copied().filter(|&i| i < heap.desc.count).collect::<Vec<u32>>();
+                let mine = slots
+                    .iter()
+                    .copied()
+                    .filter(|&i| i < heap.desc.count)
+                    .collect::<Vec<u32>>();
                 (start, u64::from(step), mine)
             })
         }) else {
@@ -1090,10 +1117,16 @@ fn placement_after(desc_ptr: *const HeapDesc) -> Placement {
     {
         let mut bytes = [0u8; size_of::<Placement>()];
         if !crate::host::read_into(desc_ptr.wrapping_add(1).cast(), &mut bytes) {
-            return Placement { address: 0, size: 0 };
+            return Placement {
+                address: 0,
+                size: 0,
+            };
         }
         let [a, s] = [0, 8].map(|i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap()));
-        Placement { address: a, size: s }
+        Placement {
+            address: a,
+            size: s,
+        }
     }
     #[cfg(not(windows))]
     // SAFETY: as above, on the hope that the title has its own memory there.
@@ -1198,7 +1231,8 @@ static FUNCTIONS: Table<24> = {
 pub(crate) mod tests {
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.
-    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
+    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> =
+        std::sync::Mutex::new(None);
 
     /// The work [`WHILE_MAKING`] runs.
     pub(crate) type Work = Box<dyn FnOnce() + Send>;
@@ -1264,25 +1298,45 @@ pub(crate) mod tests {
     #[test]
     fn a_plain_description_at_the_end_of_mapped_memory_is_read_whole() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-            VirtualProtect,
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
         };
         // SAFETY: a fresh allocation of two pages, the second made
         // inaccessible; freed below.
         let page = unsafe {
-            let p = VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                8192,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            );
             assert!(!p.is_null());
             let mut old = 0;
-            assert!(VirtualProtect(p.cast::<u8>().add(4096).cast(), 4096, PAGE_NOACCESS, &mut old) != 0);
+            assert!(
+                VirtualProtect(
+                    p.cast::<u8>().add(4096).cast(),
+                    4096,
+                    PAGE_NOACCESS,
+                    &mut old
+                ) != 0
+            );
             p.cast::<u8>()
         };
-        let desc = HeapDesc { kind: 0, count: 8, flags: 0, nodes: 0 };
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 0,
+            nodes: 0,
+        };
         // SAFETY: the last 16 bytes of the first page.
         let at = unsafe { page.add(4096 - size_of::<HeapDesc>()) }.cast::<HeapDesc>();
         // SAFETY: as above.
         unsafe { at.write(desc) };
         let mut h = std::ptr::null();
-        assert_eq!(create_heap(std::ptr::null(), at, &HEAP_IIDS[0], &mut h), S_OK);
+        assert_eq!(
+            create_heap(std::ptr::null(), at, &HEAP_IIDS[0], &mut h),
+            S_OK
+        );
         assert!(!h.is_null());
         // SAFETY: our allocation.
         unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
@@ -1299,10 +1353,26 @@ pub(crate) mod tests {
             desc: [format, 3, 1, 0, 0, 0],
         };
         let d32 = 40;
-        assert_eq!(record(0).host_words(3, || Some(d32)).unwrap()[..2], [d32, 3], "typeless host copy");
-        assert_eq!(record(0).host_words(3, || None).unwrap()[0], 0, "typed host copy");
-        assert_eq!(record(45).host_words(3, || Some(d32)).unwrap()[0], 45, "a format named is kept");
-        assert_eq!(record(0).host_words(3, || Some(118)).unwrap()[0], 20, "as the host has it");
+        assert_eq!(
+            record(0).host_words(3, || Some(d32)).unwrap()[..2],
+            [d32, 3],
+            "typeless host copy"
+        );
+        assert_eq!(
+            record(0).host_words(3, || None).unwrap()[0],
+            0,
+            "typed host copy"
+        );
+        assert_eq!(
+            record(45).host_words(3, || Some(d32)).unwrap()[0],
+            45,
+            "a format named is kept"
+        );
+        assert_eq!(
+            record(0).host_words(3, || Some(118)).unwrap()[0],
+            20,
+            "as the host has it"
+        );
     }
 
     #[test]
@@ -1414,11 +1484,22 @@ pub(crate) mod tests {
         // SAFETY: a record written into `slots` by `create_srv`.
         let [tag, i, generation] = unsafe { *(at as *const [u32; 3]) };
         assert_eq!(tag, VIEW_TAG);
-        assert_eq!(with_generations(|gens| gens[i as usize]), generation, "the record's own");
+        assert_eq!(
+            with_generations(|gens| gens[i as usize]),
+            generation,
+            "the record's own"
+        );
         let deaths = view_deaths();
         forget(resource);
-        assert_ne!(with_generations(|gens| gens[i as usize]), generation, "the release moves it on");
-        assert!(view_deaths() > deaths, "and counts as a death for the synced pages");
+        assert_ne!(
+            with_generations(|gens| gens[i as usize]),
+            generation,
+            "the release moves it on"
+        );
+        assert!(
+            view_deaths() > deaths,
+            "and counts as a death for the synced pages"
+        );
     }
 
     /// A heap sync's pages: one job a 64 KiB page of the written ranges, in
@@ -1433,21 +1514,39 @@ pub(crate) mod tests {
         assert_eq!((jobs[0].heap, jobs[0].first, jobs[0].last), (7, 0, 2048));
         assert_eq!((jobs[1].first, jobs[1].last), (2048, 4096));
         // Two runs in one page are two jobs for it, each clipped honestly.
-        let jobs = page_jobs(7, start as u64, step, count, &[
-            (start + 64, start + 128),
-            (start + 1024, start + 2048),
-        ]);
+        let jobs = page_jobs(
+            7,
+            start as u64,
+            step,
+            count,
+            &[(start + 64, start + 128), (start + 1024, start + 2048)],
+        );
         assert_eq!(jobs.len(), 2);
         assert_eq!((jobs[0].first, jobs[0].last), (2, 4));
         assert_eq!((jobs[1].first, jobs[1].last), (32, 64));
         // A page half past the host's slots is clipped, one wholly past it
         // is left out, and a heap with no host slots has no jobs.
         let count = 3000;
-        let jobs = page_jobs(7, start as u64, step, count, &[(start + 62000, start + 100000)]);
+        let jobs = page_jobs(
+            7,
+            start as u64,
+            step,
+            count,
+            &[(start + 62000, start + 100000)],
+        );
         assert_eq!(jobs.len(), 2);
         assert_eq!((jobs[0].first, jobs[0].last), (1937, 2048));
         assert_eq!((jobs[1].first, jobs[1].last), (2048, 3000));
-        assert!(page_jobs(7, start as u64, step, count, &[(start + 2 * page, start + 3 * page)]).is_empty());
+        assert!(
+            page_jobs(
+                7,
+                start as u64,
+                step,
+                count,
+                &[(start + 2 * page, start + 3 * page)]
+            )
+            .is_empty()
+        );
         assert!(page_jobs(7, start as u64, step, 0, &[(start, start + 4096 * 32)]).is_empty());
     }
 
@@ -1473,7 +1572,11 @@ pub(crate) mod tests {
             // Our record, written where no heap sees it, then copied in.
             let mut elsewhere = [0u64; 2];
             let at = elsewhere.as_mut_ptr() as u64;
-            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            create_sampler(
+                std::ptr::null(),
+                &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
+                at,
+            );
             let slot = memory as u64 + 5 * 16;
             // SAFETY: 16 bytes of each, ours; the heap's page is guarded
             // (our handler opens it).
@@ -1499,7 +1602,10 @@ pub(crate) mod tests {
             nodes: 1,
         };
         let mut h = std::ptr::null();
-        let placement = Placement { address, size: 64 * 32 };
+        let placement = Placement {
+            address,
+            size: 64 * 32,
+        };
         assert_eq!(create(desc, placement, &mut h), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
@@ -1516,11 +1622,19 @@ pub(crate) mod tests {
             // Reuse the address without relying on the allocator to give it
             // to another test. The descriptor write must reach the new heap.
             assert_eq!(create(desc, placement, &mut h), S_OK);
-            create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), address);
+            create_srv(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                address,
+            );
             let reused = heap(h);
             let queued = reused.pending.lock().unwrap().as_slice() == [0];
             release(h);
-            assert!(queued, "the descriptor write reached the heap at the reused address");
+            assert!(
+                queued,
+                "the descriptor write reached the heap at the reused address"
+            );
         }
     }
 
@@ -1549,9 +1663,15 @@ pub(crate) mod tests {
         assert_eq!(rtv_ms.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DMS);
 
         let rtv_ms_arr = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4), fmt);
-        assert_eq!(rtv_ms_arr.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY);
-        // SAFETY: ViewDimension is TEXTURE2DMSARRAY.
-        assert_eq!(unsafe { rtv_ms_arr.Anonymous.Texture2DMSArray.ArraySize }, 4);
+        assert_eq!(
+            rtv_ms_arr.ViewDimension,
+            D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY
+        );
+        assert_eq!(
+            // SAFETY: ViewDimension is TEXTURE2DMSARRAY.
+            unsafe { rtv_ms_arr.Anonymous.Texture2DMSArray.ArraySize },
+            4
+        );
 
         let rtv_arr = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6, 1), fmt);
         assert_eq!(rtv_arr.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DARRAY);

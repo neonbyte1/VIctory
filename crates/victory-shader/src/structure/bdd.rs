@@ -5,7 +5,7 @@
 //! The low branch is still processed first; canonical nodes, memoization,
 //! and the conservative satisfiability budget retain their original meaning.
 
-use super::{Bool, Bools, Map, MAX_MEET, MAX_MEMO, TERMINAL};
+use super::{Bool, Bools, MAX_MEET, MAX_MEMO, Map, TERMINAL};
 use std::collections::HashSet;
 
 type Triple = (Bool, Bool, Bool);
@@ -83,12 +83,7 @@ impl Bools {
     }
 
     /// Existentially quantify atoms defined in the rewritten part of a loop.
-    pub(super) fn forget(
-        &mut self,
-        b: Bool,
-        from: usize,
-        memo: &mut Map<Bool, Bool>,
-    ) -> Bool {
+    pub(super) fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
         self.rewrite(b, Rewrite::ForgetFrom(from), memo)
     }
 
@@ -266,9 +261,8 @@ mod tests {
                 }
                 for hold_f in [false, true] {
                     for hold_g in [false, true] {
-                        let expected = (0..8).any(|x| {
-                            eval(&b, f, x) == hold_f && eval(&b, g, x) == hold_g
-                        });
+                        let expected =
+                            (0..8).any(|x| eval(&b, f, x) == hold_f && eval(&b, g, x) == hold_g);
                         assert_eq!(b.meet(&[(f, hold_f), (g, hold_g)]), expected);
                     }
                 }
@@ -284,9 +278,7 @@ mod tests {
                 let r = b.forget(f, v as usize, &mut Map::default());
                 for x in 0..8 {
                     let fixed = (1 << v) - 1;
-                    let expected = (0..8).any(|y| {
-                        (x & fixed) == (y & fixed) && eval(&b, f, y)
-                    });
+                    let expected = (0..8).any(|y| (x & fixed) == (y & fixed) && eval(&b, f, y));
                     assert_eq!(eval(&b, r, x), expected);
                 }
             }

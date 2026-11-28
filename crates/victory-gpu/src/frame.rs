@@ -198,7 +198,9 @@ pub(crate) fn presented() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log() {
     let [waits, at_once, shared] = [0, 1, 2].map(|i| WAITS[i].swap(0, Ordering::Relaxed));
-    tracing::info!("frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}");
+    tracing::info!(
+        "frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}"
+    );
 }
 
 /// Device method: no statistics are kept, so none are returned.
@@ -300,10 +302,16 @@ mod tests {
         // The late wait takes the latest missed tick. The next wait, begun
         // at the same time, must advance to a future tick.
         set_elapsed(40);
-        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
         let late = last(FLIP).load(Ordering::Relaxed);
         assert_eq!(late, flips[3] + 3);
-        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
         assert_eq!(last(FLIP).load(Ordering::Relaxed), late + 1);
     }
 

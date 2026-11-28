@@ -872,16 +872,23 @@ mod tests {
             S_ENDPGM,
         ]);
         let mut h = Halves::new(&p);
-        assert!(h.defs.is_none(), "defs table stays unallocated before pair()");
+        assert!(
+            h.defs.is_none(),
+            "defs table stays unallocated before pair()"
+        );
         h.ensure_defs();
         let defs = h.defs.as_ref().unwrap();
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
-                assert!(matches!(defs[phi.value.0 as usize], Def::Phi(bb, ii) if bb as usize == b && ii as usize == i));
+                assert!(
+                    matches!(defs[phi.value.0 as usize], Def::Phi(bb, ii) if bb as usize == b && ii as usize == i)
+                );
             }
             for (i, inst) in block.insts.iter().enumerate() {
                 for &(_, v) in &inst.writes {
-                    assert!(matches!(defs[v.0 as usize], Def::Inst(bb, ii) if bb as usize == b && ii as usize == i));
+                    assert!(
+                        matches!(defs[v.0 as usize], Def::Inst(bb, ii) if bb as usize == b && ii as usize == i)
+                    );
                 }
             }
         }

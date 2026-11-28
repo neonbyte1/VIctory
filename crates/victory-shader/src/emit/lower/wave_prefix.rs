@@ -80,5 +80,4 @@ impl<'a> Lower<'a> {
         }
         acc
     }
-
 }

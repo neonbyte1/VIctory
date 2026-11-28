@@ -698,8 +698,7 @@ pub fn stream<'a>(
     let (sample_mask, count, quality) = samples;
     let mut s = Box::new(AlignedBytes([0u8; 0x2b0]));
     let put = |s: &mut [u8], at: usize, v: u32| s[at..at + 4].copy_from_slice(&v.to_le_bytes());
-    let put64 =
-        |s: &mut [u8], at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    let put64 = |s: &mut [u8], at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
     for (at, kind) in [
         (0x10, if mesh { 24 } else { 1 }),
         (0x28, 2),

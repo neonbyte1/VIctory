@@ -502,7 +502,9 @@ fn same_key(a: &KeyState, b: &KeyState) -> bool {
 impl Latch {
     /// `value` from the host, with the presses since the last read held.
     fn hold(&mut self, value: Value, now: u64, enabled: bool) -> Value {
-        let reader = self.read.is_some_and(|t| now.saturating_sub(t) < LATCH_IDLE);
+        let reader = self
+            .read
+            .is_some_and(|t| now.saturating_sub(t) < LATCH_IDLE);
         if !enabled || !reader {
             self.buttons.clear();
             self.keys.clear();
@@ -516,7 +518,10 @@ impl Latch {
                     let pressed = pad.buttons & !before;
                     // The same buttons tapped again before a read are one
                     // press: queued twice, they stayed down for two reads.
-                    if pressed != 0 && self.buttons.back() != Some(&pressed) && self.buttons.len() < LATCH_QUEUE {
+                    if pressed != 0
+                        && self.buttons.back() != Some(&pressed)
+                        && self.buttons.len() < LATCH_QUEUE
+                    {
                         self.buttons.push_back(pressed);
                     }
                 }
@@ -525,10 +530,14 @@ impl Latch {
                         Some(Value::Keys(raw)) => raw,
                         _ => &[],
                     };
-                    let pressed: Vec<KeyState> =
-                        keys.iter().filter(|k| !before.iter().any(|b| same_key(b, k))).copied().collect();
+                    let pressed: Vec<KeyState> = keys
+                        .iter()
+                        .filter(|k| !before.iter().any(|b| same_key(b, k)))
+                        .copied()
+                        .collect();
                     let again = self.keys.back().is_some_and(|last| {
-                        last.len() == pressed.len() && last.iter().all(|l| pressed.iter().any(|p| same_key(l, p)))
+                        last.len() == pressed.len()
+                            && last.iter().all(|l| pressed.iter().any(|p| same_key(l, p)))
                     });
                     if !pressed.is_empty() && !again && self.keys.len() < LATCH_QUEUE {
                         self.keys.push_back(pressed);
@@ -553,8 +562,9 @@ impl Latch {
             Value::Keys(mut keys) => {
                 let first: &[KeyState] = self.keys.front().map_or(&[], |k| k);
                 let later = self.keys.iter().skip(1).flatten();
-                let later: Vec<&KeyState> =
-                    later.filter(|l| !first.iter().any(|f| same_key(f, l))).collect();
+                let later: Vec<&KeyState> = later
+                    .filter(|l| !first.iter().any(|f| same_key(f, l)))
+                    .collect();
                 keys.retain(|k| !later.iter().any(|l| same_key(l, k)));
                 for key in first {
                     if !keys.iter().any(|k| same_key(k, key)) {
@@ -579,12 +589,24 @@ impl Latch {
                 if let Some(&first) = self.buttons.front()
                     && first & !raw.buttons != 0
                 {
-                    tracing::info!(buttons = format_args!("{:#x}", first & !raw.buttons), "a tap kept for the title's read (released before it)");
+                    tracing::info!(
+                        buttons = format_args!("{:#x}", first & !raw.buttons),
+                        "a tap kept for the title's read (released before it)"
+                    );
                 }
             }
             Some(Value::Keys(raw)) => {
-                for key in self.keys.front().into_iter().flatten().filter(|k| !raw.iter().any(|r| same_key(r, k))) {
-                    tracing::info!(virtual_key = key.virtual_key, "a key tap kept for the title's read (released before it)");
+                for key in self
+                    .keys
+                    .front()
+                    .into_iter()
+                    .flatten()
+                    .filter(|k| !raw.iter().any(|r| same_key(r, k)))
+                {
+                    tracing::info!(
+                        virtual_key = key.virtual_key,
+                        "a key tap kept for the title's read (released before it)"
+                    );
                 }
             }
             None => {}
@@ -695,9 +717,10 @@ impl Hub {
             let scripted: [KeyState; 0] = [];
             // The mouse only drives the stand-in pad, which an active real pad
             // turns off; sampling it then would still re-centre the cursor.
-            let any_pad = pads.iter().enumerate().any(|(slot, pad)| {
-                pad.is_some_and(|p| seen[slot] || p != PadState::default())
-            });
+            let any_pad = pads
+                .iter()
+                .enumerate()
+                .any(|(slot, pad)| pad.is_some_and(|p| seen[slot] || p != PadState::default()));
             let mouse = if any_pad {
                 source.mouse_idle();
                 (0.0, 0.0)
@@ -706,7 +729,9 @@ impl Hub {
             };
             (pads, source.keys(), scripted, mouse)
         };
-        let events = self.state().poll(&self.devices, pads, keys, &scripted, mouse);
+        let events = self
+            .state()
+            .poll(&self.devices, pads, keys, &scripted, mouse);
         self.deliver(events);
     }
 
@@ -1234,9 +1259,10 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
     let state = hub.state();
     // A slot has a reading after its first connection. Its history also
     // keeps the device known if it later disconnects.
-    let known = hub.devices.iter().find(|device| {
-        device.info.id == *id && !state.slots[device.index].history.is_empty()
-    });
+    let known = hub
+        .devices
+        .iter()
+        .find(|device| device.info.id == *id && !state.slots[device.index].history.is_empty());
     match known {
         Some(device) => {
             // SAFETY: checked non-null.
@@ -2101,7 +2127,11 @@ mod tests {
     fn keyboard_reading_clears_previous_gamepad_state() {
         let (hub, _) = fake();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
-        let mut state = PadState { buttons: A, left_trigger: 1.0, ..Default::default() };
+        let mut state = PadState {
+            buttons: A,
+            left_trigger: 1.0,
+            ..Default::default()
+        };
         assert!(!gamepad_state(r, &mut state));
         assert_eq!(state, PadState::default());
         release(r);
@@ -2809,7 +2839,3 @@ mod tests {
         assert_eq!(press_order(&[], b"AA"), b"A");
     }
 }
-
-
-
-

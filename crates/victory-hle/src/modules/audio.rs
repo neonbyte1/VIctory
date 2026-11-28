@@ -545,9 +545,10 @@ impl Xma {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
+            if let (Some(context), Some(voice)) = (
+                self.context(index),
+                &mut *lock(&self.voices[index as usize]),
+            ) {
                 pump(context, voice);
                 active += 1;
             }
@@ -649,7 +650,11 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         return true;
     };
     let at = context.field(2, 0, 26) as usize;
-    let start = if at < 32 { xma::first_frame(data) } else { Some(at) };
+    let start = if at < 32 {
+        xma::first_frame(data)
+    } else {
+        Some(at)
+    };
     let Some(frame) = start.and_then(|pos| xma::read_frame(data, pos)) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
@@ -724,7 +729,10 @@ fn dump_input(index: u32, context: Context) {
     );
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
+    let _ = std::fs::write(
+        dir.join(format!("{n:02}-{index}.xma")),
+        input.unwrap_or_default(),
+    );
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
@@ -1233,7 +1241,10 @@ mod tests {
         // Blocks 2, 3 and 0 written (silence), 1 left for the title, and
         // nothing past the ring.
         assert_eq!((write, writable), (1, 0));
-        assert!(ring[0x400..].iter().all(|&b| b == 0x55), "written past the ring");
+        assert!(
+            ring[0x400..].iter().all(|&b| b == 0x55),
+            "written past the ring"
+        );
         let block = |n: usize| &ring[n * 0x100..(n + 1) * 0x100];
         assert!([0, 2, 3].iter().all(|&n| block(n).iter().all(|&b| b == 0)));
         assert!(block(1).iter().all(|&b| b == 0x55));

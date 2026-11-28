@@ -212,12 +212,14 @@ pub(crate) fn control<'a>(
     len: usize,
     before: impl Fn(usize) -> Option<&'a Instruction>,
 ) -> Result<Flow, ShaderError> {
-    Ok(match flow(inst, inst.offset + 4 * inst.words().len(), len)? {
-        Flow::Stop if inst.name() == Some("s_setpc_b64") => {
-            far_jump(before, inst, len)?.map_or(Flow::Stop, Flow::Jump)
-        }
-        flow => flow,
-    })
+    Ok(
+        match flow(inst, inst.offset + 4 * inst.words().len(), len)? {
+            Flow::Stop if inst.name() == Some("s_setpc_b64") => {
+                far_jump(before, inst, len)?.map_or(Flow::Stop, Flow::Jump)
+            }
+            flow => flow,
+        },
+    )
 }
 
 fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError> {

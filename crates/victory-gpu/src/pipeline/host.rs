@@ -250,11 +250,20 @@ impl GraphicsState {
             .map(|(e, name)| {
                 format!(
                     "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate
                 )
             })
             .collect();
-        let depth_bounds = if self.depth_bounds { " depth bounds" } else { "" };
+        let depth_bounds = if self.depth_bounds {
+            " depth bounds"
+        } else {
+            ""
+        };
         format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{depth_bounds}",
             self.blend,
@@ -447,7 +456,10 @@ impl HostPipeline {
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+            return refuse(
+                "the host GPU has no mesh shaders (or no shader model 6.6)",
+                shaders,
+            );
         }
         for (s, _) in &stages {
             s.translated()?;
@@ -546,9 +558,24 @@ impl HostPipeline {
                 }
             }
             for (used, kind, register, out) in [
-                (t.memory, D3D12_ROOT_PARAMETER_TYPE_SRV, 0, &mut stage.memory),
-                (t.memory_writes, D3D12_ROOT_PARAMETER_TYPE_UAV, 0, &mut stage.memory_dirty),
-                (t.view_addresses, D3D12_ROOT_PARAMETER_TYPE_SRV, 1, &mut stage.view_addresses),
+                (
+                    t.memory,
+                    D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    0,
+                    &mut stage.memory,
+                ),
+                (
+                    t.memory_writes,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    0,
+                    &mut stage.memory_dirty,
+                ),
+                (
+                    t.view_addresses,
+                    D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    1,
+                    &mut stage.view_addresses,
+                ),
             ] {
                 if used {
                     *out = Some(params.len() as u32);
@@ -591,8 +618,14 @@ impl HostPipeline {
             .then(|| {
                 let first = params.len() as u32;
                 for (kind, register) in [
-                    (D3D12_ROOT_PARAMETER_TYPE_SRV, victory_shader::emit::VIEW_MARKS),
-                    (D3D12_ROOT_PARAMETER_TYPE_UAV, victory_shader::emit::VIEW_WRITES),
+                    (
+                        D3D12_ROOT_PARAMETER_TYPE_SRV,
+                        victory_shader::emit::VIEW_MARKS,
+                    ),
+                    (
+                        D3D12_ROOT_PARAMETER_TYPE_UAV,
+                        victory_shader::emit::VIEW_WRITES,
+                    ),
                 ] {
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,
@@ -608,13 +641,14 @@ impl HostPipeline {
                 }
                 (first, first + 1)
             });
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
-            Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
-            }
-        };
+        let (root, root_blob) =
+            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+                Ok(root) => root,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                    return None;
+                }
+            };
         let stage_dxil = |i: usize| {
             stages
                 .get(i)
@@ -677,12 +711,20 @@ impl HostPipeline {
             let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device,
+                    &root,
+                    ms,
+                    code(1),
+                    g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
                     &name,
                 ),
                 None => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device,
+                    &root,
+                    ms,
+                    code(1),
+                    g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
                     &name,
                 ),
@@ -715,7 +757,10 @@ impl HostPipeline {
         // Rectangle lists: a geometry shader made for the vertex shader adds
         // each rectangle's fourth corner (else rectangles are expanded on
         // the CPU from vertex inputs, see `draw`).
-        let gs = match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
+        let gs = match (
+            g.topology.0,
+            stages.first().and_then(|(s, _)| s.translated()),
+        ) {
             (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
                 Ok(gs) => gs,
                 Err(e) => {
@@ -731,7 +776,11 @@ impl HostPipeline {
             VS: code(0),
             PS: code(1),
             GS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+                pShaderBytecode: if gs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    gs.as_ptr().cast()
+                },
                 BytecodeLength: gs.len(),
             },
             BlendState: host_blend(&g.blend, &g.targets),
@@ -761,14 +810,21 @@ impl HostPipeline {
             let vertex = VertexStream {
                 vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc.VS),
                 gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, desc.GS),
-                input: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, desc.InputLayout),
+                input: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
+                    desc.InputLayout,
+                ),
                 strip_cut: Sub(
                     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE,
                     desc.IBStripCutValue,
                 ),
             };
             stream_pipeline(
-                &host.device, &root, vertex, desc.PS, g,
+                &host.device,
+                &root,
+                vertex,
+                desc.PS,
+                g,
                 Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
                 &name,
             )
@@ -789,7 +845,12 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
+        tracing::info!(
+            ?shaders,
+            ms = started.elapsed().as_millis(),
+            rectangles = !gs.is_empty(),
+            "host pipeline"
+        );
         crate::host::name(&made.pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -864,21 +925,39 @@ fn stream_pipeline<S, D>(
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
     let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+        root: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            root.as_raw(),
+        ),
         stages,
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+        blend: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+            host_blend(&g.blend, &g.targets),
+        ),
+        mask: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+            g.sample_mask,
+        ),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth,
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+        targets: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            g.targets,
+        ),
+        dsv: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+            g.depth_format,
+        ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
         // A vertex pipeline needs its type. A mesh pipeline's, which the
         // host derives from the mesh shader anyway, is given too: a
         // pipeline library compares descriptions with it, and loads none
         // made from a stream without it.
-        topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
+        topology: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+            host_topology(g),
+        ),
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of_val(&stream),
@@ -896,13 +975,12 @@ fn stream_pipeline<S, D>(
 
 /// Shader bytecode referencing a translated DXIL slice (default for an absent stage).
 fn shader_bytecode(dxil: Option<&[u8]>) -> D3D12_SHADER_BYTECODE {
-    dxil.map_or(
-        D3D12_SHADER_BYTECODE::default(),
-        |bytes| D3D12_SHADER_BYTECODE {
+    dxil.map_or(D3D12_SHADER_BYTECODE::default(), |bytes| {
+        D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
-        },
-    )
+        }
+    })
 }
 
 fn root_signature(
@@ -1028,7 +1106,7 @@ mod tests {
             shader
                 .translated
                 .set(Some(Translated {
-                        atomics64: false,
+                    atomics64: false,
                     host: host_shader,
                     used: vec![],
                 }))
@@ -1089,7 +1167,8 @@ mod tests {
             S_OK
         );
         slot::<extern "system" fn(This, u32, *const This)>(
-            list, crate::list::slot_offset_for_test(list, 0x100),
+            list,
+            crate::list::slot_offset_for_test(list, 0x100),
         )(list, 1, &heap);
         let native = crate::list::host_list(list).unwrap();
         slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
@@ -1113,7 +1192,10 @@ mod tests {
         let size = (count * size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>()) as u64;
         let (readback, mapped) = native.readback(host, size).unwrap();
         let kind = D3D12_QUERY_TYPE_PIPELINE_STATISTICS1;
-        let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(list, crate::list::slot_offset_for_test(list, 0x3f8));
+        let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(
+            list,
+            crate::list::slot_offset_for_test(list, 0x3f8),
+        );
         for (index, (x, y, z)) in groups.into_iter().enumerate() {
             // SAFETY: the open list and the indexed query belong to this fixture.
             unsafe { native.list.BeginQuery(&queries, kind, index as u32) };
@@ -1124,7 +1206,10 @@ mod tests {
         let last = groups.len() as u32;
         // SAFETY: a live query heap with one more query and a live command list.
         unsafe { native.list.BeginQuery(&queries, kind, last) };
-        slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, crate::list::slot_offset_for_test(list, 0x310))(list, 2, 0, 0, 0);
+        slot::<extern "system" fn(This, u32, u64, u64, u64)>(
+            list,
+            crate::list::slot_offset_for_test(list, 0x310),
+        )(list, 2, 0, 0, 0);
         // SAFETY: every query has been begun and ended by this command list;
         // readback holds one statistics record per query.
         unsafe {
@@ -1297,7 +1382,10 @@ mod tests {
         };
         // SAFETY: `stream` is a packed sequence of initialized subobjects.
         let bytes = unsafe {
-            std::slice::from_raw_parts(std::ptr::from_ref(&stream).cast::<u8>(), size_of_val(&stream))
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&stream).cast::<u8>(),
+                size_of_val(&stream),
+            )
         };
         let state = read_stream(bytes, |_, _| None).1;
         assert_eq!(state.rasterizer.ForcedSampleCount, 1);

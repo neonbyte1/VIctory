@@ -122,7 +122,9 @@ impl Rng {
 
 /// Write-watched memory, as the runtime's pools.
 fn pool(len: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    };
     let kind = MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH;
     // SAFETY: a fresh allocation, kept for the process's life.
     let p = unsafe { VirtualAlloc(null(), len, kind, PAGE_READWRITE) } as usize;
@@ -136,25 +138,43 @@ fn pool(len: usize) -> usize {
 /// the runtime reports it. The second mapping's address, then the first's.
 fn views(len: usize) -> (usize, usize) {
     use windows_sys::Win32::System::Memory::{
-        CreateFileMappingW, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
-        MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
-        VirtualAlloc2, VirtualFree,
+        CreateFileMappingW, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+        MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MapViewOfFile,
+        MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc2, VirtualFree,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: a pagefile section mapped read-write; the views are kept for
     // the process's life. The second mapping replaces, page by page, a
     // placeholder of ours split around each page (as the runtime's `map`).
     unsafe {
-        let section =
-            CreateFileMappingW(-1isize as _, null(), PAGE_READWRITE, (len >> 32) as u32, len as u32, null());
+        let section = CreateFileMappingW(
+            -1isize as _,
+            null(),
+            PAGE_READWRITE,
+            (len >> 32) as u32,
+            len as u32,
+            null(),
+        );
         assert!(!section.is_null(), "no section of {len} bytes");
         let a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
         assert_ne!(a, 0);
         let kind = MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
-        let b = VirtualAlloc2(GetCurrentProcess(), null(), len, kind, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+        let b = VirtualAlloc2(
+            GetCurrentProcess(),
+            null(),
+            len,
+            kind,
+            PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        ) as usize;
         assert_ne!(b, 0, "no placeholder of {len} bytes");
         for k in (0..len).step_by(PAGE) {
-            VirtualFree((b + k) as *mut _, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree(
+                (b + k) as *mut _,
+                PAGE,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
             let at = MapViewOfFile3(
                 section,
                 GetCurrentProcess(),
@@ -166,7 +186,12 @@ fn views(len: usize) -> (usize, usize) {
                 std::ptr::null_mut(),
                 0,
             );
-            assert_eq!(at.Value as usize, b + k, "{}", std::io::Error::last_os_error());
+            assert_eq!(
+                at.Value as usize,
+                b + k,
+                "{}",
+                std::io::Error::last_os_error()
+            );
             crate::watch::title_memory_aliased(b + k, &[a + k]);
         }
         (b, a)
@@ -186,13 +211,22 @@ impl Buffer {
     fn new(start: usize, len: usize, other: usize) -> Option<Buffer> {
         crate::shadow::register(start, start as u64, len as u64);
         let copy = crate::shadow::find(start as u64, len as u64)?;
-        Some(Buffer { copy, start, len, other })
+        Some(Buffer {
+            copy,
+            start,
+            len,
+            other,
+        })
     }
 
     /// The title writes page `page` of the buffer: through the other view
     /// where there is one and `through` asks, else here.
     fn write(&self, page: usize, value: u64, through: bool) {
-        let base = if through && self.other != 0 { self.other } else { self.start };
+        let base = if through && self.other != 0 {
+            self.other
+        } else {
+            self.start
+        };
         // SAFETY: a dword pair inside the buffer's memory (a guarded page
         // faults into the handler).
         unsafe { ((base + page * PAGE + 64) as *mut u64).write_volatile(value) };
@@ -220,7 +254,9 @@ fn buffers() -> Option<Vec<Buffer>> {
 
 /// Our process's page faults so far (soft ones too).
 fn page_faults() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS {
         cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
@@ -259,7 +295,11 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
     let heap = &all[0];
     let mut f = Frame::default();
     let us = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed);
-    let (prepared, on_gpu, back) = (us(&SUBMISSION_US[0]), us(&SUBMISSION_US[1]), us(&COPY_BACK[0]));
+    let (prepared, on_gpu, back) = (
+        us(&SUBMISSION_US[0]),
+        us(&SUBMISSION_US[1]),
+        us(&COPY_BACK[0]),
+    );
     let merged = us(&COPY_BACK[1]);
     for s in 0..SUBMISSIONS {
         // The title writes: the same pages as before every submission, then
@@ -268,8 +308,16 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
         let started = Instant::now();
         let mut same = Rng(0x5eed);
         for k in 0..WRITTEN {
-            let r = if k < WRITTEN_SAME { &mut same } else { &mut *rng };
-            let b = if k % 3 != 2 { heap } else { &all[1 + r.below(all.len() - 1)] };
+            let r = if k < WRITTEN_SAME {
+                &mut same
+            } else {
+                &mut *rng
+            };
+            let b = if k % 3 != 2 {
+                heap
+            } else {
+                &all[1 + r.below(all.len() - 1)]
+            };
             *stamp += 1;
             b.write(r.below(b.len / PAGE), *stamp, k % 2 == 1);
         }
@@ -313,8 +361,10 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
             // Views whose writes shaders mark.
             if MARKED_HEAP_LISTS.contains(&l) {
                 let at = heap.start + (rng.below(heap.len - MIB) & !255);
-                heap.copy.refresh(list, at as u64, heap.copy.left(at as u64));
-                heap.copy.gpu_writes(list, at as u64, heap.copy.left(at as u64), true);
+                heap.copy
+                    .refresh(list, at as u64, heap.copy.left(at as u64));
+                heap.copy
+                    .gpu_writes(list, at as u64, heap.copy.left(at as u64), true);
                 marked.push((0, at, heap.start + heap.len - at));
             }
             if !root_uavs {
@@ -326,8 +376,15 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
             }
             // The title's buffer copies: 75 a frame, a few KB each.
             if TITLE_COPY_LISTS[..2].contains(&l) || (l == TITLE_COPY_LISTS[2] && s % 4 == 0) {
-                let (to, from) = (&all[1 + rng.below(all.len() - 1)], &all[1 + rng.below(all.len() - 1)]);
-                list.defer_copy((to.start + 512) as *mut u8, (from.start + 4096) as *const u8, 5333);
+                let (to, from) = (
+                    &all[1 + rng.below(all.len() - 1)],
+                    &all[1 + rng.below(all.len() - 1)],
+                );
+                list.defer_copy(
+                    (to.start + 512) as *mut u8,
+                    (from.start + 4096) as *const u8,
+                    5333,
+                );
             }
             if l == LISTS - 1 {
                 // The shaders' part: pages marked, bytes changed in some.
@@ -338,7 +395,11 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
                     .map(|n| {
                         let (k, start, len) = marked[rng.below(marked.len())];
                         let at = (start + rng.below(len)) & !7;
-                        (all[k].copy.clone(), at.min(start + len - 8) as u64, n < MARKED_CHANGED)
+                        (
+                            all[k].copy.clone(),
+                            at.min(start + len - 8) as u64,
+                            n < MARKED_CHANGED,
+                        )
                     })
                     .collect();
                 // And one piece of each unmarked range, not marked, with a
@@ -347,7 +408,10 @@ fn frame(all: &[Buffer], lists: &[HostList], rng: &mut Rng, stamp: &mut u64) -> 
                     .iter()
                     .map(|&k| {
                         let b = &all[k];
-                        (b.copy.clone(), (b.start + rng.below(b.len / PAGE) * PAGE + 128) as u64)
+                        (
+                            b.copy.clone(),
+                            (b.start + rng.below(b.len / PAGE) * PAGE + 128) as u64,
+                        )
                     })
                     .collect();
                 f.changed += merges.len() as u64;
@@ -417,7 +481,9 @@ fn world_frame_preparing() {
         all.iter().filter(|b| b.other == 0).count()
     );
     let host = host().expect("checked above");
-    let lists: Vec<HostList> = (0..LISTS).map(|_| host.new_list().expect("a list")).collect();
+    let lists: Vec<HostList> = (0..LISTS)
+        .map(|_| host.new_list().expect("a list"))
+        .collect();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut stamp = 0u64;
     let mut frames = Vec::new();
@@ -438,18 +504,34 @@ fn world_frame_preparing() {
             frames.push(f);
         }
     }
-    println!("\nmedian of {COUNTED} frames (synthetic; published: the title on an RX 6700 XT, #400):");
-    let row = |what: &str, ours: f64, published: &str| println!("  {what:<44} {ours:>12.1}   {published}");
+    println!(
+        "\nmedian of {COUNTED} frames (synthetic; published: the title on an RX 6700 XT, #400):"
+    );
+    let row = |what: &str, ours: f64, published: &str| {
+        println!("  {what:<44} {ours:>12.1}   {published}")
+    };
     row("preparing, ms", median(&frames, |f| f.preparing), "1198");
     row("copying back, ms", median(&frames, |f| f.back), "122");
-    row("  declared pieces the shaders changed", median(&frames, |f| f.changed as f64), "made up");
+    row(
+        "  declared pieces the shaders changed",
+        median(&frames, |f| f.changed as f64),
+        "made up",
+    );
     row(
         "  merged and written back",
         median(&frames, |f| (f.merged / PAGE as u64) as f64),
         "made up",
     );
-    row("    MB", median(&frames, |f| f.merged as f64 / 1e6), "made up");
-    row("the title's writes (guard faults), ms", median(&frames, |f| f.title), "not published");
+    row(
+        "    MB",
+        median(&frames, |f| f.merged as f64 / 1e6),
+        "made up",
+    );
+    row(
+        "the title's writes (guard faults), ms",
+        median(&frames, |f| f.title),
+        "not published",
+    );
     row(
         "page faults",
         median(&frames, |f| (f.faults_submitting + f.faults_title) as f64),
@@ -468,7 +550,11 @@ fn world_frame_preparing() {
         row("  asking for, MB", mb(C::RefreshBytes), "20600");
         row("change checks", c(C::Watches), "254139");
         row("  checked, MB", mb(C::Checked), "92800");
-        row("  changed (copied), MB", mb(C::Checked) - mb(C::Unchanged), "240");
+        row(
+            "  changed (copied), MB",
+            mb(C::Checked) - mb(C::Unchanged),
+            "240",
+        );
         row("protect calls", c(C::ProtectCalls), "7147");
         row("  pages", c(C::ProtectPages), "9528");
         row("pages opened", c(C::OpenPages), "not quoted");
@@ -478,12 +564,20 @@ fn world_frame_preparing() {
         row("  the frame before too", c(C::WrittenAgain), "not quoted");
         row("snapshots, MB", mb(C::SnapshotBytes), "563");
         row("  ms", ms(C::SnapshotUs), "31.7");
-        row("declared ranges compared, MB", mb(C::CompareBytes), "not quoted");
+        row(
+            "declared ranges compared, MB",
+            mb(C::CompareBytes),
+            "not quoted",
+        );
         row("  ms", ms(C::CompareUs), "not quoted");
         row("marked pages compared", c(C::MarkedPages), "1996");
         row("  written back, MB", mb(C::MarkedBytes), "77.6");
         row("  ms", ms(C::MarkedUs), "74.4");
-        row("  saved at the title's first write", c(C::SavedPages), "not quoted");
+        row(
+            "  saved at the title's first write",
+            c(C::SavedPages),
+            "not quoted",
+        );
         row("title copies", c(C::Copies), "75");
         println!("  preparing by step (each with the refresh batch it flushes), ms:");
         row("  refresh steps", ms(C::StepRefreshUs), "not quoted");
@@ -493,10 +587,18 @@ fn world_frame_preparing() {
         row("  work", ms(C::StepWorkUs), "not quoted");
         row("  state preludes", ms(C::PreludeUs), "not quoted");
         println!("  inside those, ms:");
-        row("  refresh batches (checks and copies)", ms(C::FlushUs), "not quoted");
+        row(
+            "  refresh batches (checks and copies)",
+            ms(C::FlushUs),
+            "not quoted",
+        );
         row("  change checks", ms(C::WatchUs), "36.0");
         row("  protecting", ms(C::ProtectUs), "not quoted");
-        row("  waiting for the guard lock", ms(C::GuardWaitUs), "not quoted");
+        row(
+            "  waiting for the guard lock",
+            ms(C::GuardWaitUs),
+            "not quoted",
+        );
         row("  the kernel's copies", ms(C::MoveUs), "not quoted");
         row("  page faults preparing", c(C::FaultsPrep), "not quoted");
         row("  page faults copying back", c(C::FaultsBack), "not quoted");
@@ -543,7 +645,11 @@ fn distant_refreshes_preparing() {
     let copy = b.copy.clone();
     list.defer_host(move || {
         for at in ranges {
-            assert_eq!(copy.read_host(at + 64, 1), [CPU], "the refresh reached the copy");
+            assert_eq!(
+                copy.read_host(at + 64, 1),
+                [CPU],
+                "the refresh reached the copy"
+            );
             copy.write_host(at + 128, &GPU.to_le_bytes());
         }
     });
@@ -635,11 +741,16 @@ fn unit_costs(all: &[Buffer]) {
         for &(at, len) in &ranges {
             heap.copy.copy_back(0, at, len);
         }
-        println!("  a check of the unchanged heap with {declared} declared ranges on it: {each:.2} us");
+        println!(
+            "  a check of the unchanged heap with {declared} declared ranges on it: {each:.2} us"
+        );
     }
     // 2. Declaring a range shaders write through marked views: the heap
     // from an address to its end, as a root view's.
-    for (what, at) in [("the heap from its start", heap.start + 256), ("the heap's last 1 MiB", heap.start + heap.len - MIB)] {
+    for (what, at) in [
+        ("the heap from its start", heap.start + 256),
+        ("the heap's last 1 MiB", heap.start + heap.len - MIB),
+    ] {
         const N: usize = 200;
         let len = heap.start + heap.len - at;
         let started = Instant::now();
@@ -664,9 +775,14 @@ fn unit_costs(all: &[Buffer]) {
         one.copy.writing(0, one.start, one.len, false);
         kept += ms(started);
         let at = one.start + (n % (MIB / PAGE)) * PAGE + 128;
-        one.copy.write_host(at as u64, &(n as u64 | 1 << 62).to_le_bytes());
+        one.copy
+            .write_host(at as u64, &(n as u64 | 1 << 62).to_le_bytes());
         let started = Instant::now();
-        assert_eq!(one.copy.copy_back(0, one.start, one.len), PAGE, "one piece merged");
+        assert_eq!(
+            one.copy.copy_back(0, one.start, one.len),
+            PAGE,
+            "one piece merged"
+        );
         back += ms(started);
     }
     println!(
@@ -677,13 +793,17 @@ fn unit_costs(all: &[Buffer]) {
     // 3. A guard's round by the kind of memory: the title writes a page
     // (the fault, the handler), the next refresh copies and guards it again.
     for (kind, in_views) in [("a write-watched pool", false), ("views shown twice", true)] {
-        let Some(b) = all.iter().find(|b| b.len == 8 * MIB && (b.other != 0) == in_views) else {
+        let Some(b) = all
+            .iter()
+            .find(|b| b.len == 8 * MIB && (b.other != 0) == in_views)
+        else {
             continue;
         };
         let pages = b.len / PAGE;
         for (what, step) in [("every other page", 2usize), ("every page", 1)] {
             let n = pages / step;
-            let (mut write_ms, mut refresh_ms, mut write_faults, mut refresh_faults) = (0.0, 0.0, 0, 0);
+            let (mut write_ms, mut refresh_ms, mut write_faults, mut refresh_faults) =
+                (0.0, 0.0, 0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::take();
             const TIMES: usize = 10;
@@ -728,7 +848,10 @@ fn unit_costs(all: &[Buffer]) {
         }
     }
     // 4. The copy itself: a page through the kernel and in user mode.
-    let from = all.iter().find(|b| b.len == 8 * MIB && b.other == 0).expect("a pool copy");
+    let from = all
+        .iter()
+        .find(|b| b.len == 8 * MIB && b.other == 0)
+        .expect("a pool copy");
     let mut to = vec![0u8; from.len];
     for (what, piece) in [("64 KiB pages", PAGE), ("8 MiB at once", 8 * MIB)] {
         const TIMES: usize = 20;
@@ -748,6 +871,8 @@ fn unit_costs(all: &[Buffer]) {
             (TIMES * from.len) as f64 / 1e6 / started.elapsed().as_secs_f64()
         };
         let (kernel, plain) = (time(false), time(true));
-        println!("  copying {what}: {kernel:.0} MB/s through the kernel, {plain:.0} MB/s in user mode");
+        println!(
+            "  copying {what}: {kernel:.0} MB/s through the kernel, {plain:.0} MB/s in user mode"
+        );
     }
 }

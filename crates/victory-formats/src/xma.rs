@@ -190,12 +190,17 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     // A frame that ends in a packet where no frame begins (the tail of a frame
     // that crossed packets, then padding) is the last one before the next
     // packet that has frames.
-    let ends_in_packet_without_frames =
-        end / PACKET_BITS != index && !end.is_multiple_of(PACKET_BITS) && packet(data, end / PACKET_BITS)?.frames == 0;
-    if end.is_multiple_of(PACKET_BITS) || (last && end / PACKET_BITS == index) || ends_in_packet_without_frames {
+    let ends_in_packet_without_frames = end / PACKET_BITS != index
+        && !end.is_multiple_of(PACKET_BITS)
+        && packet(data, end / PACKET_BITS)?.frames == 0;
+    if end.is_multiple_of(PACKET_BITS)
+        || (last && end / PACKET_BITS == index)
+        || ends_in_packet_without_frames
+    {
         // The next frame begins in the next packet of this stream that has one;
         // a packet with none (a frame spans all of it) holds no start.
-        let mut next = (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
+        let mut next =
+            (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
         let mut header = packet(data, next)?;
         while header.frames == 0 {
             next += 1 + header.skip as usize;
@@ -375,10 +380,20 @@ fn codes() -> &'static Codes {
             scale: pairs(&SCALE, -60),
             scale_rl: pairs(&SCALE_RL, 0),
             coef: [
-                Vlc::new(COEF0_SYMS.iter().zip(COEF0_LENS).map(|(&s, l)| (s as i32, l))),
+                Vlc::new(
+                    COEF0_SYMS
+                        .iter()
+                        .zip(COEF0_LENS)
+                        .map(|(&s, l)| (s as i32, l)),
+                ),
                 pairs(&COEF1, 0),
             ],
-            vec4: Vlc::new(VEC4_SYMS.iter().zip(VEC4_LENS).map(|(&s, l)| (s as i32 - 1, l))),
+            vec4: Vlc::new(
+                VEC4_SYMS
+                    .iter()
+                    .zip(VEC4_LENS)
+                    .map(|(&s, l)| (s as i32 - 1, l)),
+            ),
             vec2: pairs(&VEC2, -1),
             vec1: pairs(&VEC1, 0),
         }
@@ -1023,7 +1038,11 @@ impl Decoder {
             ch.scale_factors = target;
             if ch.reuse_sf {
                 let from = ch.saved_scale_factors[ch.scale_factor_idx];
-                for (sf, &offset) in ch.saved_scale_factors[target].iter_mut().zip(&sf_offsets).take(self.num_bands) {
+                for (sf, &offset) in ch.saved_scale_factors[target]
+                    .iter_mut()
+                    .zip(&sf_offsets)
+                    .take(self.num_bands)
+                {
                     *sf = from[offset];
                 }
             }
@@ -1156,7 +1175,11 @@ impl Decoder {
                     }
                     quant += 31;
                 }
-                quant_step += if negative { -(quant + step) } else { quant + step };
+                quant_step += if negative {
+                    -(quant + step)
+                } else {
+                    quant + step
+                };
             }
             if self.channels_for_cur_subframe == 1 {
                 self.ch[self.channel_indexes[0]].quant_step = quant_step;
@@ -1199,13 +1222,21 @@ impl Decoder {
                 let sf = ch.saved_scale_factors[ch.scale_factors];
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
-                    let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
+                    let exp =
+                        ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
                     let quant = quant_factor(exp);
-                    for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
+                    for (t, &c) in tmp[sfb[band]..end]
+                        .iter_mut()
+                        .zip(&ch.coeffs[sfb[band]..end])
+                    {
                         *t = c * quant;
                     }
                 }
-                imdct_half(&tmp[..subframe_len], &mut ch.out[at..at + subframe_len], scale);
+                imdct_half(
+                    &tmp[..subframe_len],
+                    &mut ch.out[at..at + subframe_len],
+                    scale,
+                );
             }
         } else {
             for i in 0..self.channels_for_cur_subframe {
@@ -1222,7 +1253,10 @@ impl Decoder {
                 start += (winlen - subframe_len) / 2;
                 winlen = subframe_len;
             }
-            window_overlap(&mut ch.out[start..start + winlen], &windows()[log2(winlen) as usize - 7]);
+            window_overlap(
+                &mut ch.out[start..start + winlen],
+                &windows()[log2(winlen) as usize - 7],
+            );
             ch.prev_block_len = subframe_len;
         }
 
@@ -1339,7 +1373,12 @@ mod tests {
         let frame = read_frame(&data, second).unwrap();
         assert_eq!(frame.bits, bits);
         assert_eq!(frame.next, Some(3 * PACKET_BITS + HEADER_BITS));
-        assert_eq!(read_frame(&data, 3 * PACKET_BITS + HEADER_BITS).unwrap().next, None);
+        assert_eq!(
+            read_frame(&data, 3 * PACKET_BITS + HEADER_BITS)
+                .unwrap()
+                .next,
+            None
+        );
     }
 
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
@@ -1352,7 +1391,9 @@ mod tests {
                 -input
                     .iter()
                     .enumerate()
-                    .map(|(k, &x)| x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos())
+                    .map(|(k, &x)| {
+                        x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos()
+                    })
                     .sum::<f64>()
             })
             .collect()
@@ -1365,7 +1406,8 @@ mod tests {
             let mut check = |input: &[f32], scale: f32| {
                 let mut fast = vec![0.0; n];
                 imdct_half(input, &mut fast, scale);
-                for (i, (&actual, expected)) in fast.iter().zip(imdct_reference(input)).enumerate() {
+                for (i, (&actual, expected)) in fast.iter().zip(imdct_reference(input)).enumerate()
+                {
                     let error = (f64::from(actual) - expected * f64::from(scale)).abs();
                     assert!(error < 1e-5, "n {n}, sample {i}, error {error}");
                     max_error = max_error.max(error);
@@ -1393,7 +1435,9 @@ mod tests {
     fn decode_single_bin_xma_frame() {
         // Mono, 48 kHz, one 512-sample subframe. All scale factors are equal,
         // quant_step = 80 and coefficient 0 is +1, followed by end-of-block.
-        let frame = [0x00, 0xa5, 0x00, 0x0c, 0x03, 0x63, 0xff, 0xff, 0xf8, 0xab, 0x00];
+        let frame = [
+            0x00, 0xa5, 0x00, 0x0c, 0x03, 0x63, 0xff, 0xff, 0xf8, 0xab, 0x00,
+        ];
         let mut decoder = Decoder::new(1, 48_000);
         let mut pcm = Vec::new();
         decoder.decode(&frame, 82, &mut pcm).unwrap();
@@ -1533,8 +1577,16 @@ mod tests {
                 let end = code.wrapping_add((1u64 << (32 - len)).wrapping_sub(1) as u32);
                 for word in [code, end] {
                     let bytes = word.to_be_bytes();
-                    let mut a = Bits { data: &bytes, pos: 0, end: 32 };
-                    let mut b = Bits { data: &bytes, pos: 0, end: 32 };
+                    let mut a = Bits {
+                        data: &bytes,
+                        pos: 0,
+                        end: 32,
+                    };
+                    let mut b = Bits {
+                        data: &bytes,
+                        pos: 0,
+                        end: 32,
+                    };
                     assert_eq!(
                         (vlc.read(&mut a), a.pos),
                         (vlc.read_binary_search(&mut b), b.pos),
@@ -1549,8 +1601,16 @@ mod tests {
                 *byte = (rng >> 56) as u8;
             }
             let (mut a, mut b) = (
-                Bits { data: &buf, pos: 0, end: buf.len() * 8 - 32 },
-                Bits { data: &buf, pos: 0, end: buf.len() * 8 - 32 },
+                Bits {
+                    data: &buf,
+                    pos: 0,
+                    end: buf.len() * 8 - 32,
+                },
+                Bits {
+                    data: &buf,
+                    pos: 0,
+                    end: buf.len() * 8 - 32,
+                },
             );
             while a.pos < a.end {
                 assert_eq!(
@@ -1588,7 +1648,11 @@ mod tests {
             *byte = (rng >> 56) as u8;
         }
         let end = (buf.len() - 8) * 8;
-        for (name, vlc) in [("coef0", &c.coef[0]), ("coef1", &c.coef[1]), ("vec4", &c.vec4)] {
+        for (name, vlc) in [
+            ("coef0", &c.coef[0]),
+            ("coef1", &c.coef[1]),
+            ("vec4", &c.vec4),
+        ] {
             let time_vlc = |f: fn(&Vlc, &mut Bits) -> i32| {
                 let mut best = f64::MAX;
                 for _ in 0..3 {
@@ -1596,7 +1660,11 @@ mod tests {
                     let mut sum = 0i64;
                     let mut syms = 0u64;
                     for _ in 0..20 {
-                        let mut bits = Bits { data: &buf, pos: 0, end };
+                        let mut bits = Bits {
+                            data: &buf,
+                            pos: 0,
+                            end,
+                        };
                         while bits.pos < bits.end {
                             sum = sum.wrapping_add(f(vlc, &mut bits) as i64);
                             syms += 1;
@@ -1609,7 +1677,10 @@ mod tests {
             };
             let before = time_vlc(Vlc::read_binary_search);
             let after = time_vlc(Vlc::read);
-            println!("vlc {name:6}: bsearch {before:.2} ns/sym, lut {after:.2} ns/sym ({:.2}x)", before / after);
+            println!(
+                "vlc {name:6}: bsearch {before:.2} ns/sym, lut {after:.2} ns/sym ({:.2}x)",
+                before / after
+            );
         }
         let exps: Vec<i32> = (-120..240).cycle().take(1_000_000).collect();
         let time_q = |f: fn(i32) -> f32| {
@@ -1627,7 +1698,10 @@ mod tests {
         };
         let q_before = time_q(|e| 10f32.powf(e as f32 / 20.0));
         let q_after = time_q(quant_factor);
-        println!("quant     : powf {q_before:.2} ns/op, lut {q_after:.2} ns/op ({:.2}x)", q_before / q_after);
+        println!(
+            "quant     : powf {q_before:.2} ns/op, lut {q_after:.2} ns/op ({:.2}x)",
+            q_before / q_after
+        );
     }
 
     /// The cached tables are the ones the sizes ask for.
@@ -1719,7 +1793,12 @@ mod tests {
             }
         }
         for i in n..5 * n {
-            assert!((out[i] - signal[i]).abs() < 1e-3, "{i}: {} vs {}", out[i], signal[i]);
+            assert!(
+                (out[i] - signal[i]).abs() < 1e-3,
+                "{i}: {} vs {}",
+                out[i],
+                signal[i]
+            );
         }
     }
 

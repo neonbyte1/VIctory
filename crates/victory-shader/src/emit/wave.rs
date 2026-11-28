@@ -169,7 +169,14 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             break;
         };
         let (shapes, unknown) = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes, unknown });
+        out.insert(
+            i,
+            Section {
+                end,
+                shapes,
+                unknown,
+            },
+        );
         i = end + 1;
     }
     out
@@ -336,7 +343,11 @@ fn unmodelled(name: &str) -> &'static str {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, Option<&'static str>) {
+fn simulate(
+    insts: &[Inst],
+    wave: u32,
+    saved: Value,
+) -> (HashMap<Value, Shape>, Option<&'static str>) {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -1195,13 +1206,13 @@ mod tests {
         };
 
         let (zero_shape, v0_in, saved) = run(128);
-        assert_eq!(
-            zero_shape,
-            Some(Shape::Half(Op::AddH, v0_in, saved, 0, 31))
-        );
+        assert_eq!(zero_shape, Some(Shape::Half(Op::AddH, v0_in, saved, 0, 31)));
         for c in 240..=248u16 {
             let (shape, _, _) = run(c);
-            assert_eq!(shape, None, "inline float const {c} was treated as identity");
+            assert_eq!(
+                shape, None,
+                "inline float const {c} was treated as identity"
+            );
         }
     }
 }

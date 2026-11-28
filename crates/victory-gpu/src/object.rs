@@ -634,19 +634,32 @@ mod tests {
             assert_eq!(set(object, expected.as_ptr()), S_OK);
             let mut size = 0;
             assert_eq!(
-                get(object, &DEBUG_OBJECT_NAME_W, &mut size, std::ptr::null_mut()),
+                get(
+                    object,
+                    &DEBUG_OBJECT_NAME_W,
+                    &mut size,
+                    std::ptr::null_mut()
+                ),
                 S_OK
             );
             assert_eq!(size as usize, size_of_val(expected.as_slice()));
 
             let mut actual = vec![u16::MAX; expected.len()];
             assert_eq!(
-                get(object, &DEBUG_OBJECT_NAME_W, &mut size, actual.as_mut_ptr().cast()),
+                get(
+                    object,
+                    &DEBUG_OBJECT_NAME_W,
+                    &mut size,
+                    actual.as_mut_ptr().cast()
+                ),
                 S_OK
             );
             assert_eq!(actual, expected);
         }
 
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(object, 0x10)(object), 0);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
+            0
+        );
     }
 }

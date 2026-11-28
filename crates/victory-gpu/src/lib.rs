@@ -30,25 +30,25 @@ mod census;
 mod compute;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
-mod crumbs;
-#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod crumbs;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+pub mod dxgi;
 #[cfg(windows)]
 mod early;
-pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
 #[cfg(windows)]
 mod feeds;
 pub mod fence;
 pub mod frame;
-mod hold;
 #[cfg(windows)]
 mod fx;
+mod hold;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -93,11 +93,11 @@ mod watch;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
-#[cfg(windows)]
-pub use watch::{
-    UnseenWriting, Writing as KernelWrite, set_writable_alias, title_memory_aliased, title_memory_remapped,
-    title_memory_unmapped, unseen_writing, writing as kernel_will_write,
-};
 /// The write watch's trackers, for other crates' tests (feature `test-hooks`).
 #[cfg(all(windows, feature = "test-hooks"))]
 pub use watch::{Tracked, track};
+#[cfg(windows)]
+pub use watch::{
+    UnseenWriting, Writing as KernelWrite, set_writable_alias, title_memory_aliased,
+    title_memory_remapped, title_memory_unmapped, unseen_writing, writing as kernel_will_write,
+};

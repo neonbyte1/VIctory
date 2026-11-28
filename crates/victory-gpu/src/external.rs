@@ -45,7 +45,10 @@ pub fn record<R>(
         // What the library records may write buffers.
         crate::indirect::end_window(host);
         #[cfg(feature = "diagnostics")]
-        let (timed, started) = (crate::library_timing::begin(host), std::time::Instant::now());
+        let (timed, started) = (
+            crate::library_timing::begin(host),
+            std::time::Instant::now(),
+        );
         out = Some(f(&host.list));
         #[cfg(feature = "diagnostics")]
         if let Some(pair) = timed {

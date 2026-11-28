@@ -36,7 +36,10 @@ fn shader_effects_has_its_own_summary() {
     assert!(found.status.success(), "{found:?}");
     assert!(text.contains("effect test"), "{text}");
     assert!(text.contains("shader effect databases found: 1"), "{text}");
-    assert!(!text.contains("containers found") && !text.contains("(none found:"), "{text}");
+    assert!(
+        !text.contains("containers found") && !text.contains("(none found:"),
+        "{text}"
+    );
     let text = String::from_utf8_lossy(&missing.stdout);
     assert!(missing.status.success(), "{missing:?}");
     assert!(text.contains("shader effect databases found: 0"), "{text}");

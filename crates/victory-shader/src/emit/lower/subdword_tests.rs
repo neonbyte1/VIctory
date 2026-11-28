@@ -1,5 +1,7 @@
 use super::*;
-use crate::native::{ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
+use crate::native::{
+    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+};
 use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -15,7 +17,6 @@ fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
     }
 }
 
-
 #[test]
 fn subdword_buffer_stores_emit_cas_loop_and_validate() {
     for (name, mubuf_op) in [
@@ -29,9 +30,9 @@ fn subdword_buffer_stores_emit_cas_loop_and_validate() {
                     0xBE84_0300u32, // s_mov_b32 s4, s0
                     0xBE85_0380,    // s_mov_b32 s5, 0
                     0xF408_0202,
-                    0xFA00_0000,    // s_load_dwordx4 s[8:11], s[4:5], 0x0
-                    0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
-                    0x3402_0081,    // v_lshlrev_b32 v1, 1, v0
+                    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                    0x3402_0081, // v_lshlrev_b32 v1, 1, v0
                 ];
                 if guarded {
                     words.push(0x7DA8_0084); // v_cmpx_gt_u32 exec_lo, 4, v0
@@ -75,8 +76,7 @@ fn subdword_buffer_stores_emit_cas_loop_and_validate() {
                     "expected {name} in disassembled IR"
                 );
                 let st = structure::structure(&p).unwrap();
-                let res =
-                    resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
                 let io = io::raise(&p, &native).unwrap();
                 let lowered = lower(&Parts {
                     native: &native,
@@ -136,11 +136,7 @@ fn subdword_buffer_stores_emit_cas_loop_and_validate() {
                                     "{name} (guarded={guarded}, view_marks={view_marks}): DXIL validation failed: {e}"
                                 )
                             });
-                            assert_eq!(
-                                copy[4..20],
-                                ours[..],
-                                "{name}: container hash mismatch"
-                            );
+                            assert_eq!(copy[4..20], ours[..], "{name}: container hash mismatch");
                         }
                         Err(e) if std::env::var_os("VICTORY_DXIL").is_some() => {
                             panic!("VICTORY_DXIL is set but dxil.dll failed to load: {e}");

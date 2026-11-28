@@ -141,7 +141,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
@@ -208,17 +211,50 @@ pub(crate) fn take_cuts() -> (u64, u64) {
 /// title list records into (the queue runs each once its waits hold,
 /// `crate::hold`); bottom-of-pipe writes recorded before it land when the
 /// part before it has run.
-extern "system" fn wait32(this: This, address: u64, comparison: u32, reference: u32, mask: u32, _flags: u32) {
-    wait(this, crate::hold::ValueWait { address, bytes: 4, comparison, reference: u64::from(reference), mask: u64::from(mask) });
+extern "system" fn wait32(
+    this: This,
+    address: u64,
+    comparison: u32,
+    reference: u32,
+    mask: u32,
+    _flags: u32,
+) {
+    wait(
+        this,
+        crate::hold::ValueWait {
+            address,
+            bytes: 4,
+            comparison,
+            reference: u64::from(reference),
+            mask: u64::from(mask),
+        },
+    );
 }
-pub(crate) extern "system" fn wait64(this: This, address: u64, comparison: u32, reference: u64, _flags: u32) {
-    wait(this, crate::hold::ValueWait { address, bytes: 8, comparison, reference, mask: u64::MAX });
+pub(crate) extern "system" fn wait64(
+    this: This,
+    address: u64,
+    comparison: u32,
+    reference: u64,
+    _flags: u32,
+) {
+    wait(
+        this,
+        crate::hold::ValueWait {
+            address,
+            bytes: 8,
+            comparison,
+            reference,
+            mask: u64::MAX,
+        },
+    );
 }
 
 fn wait(this: This, wait: crate::hold::ValueWait) {
     #[cfg(windows)]
     {
-        let Some(current) = host_list(this) else { return };
+        let Some(current) = host_list(this) else {
+            return;
+        };
         if !current.is_empty() {
             let Some(next) = next_segment(this) else {
                 // Without the wait, what follows would run too early: the
@@ -234,7 +270,10 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
             current.close();
             // SAFETY: the title passes one of our lists.
             let list = unsafe { &*this.cast::<List>() };
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+            list.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cut(next);
             next.defer_wait(wait);
             return;
         }
@@ -307,7 +346,10 @@ fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
         let held = std::sync::Arc::strong_count(h) > 1;
         if held {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
+            tracing::debug!(
+                segment = k,
+                "a list reset while a queue still holds part of it: that part keeps its own host list"
+            );
         }
         if k >= keep {
             // Cut off below: a held one is the queue's now.
@@ -364,8 +406,15 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
 /// descriptor slots and title-memory page table. Freed once that host list
 /// (the list's last held one, so the last to run) is gone.
 #[cfg(windows)]
-fn leave(to: Option<std::sync::Arc<crate::host::HostList>>, uploads: Vec<Upload>, state: crate::draw::State) {
-    struct Kept(#[allow(dead_code)] Vec<Upload>, #[allow(dead_code)] crate::draw::State);
+fn leave(
+    to: Option<std::sync::Arc<crate::host::HostList>>,
+    uploads: Vec<Upload>,
+    state: crate::draw::State,
+) {
+    struct Kept(
+        #[allow(dead_code)] Vec<Upload>,
+        #[allow(dead_code)] crate::draw::State,
+    );
     // SAFETY: only dropped, with the host list, after it has run.
     unsafe impl Send for Kept {}
     if let Some(held) = to {
@@ -505,11 +554,20 @@ extern "system" fn list_release(this: This) -> u32 {
     if !this.is_null() && object::refs(this) == 1 {
         // SAFETY: the title passes one of our lists.
         let list = unsafe { &*this.cast::<List>() };
-        let held = list.hosts.lock().unwrap_or_else(|e| e.into_inner()).iter().rfind(|h| std::sync::Arc::strong_count(h) > 1).cloned();
+        let held = list
+            .hosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rfind(|h| std::sync::Arc::strong_count(h) > 1)
+            .cloned();
         if held.is_some() {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!("a list released while a queue still holds part of it: that part runs on its own");
-            let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
+            tracing::debug!(
+                "a list released while a queue still holds part of it: that part runs on its own"
+            );
+            let uploads =
+                std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
             leave(held, uploads, state);
         }
@@ -637,15 +695,20 @@ fn push_host_barriers(list: &crate::host::HostList, b: &Barrier, out: &mut Vec<B
                 emit_barriers(list, out);
                 out.clear();
             }
-            list.transition(&copy, b.second as u32, wanted, |texture, index, before, after| {
-                out.push(Barrier {
-                    kind: 0,
-                    flags: 0,
-                    first: texture.as_raw().cast_const().cast(),
-                    second: u64::from(index) | (u64::from(before) << 32),
-                    last: u64::from(after),
-                });
-            });
+            list.transition(
+                &copy,
+                b.second as u32,
+                wanted,
+                |texture, index, before, after| {
+                    out.push(Barrier {
+                        kind: 0,
+                        flags: 0,
+                        first: texture.as_raw().cast_const().cast(),
+                        second: u64::from(index) | (u64::from(before) << 32),
+                        last: u64::from(after),
+                    });
+                },
+            );
         }
         1 => {
             let first = if b.first.is_null() {
@@ -720,7 +783,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TitleBarrierCalls, 1);
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| format!("barrier kinds {:?}", barriers.iter().map(|b| b.kind).collect::<Vec<_>>()));
+        list.note_op(|| {
+            format!(
+                "barrier kinds {:?}",
+                barriers.iter().map(|b| b.kind).collect::<Vec<_>>()
+            )
+        });
         let mut host = Vec::with_capacity(barriers.len());
         for b in barriers {
             push_host_barriers(list, b, &mut host);
@@ -758,7 +826,12 @@ fn emit_barriers(list: &crate::host::HostList, barriers: &[Barrier]) {
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    ensure_subresource_state(list, resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state);
+    ensure_subresource_state(
+        list,
+        resource,
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        state,
+    );
 }
 
 /// Moves a single host subresource, or the whole texture, to `state`.
@@ -1101,7 +1174,8 @@ extern "system" fn copy_texture_region(
 /// Texture read backs since the last frame-rate line: how many, bytes
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
-pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// (texture, buffer) pairs read back so far, each logged once (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1112,7 +1186,13 @@ static READ_BACK_PAIRS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex
 /// run its rows go into the title's buffer (the title reads them on the CPU
 /// after its fence).
 #[cfg(windows)]
-fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src: &CopyLocation, source_box: *const [u32; 6]) {
+fn read_back(
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    at: [u32; 3],
+    src: &CopyLocation,
+    source_box: *const [u32; 6],
+) {
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_BOX, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
     };
@@ -1131,12 +1211,24 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     // SAFETY: the title's box (same layout as the host's) or null; a live texture.
     let (b, desc) = unsafe { (source_box.cast::<D3D12_BOX>().as_ref(), texture.GetDesc()) };
     let size = match b {
-        Some(b) => [b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top), b.back.saturating_sub(b.front)],
+        Some(b) => [
+            b.right.saturating_sub(b.left),
+            b.bottom.saturating_sub(b.top),
+            b.back.saturating_sub(b.front),
+        ],
         None => {
             // A subresource index shares the footprint's first dword.
             let mip = src.subresource() % u32::from(desc.MipLevels.max(1));
-            let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(desc.DepthOrArraySize) } else { 1 };
-            [((desc.Width >> mip) as u32).max(1), (desc.Height >> mip).max(1), (depth >> mip).max(1)]
+            let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                u32::from(desc.DepthOrArraySize)
+            } else {
+                1
+            };
+            [
+                ((desc.Width >> mip) as u32).max(1),
+                (desc.Height >> mip).max(1),
+                (depth >> mip).max(1),
+            ]
         }
     };
     // The host takes footprints of 256-byte pitches only (as the console).
@@ -1178,7 +1270,8 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     #[cfg(feature = "diagnostics")]
     {
         let text = || {
-            let mem = crate::resource::texture_memory(src.resource).map_or(0, |(at, _)| at as usize);
+            let mem =
+                crate::resource::texture_memory(src.resource).map_or(0, |(at, _)| at as usize);
             format!(
                 "read back {:?} (mem {mem:#x}, {}x{} f{} sub {}) {size:?} at {at:?} into {:?}+{:#x}, {len} bytes",
                 src.resource,
@@ -1215,7 +1308,10 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (data, title) = (data as usize, title as usize);
     // The rows are all it writes in title memory: named, later submissions
     // wait for it only where they read them (`HostList::defer_after_writing`).
-    let writes = rows.iter().map(|&(at, n)| (title + at as usize, title + (at + n) as usize)).collect();
+    let writes = rows
+        .iter()
+        .map(|&(at, n)| (title + at as usize, title + (at + n) as usize))
+        .collect();
     list.defer_after_writing(writes, move || {
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);
@@ -1269,7 +1365,12 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         list.crumbed(crate::host::Crumb::Resolve, Some("resolve"), || unsafe {
             let format = DXGI_FORMAT(format as i32);
-            if let Some(rect) = resolve_region(to.texture.GetDesc(), dst_sub, from.texture.GetDesc(), src_sub) {
+            if let Some(rect) = resolve_region(
+                to.texture.GetDesc(),
+                dst_sub,
+                from.texture.GetDesc(),
+                src_sub,
+            ) {
                 if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                     // The console clips a larger source to the destination.
                     list1.ResolveSubresourceRegion(
@@ -1303,7 +1404,8 @@ fn resolve_region(
     src: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
     src_sub: u32,
 ) -> Option<windows::Win32::Foundation::RECT> {
-    let extent = |d: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC, subresource: u32| {
+    let extent = |d: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+                  subresource: u32| {
         // Mips are the low-order component of an array or plane subresource index.
         let mip = subresource % u32::from(d.MipLevels);
         ((d.Width >> mip).max(1), (d.Height >> mip).max(1))
@@ -1365,9 +1467,11 @@ extern "system" fn clear_rtv(
         ensure_copy_state(list, &copy, subresource, RENDER_TARGET);
         let rtv = host.rtv(Some(&copy.texture), desc.as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
-        list.crumbed(crate::host::Crumb::Clear, Some("render target clear"), || unsafe {
-            list.list.ClearRenderTargetView(rtv, color, rects)
-        });
+        list.crumbed(
+            crate::host::Crumb::Clear,
+            Some("render target clear"),
+            || unsafe { list.list.ClearRenderTargetView(rtv, color, rects) },
+        );
         #[cfg(feature = "diagnostics")]
         crate::capture::note_clear(list, record.resource);
     }
@@ -1408,8 +1512,13 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         list.crumbed(crate::host::Crumb::Clear, Some("depth clear"), || unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         });
         #[cfg(feature = "diagnostics")]
         if flags & 3 != 0 {
@@ -1581,10 +1690,22 @@ extern "system" fn resolve_queries(
 /// buffer's host copy: the copy is in whatever state the title's shaders
 /// and indirect executions left it in, which a resolve cannot rely on.
 #[cfg(windows)]
-fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, bytes: u64) -> Option<(Vec<bool>, usize)> {
+fn host_resolve(
+    this: This,
+    heap: This,
+    kind: u32,
+    first: u32,
+    count: u32,
+    bytes: u64,
+) -> Option<(Vec<bool>, usize)> {
     use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE;
-    let (list, host) = (host_list(this)?, crate::query::host(heap, kind, first, count)?);
-    let measured: Vec<bool> = (first..first + count).map(|i| host.measured(i, kind)).collect();
+    let (list, host) = (
+        host_list(this)?,
+        crate::query::host(heap, kind, first, count)?,
+    );
+    let measured: Vec<bool> = (first..first + count)
+        .map(|i| host.measured(i, kind))
+        .collect();
     // Runs of measured queries: (first index from `first`, count).
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for (i, _) in measured.iter().enumerate().filter(|(_, m)| **m) {
@@ -1604,7 +1725,16 @@ fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, bytes
         let offset = base + u64::from(from) * bytes;
         // SAFETY: an open list, a live heap kept until the list is reset,
         // and the list's read-back memory.
-        unsafe { list.list.ResolveQueryData(&host.heap, D3D12_QUERY_TYPE(kind as i32), first + from, n, &back, offset) };
+        unsafe {
+            list.list.ResolveQueryData(
+                &host.heap,
+                D3D12_QUERY_TYPE(kind as i32),
+                first + from,
+                n,
+                &back,
+                offset,
+            )
+        };
     }
     Some((measured, results as usize))
 }
@@ -1677,7 +1807,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -1769,8 +1902,10 @@ unsafe impl Send for Upload {}
 
 /// Live list upload blocks and their bytes (the statistics).
 #[cfg(windows)]
-pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
@@ -1816,8 +1951,10 @@ mod state {
         with_state(this, |list, s| s.scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        // SAFETY: the title passes four floats or null.
-        with_state(this, |list, s| s.blend_factor(list, unsafe { factor.as_ref() }));
+        with_state(this, |list, s| {
+            // SAFETY: the title passes four floats or null.
+            s.blend_factor(list, unsafe { factor.as_ref() })
+        });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         with_state(this, |list, s| s.stencil_ref(list, reference));
@@ -2104,7 +2241,9 @@ extern "system" fn execute_indirect(
         return;
     };
     let range = match args {
-        [[kind, ..]] => indirect_arguments(arguments, offset, (*kind, stride, max), !count.is_null()),
+        [[kind, ..]] => {
+            indirect_arguments(arguments, offset, (*kind, stride, max), !count.is_null())
+        }
         _ => None,
     };
     #[cfg(windows)]
@@ -2119,7 +2258,11 @@ extern "system" fn execute_indirect(
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let kind = if *kind == DISPATCH_SINGLE {
+            DISPATCH
+        } else {
+            *kind
+        };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, limit), (address, len), counter);
         });
@@ -2191,8 +2334,8 @@ fn indirect_argument_limit(
 /// The final record needs its argument payload, with no trailing padding.
 fn indirect_argument_span(kind: u32, stride: u32, count: u32) -> Option<u64> {
     let payload = match kind {
-        0 => 16, // Draw.
-        1 => 20, // Draw indexed.
+        0 => 16,            // Draw.
+        1 => 20,            // Draw indexed.
         2 | 10 | 105 => 12, // Dispatch, mesh dispatch, single-pass dispatch.
         _ => return None,
     };
@@ -2242,7 +2385,6 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-
 /// An enhanced barrier group (`ID3D12GraphicsCommandList7::Barrier`):
 /// barrier type (0 global, 1 texture, 2 buffer), barrier count, and
 /// pointer to the barrier array.
@@ -2280,7 +2422,9 @@ const _: () = {
     assert!(size_of::<BarrierGroup>() == size_of::<D3D12_BARRIER_GROUP>());
     assert!(size_of::<TextureBarrier>() == size_of::<D3D12_TEXTURE_BARRIER>());
     assert!(offset_of!(TextureBarrier, resource) == offset_of!(D3D12_TEXTURE_BARRIER, pResource));
-    assert!(offset_of!(TextureBarrier, subresources) == offset_of!(D3D12_TEXTURE_BARRIER, Subresources));
+    assert!(
+        offset_of!(TextureBarrier, subresources) == offset_of!(D3D12_TEXTURE_BARRIER, Subresources)
+    );
     assert!(size_of::<[u32; 6]>() == size_of::<D3D12_BARRIER_SUBRESOURCE_RANGE>());
     assert!(offset_of!(D3D12_BARRIER_SUBRESOURCE_RANGE, IndexOrFirstMipLevel) == 0);
     assert!(offset_of!(D3D12_BARRIER_SUBRESOURCE_RANGE, NumMipLevels) == 4);
@@ -2330,8 +2474,14 @@ fn is_whole_resource_barrier(
     } else {
         u32::from(desc.DepthOrArraySize).max(1)
     };
-    let [first_mip_or_index, num_mips, first_slice, num_slices, first_plane, num_planes] =
-        *subresources;
+    let [
+        first_mip_or_index,
+        num_mips,
+        first_slice,
+        num_slices,
+        first_plane,
+        num_planes,
+    ] = *subresources;
     if num_mips == 0 {
         first_mip_or_index == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
             || (first_mip_or_index == 0 && mips == 1 && slices == 1 && planes == 1)
@@ -2501,7 +2651,13 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const Barrier
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
     defer_write(this, address, Written::Value(u64::from(value)), 4);
 }
-pub(crate) extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+pub(crate) extern "system" fn write64(
+    this: This,
+    address: u64,
+    value: u64,
+    _flush: u32,
+    flags: u32,
+) {
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
@@ -2714,10 +2870,17 @@ mod tests {
     /// alive: the title may release them before the list runs.
     #[test]
     fn uav_and_aliasing_barriers_keep_their_resources() {
-        let Some(host) = crate::host::host() else { return };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
         let desc: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
         let properties = [1u32, 0, 0, 0, 0];
-        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
         let mut texture = std::ptr::null();
         let made = crate::resource::create_committed(
             std::ptr::null(),
@@ -2733,7 +2896,13 @@ mod tests {
         let list = host.new_list().unwrap();
         for kind in [1, 2] {
             let before = list.kept_count();
-            let barrier = Barrier { kind, flags: 0, first: texture, second: 0, last: 0 };
+            let barrier = Barrier {
+                kind,
+                flags: 0,
+                first: texture,
+                second: 0,
+                last: 0,
+            };
             let mut out = Vec::new();
             push_host_barriers(&list, &barrier, &mut out);
             assert_eq!(out.len(), 1);
@@ -2748,10 +2917,19 @@ mod tests {
     #[test]
     fn memory_copies_do_not_fault_on_read_only_destinations() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
         };
         // SAFETY: a fresh allocation of two pages, freed below.
-        let page = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                8192,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
         assert!(!page.is_null());
         // SAFETY: bytes of our allocation.
         unsafe { (0..16).for_each(|i| page.add(i).write(i as u8)) };
@@ -2767,8 +2945,10 @@ mod tests {
         let moved: Vec<u8> = (0..16).map(|i| unsafe { page.add(i).read() }).collect();
         assert_eq!(moved, [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]);
         let mut old = 0;
-        // SAFETY: the second page of our allocation.
-        assert!(unsafe { VirtualProtect(page.add(4096).cast(), 4096, PAGE_READONLY, &mut old) } != 0);
+        assert!(
+            // SAFETY: the second page of our allocation.
+            unsafe { VirtualProtect(page.add(4096).cast(), 4096, PAGE_READONLY, &mut old) } != 0
+        );
         copy_title_memory(at + 4096, at, 8);
         // A size no memory has is no copy (and no allocation).
         copy_title_memory(at + 64, at, usize::MAX / 4);
@@ -3231,7 +3411,10 @@ mod tests {
         assert_eq!(indirect_buffer_address(outer, 4, span), Some(base + 4));
         assert_eq!(indirect_buffer_address(inner, 0, span), Some(base));
         assert_eq!(indirect_buffer_address(inner, 4, span), None);
-        assert_eq!(indirect_arguments(inner, 4, (2, 16, 64), true), Some((base + 4, 12, 1)));
+        assert_eq!(
+            indirect_arguments(inner, 4, (2, 16, 64), true),
+            Some((base + 4, 12, 1))
+        );
         assert_eq!(indirect_arguments(inner, 4, (2, 16, 64), false), None);
         assert_eq!(indirect_buffer_address(inner, 24, 4), Some(base + 24));
         assert_eq!(indirect_buffer_address(inner, 28, 4), None);
@@ -3276,9 +3459,19 @@ mod tests {
             crate::descriptor::create_heap(null, desc.as_ptr().cast(), &iid, &mut heap),
             S_OK
         );
-        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
-        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
-        let heap_slot = if has_newer_table(list) { newer_slot(0x100 / 8) * 8 } else { 0x100 };
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let heap_slot = if has_newer_table(list) {
+            newer_slot(0x100 / 8) * 8
+        } else {
+            0x100
+        };
         slot::<extern "system" fn(This, u32, *const This)>(list, heap_slot)(list, 1, &heap);
 
         let buffer = crate::resource::test_buffer(128);
@@ -3342,10 +3535,18 @@ mod tests {
         assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        assert!(
+            allocate_upload(list, 8, 0x30).is_null(),
+            "not a power of two"
+        );
         assert_eq!(reset(list, allocator, null), S_OK);
-        // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        assert!(
+            // SAFETY: the list is ours.
+            unsafe { &(*list.cast::<List>()).uploads }
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
@@ -3369,9 +3570,15 @@ mod tests {
         }
         let null = std::ptr::null();
         let mut allocator = null;
-        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
         let mut list = null;
-        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
         assert!(host_list(list).is_some());
         assert_eq!(close(list), S_OK);
         // Simulate a queue holding the closed segment while the title resets it.
@@ -3381,7 +3588,10 @@ mod tests {
         let hr = reset(list, allocator, null);
         NO_NEW_LIST.with(|f| f.set(false));
         assert_eq!(hr, E_OUTOFMEMORY);
-        assert!(host_list(list).is_none(), "closed queue-held list must not stay attached");
+        assert!(
+            host_list(list).is_none(),
+            "closed queue-held list must not stay attached"
+        );
         let mut value = 0u64;
         write64(list, std::ptr::from_mut(&mut value) as u64, 1, 0, 0);
         assert_eq!(value, 0, "nothing runs, so nothing is written as if it had");
@@ -3389,7 +3599,10 @@ mod tests {
         // Once the queue finishes and recycles it, the next reset recovers.
         held.into_iter().for_each(recycle);
         assert_eq!(reset(list, allocator, null), S_OK);
-        assert!(host_list(list).is_some(), "recovered a fresh host list on the next reset");
+        assert!(
+            host_list(list).is_some(),
+            "recovered a fresh host list on the next reset"
+        );
         assert_eq!(close(list), S_OK);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
@@ -3409,9 +3622,15 @@ mod tests {
         }
         let null = std::ptr::null();
         let mut allocator = null;
-        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
         let mut list = null;
-        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
         let (mut value, mut fence) = (0u64, 0u64);
         // `n` segments: a bottom-of-pipe write each (nothing runs: the
         // lists are never submitted), cut by waits; then closed.
@@ -3439,8 +3658,14 @@ mod tests {
         assert_eq!(held.len(), 2);
         let after = [held[0].work_after(), held[1].work_after()];
         cut_without_new_lists();
-        assert!(host_list(list).is_none(), "no held host list stays attached");
-        assert!(held.iter().all(|h| std::sync::Arc::strong_count(h) == 1), "the title list holds none of them");
+        assert!(
+            host_list(list).is_none(),
+            "no held host list stays attached"
+        );
+        assert!(
+            held.iter().all(|h| std::sync::Arc::strong_count(h) == 1),
+            "the title list holds none of them"
+        );
         assert_eq!(
             [held[0].work_after(), held[1].work_after()],
             [after[0], after[1] + 1],
@@ -3460,7 +3685,10 @@ mod tests {
         assert_eq!(std::sync::Arc::strong_count(&first), 1);
         drop(first);
         assert_eq!(reset(list, allocator, null), S_OK);
-        assert!(host_list(list).is_some(), "the next reset takes a spare or makes one");
+        assert!(
+            host_list(list).is_some(),
+            "the next reset takes a spare or makes one"
+        );
         assert_eq!(close(list), S_OK);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
@@ -3480,9 +3708,15 @@ mod tests {
         }
         let null = std::ptr::null();
         let mut allocator = null;
-        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
         let mut list = null;
-        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
         let (mut first, mut before, mut after, fence) = (0u64, 0u64, 0u64, 0u64);
         // One cut that works (a second host list), then one that does not.
         write64(list, std::ptr::from_mut(&mut first) as u64, 1, 0, 0);
@@ -3492,15 +3726,26 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         NO_NEW_LIST.with(|f| f.set(true));
         wait64(list, std::ptr::from_ref(&fence) as u64, 0, 0, 0);
-        assert!(host_list(list).is_none(), "nothing records past the lost wait");
+        assert!(
+            host_list(list).is_none(),
+            "nothing records past the lost wait"
+        );
         write64(list, std::ptr::from_mut(&mut after) as u64, 1, 0, 0);
         assert_eq!(close(list), E_OUTOFMEMORY);
         assert!(segments(list).is_empty(), "a submission runs none of it");
-        assert_eq!([first, before, after], [0, 0, 0], "nothing was written as if it had run");
+        assert_eq!(
+            [first, before, after],
+            [0, 0, 0],
+            "nothing was written as if it had run"
+        );
         // Still no new host list to be had: the reset reuses its own.
         assert_eq!(reset(list, allocator, null), S_OK);
         NO_NEW_LIST.with(|f| f.set(false));
-        assert_eq!(host_list(list).map(std::ptr::from_ref), Some(recorded[0]), "the reset starts again in place");
+        assert_eq!(
+            host_list(list).map(std::ptr::from_ref),
+            Some(recorded[0]),
+            "the reset starts again in place"
+        );
         assert_eq!(close(list), S_OK);
         assert_eq!(segments(list).len(), 1);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
@@ -4257,10 +4502,7 @@ mod tests {
             assert_eq!(close(list2), S_OK);
             execute(queue, 1, &list2);
             assert!(host.log_messages().is_none());
-            assert_eq!(
-                crate::resource::host_copy(tex).unwrap().state(0),
-                0x800
-            );
+            assert_eq!(crate::resource::host_copy(tex).unwrap().state(0), 0x800);
             assert!(errors.0.lock().unwrap().is_empty());
             assert_eq!(read_pixel(), [191, 64, 128, 255]);
 
@@ -4552,7 +4794,10 @@ void main() {
             let code = code.unwrap();
             // SAFETY: compiled shader blob bytes.
             let bytes = unsafe {
-                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+                std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                )
             };
             // SAFETY: root signature and compute PSO compiled above.
             let (root, pso) = unsafe {
@@ -4565,7 +4810,8 @@ void main() {
                     },
                     ..Default::default()
                 };
-                let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc).unwrap();
+                let pso: ID3D12PipelineState =
+                    host.device.CreateComputePipelineState(&desc).unwrap();
                 (root, pso)
             };
 
@@ -4620,7 +4866,9 @@ void main() {
                     .list
                     .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
                 hlist.list.SetComputeRootSignature(&root);
-                hlist.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+                hlist
+                    .list
+                    .SetComputeRootDescriptorTable(0, heap_host.gpu(0));
                 hlist.list.SetComputeRootUnorderedAccessView(1, out_gpu);
                 hlist.list.SetPipelineState(&pso);
                 hlist.list.Dispatch(1, 1, 1);
@@ -4867,6 +5115,4 @@ void main() {
             assert_eq!(release(o), 0);
         }
     }
-
-    
 }

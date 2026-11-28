@@ -183,7 +183,11 @@ pub fn track(
                 let (param, dword) = t.param_of(reg)?;
                 Some((v, param, dword))
             })
-            .chain(t.spilled.iter().map(|(&v, &(param, dword))| (v, param, dword)))
+            .chain(
+                t.spilled
+                    .iter()
+                    .map(|(&v, &(param, dword))| (v, param, dword)),
+            )
             .collect(),
         ..Resources::default()
     };
@@ -297,12 +301,12 @@ pub fn track(
     for (block, (accesses, mut reads)) in first_lane_at {
         reads.sort_unstable();
         reads.dedup();
-        let proof = t
-            .waterfall(block, &accesses, &reads)
-            .map_err(|what| ShaderError::Unsupported {
-                offset: t.inst((block, accesses[0])).machine.offset,
-                what,
-            })?;
+        let proof =
+            t.waterfall(block, &accesses, &reads)
+                .map_err(|what| ShaderError::Unsupported {
+                    offset: t.inst((block, accesses[0])).machine.offset,
+                    what,
+                })?;
         out.waterfall.compares.extend(proof.compares);
         out.waterfall.reads.extend(proof.reads);
     }
@@ -754,7 +758,10 @@ impl<'a> Tracer<'a> {
             *unguarded &= local;
             return dynamic;
         };
-        let (x, y) = (self.sum(a, known, &mut local), self.sum(b, known, &mut local));
+        let (x, y) = (
+            self.sum(a, known, &mut local),
+            self.sum(b, known, &mut local),
+        );
         *unguarded &= local;
         let sum =
             if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
@@ -1389,10 +1396,18 @@ impl<'a> Tracer<'a> {
         let args = match taken.iter().position(|&t| t) {
             Some(first) if taken.contains(&false) => edge(first, joins, known).and_then(|live| {
                 (0..preds.len())
-                    .map(|j| if taken[j] { edge(j, joins, known) } else { Ok(live.clone()) })
+                    .map(|j| {
+                        if taken[j] {
+                            edge(j, joins, known)
+                        } else {
+                            Ok(live.clone())
+                        }
+                    })
                     .collect::<Result<_, _>>()
             }),
-            _ => (0..preds.len()).map(|j| edge(j, joins, known)).collect::<Result<_, _>>(),
+            _ => (0..preds.len())
+                .map(|j| edge(j, joins, known))
+                .collect::<Result<_, _>>(),
         };
         joins.pop();
         Ok(Some(Source::Phi { block, args: args? }))
@@ -2218,7 +2233,8 @@ impl<'a> Tracer<'a> {
                 } else {
                     continue;
                 };
-                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
+                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1)))
+                else {
                     continue;
                 };
                 if meet(&[reach, (selected, true), (matched, false)]) {
@@ -3415,9 +3431,16 @@ pub(crate) mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader =
-            crate::emit::emit(&empty, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
-                .unwrap();
+        let shader = crate::emit::emit(
+            &empty,
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+            crate::emit::Target::ANY,
+        )
+        .unwrap();
         assert!(shader.user_data.contains(&crate::emit::UserData {
             index: 16,
             slot: 1,
@@ -3448,16 +3471,26 @@ pub(crate) mod tests {
             S_ENDPGM,
         ];
         let s16_only = NativeProgram {
-            code: s16_only_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            code: s16_only_words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect(),
             ..native
         };
         let p2 = crate::ir::build(&s16_only.code, s16_only.wave64, s16_only.vgprs).unwrap();
         let st2 = crate::structure::structure(&p2).unwrap();
         let res2 = track(&p2, &s16_only.layout, s16_only.stage, Some(&st2)).unwrap();
         let io2 = crate::io::raise(&p2, &s16_only).unwrap();
-        let shader2 =
-            crate::emit::emit(&empty, &s16_only, &p2, &st2, &io2, &res2, crate::emit::Target::ANY)
-                .unwrap();
+        let shader2 = crate::emit::emit(
+            &empty,
+            &s16_only,
+            &p2,
+            &st2,
+            &io2,
+            &res2,
+            crate::emit::Target::ANY,
+        )
+        .unwrap();
         assert!(
             !shader2.user_data.iter().any(|u| u.index >= 16),
             "reading GroupId in s16 must not reference spilled user_data[16]: {:?}",

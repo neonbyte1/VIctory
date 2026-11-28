@@ -42,7 +42,9 @@ pub(crate) fn on() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         let on = crate::switch::on("VICTORY_EARLY_RELEASE");
         if on {
-            tracing::info!("held queue waits read the values of bottom-of-pipe writes in flight (VICTORY_EARLY_RELEASE)");
+            tracing::info!(
+                "held queue waits read the values of bottom-of-pipe writes in flight (VICTORY_EARLY_RELEASE)"
+            );
         }
         on
     });
@@ -98,7 +100,11 @@ pub(crate) enum Answer {
 
 /// The low `bytes` bytes of a value.
 fn low(value: u64, bytes: usize) -> u64 {
-    if bytes >= 8 { value } else { value & ((1u64 << (8 * bytes)) - 1) }
+    if bytes >= 8 {
+        value
+    } else {
+        value & ((1u64 << (8 * bytes)) - 1)
+    }
 }
 
 /// A word value writes in flight go to.
@@ -239,7 +245,8 @@ fn overlay() -> std::sync::MutexGuard<'static, Overlay> {
 /// `address`, if readable.
 fn title(address: usize, bytes: usize) -> Option<u64> {
     let mut value = [0u8; 8];
-    crate::host::read_into(address as *const u8, &mut value[..bytes.min(8)]).then(|| u64::from_le_bytes(value))
+    crate::host::read_into(address as *const u8, &mut value[..bytes.min(8)])
+        .then(|| u64::from_le_bytes(value))
 }
 
 /// [`Overlay::fly`] of the submissions in flight (`Host::run`, with the
@@ -269,11 +276,18 @@ pub(crate) fn land(owner: u64) {
 /// The value a held wait reads (`crate::queue`'s pump, with the switch
 /// on): that of the last value write in flight to the word, else title
 /// memory (`memory`).
-pub(crate) fn read(address: u64, bytes: u8, memory: &dyn Fn(u64, u8) -> Option<u64>) -> Option<u64> {
+pub(crate) fn read(
+    address: u64,
+    bytes: u8,
+    memory: &dyn Fn(u64, u8) -> Option<u64>,
+) -> Option<u64> {
     if FLYING.load(Ordering::Acquire) {
-        let answer = overlay().value(address as usize, usize::from(bytes), &title, &|start, end| {
-            crate::shadow::crossing(start, end, crate::shadow::LABEL).map(|c| c.0)
-        });
+        let answer = overlay().value(
+            address as usize,
+            usize::from(bytes),
+            &title,
+            &|start, end| crate::shadow::crossing(start, end, crate::shadow::LABEL).map(|c| c.0),
+        );
         match answer {
             Answer::Value(value) => return Some(value),
             #[cfg(feature = "diagnostics")]
@@ -313,10 +327,23 @@ mod tests {
 
     impl Title {
         fn ask(&self, o: &mut Overlay, at: usize, bytes: usize) -> Answer {
-            o.value(at, bytes, &|a, _| Some(*self.words.get(&a).unwrap_or(&0)), &|_, _| self.writer)
+            o.value(
+                at,
+                bytes,
+                &|a, _| Some(*self.words.get(&a).unwrap_or(&0)),
+                &|_, _| self.writer,
+            )
         }
-        fn fly(&self, o: &mut Overlay, owner: u64, barrier: bool, writes: &[(usize, Written, usize)]) {
-            o.fly(owner, barrier, writes, &|a, _| Some(*self.words.get(&a).unwrap_or(&0)));
+        fn fly(
+            &self,
+            o: &mut Overlay,
+            owner: u64,
+            barrier: bool,
+            writes: &[(usize, Written, usize)],
+        ) {
+            o.fly(owner, barrier, writes, &|a, _| {
+                Some(*self.words.get(&a).unwrap_or(&0))
+            });
         }
     }
 
@@ -330,15 +357,36 @@ mod tests {
         let mut o = Overlay::new();
         assert_eq!(title.ask(&mut o, L, 8), Answer::Memory, "nothing in flight");
         title.fly(&mut o, 5, false, &[(L, Written::Value(5), 8)]);
-        title.fly(&mut o, 6, false, &[(L, Written::Value(6), 8), (L + 8, Written::Value(1), 8)]);
-        assert_eq!(title.ask(&mut o, L, 8), Answer::Value(6), "the later writer's value");
+        title.fly(
+            &mut o,
+            6,
+            false,
+            &[(L, Written::Value(6), 8), (L + 8, Written::Value(1), 8)],
+        );
+        assert_eq!(
+            title.ask(&mut o, L, 8),
+            Answer::Value(6),
+            "the later writer's value"
+        );
         assert_eq!(title.words[&L], 4, "title memory untouched");
-        assert_eq!(title.ask(&mut o, L + 0x100, 8), Answer::Memory, "another word");
+        assert_eq!(
+            title.ask(&mut o, L + 0x100, 8),
+            Answer::Memory,
+            "another word"
+        );
         // Submission 5 completes: its label lands, then leaves the overlay.
         title.words.insert(L, 5);
-        assert_eq!(title.ask(&mut o, L, 8), Answer::Refused(Refused::Cpu, true), "written, not landed yet: memory");
+        assert_eq!(
+            title.ask(&mut o, L, 8),
+            Answer::Refused(Refused::Cpu, true),
+            "written, not landed yet: memory"
+        );
         o.land(5);
-        assert_eq!(title.ask(&mut o, L, 8), Answer::Value(6), "the base is 5 now");
+        assert_eq!(
+            title.ask(&mut o, L, 8),
+            Answer::Value(6),
+            "the base is 5 now"
+        );
         title.words.insert(L, 6);
         title.words.insert(L + 8, 1);
         o.land(6);
@@ -354,11 +402,27 @@ mod tests {
         let mut o = Overlay::new();
         title.fly(&mut o, 1, false, &[(L, Written::Value(0x1_0000_0007), 4)]);
         assert_eq!(title.ask(&mut o, L, 4), Answer::Value(7));
-        assert_eq!(title.ask(&mut o, L, 8), Answer::Refused(Refused::Size, true), "wider wait");
-        assert_eq!(title.ask(&mut o, L - 4, 8), Answer::Refused(Refused::Size, false), "overlapping, counted once");
-        assert_eq!(title.ask(&mut o, L + 4, 4), Answer::Memory, "the word after");
+        assert_eq!(
+            title.ask(&mut o, L, 8),
+            Answer::Refused(Refused::Size, true),
+            "wider wait"
+        );
+        assert_eq!(
+            title.ask(&mut o, L - 4, 8),
+            Answer::Refused(Refused::Size, false),
+            "overlapping, counted once"
+        );
+        assert_eq!(
+            title.ask(&mut o, L + 4, 4),
+            Answer::Memory,
+            "the word after"
+        );
         title.fly(&mut o, 2, false, &[(L, Written::Value(8), 8)]);
-        assert_eq!(title.ask(&mut o, L, 4), Answer::Refused(Refused::Size, true), "mixed sizes");
+        assert_eq!(
+            title.ask(&mut o, L, 4),
+            Answer::Refused(Refused::Size, true),
+            "mixed sizes"
+        );
     }
 
     /// The title's CPU writing the word after the writes in flight were
@@ -370,7 +434,11 @@ mod tests {
         title.fly(&mut o, 1, false, &[(L, Written::Value(9), 8)]);
         title.words.insert(L, 0x77);
         assert_eq!(title.ask(&mut o, L, 8), Answer::Refused(Refused::Cpu, true));
-        assert_eq!(title.ask(&mut o, L, 8), Answer::Refused(Refused::Cpu, false), "counted once");
+        assert_eq!(
+            title.ask(&mut o, L, 8),
+            Answer::Refused(Refused::Cpu, false),
+            "counted once"
+        );
     }
 
     /// Writers whose value is not known ahead are refused: a timestamp, a
@@ -382,25 +450,44 @@ mod tests {
         let mut title = Title::default();
         let mut o = Overlay::new();
         title.fly(&mut o, 3, false, &[(L, Written::GpuTimestamp, 8)]);
-        assert_eq!(title.ask(&mut o, L, 8), Answer::Refused(Refused::Stamp, true));
+        assert_eq!(
+            title.ask(&mut o, L, 8),
+            Answer::Refused(Refused::Stamp, true)
+        );
         o.land(3);
         assert_eq!(title.ask(&mut o, L, 8), Answer::Memory);
         title.words.insert(L + 8, 1);
         title.fly(&mut o, 5, false, &[(L + 8, Written::Value(2), 8)]);
         title.writer = Some(4);
-        assert_eq!(title.ask(&mut o, L + 8, 8), Answer::Value(2), "an earlier copy writer");
+        assert_eq!(
+            title.ask(&mut o, L + 8, 8),
+            Answer::Value(2),
+            "an earlier copy writer"
+        );
         for writer in [5, 6] {
             title.writer = Some(writer);
-            assert_eq!(title.ask(&mut o, L + 8, 8), Answer::Refused(Refused::Writer, writer == 5), "copy writer {writer}");
+            assert_eq!(
+                title.ask(&mut o, L + 8, 8),
+                Answer::Refused(Refused::Writer, writer == 5),
+                "copy writer {writer}"
+            );
         }
         title.writer = None;
         title.fly(&mut o, 7, true, &[]);
-        assert_eq!(title.ask(&mut o, L + 8, 8), Answer::Refused(Refused::Barrier, false), "a barrier after");
+        assert_eq!(
+            title.ask(&mut o, L + 8, 8),
+            Answer::Refused(Refused::Barrier, false),
+            "a barrier after"
+        );
         o.land(5);
         o.land(7);
         assert!(o.is_empty());
         title.fly(&mut o, 8, true, &[(L, Written::Value(1), 8)]);
-        assert_eq!(title.ask(&mut o, L, 8), Answer::Refused(Refused::Barrier, true), "the writer is one");
+        assert_eq!(
+            title.ask(&mut o, L, 8),
+            Answer::Refused(Refused::Barrier, true),
+            "the writer is one"
+        );
     }
 
     /// With the switch's pieces together (`crate::hold`'s pump reading
@@ -441,7 +528,8 @@ mod tests {
                 let w: Vec<_> = segments.iter().flat_map(|s| writes(s)).collect();
                 fly(owner, segments.contains(&"pages"), &w);
                 in_flight.borrow_mut().push((owner, w));
-                log.borrow_mut().push(format!("q{q}: {}", segments.join(" ")));
+                log.borrow_mut()
+                    .push(format!("q{q}: {}", segments.join(" ")));
             };
             held.pump(&mut World {
                 read: &overlaid,
@@ -464,21 +552,41 @@ mod tests {
         held.push(2, Item::Segment("depth", vec![ge(0, 2)]));
         held.push(1, Item::Segment("draw", vec![]));
         let pumped = pump(&mut held);
-        assert_eq!(*log.borrow(), ["q1: draw", "q2: depth"], "released behind its writer");
+        assert_eq!(
+            *log.borrow(),
+            ["q1: draw", "q2: depth"],
+            "released behind its writer"
+        );
         assert_eq!(pumped.early, 1);
-        // SAFETY: as above.
-        assert_eq!(unsafe { word(0).read_volatile() }, 0, "the label is not in title memory yet");
+        assert_eq!(
+            // SAFETY: as above.
+            unsafe { word(0).read_volatile() },
+            0,
+            "the label is not in title memory yet"
+        );
         complete();
-        // SAFETY: as above.
-        assert_eq!(unsafe { word(0).read_volatile() }, 2, "it lands with the completion");
+        assert_eq!(
+            // SAFETY: as above.
+            unsafe { word(0).read_volatile() },
+            2,
+            "it lands with the completion"
+        );
         // A barrier's label: the wait reads title memory.
         held.push(2, Item::Segment("late", vec![ge(8, 2)]));
         held.push(1, Item::Segment("pages", vec![]));
         let pumped = pump(&mut held);
-        assert_eq!((pumped.early, held.holds_work(2)), (0, true), "held behind a barrier's label");
+        assert_eq!(
+            (pumped.early, held.holds_work(2)),
+            (0, true),
+            "held behind a barrier's label"
+        );
         complete();
         let pumped = pump(&mut held);
-        assert_eq!((pumped.early, held.holds_work(2)), (0, false), "released by the landed value");
+        assert_eq!(
+            (pumped.early, held.holds_work(2)),
+            (0, false),
+            "released by the landed value"
+        );
         assert!(!FLYING.load(Ordering::Acquire));
         crate::watch::tests::free(p);
     }
@@ -493,16 +601,41 @@ mod tests {
         const WRITER: u64 = u64::MAX / 4 + 100;
         let (range, label) = (0x10_0000, 0x20_0000);
         let mut o = Overlay::new();
-        o.fly(WRITER, false, &[(label, Written::Value(3), 8)], &|_, _| Some(2));
-        crate::shadow::fly(WRITER, vec![(range, range + 0x100, 1), (label, label + 8, crate::shadow::LABEL)]);
+        o.fly(WRITER, false, &[(label, Written::Value(3), 8)], &|_, _| {
+            Some(2)
+        });
+        crate::shadow::fly(
+            WRITER,
+            vec![
+                (range, range + 0x100, 1),
+                (label, label + 8, crate::shadow::LABEL),
+            ],
+        );
         assert_eq!(
-            o.value(label, 8, &|_, _| Some(2), &|s, e| crate::shadow::crossing(s, e, crate::shadow::LABEL).map(|c| c.0)),
+            o.value(label, 8, &|_, _| Some(2), &|s, e| crate::shadow::crossing(
+                s,
+                e,
+                crate::shadow::LABEL
+            )
+            .map(|c| c.0)),
             Answer::Value(3),
             "released early"
         );
-        assert_eq!(crate::shadow::crossing(range + 0x80, range + 0x88, 2), Some((WRITER, false)), "its range: Alias settle");
-        assert_eq!(crate::shadow::crossing(label, label + 8, 2), Some((WRITER, true)), "its label: Label settle");
-        assert_eq!(crate::shadow::crossing(range + 0x100, range + 0x200, 2), None, "elsewhere: none");
+        assert_eq!(
+            crate::shadow::crossing(range + 0x80, range + 0x88, 2),
+            Some((WRITER, false)),
+            "its range: Alias settle"
+        );
+        assert_eq!(
+            crate::shadow::crossing(label, label + 8, 2),
+            Some((WRITER, true)),
+            "its label: Label settle"
+        );
+        assert_eq!(
+            crate::shadow::crossing(range + 0x100, range + 0x200, 2),
+            None,
+            "elsewhere: none"
+        );
         crate::shadow::land(WRITER);
         o.land(WRITER);
         assert_eq!(crate::shadow::crossing(label, label + 8, 2), None);

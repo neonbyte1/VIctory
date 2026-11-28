@@ -58,23 +58,40 @@ fn timer() -> Option<&'static Timer> {
             let host = host()?;
             let mut heap: Option<ID3D12QueryHeap> = None;
             let mut back: Option<ID3D12Resource> = None;
-            let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let readback = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
             let desc = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
                 Width: u64::from(PAIRS) * 16,
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 ..Default::default()
             };
             // SAFETY: plain object creation; our out pointers.
             unsafe {
-                let query = D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: PAIRS * 2, NodeMask: 0 };
+                let query = D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: PAIRS * 2,
+                    NodeMask: 0,
+                };
                 host.device.CreateQueryHeap(&query, &mut heap).ok()?;
                 host.device
-                    .CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut back)
+                    .CreateCommittedResource(
+                        &readback,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut back,
+                    )
                     .ok()?;
             }
             tracing::info!("host library work timed on the GPU (VICTORY_LIBRARY_TIMING)");
@@ -82,7 +99,10 @@ fn timer() -> Option<&'static Timer> {
                 heap: heap?,
                 back: back?,
                 frequency: host.timestamp_frequency(),
-                state: Mutex::new(State { busy: vec![false; PAIRS as usize], ..State::default() }),
+                state: Mutex::new(State {
+                    busy: vec![false; PAIRS as usize],
+                    ..State::default()
+                }),
             })
         })
         .as_ref()
@@ -98,13 +118,18 @@ pub(crate) fn begin(list: &HostList) -> Option<u32> {
     let pair = {
         let mut s = t.state.lock().unwrap_or_else(|e| e.into_inner());
         let start = s.next;
-        let pair = (0..PAIRS).map(|i| (start + i) % PAIRS).find(|&p| !s.busy[p as usize])?;
+        let pair = (0..PAIRS)
+            .map(|i| (start + i) % PAIRS)
+            .find(|&p| !s.busy[p as usize])?;
         s.busy[pair as usize] = true;
         s.next = (pair + 1) % PAIRS;
         pair
     };
     // SAFETY: an open list and our heap.
-    unsafe { list.list.EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2) };
+    unsafe {
+        list.list
+            .EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2)
+    };
     Some(pair)
 }
 
@@ -114,11 +139,22 @@ pub(crate) fn end(list: &HostList, pair: u32, cpu: Duration) {
     let Some(t) = timer() else { return };
     // SAFETY: an open list, our heap and read-back buffer.
     unsafe {
-        list.list.EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2 + 1);
-        list.list.ResolveQueryData(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2, 2, &t.back, u64::from(pair) * 16);
+        list.list
+            .EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2 + 1);
+        list.list.ResolveQueryData(
+            &t.heap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            pair * 2,
+            2,
+            &t.back,
+            u64::from(pair) * 16,
+        );
     }
     let mut s = t.state.lock().unwrap_or_else(|e| e.into_inner());
-    s.pending.entry(std::ptr::from_ref(list) as usize).or_default().push((pair, cpu));
+    s.pending
+        .entry(std::ptr::from_ref(list) as usize)
+        .or_default()
+        .push((pair, cpu));
 }
 
 /// At `list`'s reset (its submission finished): reads its timed calls.
@@ -128,17 +164,32 @@ pub(crate) fn list_reset(list: &HostList) {
     }
     let Some(t) = timer() else { return };
     let mut s = t.state.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(calls) = s.pending.remove(&(std::ptr::from_ref(list) as usize)) else { return };
+    let Some(calls) = s.pending.remove(&(std::ptr::from_ref(list) as usize)) else {
+        return;
+    };
     let mut data = std::ptr::null_mut();
     // SAFETY: a read-back buffer the finished list resolved into.
-    let mapped = unsafe { t.back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: PAIRS as usize * 16 }), Some(&mut data)) };
+    let mapped = unsafe {
+        t.back.Map(
+            0,
+            Some(&D3D12_RANGE {
+                Begin: 0,
+                End: PAIRS as usize * 16,
+            }),
+            Some(&mut data),
+        )
+    };
     for (pair, cpu) in calls {
         s.busy[pair as usize] = false;
         if mapped.is_ok() {
             // SAFETY: the pair's 16 bytes inside the mapped buffer.
             let [a, b] = unsafe { data.cast::<[u64; 2]>().add(pair as usize).read_unaligned() };
             let gpu_ms = ticks_ms(a, b, t.frequency);
-            tracing::debug!(gpu_ms = format_args!("{gpu_ms:.3}"), cpu_us = cpu.as_micros(), "host library call");
+            tracing::debug!(
+                gpu_ms = format_args!("{gpu_ms:.3}"),
+                cpu_us = cpu.as_micros(),
+                "host library call"
+            );
             s.gpu_ms.push(gpu_ms);
             s.cpu.push(cpu);
         }
@@ -217,12 +268,21 @@ mod tests {
             0
         };
         // SAFETY: an open list and our heap.
-        unsafe { list.list.EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2) };
+        unsafe {
+            list.list
+                .EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2)
+        };
         end(&list, pair, Duration::from_micros(5));
         list.close();
         host.execute(&[&list]);
         // `on()` is off in tests: read through the same path directly.
-        let calls = t.state.lock().unwrap().pending.get(&(std::ptr::from_ref(&list) as usize)).cloned();
+        let calls = t
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .get(&(std::ptr::from_ref(&list) as usize))
+            .cloned();
         assert_eq!(calls.map(|c| c.len()), Some(1));
         let mut data = std::ptr::null_mut();
         // SAFETY: the finished list resolved into the buffer.

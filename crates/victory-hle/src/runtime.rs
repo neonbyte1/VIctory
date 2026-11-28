@@ -568,7 +568,11 @@ mod tests {
     fn references_and_self_closing_elements_combine() {
         let found = elements("<G><Name>x&#38;y&lt;z</Name><Flag/>&#65;<Tail>&#x42;</Tail></G>");
         assert_eq!(body(&found, "G/Name"), Some("x&y<z"));
-        assert_eq!(body(&found, "G/Flag"), Some(""), "the text after `/>` is not its own");
+        assert_eq!(
+            body(&found, "G/Flag"),
+            Some(""),
+            "the text after `/>` is not its own"
+        );
         assert_eq!(body(&found, "G/Tail"), Some("B"));
     }
 }

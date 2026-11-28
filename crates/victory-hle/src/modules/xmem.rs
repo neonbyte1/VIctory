@@ -492,7 +492,11 @@ impl Drop for Section {
             && at != 0
         {
             // SAFETY: our own view of the section.
-            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) };
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut c_void,
+                })
+            };
         }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
@@ -655,7 +659,12 @@ pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
         .next_back()
         .filter(|(base, (size, _))| *base + size > at)
         .map(|(base, _)| *base);
-    let starts = first.into_iter().chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
+    let starts = first.into_iter().chain(
+        physical
+            .views
+            .range(at.saturating_add(1)..end)
+            .map(|(b, _)| *b),
+    );
     for base in starts.collect::<Vec<_>>() {
         let (size, slice) = &physical.views[&base];
         let (from, to) = (at.max(base), end.min(base + size));
@@ -775,7 +784,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// destination that could not be written).
 pub(crate) fn unknown_pages(pages: &[usize]) -> usize {
     let physical = physical();
-    pages.iter().filter(|p| !physical.pages.contains_key(p)).count()
+    pages
+        .iter()
+        .filter(|p| !physical.pages.contains_key(p))
+        .count()
 }
 
 /// Pages still mapped stay readable through their views until unmapped.
@@ -876,7 +888,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
-    let reached = pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]);
+    let reached = pages
+        .get(offset / PAGE..(offset + data.len()).div_ceil(PAGE))
+        .unwrap_or(&[]);
     // Title views showing the pages: those whose shaders' bytes have not
     // gone back get them now, under ours (`victory_gpu::unseen_writing`).
     let unseen = victory_gpu::unseen_writing(|| shown_at(reached));
@@ -937,7 +951,10 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
-    let reached = pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec();
+    let reached = pages
+        .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+        .unwrap_or(&[])
+        .to_vec();
     let view = View::map(slice, *n)?;
     Some(PageWindow {
         view,
@@ -1399,8 +1416,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             physical.hole(at, size);
         }
         if at < base {
-        map(physical, at, base - at, slice.clone());
-    }
+            map(physical, at, base - at, slice.clone());
+        }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
@@ -1825,7 +1842,11 @@ mod tests {
         both.sort_unstable();
         assert_eq!(both, [b as usize, at(b, 1) as usize]);
         assert!(map_alias(b as u64, 0, PAGE as u64));
-        assert_eq!(others(at(a, 2)), [at(b, 1) as usize], "unmapped views are forgotten");
+        assert_eq!(
+            others(at(a, 2)),
+            [at(b, 1) as usize],
+            "unmapped views are forgotten"
+        );
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
@@ -2214,7 +2235,15 @@ mod tests {
     #[test]
     fn page_windows_report_where_the_pages_show_when_done() {
         let pages = allocate(1);
-        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
         let (a, b) = (reserve(), reserve());
         assert!(!a.is_null() && !b.is_null());
         assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);

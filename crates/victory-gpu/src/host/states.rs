@@ -49,7 +49,11 @@ impl HostTexture {
 
     #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn state(&self, subresource: u32) -> u32 {
-        let states = self.states.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let states = self
+            .states
+            .committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match &*states {
             Subresources::Uniform(state) => *state,
             Subresources::Split(states) => states[subresource as usize],
@@ -59,7 +63,11 @@ impl HostTexture {
     /// Visits the selected committed states, using one whole-texture entry
     /// when the texture is uniform and the whole texture was requested.
     pub(super) fn visit_states(&self, subresource: u32, mut visit: impl FnMut(u32, u32)) {
-        let states = self.states.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let states = self
+            .states
+            .committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match &*states {
             Subresources::Uniform(state) => visit(subresource, *state),
             Subresources::Split(states)
@@ -145,7 +153,9 @@ impl RecordedTexture {
         if subresource >= count {
             return;
         }
-        if count == 1 && let Subresources::Uniform(state) = &mut self.states {
+        if count == 1
+            && let Subresources::Uniform(state) = &mut self.states
+        {
             record(subresource, state);
         } else if !matches!(self.states, Subresources::Uniform(Some(used)) if used.last == wanted) {
             record(
@@ -167,7 +177,12 @@ impl RecordedTexture {
     /// Fills in the list's initial states and commits its final states in
     /// submission order. Subresources the list did not use keep their state.
     pub(super) fn reconcile(&self, mut emit: impl FnMut(u32, u32, u32)) {
-        let mut real = self.copy.states.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut real = self
+            .copy
+            .states
+            .committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut apply = |index, state: &mut u32, used: Use| {
             if *state != used.first {
                 emit(index, *state, used.first);

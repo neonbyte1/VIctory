@@ -126,8 +126,9 @@ fn read_config_file(path: &Path, required: bool) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
-        Err(error) if required => Err(error)
-            .with_context(|| format!("reading VICTORY_CONFIG at {}", path.display())),
+        Err(error) if required => {
+            Err(error).with_context(|| format!("reading VICTORY_CONFIG at {}", path.display()))
+        }
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
 }
