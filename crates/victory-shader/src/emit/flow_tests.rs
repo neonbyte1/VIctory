@@ -382,7 +382,7 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
     ];
     let mut failures = Vec::new();
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;

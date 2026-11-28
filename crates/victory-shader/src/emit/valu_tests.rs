@@ -248,7 +248,7 @@ fn run_cases_with_outputs(
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let host = match Host::new(warp) {
             Ok(host) => host,
             Err(e) => {
@@ -2896,7 +2896,7 @@ fn image_addresses_of_16_bits_and_clamps() {
         (&gathers, f(-1.0), &gathered(1.0)),
     ];
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -3345,7 +3345,7 @@ fn image_atomics_of_64_bits() {
         want[96 + l as usize] = b(l);
     }
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;

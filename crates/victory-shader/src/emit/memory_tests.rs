@@ -260,7 +260,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
     view_addresses[9..12].copy_from_slice(&image);
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -743,7 +743,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         .unwrap_or_else(|e| e.into_inner());
     let copy: Vec<u32> = (0..256).map(|k| 0x1000 + k).collect();
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -883,7 +883,7 @@ fn writes_through_views_mark_their_pages() {
     let value = 0x1234_5678;
     let marks = vec![100, 0xFFF0, super::VIEW_MARK_NONE, 0, 200, 0];
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -1030,7 +1030,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     let words = (super::VIEW_READS + 64) / 32;
     let texel = [[0.5f32; 4]];
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -1163,7 +1163,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;

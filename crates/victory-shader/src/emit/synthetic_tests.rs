@@ -327,7 +327,7 @@ fn gathers_at_a_level_match_the_hardware() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -443,7 +443,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -510,7 +510,7 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -681,7 +681,7 @@ fn a_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -752,7 +752,7 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
         let _one = super::valu_tests::ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for (label, warp) in [("hardware", false), ("warp", true)] {
+        for (label, warp) in Host::test_backends() {
             let Ok(host) = Host::new(warp) else {
                 eprintln!("no SM 6.6 {label} device; skipped");
                 continue;
@@ -860,7 +860,7 @@ fn relative_moves_in_waterfall_loops_reach_each_lane_s_element() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;

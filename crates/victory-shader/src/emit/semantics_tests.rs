@@ -552,7 +552,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut hosts: Vec<(&str, bool, Host)> = Vec::new();
     let mut errors = Vec::new();
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         match Host::new(warp) {
             Ok(h) => hosts.push((label, warp, h)),
             Err(e) => errors.push(format!("{label}: {e}")),
@@ -3230,12 +3230,16 @@ fn whole_wave_sections_keep_rounding_mode_changes() {
 #[test]
 fn hosts_that_do_not_fuse_are_named() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(warp) = Host::new(true) {
-        assert_eq!(warp.fuses_fmad(), Ok(false), "WARP");
-    }
-    if let Ok(hardware) = Host::new(false) {
-        let fuses = hardware.fuses_fmad().expect("the check runs");
-        eprintln!("hardware adapter fuses FMad: {fuses}");
+    for (label, warp) in Host::test_backends() {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let fuses = host.fuses_fmad().expect("the check runs");
+        if warp {
+            assert!(!fuses, "{label}");
+        } else {
+            eprintln!("{label} adapter fuses FMad: {fuses}");
+        }
     }
 }
 
