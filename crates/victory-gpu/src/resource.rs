@@ -313,22 +313,25 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
 /// typeless depth resources.
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
 
-/// Mip levels, the full chain for 0.
-fn mip_count(desc: &ResourceDesc) -> u32 {
+/// Full mip chain length for `desc`'s dimensions (at least 1).
+fn full_mip_count(desc: &ResourceDesc) -> u32 {
     let depth = if desc.dimension == TEXTURE_3D {
         u64::from(desc.depth_or_array_size)
     } else {
         1
     };
+    64 - desc
+        .width
+        .max(u64::from(desc.height))
+        .max(depth)
+        .max(1)
+        .leading_zeros()
+}
+
+/// Mip levels, the full chain for 0.
+fn mip_count(desc: &ResourceDesc) -> u32 {
     match desc.mip_levels {
-        0 => {
-            64 - desc
-                .width
-                .max(u64::from(desc.height))
-                .max(depth)
-                .max(1)
-                .leading_zeros()
-        }
+        0 => full_mip_count(desc),
         n => u32::from(n),
     }
 }
@@ -415,11 +418,14 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
             width: u32::try_from(desc.width).ok()?,
             height: 1,
             depth: 1,
-            row_pitch: u32::try_from(desc.width.next_multiple_of(PITCH)).ok()?,
+            row_pitch: u32::try_from(desc.width.checked_next_multiple_of(PITCH)?).ok()?,
         };
         return (index == 0).then_some((footprint, 1, desc.width));
     }
     let mips = mip_count(desc);
+    if mips > full_mip_count(desc) {
+        return None;
+    }
     let slices = if desc.dimension == TEXTURE_3D {
         1
     } else {
@@ -440,23 +446,28 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         _ => return None,
     };
     let (element, block) = element(format)?;
-    let width = (desc.width >> extent_shift).max(1).next_multiple_of(block);
-    let height = (u64::from(desc.height) >> extent_shift)
+    let width = desc
+        .width
+        .checked_shr(extent_shift)?
         .max(1)
-        .next_multiple_of(block);
+        .checked_next_multiple_of(block)?;
+    let height = u64::from(desc.height)
+        .checked_shr(extent_shift)?
+        .max(1)
+        .checked_next_multiple_of(block)?;
     let depth = if desc.dimension == TEXTURE_3D {
-        (u32::from(desc.depth_or_array_size) >> mip).max(1)
+        u32::from(desc.depth_or_array_size).checked_shr(mip)?.max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = (width / block).checked_mul(element)?;
     let footprint = PlacedFootprint {
         offset: 0,
         format,
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         depth,
-        row_pitch: u32::try_from(row_size.next_multiple_of(pitch_alignment)).ok()?,
+        row_pitch: u32::try_from(row_size.checked_next_multiple_of(pitch_alignment)?).ok()?,
     };
     Some((footprint, u32::try_from(height / block).ok()?, row_size))
 }
@@ -481,13 +492,20 @@ pub(crate) extern "system" fn copyable_footprints(
     let mut end = base;
     let mut known = desc.is_some();
     for i in 0..count {
-        let one = desc.and_then(|d| subresource(d, first + i));
+        let one = desc.and_then(|d| {
+            let index = first.checked_add(i)?;
+            let (mut footprint, row_count, row_size) = subresource(d, index)?;
+            let offset = end.checked_next_multiple_of(PLACEMENT)?;
+            let pitch = u64::from(footprint.row_pitch);
+            let lines = u64::from(row_count).checked_mul(u64::from(footprint.depth))?;
+            let body = pitch.checked_mul(lines.saturating_sub(1))?;
+            let next_end = offset.checked_add(body)?.checked_add(row_size)?;
+            footprint.offset = offset;
+            Some((footprint, row_count, row_size, next_end))
+        });
         let (layout, row_count, row_size) = match one {
-            Some((mut footprint, row_count, row_size)) => {
-                footprint.offset = end.next_multiple_of(PLACEMENT);
-                let pitch = u64::from(footprint.row_pitch);
-                let lines = u64::from(row_count) * u64::from(footprint.depth);
-                end = footprint.offset + pitch * lines.saturating_sub(1) + row_size;
+            Some((footprint, row_count, row_size, next_end)) => {
+                end = next_end;
                 (footprint, row_count, row_size)
             }
             None => {
@@ -4324,5 +4342,102 @@ pub(crate) mod tests {
         assert_eq!(each3[0].offset, 0);
         assert_eq!(each3[1].offset, buf_off);
         assert_eq!(each3[2].offset, lin_off);
+    }
+
+    #[test]
+    fn copyable_footprints_handles_large_mips_and_overflows_without_panicking() {
+        let null = std::ptr::null();
+        let sentinel = (NO_FOOTPRINT, u32::MAX, u64::MAX, u64::MAX);
+        // Invalid mip counts exceeding the full mip chain (including mip >= 32
+        // / >= 64) give the documented all-ones sentinel without panicking.
+        let tex3d = ResourceDesc {
+            dimension: TEXTURE_3D,
+            depth_or_array_size: 16,
+            ..texture(16, 16, 28, 40)
+        };
+        let (mut layout, mut rows, mut size, mut total) = (NO_FOOTPRINT, 0, 0, 0);
+        copyable_footprints(
+            null,
+            &tex3d,
+            32,
+            1,
+            0,
+            &mut layout,
+            &mut rows,
+            &mut size,
+            &mut total,
+        );
+        assert_eq!((layout, rows, size, total), sentinel);
+
+        let tex2d = texture(16, 16, 28, 70);
+        copyable_footprints(
+            null,
+            &tex2d,
+            64,
+            1,
+            0,
+            &mut layout,
+            &mut rows,
+            &mut size,
+            &mut total,
+        );
+        assert_eq!((layout, rows, size, total), sentinel);
+
+        // One past the full 5-mip chain for 16x16 is also invalid.
+        copyable_footprints(
+            null,
+            &texture(16, 16, 28, 6),
+            0,
+            1,
+            0,
+            &mut layout,
+            &mut rows,
+            &mut size,
+            &mut total,
+        );
+        assert_eq!((layout, rows, size, total), sentinel);
+
+        // Overflowing subresource index, base offset, and buffer width yield the
+        // documented all-ones sentinel without panicking.
+        let mut layouts = [NO_FOOTPRINT; 2];
+        let (mut rows2, mut sizes2) = ([0; 2], [0; 2]);
+        copyable_footprints(
+            null,
+            &texture(16, 16, 28, 1),
+            u32::MAX,
+            2,
+            0,
+            layouts.as_mut_ptr(),
+            rows2.as_mut_ptr(),
+            sizes2.as_mut_ptr(),
+            &mut total,
+        );
+        assert_eq!((layouts[1], rows2[1], sizes2[1], total), sentinel);
+
+        copyable_footprints(
+            null,
+            &texture(16, 16, 28, 1),
+            0,
+            1,
+            u64::MAX - 16,
+            &mut layout,
+            &mut rows,
+            &mut size,
+            &mut total,
+        );
+        assert_eq!((layout, rows, size, total), sentinel);
+
+        copyable_footprints(
+            null,
+            &buffer(u64::MAX - 1),
+            0,
+            1,
+            0,
+            &mut layout,
+            &mut rows,
+            &mut size,
+            &mut total,
+        );
+        assert_eq!((layout, rows, size, total), sentinel);
     }
 }
