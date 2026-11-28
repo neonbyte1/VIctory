@@ -911,13 +911,14 @@ impl State {
                 let table = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                     .flatten()
-                    .and_then(|h| kept_view_addresses(list, h));
-                let Some((table, gpu)) = table else {
+                    .and_then(|h| h.view_addresses());
+                let Some((table, _, gpu)) = table else {
                     once!("a shader reading a view's address dropped: no view heap");
                     not_run("view addresses without a view heap");
                     return false;
                 };
-                // SAFETY: an open list; the table is kept by the list.
+                list.keep(table);
+                // SAFETY: an open list; the table lives while the list holds it.
                 unsafe {
                 if compute {
                     l.SetComputeRootShaderResourceView(param, gpu);
@@ -2198,14 +2199,6 @@ fn is_view_offset(u: &victory_shader::emit::UserData) -> bool {
 /// The host address of `heap`'s view-address table, which the list keeps
 /// until it is reset: the title may release the heap while the GPU still
 /// reads it.
-fn kept_view_addresses(list: &HostList, heap: &crate::descriptor::host::HostHeap) -> Option<u64> {
-    let gpu = heap.view_addresses()?;
-    if let Some(table) = heap.view_addresses_buffer() {
-        list.keep(table);
-    }
-    Some(gpu)
-}
-
 /// A user-data entry that takes the heap index of a root view's view.
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
@@ -2373,7 +2366,7 @@ mod tests {
         };
         let list = host.new_list().unwrap();
         let before = list.kept_count();
-        let gpu = kept_view_addresses(&list, &heap).expect("a table");
+        let (_, _, gpu) = heap.view_addresses().expect("a table");
         assert_eq!(list.kept_count(), before + 1);
         // SAFETY: a live buffer.
         assert_eq!(gpu, unsafe { heap.view_addresses_buffer().unwrap().GetGPUVirtualAddress() });

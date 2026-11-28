@@ -577,9 +577,9 @@ impl HostHeap {
 
     /// The view-address table (see the field) and its GPU address, made on
     /// first use from the slots made so far.
-    pub(crate) fn view_addresses(&self) -> Option<(&ID3D12Resource, u64)> {
+    pub(crate) fn view_addresses(&self) -> Option<(&ID3D12Resource, usize, u64)> {
         if let Some(made) = self.addresses.get() {
-            return made.as_ref().map(|m| m.2);
+            return made.as_ref().map(|m| (&m.0, m.1, m.2));
         }
         // Held until the table is published: `mirror` (which holds it while
         // it notes an address) neither slips in between nor is lost.
@@ -606,7 +606,7 @@ impl HostHeap {
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             Some((buffer, data, gpu))
         });
-        made.as_ref().map(|(buffer, _, gpu)| (buffer, *gpu))
+        made.as_ref().map(|(buffer, data, gpu)| (buffer, *data, *gpu))
     }
 
     /// The slots the view addresses have an entry for: the title's and the
@@ -3435,7 +3435,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return;
         };
-        let (table, _) = heap.view_addresses().unwrap();
+        let (table, _, _) = heap.view_addresses().unwrap();
         let table = table.clone();
         // SAFETY: live D3D12 resource and COM refcount inspection.
         unsafe {
