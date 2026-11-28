@@ -96,6 +96,9 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const NO_REFACTORING: u64 = 1 << 1;
+    /// `[earlydepthstencil]`: depth and stencil are tested before the
+    /// program runs (no feature bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLE_EXTENSIONS: u64 = 1 << 6;
     pub const STENCIL_REF: u64 = 1 << 11;
