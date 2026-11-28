@@ -27,7 +27,9 @@ fn check(inner: &Inner, reference: &BTreeMap<u32, Expected>) {
             reverse.entry(r).or_default().insert(slot);
         }
     }
-    assert_eq!(inner.textures, reverse);
+    let seen_reverse: BTreeMap<usize, BTreeSet<u32>> =
+        inner.textures.iter().map(|(&k, v)| (k, v.clone())).collect();
+    assert_eq!(seen_reverse, reverse);
     assert!(inner.ranges.is_empty());
     assert!(inner.ends.is_empty());
     assert!(inner.hulls.is_empty());

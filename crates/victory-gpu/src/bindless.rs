@@ -50,39 +50,6 @@ impl Hasher for FxHasher {
 
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
-/// Heap slots currently viewing a single title-written texture (usually one).
-enum TextureSlots {
-    One(u32),
-    Many(Vec<u32>),
-}
-
-impl TextureSlots {
-    fn insert(&mut self, slot: u32) {
-        match self {
-            Self::One(first) => *self = Self::Many(vec![*first, slot]),
-            Self::Many(slots) => slots.push(slot),
-        }
-    }
-
-    /// Removes `slot`, returning whether the set is now empty.
-    fn remove(&mut self, slot: u32) -> bool {
-        match self {
-            Self::One(first) => *first == slot,
-            Self::Many(slots) => {
-                if let Some(pos) = slots.iter().position(|&s| s == slot) {
-                    slots.swap_remove(pos);
-                }
-                if slots.len() == 1 {
-                    *self = Self::One(slots[0]);
-                    false
-                } else {
-                    slots.is_empty()
-                }
-            }
-        }
-    }
-}
-
 /// What a title heap slot views that title memory feeds.
 #[derive(Clone)]
 enum Seen {
@@ -175,7 +142,7 @@ impl Inner {
         }
     }
 
-    fn count(&mut self, index: u32, seen: &Seen, slot: u32, add: bool) {
+    fn count(&mut self, index: u32, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
@@ -224,38 +191,6 @@ impl Inner {
         }
     }
 
-    fn set_seen(&mut self, index: u32, seen: Option<Seen>) {
-        let unchanged = match (self.slots.get(&index), &seen) {
-            (Some(old), Some(new)) => same_seen(old, new),
-            (None, None) => true,
-            _ => false,
-        };
-        if unchanged {
-            return;
-        }
-        if let Some(old) = self.slots.remove(&index) {
-            self.count(&old, index, false);
-        }
-        if let Some(seen) = seen {
-            self.count(&seen, index, true);
-            self.slots.insert(index, seen);
-        }
-    }
-
-    fn forget_resource(&mut self, resource: usize) {
-        if let Some(slots) = self.textures.remove(&resource) {
-            match slots {
-                TextureSlots::One(slot) => {
-                    self.slots.remove(&slot);
-                }
-                TextureSlots::Many(slots) => {
-                    for slot in slots {
-                        self.slots.remove(&slot);
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl Viewed {
@@ -716,23 +651,23 @@ void main(uint3 id : SV_DispatchThreadID) {
     fn texture_reverse_index_tracks_multi_slot_and_forget() {
         let mut inner = Inner::default();
         // Single-slot texture and multi-slot texture + unrelated Left slot.
-        inner.set_seen(0, Some(Seen::Texture(0x1000)));
-        inner.set_seen(1, Some(Seen::Texture(0x2000)));
-        inner.set_seen(2, Some(Seen::Texture(0x2000)));
-        inner.set_seen(3, Some(Seen::Texture(0x2000)));
-        inner.set_seen(4, Some(Seen::Left((2, 0x4000, 0x1000))));
+        inner.replace(0, Some(Seen::Texture(0x1000)));
+        inner.replace(1, Some(Seen::Texture(0x2000)));
+        inner.replace(2, Some(Seen::Texture(0x2000)));
+        inner.replace(3, Some(Seen::Texture(0x2000)));
+        inner.replace(4, Some(Seen::Left((2, 0x4000, 0x1000))));
         // Identical overwrite is a no-op (must not duplicate slot 1 in 0x2000).
-        inner.set_seen(1, Some(Seen::Texture(0x2000)));
-        inner.set_seen(99, None);
+        inner.replace(1, Some(Seen::Texture(0x2000)));
+        inner.replace(99, None);
         assert_eq!(inner.slots.len(), 5);
         assert_eq!(inner.textures.len(), 2);
 
         // Rebind one slot of 0x2000 -> 0x1000.
-        inner.set_seen(2, Some(Seen::Texture(0x1000)));
+        inner.replace(2, Some(Seen::Texture(0x1000)));
         assert_eq!(inner.textures.len(), 2);
 
         // Forget 0x2000: removes slots 1 and 3, keeps 0, 2, 4.
-        inner.forget_resource(0x2000);
+        inner.forget_texture(0x2000);
         assert!(!inner.textures.contains_key(&0x2000));
         assert!(!inner.slots.contains_key(&1));
         assert!(!inner.slots.contains_key(&3));
@@ -741,13 +676,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(inner.slots.contains_key(&4));
 
         // Re-forgetting a missing texture is a no-op.
-        inner.forget_resource(0x2000);
+        inner.forget_texture(0x2000);
         // Clear slot 2 -> 0x1000 collapses back to single slot 0.
-        inner.set_seen(2, None);
+        inner.replace(2, None);
         assert!(inner.textures.contains_key(&0x1000));
         assert!(!inner.slots.contains_key(&2));
         // Forget 0x1000 -> removes slot 0, leaves only slot 4.
-        inner.forget_resource(0x1000);
+        inner.forget_texture(0x1000);
         assert!(inner.textures.is_empty());
         assert_eq!(inner.slots.len(), 1);
         assert!(inner.slots.contains_key(&4));
@@ -767,7 +702,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 } else {
                     Seen::Left((0, u64::from(s) * 32, 32))
                 };
-                inner.set_seen(s, Some(seen));
+                inner.replace(s, Some(seen));
             }
             inner
         };
@@ -776,7 +711,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut inner = build();
         let t0 = std::time::Instant::now();
         for i in 0..500usize {
-            inner.forget_resource(0x1000_0000 + i * 64);
+            inner.forget_texture(0x1000_0000 + i * 64);
         }
         let forget_hit_ms = t0.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(inner.slots.len());
@@ -784,7 +719,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // 2) 10,000 forget misses (non-bindless buffers/textures).
         let t1 = std::time::Instant::now();
         for i in 0..10_000usize {
-            inner.forget_resource(0x9000_0000 + i * 64);
+            inner.forget_texture(0x9000_0000 + i * 64);
         }
         let forget_miss_us = t1.elapsed().as_secs_f64() * 1e6;
 
