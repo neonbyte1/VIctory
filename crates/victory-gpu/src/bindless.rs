@@ -1074,6 +1074,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// subsequent writes or stale-bit reuse after eviction and recreation.
     #[test]
     fn cached_dirty_bit_reuploads_after_write_and_after_evict_recreate() {
+        if crate::host::skip_on_software_adapter(
+            "bindless::tests::cached_dirty_bit_reuploads_after_write_and_after_evict_recreate",
+            "WARP's upload copy writes the watched page, so the clean fast path uploads again",
+        ) {
+            return;
+        }
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
