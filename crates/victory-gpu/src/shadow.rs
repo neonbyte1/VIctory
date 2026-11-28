@@ -2650,6 +2650,14 @@ pub(crate) const LABEL: usize = usize::MAX;
 /// bottom-of-pipe write.
 pub(crate) const AFTER: usize = usize::MAX - 1;
 
+/// The copy of [`Flight`]'s ranges a submission whose page tables made no
+/// barrier declared, that a miss of its lists keeps out of title memory and
+/// has every copy of it retake at its next refresh
+/// (`crate::host`'s `kept_of`, `VICTORY_PT_BARRIER`): none, as [`LABEL`], so
+/// that even the copy its shaders write through crosses them (passed by as
+/// clean, it would keep what the miss withholds).
+pub(crate) const KEPT: usize = usize::MAX - 2;
+
 /// Title memory that submissions in flight write and that reaches title
 /// memory only once each completes (`crate::host::Host::finish`), by
 /// submission: ranges `(start, end, copy)` their shaders declared as written
@@ -4543,6 +4551,25 @@ pub(crate) mod tests {
         f.land(3);
         assert_eq!(f.crossing(0, usize::MAX, 9), None);
         assert!(f.is_empty(), "nothing in flight writes anything");
+    }
+
+    /// What a miss of a submission whose page tables made no barrier may
+    /// withhold ([`KEPT`]) is crossed by every copy, the one its shaders
+    /// write through too, and by title reads: none passes it by as clean.
+    #[test]
+    fn kept_ranges_cross_every_copy() {
+        let mut f = Flight::default();
+        f.fly(4, vec![(0x1000, 0x2000, 1), (0x1000, 0x2000, KEPT)]);
+        for copy in [1, 2, 0, LABEL] {
+            assert_eq!(
+                f.crossing(0x1800, 0x1900, copy),
+                Some((4, false)),
+                "copy {copy:#x}"
+            );
+        }
+        assert_eq!(f.crossing(0x2000, 0x3000, 1), None, "past it");
+        f.land(4);
+        assert!(f.is_empty());
     }
 
     /// Two submissions in flight on one copy: each keeps its own snapshot;

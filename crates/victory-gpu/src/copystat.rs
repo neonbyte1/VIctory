@@ -242,6 +242,9 @@ pub(crate) enum C {
     SettleFill,
     SettleTexture,
     SettleCopy,
+    /// A settle before a page table's rewrite (`crate::memory::prepare`,
+    /// `VICTORY_PT_BARRIER`), counted only when its last user was in flight.
+    SettleTable,
     SettleUs,
     /// Early release (`crate::early`, `VICTORY_EARLY_RELEASE`): held
     /// segments released on values of writes in flight that title memory
@@ -355,6 +358,23 @@ pub(crate) enum C {
     /// nothing of theirs overlapped this submission's GPU work
     /// (`PreparedOverlapping` counts the others).
     PreparedEmpty,
+    /// Submissions using title memory through page tables
+    /// (`crate::host`'s `light_reasons`, `VICTORY_PT_BARRIER`): barriers with
+    /// the switch off; with it, left in flight, or barriers still for a
+    /// program storing through a table or for another reason. Ranges a miss
+    /// may withhold registered in flight for those left there
+    /// (`crate::shadow::KEPT`). How those left in flight completed: by a
+    /// settle of a later preparing, waited for before one, or by the
+    /// completion thread (or a wait for all); the fence time of all three.
+    TablesOff,
+    TablesLight,
+    TablesKeptStores,
+    TablesKeptOther,
+    TablesKeptRanges,
+    TablesBySettle,
+    TablesByWait,
+    TablesByOther,
+    TablesWaitedUs,
     /// Not a counter: how many there are. Keep it last.
     Count,
 }
@@ -908,6 +928,23 @@ pub(crate) fn log(frames: f64, gpu_ms: f64, back_ms: f64) {
         c[C::SettleAliasClean as usize],
         c[C::SettleLabelClean as usize],
         c[C::SettleTextureClean as usize],
+    );
+    tracing::info!(
+        "  page tables per frame (VICTORY_PT_BARRIER): {:.1} barriers with the switch off; with it {:.1} \
+         left in flight, {:.1} kept for a program storing through a table, {:.1} kept for another \
+         reason; {:.1} ranges a miss may withhold in flight; those left in flight completed: {:.1} \
+         settled by a later preparing ({:.1} before a table's rewrite), {:.1} waited for before one, \
+         {:.1} by the completion thread or a wait for all ({:.1} ms on their fences)",
+        c[C::TablesOff as usize],
+        c[C::TablesLight as usize],
+        c[C::TablesKeptStores as usize],
+        c[C::TablesKeptOther as usize],
+        c[C::TablesKeptRanges as usize],
+        c[C::TablesBySettle as usize],
+        c[C::SettleTable as usize],
+        c[C::TablesByWait as usize],
+        c[C::TablesByOther as usize],
+        ms(c[C::TablesWaitedUs as usize]),
     );
     for line in crate::census::lines(frames) {
         tracing::info!("{line}");

@@ -168,6 +168,9 @@ pub(crate) struct Shader {
     pub memory_null: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
     pub memory_dirty: Option<V>,
+    /// Whether an access through the page table stores or does atomics
+    /// (the bitmap's bits are then pages written, not only pages missed).
+    pub memory_stores: bool,
     /// The view addresses' handle, once a descriptor's address is read.
     pub view_addresses: Option<V>,
     /// The view-mark table's and the buffer views' written-pages bitmap's
@@ -285,6 +288,7 @@ impl Shader {
             memory: None,
             memory_null: None,
             memory_dirty: None,
+            memory_stores: false,
             view_addresses: None,
             view_marks: None,
             view_writes: None,

@@ -87,6 +87,7 @@ fn host_shader(
                 root_uavs: Vec::new(),
                 memory: false,
                 memory_writes: false,
+                memory_stores: false,
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,

@@ -115,6 +115,45 @@ fn program() -> HostShader {
         w.extend(buffer_store_dword(5, 8, at));
     }
     w.push(S_ENDPGM);
+    let (l, memory) = lowered(&w);
+    assert_eq!(
+        memory, 11,
+        "every access through the pointer is title memory"
+    );
+    assert!(l.memory_stores, "it stores and does atomics there");
+    assert!(l.memory && l.memory_writes && l.view_addresses);
+    assert!(
+        l.root_uavs.is_empty(),
+        "the root UAV is read as title memory"
+    );
+    let shader = HostShader {
+        wave_size: l.wave_size,
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        memory_stores: l.memory_stores,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// Lowers a program of `w` with [`program`]'s root layout (constants, the
+/// result UAV's table, a root UAV), and counts its title-memory accesses.
+fn lowered(w: &[u32]) -> (lower::Lowered, usize) {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -181,10 +220,6 @@ fn program() -> HostShader {
         .iter()
         .filter(|s| s.1.param == resource::MEMORY)
         .count();
-    assert_eq!(
-        memory, 11,
-        "every access through the pointer is title memory"
-    );
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         native: &native,
@@ -202,33 +237,28 @@ fn program() -> HostShader {
         view_marks: false,
     })
     .expect("lower");
-    assert!(l.memory && l.memory_writes && l.view_addresses);
-    assert!(
-        l.root_uavs.is_empty(),
-        "the root UAV is read as title memory"
-    );
-    let shader = HostShader {
-        wave_size: l.wave_size,
-        stage: HwStage::Cs,
-        dxil: l.dxil,
-        user_data: l.user_data,
-        samplers: l.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: l.root_cbvs,
-        root_srvs: l.root_srvs,
-        root_uavs: l.root_uavs,
-        memory: l.memory,
-        memory_writes: l.memory_writes,
-        view_addresses: l.view_addresses,
-        heap: l.heap,
-        heap_writes: l.heap_writes,
-        view_marks: l.view_marks,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
-    shader
+    (l, memory)
+}
+
+/// A program that only loads through the page table marks misses in the
+/// bitmap but stores nothing there: its submissions write no title memory
+/// through the table (`memory_stores`, which the host's page-table barriers
+/// go by); [`program`], storing and doing atomics, does.
+#[test]
+fn only_stores_and_atomics_through_the_table_count_as_stores() {
+    let mut w = vec![s_mov_b32(5, 0x80)]; // s[4:5]: the table at s4
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
+    w.push(v_mov_b32(1, ZERO));
+    w.extend(global(12, 2, 1, 0, 0, 0)); // global_load_dword v2, v1, s[0:1]
+    w.extend(s_load(1, 12, 0, 8)); // s[12:13] = the pointer at +8
+    w.push(S_WAITCNT_ALL);
+    w.extend(buffer_store_dword(2, 8, 0)); // into the result UAV
+    w.push(S_ENDPGM);
+    let (l, memory) = lowered(&w);
+    assert!(memory > 0, "it reads title memory");
+    assert!(l.memory && l.memory_writes, "its misses are marked");
+    assert!(!l.memory_stores);
+    assert!(program().memory_stores);
 }
 
 /// The page table for one copy of title memory at [`TITLE`] whose views
@@ -810,6 +840,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        memory_stores: l.memory_stores,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
@@ -957,6 +988,7 @@ fn writes_through_views_mark_their_pages() {
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        memory_stores: l.memory_stores,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
@@ -1122,6 +1154,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        memory_stores: l.memory_stores,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
@@ -1246,6 +1279,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        memory_stores: l.memory_stores,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
@@ -1566,6 +1600,7 @@ fn wave_coalesced_marks_equal_per_lane_marks_on_the_gpu() {
                 root_uavs: l.root_uavs,
                 memory: l.memory,
                 memory_writes: l.memory_writes,
+                memory_stores: l.memory_stores,
                 view_addresses: l.view_addresses,
                 heap: l.heap,
                 heap_writes: l.heap_writes,
@@ -1781,6 +1816,7 @@ fn lower_code_table_program(words: &[u32]) -> Result<HostShader, String> {
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        memory_stores: l.memory_stores,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,

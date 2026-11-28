@@ -638,6 +638,20 @@ pub(crate) mod tests {
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
         pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// [`super::light_tables`] on this thread, if a test chose it.
+        pub(crate) static LIGHT_TABLES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// `VICTORY_PT_BARRIER` on this thread (`on`) until the guard goes.
+    pub(crate) fn light_tables_for(on: bool) -> impl Drop {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                LIGHT_TABLES.with(|l| l.set(None));
+            }
+        }
+        LIGHT_TABLES.with(|l| l.set(Some(on)));
+        Reset
     }
 
     #[test]
@@ -2294,6 +2308,11 @@ pub(crate) enum Settled {
     /// whose source or destination it writes: on the GPU's timeline the
     /// copy comes after it, so it reads and overwrites its results.
     Copy,
+    /// A page table it reads is about to be rewritten in place, its view
+    /// pairs of copies gone freed (`crate::memory::prepare`,
+    /// `VICTORY_PT_BARRIER`): asked of the last submission using the table
+    /// whether or not it is still in flight.
+    Table,
 }
 
 /// Tests: the `settle` of a preparing with nothing in flight, never asked.
@@ -2421,6 +2440,14 @@ struct Deferred {
     /// Some of `after` writes title memory it does not name
     /// ([`HostList::defer_after`]).
     after_unnamed: bool,
+    /// Some of `after` copies back the pages shaders wrote through a page
+    /// table ([`HostList::defer_after_table`]): title memory it does not
+    /// name, but only where a program of the list stores through the table
+    /// (`table_stores`).
+    after_table: bool,
+    /// A program of the list stores through the title-memory page table
+    /// ([`HostList::stores_through_table`]).
+    table_stores: bool,
     /// The title memory `[start, end)` the rest of `after` writes
     /// ([`HostList::defer_after_writing`]).
     after_writes: Vec<(usize, usize)>,
@@ -2444,7 +2471,7 @@ struct Deferred {
 fn reasons_of(d: &Deferred, marks: bool, heap_writes: bool) -> u8 {
     let heap = marks && d.copies.iter().any(|s| matches!(s, Step::Heap(_)));
     u8::from(heap && heap_writes)
-        | u8::from(d.after_unnamed) << 1
+        | u8::from(d.after_unnamed || d.after_table) << 1
         | u8::from(!d.writes.is_empty()) << 2
         | u8::from(!d.missed.is_empty()) << 3
         | u8::from(d.copies.iter().any(|s| matches!(s, Step::GpuWrite(..)))) << 4
@@ -2457,20 +2484,77 @@ fn reasons_of(d: &Deferred, marks: bool, heap_writes: bool) -> u8 {
         }
 }
 
+/// The bits of [`reasons_of`] a list's page tables alone give it: the table
+/// (`Step::Memory`), its missed checks, and its work after (the copy-back
+/// of the pages shaders marked as written) unless other work after writes
+/// title memory it does not name.
+fn table_bits(d: &Deferred) -> u8 {
+    REASON_MEMORY | 1 << 3 | if d.after_unnamed { 0 } else { 1 << 1 }
+}
+
+/// `reasons` ([`reasons_of`] of `d`) as [`barrier`] takes them: with
+/// `VICTORY_PT_BARRIER` (`light`, [`light_tables`]), without what the
+/// list's page tables alone make heavy where no program of the list stores
+/// through a table. Such a list writes no title memory through the table
+/// (its bitmap marks only misses); a miss withholds its declared ranges,
+/// registered in flight ([`kept_of`]); a table it reads is rewritten only
+/// once it has completed (`crate::memory::prepare`); and its checks are
+/// asked at its completion, in order. So the next submission is prepared
+/// with it in flight and settles it where it meets what it writes.
+fn light_reasons(reasons: u8, d: &Deferred, light: bool) -> u8 {
+    if light && reasons & REASON_MEMORY != 0 && !d.table_stores {
+        reasons & !table_bits(d)
+    } else {
+        reasons
+    }
+}
+
+/// A list's declared ranges `(start, end, copy, memory)` (marked ones as
+/// the whole pages their copy-back writes), `memory` where a program using
+/// title memory declared it: what a miss keeps out of title memory
+/// (`Host::finish`).
+fn declared_of(d: &Deferred) -> Vec<(usize, usize, usize, bool)> {
+    d.copies
+        .iter()
+        .filter_map(|s| match s {
+            Step::GpuWrite(shadow, address, len, marked, memory) => {
+                let (a, n) = if *marked {
+                    let (a, n) = shadow.page_range(*address as u64, *len as u64);
+                    (a as usize, n as usize)
+                } else {
+                    (*address, *len)
+                };
+                Some((a, a + n, std::sync::Arc::as_ptr(shadow) as usize, *memory))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Of a submission's declared ranges ([`declared_of`]), those a miss may
+/// keep out of title memory and every copy of it then retakes at its next
+/// refresh (`Host::finish`, `crate::memory::drop_withheld`): the ones
+/// programs using title memory declared, and every other range of the same
+/// copy meeting one (withheld with it). In flight as
+/// [`crate::shadow::KEPT`], which every copy and title read crosses: a
+/// preparing that passed a clean copy there by would run on what the miss
+/// withholds, where the submission completed first would have it retaken.
+fn kept_of(declared: &[(usize, usize, usize, bool)]) -> Vec<(usize, usize, usize)> {
+    declared
+        .iter()
+        .filter(|&&(a, e, c, memory)| {
+            memory
+                || declared
+                    .iter()
+                    .any(|&(x, y, k, m)| m && k == c && x < e && a < y)
+        })
+        .map(|&(a, e, _, _)| (a, e, crate::shadow::KEPT))
+        .collect()
+}
+
 /// [`HostList::flying`] of a list's deferred work.
 fn flying_of(d: &Deferred) -> Vec<(usize, usize, usize)> {
-    let declared = d.copies.iter().filter_map(|s| match s {
-        Step::GpuWrite(shadow, address, len, marked, _) => {
-            let (a, n) = if *marked {
-                let (a, n) = shadow.page_range(*address as u64, *len as u64);
-                (a as usize, n as usize)
-            } else {
-                (*address, *len)
-            };
-            Some((a, a + n, std::sync::Arc::as_ptr(shadow) as usize))
-        }
-        _ => None,
-    });
+    let declared = declared_of(d).into_iter().map(|(a, e, c, _)| (a, e, c));
     let labels = d
         .writes
         .iter()
@@ -2542,6 +2626,10 @@ struct InFlight {
     /// barrier was for page tables, [`Waited`]).
     #[cfg(feature = "diagnostics")]
     reasons: u8,
+    /// It uses page tables and is no barrier for them ([`light_reasons`]):
+    /// diagnostics counts how it completed.
+    #[cfg(feature = "diagnostics")]
+    light_tables: bool,
     /// The ranges its shaders declare as written ([`declared_overlap`]).
     declared: Vec<Declared>,
     /// It runs the upload list (`crate::bindless::uploads`), which the next
@@ -2605,6 +2693,29 @@ pub(crate) fn overlap() -> bool {
     return on && !timing() && !crate::capture::listed(crate::queue::presented() + 1);
     #[cfg(not(feature = "diagnostics"))]
     on
+}
+
+/// Whether page tables alone make no barrier (`VICTORY_PT_BARRIER=1`; off
+/// by default, logged once): a submission whose lists use title memory
+/// through page tables, with no program storing through one, stays in
+/// flight while the next is prepared ([`light_reasons`]). Tests choose it
+/// per thread (`tests::light_tables_for`).
+pub(crate) fn light_tables() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = crate::switch::on("VICTORY_PT_BARRIER");
+        if on {
+            tracing::info!(
+                "page tables make no barrier where no program stores through one; the next \
+                 submission settles them where it meets what they write (VICTORY_PT_BARRIER)"
+            );
+        }
+        on
+    });
+    #[cfg(test)]
+    if let Some(on) = tests::LIGHT_TABLES.with(std::cell::Cell::get) {
+        return on;
+    }
+    *ON
 }
 
 /// Waits until the host GPU has run what was signalled on `fence` up to
@@ -2968,8 +3079,11 @@ impl Host {
         let captured = crate::shadow::captures_write_marks();
         let relaxed = crate::early::barriers();
         let alone = alone(reasons, marking, captured, relaxed);
-        // A barrier prepared with those in flight left there (counted).
-        let waived = barrier(reasons, marking, captured, relaxed) && !alone;
+        // A barrier prepared with those in flight left there (counted); page
+        // tables alone make none with `VICTORY_PT_BARRIER` ([`light_reasons`]).
+        let light = light_tables();
+        let barring = runs.iter().fold(0u8, |r, l| r | l.light_reasons(light));
+        let waived = barrier(barring, marking, captured, relaxed) && !alone;
         let declared: Vec<Declared> = runs.iter().flat_map(|l| l.declared()).collect();
         let why = std::cell::Cell::new(0u8);
         let mut submitted = self.complete_while(self.lock_submitted(), |r| {
@@ -3223,6 +3337,13 @@ impl Host {
     /// flight up to submission `owner`, whose completion writes title
     /// memory the preparing is about to read (`why`, counted).
     fn settle(&self, submitted: &mut Submitted, owner: u64, why: Settled) {
+        // A table's last user is asked for whether or not it is in flight
+        // still: if it is not, nothing waits and nothing is counted.
+        if matches!(why, Settled::Table)
+            && !submitted.flight.front().is_some_and(|r| r.owner <= owner)
+        {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -3234,6 +3355,7 @@ impl Host {
                     Settled::Fill => C::SettleFill,
                     Settled::Texture => C::SettleTexture,
                     Settled::Copy => C::SettleCopy,
+                    Settled::Table => C::SettleTable,
                 },
                 1,
             );
@@ -3416,7 +3538,12 @@ impl Host {
         let before = self.vram_before(vram_uploads, &vram_bitmaps, marks, mark_bytes, &mut vram);
         let reasons = runs.iter().fold(0u8, |r, l| r | l.heavy_reasons());
         let relaxed = crate::early::barriers();
-        let barrier = barrier(reasons, marks, captured, relaxed);
+        // Page tables alone make no barrier with `VICTORY_PT_BARRIER`.
+        let light = light_tables();
+        let barring = runs.iter().fold(0u8, |r, l| r | l.light_reasons(light));
+        let barrier = barrier(barring, marks, captured, relaxed);
+        // It uses page tables, and they leave it in flight.
+        let light_pt = reasons & REASON_MEMORY != 0 && !barrier;
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -3440,7 +3567,7 @@ impl Host {
             if barrier {
                 let kind = [5, 3, 0, 1, 7]
                     .into_iter()
-                    .find(|&bit| reasons >> bit & 1 != 0);
+                    .find(|&bit| barring >> bit & 1 != 0);
                 add(
                     match kind {
                         Some(5) => C::BarrierMemory,
@@ -3458,6 +3585,20 @@ impl Host {
                 C::AfterNamedLight,
                 u64::from(reasons & AFTER_NAMED != 0 && !barrier),
             );
+            // Page tables: left in flight, or barriers for a program
+            // storing through one or another reason, or with the switch off.
+            if reasons & REASON_MEMORY != 0 {
+                let stores = runs.iter().any(|l| l.deferred().table_stores);
+                add(
+                    match (light, barrier, stores) {
+                        (false, ..) => C::TablesOff,
+                        (true, false, _) => C::TablesLight,
+                        (true, true, true) => C::TablesKeptStores,
+                        (true, true, false) => C::TablesKeptOther,
+                    },
+                    1,
+                );
+            }
         }
         // Completing it takes the write marks (`Host::finish`) or reads the
         // lists' page bitmaps (`crate::memory::bind`'s probes).
@@ -3476,7 +3617,18 @@ impl Host {
         // title memory on completion, for them to wait for where they read it.
         let declared: Vec<Declared> = runs.iter().flat_map(|l| l.declared()).collect();
         if overlap {
-            crate::shadow::fly(owner, runs.iter().flat_map(|l| l.flying()).collect());
+            let mut flying: Vec<_> = runs.iter().flat_map(|l| l.flying()).collect();
+            // What a miss of its page tables' lists may keep out of title
+            // memory and have every copy retake: crossed by every reader
+            // ([`kept_of`]).
+            if light_pt {
+                let declared: Vec<_> = runs.iter().flat_map(|l| l.declared_memory()).collect();
+                let kept = kept_of(&declared);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TablesKeptRanges, kept.len() as u64);
+                flying.extend(kept);
+            }
+            crate::shadow::fly(owner, flying);
             // Held waits for its bottom-of-pipe values may read them now
             // (`crate::early`): later submissions run after it on this queue.
             // In the order `Host::finish` writes them.
@@ -3687,6 +3839,8 @@ impl Host {
             // waits for this submission (`crate::copystat`).
             #[cfg(feature = "diagnostics")]
             reasons,
+            #[cfg(feature = "diagnostics")]
+            light_tables: light_pt,
             sync: !overlap,
             prepared,
             batch,
@@ -3710,6 +3864,22 @@ impl Host {
         self.wait_for(record.value);
         #[cfg(feature = "diagnostics")]
         crate::copystat::waited(waited, waiting.elapsed().as_micros() as u64);
+        // A submission page tables left in flight: completed by a settle of
+        // a preparing that met what it writes, waited for before one, or by
+        // the completion thread (or a wait for all).
+        #[cfg(feature = "diagnostics")]
+        if record.light_tables {
+            use crate::copystat::{C, add};
+            add(
+                match waited {
+                    Waited::Settle => C::TablesBySettle,
+                    Waited::Completion => C::TablesByOther,
+                    _ => C::TablesByWait,
+                },
+                1,
+            );
+            add(C::TablesWaitedUs, waiting.elapsed().as_micros() as u64);
+        }
         let _ = waited;
         SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -4677,6 +4847,14 @@ impl HostList {
         self.heap_writes.store(true, Ordering::Relaxed);
     }
 
+    /// A program of the list stores (or does atomics) through a title-memory
+    /// page table: its pages marked as written go back after it, title
+    /// memory nobody names, so its page tables keep it a barrier
+    /// ([`light_reasons`]).
+    pub(crate) fn stores_through_table(&self) {
+        self.deferred().table_stores = true;
+    }
+
     /// Why completing a submission of the list writes title memory or takes
     /// what its shaders marked as written, as bits (any of 0–5 or 7: the
     /// list is heavy): 0 writes marked through the heap's views, 1 work after
@@ -4698,6 +4876,25 @@ impl HostList {
             self.marks.load(Ordering::Relaxed),
             self.heap_writes.load(Ordering::Relaxed),
         )
+    }
+
+    /// [`HostList::heavy_reasons`] as [`barrier`] takes them: without what
+    /// page tables alone give with `VICTORY_PT_BARRIER` (`light`) where no
+    /// program of the list stores through one ([`light_reasons`]).
+    fn light_reasons(&self, light: bool) -> u8 {
+        let d = self.deferred();
+        let reasons = reasons_of(
+            &d,
+            self.marks.load(Ordering::Relaxed),
+            self.heap_writes.load(Ordering::Relaxed),
+        );
+        light_reasons(reasons, &d, light)
+    }
+
+    /// Its declared ranges, and whether a program using title memory
+    /// declared each ([`declared_of`]).
+    fn declared_memory(&self) -> Vec<(usize, usize, usize, bool)> {
+        declared_of(&self.deferred())
     }
 
     /// The ranges its shaders declare as written ([`Declared`]).
@@ -5110,6 +5307,18 @@ impl HostList {
         let mut d = self.deferred();
         d.after.push(Box::new(work));
         d.after_unnamed = true;
+    }
+
+    /// [`HostList::defer_after`] of the copy-back of the pages shaders
+    /// marked as written through a page table (`crate::memory::bind`): title
+    /// memory it does not name, but none unless a program of the list stores
+    /// through the table ([`HostList::stores_through_table`]); without, its
+    /// page tables make no barrier with `VICTORY_PT_BARRIER`
+    /// ([`light_reasons`]).
+    pub(crate) fn defer_after_table(&self, work: impl Fn() + Send + 'static) {
+        let mut d = self.deferred();
+        d.after.push(Box::new(work));
+        d.after_table = true;
     }
 
     /// [`HostList::defer_after`] of `work` that writes title memory only in
@@ -5576,7 +5785,8 @@ impl HostList {
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l, clean| {
+                    let mut table = |o: u64| settle(o, Settled::Table);
+                    crate::memory::prepare(heap, owner, &mut table, |s, a, l, clean| {
                         s.wrote_over();
                         batch.add_reached(s, a, l, clean);
                     });
@@ -8788,6 +8998,84 @@ mod vram_async {
             assert!(barrier(reasons_of(&d, false, false), false, true, true));
         }
 
+        /// Page tables alone (the table, its missed checks, its copy-back as
+        /// work after) make no barrier with `VICTORY_PT_BARRIER` where no
+        /// program of the list stores through the table. They still do with
+        /// the switch off or a program storing, and whatever else makes one
+        /// still does.
+        #[test]
+        fn page_tables_alone_make_no_barrier_with_the_switch() {
+            let table = || Deferred {
+                copies: vec![Step::Memory(1)],
+                missed: vec![Box::new(|| false)],
+                after: vec![Box::new(|| {})],
+                after_table: true,
+                ..Deferred::default()
+            };
+            let light = |d: &Deferred, marks, heap_writes| {
+                light_reasons(reasons_of(d, marks, heap_writes), d, true)
+            };
+            let d = table();
+            let reasons = reasons_of(&d, false, false);
+            assert_eq!(reasons, 1 << 1 | 1 << 3 | REASON_MEMORY, "heavy as before");
+            for relaxed in [false, true] {
+                assert!(
+                    barrier(light_reasons(reasons, &d, false), false, true, relaxed),
+                    "the switch off"
+                );
+                assert!(!barrier(light(&d, false, false), false, true, relaxed));
+            }
+            let d = Deferred {
+                table_stores: true,
+                ..table()
+            };
+            assert_eq!(light(&d, false, false), reasons, "a program stores");
+            let d = Deferred {
+                after_unnamed: true,
+                ..table()
+            };
+            assert_eq!(light(&d, false, false), 1 << 1, "other unnamed work after");
+            let d = table();
+            assert!(
+                barrier(light(&d, true, false), true, false, true),
+                "marks not captured apart"
+            );
+            let d = Deferred {
+                copies: vec![
+                    Step::Memory(1),
+                    Step::Heap(Arc::<crate::bindless::Viewed>::default()),
+                ],
+                ..table()
+            };
+            assert_eq!(light(&d, true, true), 1, "writes through the heap's views");
+            let d = Deferred {
+                missed: vec![Box::new(|| false)],
+                after_unnamed: true,
+                ..Deferred::default()
+            };
+            let reasons = reasons_of(&d, false, false);
+            assert_eq!(light_reasons(reasons, &d, true), reasons, "no page table");
+        }
+
+        /// What a miss may keep out of title memory: ranges programs using
+        /// title memory declared, and those of the same copy meeting them.
+        #[test]
+        fn kept_ranges_are_what_a_miss_withholds() {
+            use crate::shadow::KEPT;
+            let declared = [
+                (0x1000, 0x2000, 1, true),
+                (0x1800, 0x1900, 1, false),
+                (0x2000, 0x3000, 1, false),
+                (0x1800, 0x1900, 2, false),
+            ];
+            assert_eq!(
+                kept_of(&declared),
+                [(0x1000, 0x2000, KEPT), (0x1800, 0x1900, KEPT)],
+                "touching or another copy's: not withheld with it"
+            );
+            assert!(kept_of(&[(0x1000, 0x2000, 1, false)]).is_empty());
+        }
+
         /// A copy in video memory of a fresh pool of `pages` pages, and the
         /// pool; none without one.
         fn vram_copy(pages: usize) -> Option<(usize, Arc<Shadow>)> {
@@ -8834,6 +9122,14 @@ mod vram_async {
             } else {
                 copy.gpu_writes(&list, at as u64, 4, false);
             }
+            write_on_gpu(host, &list, copy, at, value);
+            list.close();
+            list
+        }
+
+        /// Records a "shader" write of `value` at title address `at` of
+        /// `copy` into `list`: a copy on the GPU.
+        fn write_on_gpu(host: &Host, list: &HostList, copy: &Arc<Shadow>, at: usize, value: u32) {
             let (up, data) = host.upload_buffer(4).expect("an upload buffer");
             // SAFETY: a mapped upload buffer of 4 bytes; an open list, live buffers.
             unsafe {
@@ -8842,8 +9138,6 @@ mod vram_async {
                     .CopyBufferRegion(&copy.buffer, copy.offset(at as u64), &up, 0, 4);
             }
             list.keep(&up);
-            list.close();
-            list
         }
 
         /// A list that only reads `copy` whole.
@@ -9075,6 +9369,220 @@ mod vram_async {
                 (0x1111_0001, 0x2222_0002)
             );
             release(p, Some(a));
+        }
+
+        /// A list using title memory through our view heap's page table,
+        /// `more` recorded into it after.
+        fn table_user(host: &Host, more: impl FnOnce(&HostList)) -> HostList {
+            let list = host.new_list().unwrap();
+            crate::memory::bind(&list, crate::memory::OURS).expect("a page table");
+            more(&list);
+            list.close();
+            list
+        }
+
+        /// Our view heap's page table names every copy there is, a
+        /// submission using it completed since: false where it cannot (no
+        /// view slots left for a copy).
+        fn table_named(host: &Host) -> bool {
+            host.submit(0, vec![Arc::new(table_user(host, |_| {}))]);
+            host.complete_all();
+            crate::memory::table_current(crate::memory::OURS)
+        }
+
+        /// With `VICTORY_PT_BARRIER` a submission using a page table no
+        /// program stores through stays in flight while the next is prepared
+        /// (that one reads nothing it writes); with the switch off the next
+        /// waits for it.
+        #[test]
+        fn page_tables_stay_in_flight_with_the_switch() {
+            let Some(host) = host() else { return };
+            if !overlap() {
+                return; // VICTORY_GPU_OVERLAP=0
+            }
+            let _queues = crate::queue::tests::TITLE_QUEUES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _tables = crate::memory::gpu_test_lock();
+            crate::memory::forget_misses();
+            let Some((q, b)) = vram_copy(1) else { return };
+            if !table_named(host) {
+                return release(q, Some(b));
+            }
+            for light in [true, false] {
+                let _light = crate::host::tests::light_tables_for(light);
+                let gate = host.hold_gpu();
+                host.submit(0, vec![Arc::new(table_user(host, |_| {}))]);
+                let released = release_gpu_after(gate, 500);
+                let started = Instant::now();
+                host.submit(0, vec![Arc::new(reader(host, &b))]);
+                let took = started.elapsed();
+                let flying = in_flight(host);
+                released.join().unwrap();
+                host.complete_all();
+                if light {
+                    assert!(
+                        took < Duration::from_millis(400),
+                        "prepared with it in flight ({took:?})"
+                    );
+                    assert_eq!(flying, 2, "both in flight");
+                } else {
+                    assert!(
+                        took >= Duration::from_millis(400),
+                        "waited for the barrier ({took:?})"
+                    );
+                }
+            }
+            release(q, Some(b));
+        }
+
+        /// A page table is rewritten in place (a copy came) only once the
+        /// submissions reading it have completed: with `VICTORY_PT_BARRIER`
+        /// the next user's preparing completes the one in flight first, and
+        /// its own table names the new copy, copied to the GPU's table by
+        /// its own list before.
+        #[test]
+        fn a_table_is_rewritten_only_once_its_last_user_completed() {
+            let Some(host) = host() else { return };
+            if !overlap() {
+                return; // VICTORY_GPU_OVERLAP=0
+            }
+            let _queues = crate::queue::tests::TITLE_QUEUES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _tables = crate::memory::gpu_test_lock();
+            crate::memory::forget_misses();
+            let _light = crate::host::tests::light_tables_for(true);
+            if !table_named(host) {
+                return;
+            }
+            let gate = host.hold_gpu();
+            host.submit(0, vec![Arc::new(table_user(host, |_| {}))]);
+            let Some((p, a)) = vram_copy(1) else {
+                drop(gate);
+                return host.complete_all();
+            };
+            let pending = !crate::memory::table_current(crate::memory::OURS);
+            let released = release_gpu_after(gate, 500);
+            let started = Instant::now();
+            host.submit(0, vec![Arc::new(table_user(host, |_| {}))]);
+            let took = started.elapsed();
+            let flying = in_flight(host);
+            let entry = crate::memory::table_entry(crate::memory::OURS, (p + 16) as u64, &a);
+            released.join().unwrap();
+            host.complete_all();
+            release(p, Some(a));
+            assert!(pending, "a copy came: the table is to be rewritten");
+            assert!(
+                took >= Duration::from_millis(400),
+                "the rewrite waited for the first ({took:?})"
+            );
+            assert_eq!(flying, 1, "the first completed, the second in flight");
+            let ((view, offset), pair, dirty) = entry.expect("our page table");
+            assert_eq!(
+                (Some(view), offset),
+                (pair, 16),
+                "the new copy's views, at its offset"
+            );
+            assert!(!dirty, "copied to the GPU's table in the second's list");
+        }
+
+        /// A submission whose page tables made no barrier declares a range a
+        /// program using title memory writes: a miss would keep it out of
+        /// title memory and have every copy retake it, so the next submission
+        /// reading that copy completes it first, though the copy is clean.
+        /// A range other programs declare leaves it in flight.
+        #[test]
+        fn a_range_a_miss_may_withhold_is_settled_before_it_is_read() {
+            let Some(host) = host() else { return };
+            if !overlap() {
+                return; // VICTORY_GPU_OVERLAP=0
+            }
+            let _queues = crate::queue::tests::TITLE_QUEUES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _tables = crate::memory::gpu_test_lock();
+            crate::memory::forget_misses();
+            let _light = crate::host::tests::light_tables_for(true);
+            let Some((p, a)) = vram_copy(1) else { return };
+            if !table_named(host) {
+                return release(p, Some(a));
+            }
+            for memory in [false, true] {
+                let value = 0x7700_0000 | u32::from(memory);
+                let list = table_user(host, |list| {
+                    let (start, len) = a.range();
+                    a.refresh(list, start, len);
+                    let _writer = list.writer_uses_memory(memory);
+                    a.gpu_writes(list, (p + 16) as u64, 4, false);
+                    write_on_gpu(host, list, &a, p + 16, value);
+                });
+                let gate = host.hold_gpu();
+                host.submit(0, vec![Arc::new(list)]);
+                let released = release_gpu_after(gate, 500);
+                let started = Instant::now();
+                host.submit(0, vec![Arc::new(reader(host, &a))]);
+                let took = started.elapsed();
+                let (flying, seen) = (in_flight(host), word(p + 16));
+                released.join().unwrap();
+                host.complete_all();
+                if memory {
+                    assert!(
+                        took >= Duration::from_millis(400),
+                        "completed before its copy was read ({took:?})"
+                    );
+                    assert_eq!(
+                        (flying, seen),
+                        (1, value),
+                        "its write went back first (no miss)"
+                    );
+                } else {
+                    assert!(
+                        took < Duration::from_millis(400),
+                        "left in flight ({took:?})"
+                    );
+                    assert_eq!(flying, 2, "both in flight");
+                }
+                assert_eq!(word(p + 16), value);
+            }
+            release(p, Some(a));
+        }
+
+        /// A program storing through the page table keeps its submission a
+        /// barrier with `VICTORY_PT_BARRIER`: the pages it wrote go back
+        /// unnamed.
+        #[test]
+        fn a_program_storing_through_a_table_keeps_the_barrier() {
+            let Some(host) = host() else { return };
+            if !overlap() {
+                return; // VICTORY_GPU_OVERLAP=0
+            }
+            let _queues = crate::queue::tests::TITLE_QUEUES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _tables = crate::memory::gpu_test_lock();
+            crate::memory::forget_misses();
+            let _light = crate::host::tests::light_tables_for(true);
+            let Some((q, b)) = vram_copy(1) else { return };
+            if !table_named(host) {
+                return release(q, Some(b));
+            }
+            let gate = host.hold_gpu();
+            host.submit(
+                0,
+                vec![Arc::new(table_user(host, HostList::stores_through_table))],
+            );
+            let released = release_gpu_after(gate, 500);
+            let started = Instant::now();
+            host.submit(0, vec![Arc::new(reader(host, &b))]);
+            let took = started.elapsed();
+            released.join().unwrap();
+            host.complete_all();
+            release(q, Some(b));
+            assert!(
+                took >= Duration::from_millis(400),
+                "waited for the barrier ({took:?})"
+            );
         }
 
         /// A preparing's refreshes complete the submissions in flight that

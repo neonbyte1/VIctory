@@ -341,6 +341,10 @@ pub struct HostShader {
     /// Whether the host binds the page bitmap `u0` in [`MEMORY_SPACE`]
     /// (pages written and pages missed): whenever [`HostShader::memory`].
     pub memory_writes: bool,
+    /// Whether an access through the page table stores or does atomics:
+    /// without, every bit it sets in `u0` is a page missed, none a page
+    /// written, and its submissions write no title memory through the table.
+    pub memory_stores: bool,
     /// Whether it reads buffer views' title addresses or texture views'
     /// sizes from their descriptors: the host binds the view addresses `t1`
     /// in [`MEMORY_SPACE`] (module notes, "View addresses").
@@ -708,6 +712,7 @@ pub fn emit_with(
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        memory_stores: l.memory_stores,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
@@ -1326,6 +1331,7 @@ mod tests {
             root_uavs: Vec::new(),
             memory: false,
             memory_writes: false,
+            memory_stores: false,
             view_addresses: false,
             heap: false,
             heap_writes: false,
@@ -1344,6 +1350,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 memory: false,
                 memory_writes: false,
+                memory_stores: false,
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,
@@ -2891,6 +2898,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 memory: l.memory,
                 memory_writes: l.memory_writes,
+                memory_stores: l.memory_stores,
                 view_addresses: l.view_addresses,
                 heap: l.heap,
                 heap_writes: l.heap_writes,
@@ -3068,6 +3076,7 @@ mod tests {
                 root_uavs: lowered.root_uavs,
                 memory: lowered.memory,
                 memory_writes: lowered.memory_writes,
+                memory_stores: lowered.memory_stores,
                 view_addresses: lowered.view_addresses,
                 heap: lowered.heap,
                 heap_writes: lowered.heap_writes,
@@ -3392,6 +3401,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 memory: l.memory,
                 memory_writes: l.memory_writes,
+                memory_stores: l.memory_stores,
                 view_addresses: l.view_addresses,
                 heap: l.heap,
                 heap_writes: l.heap_writes,
@@ -3546,6 +3556,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 memory: l.memory,
                 memory_writes: l.memory_writes,
+                memory_stores: l.memory_stores,
                 view_addresses: l.view_addresses,
                 heap: l.heap,
                 heap_writes: l.heap_writes,

@@ -78,6 +78,8 @@ pub(crate) struct Lowered {
     pub memory: bool,
     /// Writes there (the written-pages bitmap).
     pub memory_writes: bool,
+    /// Stores or does atomics there (a bitmap bit can be a page written).
+    pub memory_stores: bool,
     /// Reads buffer views' addresses or texture views' sizes from
     /// descriptors (the view addresses).
     pub view_addresses: bool,
@@ -2270,6 +2272,7 @@ impl<'a> Lower<'a> {
             root_uavs,
             memory,
             memory_writes,
+            memory_stores: self.s.memory_stores,
             view_addresses,
             heap: self.heap[0],
             heap_writes: self.heap[1],
@@ -6514,6 +6517,7 @@ impl<'a> Lower<'a> {
     ) -> (V, V) {
         let e = self.memory_entry(lo, hi, write);
         let c = self.cur;
+        self.s.memory_stores |= write;
         // Writes always mark (written or missed pages), reads only misses.
         let marks = match (write, active) {
             (true, Some(a)) => Some(a),

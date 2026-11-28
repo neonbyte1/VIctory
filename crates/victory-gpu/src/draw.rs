@@ -1061,6 +1061,11 @@ impl State {
                     return false;
                 };
                 crate::memory::note_use(&p.name);
+                // Pages it writes through the table go back after the
+                // submission, unnamed: its page tables stay a barrier.
+                if stage.translated().host.memory_stores {
+                    list.stores_through_table();
+                }
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
                 for (address, shadow) in &roots {
@@ -2915,6 +2920,7 @@ mod tests {
             root_uavs: Vec::new(),
             memory: false,
             memory_writes: false,
+            memory_stores: false,
             view_addresses: false,
             heap: true,
             heap_writes: false,
@@ -4592,6 +4598,7 @@ uint ps() : SV_Target { return 1; }
                     root_uavs: Vec::new(),
                     memory: false,
                     memory_writes: false,
+                    memory_stores: false,
                     view_addresses: false,
                     heap: false,
                     heap_writes: false,

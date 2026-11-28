@@ -284,6 +284,36 @@ struct Shared {
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
+    /// The submissions that last read it ([`prepare`]).
+    users: Users,
+}
+
+/// The last two submissions (owner numbers, 0 for none) whose preparing
+/// brought a page table up to date: a submission may name the table in
+/// several lists, and a rewrite in its own preparing must still wait for the
+/// one before it.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct Users {
+    last: u64,
+    before: u64,
+}
+
+impl Users {
+    /// Submission `owner` reads the table.
+    fn prepared(&mut self, owner: u64) {
+        if self.last != owner {
+            (self.before, self.last) = (self.last, owner);
+        }
+    }
+
+    /// The last submission other than `owner` that reads the table.
+    fn before(&self, owner: u64) -> u64 {
+        if self.last == owner {
+            self.before
+        } else {
+            self.last
+        }
+    }
 }
 
 // SAFETY: `data` is the persistent mapping of `table`, written only under
@@ -309,6 +339,41 @@ pub(crate) fn release(key: usize) {
 #[cfg(test)]
 pub(crate) fn has_table(key: usize) -> bool {
     shared().iter().any(|(k, _)| *k == key)
+}
+
+/// Tests: whether view heap `key`'s page table names the copies there are
+/// now (its next user's preparing rewrites nothing).
+#[cfg(test)]
+pub(crate) fn table_current(key: usize) -> bool {
+    shared()
+        .iter()
+        .any(|(k, s)| *k == key && s.generation == crate::shadow::generation())
+}
+
+/// Tests: what view heap `key`'s page table gives a shader looking up
+/// `address` (the view index and the byte offset in it), the view pair it
+/// keeps for `copy`, and whether the table is still to be copied to video
+/// memory.
+#[cfg(test)]
+pub(crate) fn table_entry(
+    key: usize,
+    address: u64,
+    copy: &Arc<Shadow>,
+) -> Option<((u32, u32), Option<u32>, bool)> {
+    let shared = shared();
+    let (_, s) = shared.iter().find(|(k, _)| *k == key)?;
+    // SAFETY: the persistent mapping of the table, `TABLE_DWORDS` dwords,
+    // written only under the lock we hold.
+    let dwords = unsafe { std::slice::from_raw_parts(s.data as *const u32, TABLE_DWORDS) };
+    let (lo, hi) = (address as u32, (address >> 32) as u32);
+    let block = if hi < 256 {
+        dwords[(hi << 4 | lo >> 28) as usize]
+    } else {
+        0
+    };
+    let at = LEVEL1 + 2 * (block << 12 | (lo >> 16 & 0xFFF)) as usize;
+    let pair = s.pairs.get(&(Arc::as_ptr(copy) as usize)).copied();
+    Some(((dwords[at], lo.wrapping_sub(dwords[at + 1])), pair, s.dirty))
 }
 
 /// Runs `f` on the host heap behind view heap `key` while it cannot go
@@ -633,13 +698,14 @@ impl Shared {
             pairs: HashMap::new(),
             generation: u64::MAX,
             layout: Arc::default(),
+            users: Users::default(),
         })
     }
 
     /// Names every host copy there is now (`now`: their generation): view
     /// pairs made for new copies, those of copies gone made null and given
-    /// back, the table rewritten. Only while no submission runs (the GPU
-    /// reads the table and the views).
+    /// back, the table rewritten. Only while no submission using the table
+    /// runs (the GPU reads the table and the views; [`prepare`]).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
         self.dirty = true;
         let copies = crate::shadow::all();
@@ -709,24 +775,55 @@ fn layout(key: usize) -> Arc<Layout> {
         .unwrap_or_default()
 }
 
-/// At submission, for a list using title memory with view heap `key`
-/// bound: the heap's page table names every host copy there is, each
-/// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory, and whether the copy was clean).
-pub(crate) fn prepare(key: usize, add: impl FnMut(&Arc<Shadow>, usize, usize, bool)) {
-    let layout = with_heap(key, |heap| {
-        let mut shared = shared();
-        let host = std::ptr::from_ref(heap) as usize;
-        let (_, s) = shared
-            .iter_mut()
-            .find(|(k, s)| *k == key && s.host == host)?;
-        let now = crate::shadow::generation();
-        if s.generation != now {
-            s.rewrite(heap, now);
+/// At submission `owner`'s preparing, for a list using title memory with
+/// view heap `key` bound: the heap's page table names every host copy there
+/// is, each brought up to date (`add` takes a copy's range, once per
+/// submission until a step writes title memory, and whether the copy was
+/// clean).
+///
+/// The table and its view pairs are rewritten in place when copies came or
+/// went. With `VICTORY_PT_BARRIER` its last user before `owner` may still be
+/// in flight (page tables make no barrier, `crate::host`'s `light_reasons`),
+/// its shaders reading the table and the pairs, and its completion reading
+/// the table's layout: `settle` completes it first (and those before it);
+/// asked whether or not it is still in flight.
+pub(crate) fn prepare(
+    key: usize,
+    owner: u64,
+    settle: &mut dyn FnMut(u64),
+    add: impl FnMut(&Arc<Shadow>, usize, usize, bool),
+) {
+    let light = crate::host::light_tables();
+    let mut settled = 0;
+    let layout = loop {
+        let step = with_heap(key, |heap| {
+            let mut shared = shared();
+            let host = std::ptr::from_ref(heap) as usize;
+            let (_, s) = shared
+                .iter_mut()
+                .find(|(k, s)| *k == key && s.host == host)?;
+            let now = crate::shadow::generation();
+            if s.generation != now {
+                let last = s.users.before(owner);
+                if light && last > settled {
+                    return Some(Err(last));
+                }
+                s.rewrite(heap, now);
+            }
+            s.users.prepared(owner);
+            Some(Ok(s.layout.clone()))
+        })
+        .flatten();
+        match step {
+            // Without the locks: its completion reads the layout.
+            Some(Err(last)) => {
+                settle(last);
+                settled = last;
+            }
+            Some(Ok(layout)) => break Some(layout),
+            None => break None,
         }
-        Some(s.layout.clone())
-    })
-    .flatten();
+    };
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the
     // world), unless a submission in flight writes their memory other than
@@ -854,7 +951,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
         has_missed(marks, &l)
     });
-    list.defer_after(move || {
+    list.defer_after_table(move || {
         let Layout {
             copies,
             blocks,
@@ -958,6 +1055,21 @@ mod tests {
         assert!(withheld_in(7, 7));
         assert!(withheld_in(8, 7), "the next frame reads this one's results");
         assert!(!withheld_in(9, 7));
+    }
+
+    /// A table's users: the last submission other than the one preparing,
+    /// whichever of its lists asks.
+    #[test]
+    fn a_table_knows_its_last_user_before_the_one_preparing() {
+        let mut users = Users::default();
+        assert_eq!(users.before(1), 0, "none yet");
+        users.prepared(3);
+        assert_eq!(users.before(4), 3);
+        assert_eq!(users.before(3), 0, "its own lists are not before it");
+        users.prepared(3);
+        users.prepared(5);
+        assert_eq!(users.before(5), 3, "a second list of 5 still waits for 3");
+        assert_eq!(users.before(6), 5);
     }
 
     /// The shader's lookup (`victory_shader` lowering) over a table's
