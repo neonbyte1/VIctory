@@ -1436,7 +1436,77 @@ impl<'a> Lower<'a> {
                     r
                 }
             }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
+            (Op::MinF | Op::MaxF, Some(_)) => {
+                return Err("a wave prefix of an operation other than a sum");
+            }
+            (op, Some(inclusive)) => {
+                let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+                let one_b = self.s.m.bool(true);
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let ballot =
+                    self.s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[one_b]);
+                let b_lo = self.s.m.extract(c, ballot, 0);
+                let b_hi = self.s.m.extract(c, ballot, 1);
+                let (k0, k1, k32) = (self.s.m.i32(0), self.s.m.i32(1), self.s.m.i32(32));
+                let lo_nonempty = self.s.m.cmp(c, pred::NE, b_lo, k0);
+                let lo_first =
+                    self.s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b_lo]);
+                let hi_first =
+                    self.s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b_hi]);
+                let hi_first = self.s.m.bin(c, Bin::Add, hi_first, k32);
+                let first_lane = self.s.m.select(c, lo_nonempty, lo_first, hi_first);
+                let val = if float {
+                    let f = self.as_float(x);
+                    let f = self.ftz(f);
+                    self.as_int(f)
+                } else {
+                    x
+                };
+                let mut acc = if float {
+                    let f = self.as_float(id);
+                    let f = self.ftz(f);
+                    self.as_int(f)
+                } else {
+                    id
+                };
+                for k in 0..64u32 {
+                    let k_val = self.s.m.i32(k);
+                    let word = if k < 32 { b_lo } else { b_hi };
+                    let shift = self.s.m.i32(k & 31);
+                    let bit = self.s.m.bin(c, Bin::LShr, word, shift);
+                    let bit = self.s.m.bin(c, Bin::And, bit, k1);
+                    let k_active = self.s.m.cmp(c, pred::NE, bit, k0);
+                    let safe_k = self.s.m.select(c, k_active, k_val, first_lane);
+                    let peer = self.read_lane(val, safe_k);
+                    let in_range = if inclusive {
+                        self.s.m.cmp(c, pred::IUGE, lane, k_val)
+                    } else {
+                        self.s.m.cmp(c, pred::IUGT, lane, k_val)
+                    };
+                    let take = self.s.m.bin(c, Bin::And, k_active, in_range);
+                    let merged = match op {
+                        Op::Or => self.s.m.bin(c, Bin::Or, acc, peer),
+                        Op::And => self.s.m.bin(c, Bin::And, acc, peer),
+                        Op::Xor => self.s.m.bin(c, Bin::Xor, acc, peer),
+                        Op::MinU | Op::MaxU | Op::MinI | Op::MaxI => {
+                            let p = match op {
+                                Op::MinU => pred::IULT,
+                                Op::MaxU => pred::IUGT,
+                                Op::MinI => pred::SLT,
+                                _ => pred::SGT,
+                            };
+                            let t = self.s.m.cmp(c, p, peer, acc);
+                            self.s.m.select(c, t, peer, acc)
+                        }
+                        Op::MinF | Op::MaxF | Op::AddU | Op::AddF | Op::AddH => unreachable!(),
+                    };
+                    acc = self.s.m.select(c, take, merged, acc);
+                }
+                return Ok(acc);
+            }
             (Op::Or | Op::And | Op::Xor, None) => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
