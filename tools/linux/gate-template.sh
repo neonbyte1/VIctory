@@ -35,7 +35,9 @@
 #   VICTORY_GATE_LOCK     /tmp/victory-gpu-gate.lock (same as queue.sh)
 #   VICTORY_GATE_WAIT     7200 s to wait for the gate
 #   VICTORY_TEST_TIMEOUT  900 s for the test itself
-#   WINEPREFIX            $VICTORY_SCRATCH/q-prefix
+#   VICTORY_GATE_PREFIX   $VICTORY_SCRATCH/q-prefix. The gate's own Wine prefix;
+#                         an exported WINEPREFIX (your game prefix) is ignored, because
+#                         the gate ends with `wineserver -k` on its prefix.
 #   VICTORY_VK_DRIVER_FILES / VICTORY_GPU_NAME  Vulkan ICD / DXVK filter
 #   VICTORY_HIDDEN        tools/linux/hidden.sh (found from this repo if unset)
 #   VICTORY_LOG           warn
@@ -54,7 +56,8 @@ exe=$(readlink -f "$exe")
 : "${VICTORY_TEST_TIMEOUT:=900}"
 : "${VICTORY_LOG:=warn}"
 : "${VICTORY_VKD3D_DIR:?set VICTORY_VKD3D_DIR to the vkd3d-proton x86_64-windows folder}"
-: "${WINEPREFIX:=$VICTORY_SCRATCH/q-prefix}"
+: "${VICTORY_GATE_PREFIX:=$VICTORY_SCRATCH/q-prefix}"
+WINEPREFIX=$VICTORY_GATE_PREFIX
 
 H=${VICTORY_HIDDEN:-}
 if [ -z "$H" ]; then
@@ -71,6 +74,10 @@ export VICTORY_SCRATCH VICTORY_TEST_TIMEOUT VICTORY_LOG WINEPREFIX VICTORY_VKD3D
 mkdir -p "$VICTORY_SCRATCH/logs" "$VICTORY_SCRATCH/vkd3d-cache"
 
 echo "gate: waiting for $VICTORY_GATE_LOCK (up to ${VICTORY_GATE_WAIT}s)" >&2
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+# The script path is passed on to the shell below on purpose: after the exec, the script's
+# own path is what keeps `pgrep -f` (the queue's "a gate is waiting" check)
+# matching this process while it waits for the lock.
 exec flock -w "$VICTORY_GATE_WAIT" "$VICTORY_GATE_LOCK" bash -c '
 set -u
 echo "gate: body entered" >&2
@@ -110,4 +117,4 @@ pkill -f "winedbg[ ]--auto" >/dev/null 2>&1
 wineserver -k >/dev/null 2>&1
 echo "gate: done $tag exit=$code log=$LOG" >&2
 exit "$code"
-' gate "$tag" "$exe" "$@"
+' "$SELF" "$tag" "$exe" "$@"
