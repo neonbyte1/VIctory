@@ -9823,16 +9823,18 @@ mod fills {
         };
         let (first, first_ptr) = list.upload(host, 4096).expect("first upload");
         let first_raw = windows::core::Interface::as_raw(&first);
-        // SAFETY: `list` is open from `new_list`; close it before `reset()`.
-        unsafe { list.list.Close().expect("close list") };
+        // The title closes the list it recorded into before resetting it;
+        // closing it through the host list keeps its recording flag true to
+        // the D3D12 list (a raw `Close` behind the wrapper's back makes the
+        // reset close it a second time, which D3D12 refuses).
+        list.close();
         list.reset();
         let (second, second_ptr) = list.upload(host, 4096).expect("second upload");
         let second_raw = windows::core::Interface::as_raw(&second);
         assert_eq!(first_raw, second_raw);
         assert_eq!(first_ptr, second_ptr);
         drop((first, second));
-        // SAFETY: `list` is open again after `reset()`; close it before the final `reset()`.
-        unsafe { list.list.Close().expect("close list") };
+        list.close();
         list.reset();
     }
 }
