@@ -138,7 +138,13 @@ impl Lower<'_> {
                         _ => true,
                     });
             let number = self.console_lanes && !self.x.native.wave64 && uniform;
-            let phi_edges = self.x.st.phi_masks.get(&phi.value);
+            // An edge's mask is what a lane knows on taking the edge. In
+            // the console flow every lane goes along every edge, the lanes
+            // that did not take it on the console too: they need the mask
+            // itself.
+            let phi_edges = (!self.console_cf)
+                .then(|| self.x.st.phi_masks.get(&phi.value))
+                .flatten();
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
