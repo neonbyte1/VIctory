@@ -575,7 +575,7 @@ impl HostPipeline {
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
-                    MipLODBias: s.mip_lod_bias,
+                    MipLODBias: s.mip_lod_bias_for_host(),
                     MaxAnisotropy: s.max_anisotropy,
                     ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
                     BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
@@ -1503,5 +1503,56 @@ mod tests {
                 }
             }
         }
+    }
+    /// Immediate console samplers can carry signed 14-bit 6.8 mip LOD biases
+    /// outside D3D12's `[-16.0, 15.99]` static-sampler range; clamping lets
+    /// `D3D12SerializeVersionedRootSignature` accept them.
+    #[test]
+    fn out_of_range_static_sampler_mip_lod_bias_serializes_for_host() {
+        use victory_shader::emit::StaticSampler;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let aniso_point_mip = crate::sampler::aniso_point_mip(&host.device);
+        let raw_samplers = [
+            StaticSampler::from_words([0x3088, 0x00FF_F000, 0x1400_2800, 0x8000_0000]), // -24.0
+            StaticSampler::from_words([0x3088, 0x00FF_F000, 0x1400_2000, 0x8000_0000]), // -32.0
+            StaticSampler::from_words([0x3088, 0x00FF_F000, 0x1400_1800, 0x8000_0000]), // +24.0
+            StaticSampler::from_words([0x3088, 0x00FF_F000, 0x1400_1FFF, 0x8000_0000]), // +31.996
+        ];
+        let clamped: Vec<D3D12_STATIC_SAMPLER_DESC> = raw_samplers
+            .iter()
+            .enumerate()
+            .map(|(n, s)| {
+                let bias = s.mip_lod_bias_for_host();
+                assert!(
+                    (D3D12_MIP_LOD_BIAS_MIN..=D3D12_MIP_LOD_BIAS_MAX).contains(&bias),
+                    "clamped bias {bias} outside D3D12 bounds"
+                );
+                D3D12_STATIC_SAMPLER_DESC {
+                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip) as i32),
+                    AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
+                    AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
+                    AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
+                    MipLODBias: bias,
+                    MaxAnisotropy: s.max_anisotropy,
+                    ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
+                    BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
+                    MinLOD: s.min_lod,
+                    MaxLOD: s.max_lod,
+                    ShaderRegister: n as u32,
+                    RegisterSpace: SAMPLER_SPACE,
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                }
+            })
+            .collect();
+        root_signature(&host.device, &[], &clamped, true)
+            .expect("clamped static samplers serialize");
+
+        // Confirm D3D12 itself rejects the unclamped -24.0 value.
+        let mut unclamped = clamped[0];
+        unclamped.MipLODBias = raw_samplers[0].mip_lod_bias;
+        assert!(root_signature(&host.device, &[], &[unclamped], true).is_err());
     }
 }

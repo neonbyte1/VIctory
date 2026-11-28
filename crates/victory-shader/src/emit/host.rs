@@ -621,7 +621,7 @@ impl Host {
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,
-                    MipLODBias: d.mip_lod_bias,
+                    MipLODBias: d.mip_lod_bias_for_host(),
                     MaxAnisotropy: d.max_anisotropy,
                     ComparisonFunc: D3D12_COMPARISON_FUNC(d.comparison as i32),
                     BorderColor: D3D12_STATIC_BORDER_COLOR(d.border as i32),
