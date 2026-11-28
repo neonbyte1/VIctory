@@ -3563,6 +3563,136 @@ fn f64_add_mul_and_fma_are_ieee() {
     }
 }
 
+#[test]
+fn v_cmp_and_cmpx_class_f32_match_rdna2() {
+    // VOP3: v_cmp_class_f32_e64 s6, v1, v2 (0x088); v_cndmask_b32_e64 v0, 0, 1, s6.
+    let cmp_e64 = build_valu_cs(&[
+        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[0],
+        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[1],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    // VOPC: v_cmp_class_f32_e32 vcc_lo, s0, v2; v_cndmask_b32_e64 v0, 0, 1, vcc_lo.
+    let cmp_e32_sgpr = build_valu_cs(&[
+        0x7D10_0400,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(106))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(106))[1],
+    ]);
+    // v_cmpx_class_f32_e32 v1, v2 (0x098) and v_cmpx_class_f16_e32 v1, v2 (0x09f):
+    // narrows EXEC directly; non-matching lanes keep 0xCAFE.
+    let cmpx_cs = |vopc_word: u32| {
+        build_valu_cs(&[
+            s_mov_b32(16, 126),   // s_mov_b32 s16, exec_lo
+            vop1(0x001, 0, 0xFF), // v_mov_b32 v0, 0xCAFE
+            0x0000_CAFE,          // literal
+            vopc_word,            // v_cmpx_class_* v1, v2
+            vop1(0x001, 0, 0x81), // v_mov_b32 v0, 1
+            s_mov_b32(126, 16),   // s_mov_b32 exec_lo, s16
+        ])
+    };
+    let cmpx_f32 = cmpx_cs(0x7D30_0501);
+    let cmpx_f16 = cmpx_cs(0x7D3E_0501);
+
+    // All 10 IEEE-754 binary32 classes including subnormal, normal, and NaN edges:
+    // denormals are never flushed and sNaNs are never quieted.
+    let classes: &[(u32, u32)] = &[
+        (0x7F80_0001, 0), // smallest +sNaN (quiet bit 0x0040_0000 clear)
+        (0x7FBF_FFFF, 0), // largest +sNaN
+        (0xFF80_0001, 0), // smallest -sNaN
+        (0xFFBF_FFFF, 0), // largest -sNaN
+        (0x7FC0_0000, 1), // +qNaN
+        (0xFFFF_FFFF, 1), // -qNaN
+        (0xFF80_0000, 2), // -inf
+        (0x8080_0000, 3), // smallest -normal
+        (0xBF80_0000, 3), // -1.0 (-normal)
+        (0xFF7F_FFFF, 3), // largest -normal
+        (0x8000_0001, 4), // smallest -denormal
+        (0x807F_FFFF, 4), // largest -denormal
+        (0x8000_0000, 5), // -0.0
+        (0x0000_0000, 6), // +0.0
+        (0x0000_0001, 7), // smallest +denormal
+        (0x007F_FFFF, 7), // largest +denormal
+        (0x0080_0000, 8), // smallest +normal
+        (0x3F80_0000, 8), // +1.0 (+normal)
+        (0x7F7F_FFFF, 8), // largest +normal
+        (0x7F80_0000, 9), // +inf
+    ];
+    let mut cases = Vec::new();
+    for &(bits, cls) in classes {
+        let bit = 1u32 << cls;
+        cases.push(([bits, bit, 0, 0], 1u32));
+        cases.push(([bits, 0x3FF & !bit, 0, 0], 0u32));
+        // Upper mask bits src1[31:10] are ignored by hardware.
+        cases.push(([bits, 0xFFFF_FC00, 0, 0], 0u32));
+        cases.push(([bits, 0xFFFF_FC00 | bit, 0, 0], 1u32));
+        // Combined masks: NaN (0x003), +/-inf (0x204), +/-0.0 (0x060), +/-denorm (0x090).
+        for mask in [0x003u32, 0x204, 0x060, 0x090, 0x000] {
+            cases.push(([bits, mask, 0, 0], u32::from(mask & bit != 0)));
+        }
+    }
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    for (label, cs) in [("e64", &cmp_e64), ("e32_sgpr", &cmp_e32_sgpr)] {
+        run_cases(cs, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: v_cmp_class_f32[{label}]({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    // 32-bit literal src0 in VOPC (`0xFF` followed by raw f32 bits): +sNaN and -denormal.
+    for (lit, cls) in [(0x7F80_0001u32, 0u32), (0x8000_0001u32, 4u32)] {
+        let lit_cs = build_valu_cs(&[
+            0x7D10_04FF,
+            lit,
+            vop3(0x101, 0, 0x80, 0x81, sgpr(106))[0],
+            vop3(0x101, 0, 0x80, 0x81, sgpr(106))[1],
+        ]);
+        let lit_in = [[0, 1 << cls, 0, 0], [0, 0x3FF & !(1 << cls), 0, 0]];
+        run_cases(&lit_cs, &lit_in, |backend, i, inp, got| {
+            let want = u32::from(i == 0);
+            assert_eq!(
+                got, want,
+                "{backend}: v_cmp_class_f32 literal({lit:#010x}, {:#05x}) = {got}, want {want}",
+                inp[1],
+            );
+        });
+    }
+
+    // v_cmpx_class_f32 and v_cmpx_class_f16 EXEC narrowing across matching and non-matching masks.
+    let cmpx_f32_in = [
+        [0x7F80_0001, 1 << 0, 0, 0],
+        [0x7F80_0001, 1 << 1, 0, 0],
+        [0x8000_0001, 1 << 4, 0, 0],
+        [0x8000_0001, 1 << 5, 0, 0],
+        [0x3F80_0000, 0xFFFF_FC00, 0, 0],
+    ];
+    let cmpx_want = [1u32, 0xCAFE, 1, 0xCAFE, 0xCAFE];
+    run_cases(&cmpx_f32, &cmpx_f32_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, cmpx_want[i],
+            "{backend}: v_cmpx_class_f32({:#010x}, {:#010x}) = {got:#x}, want {:#x}",
+            inp[0], inp[1], cmpx_want[i],
+        );
+    });
+    let cmpx_f16_in = [
+        [0x7C01, 1 << 0, 0, 0],
+        [0x7C01, 1 << 1, 0, 0],
+        [0x8001, 1 << 4, 0, 0],
+        [0x8001, 1 << 5, 0, 0],
+        [0x3C00, 0xFFFF_FC00, 0, 0],
+    ];
+    run_cases(&cmpx_f16, &cmpx_f16_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, cmpx_want[i],
+            "{backend}: v_cmpx_class_f16({:#06x}, {:#010x}) = {got:#x}, want {:#x}",
+            inp[0], inp[1], cmpx_want[i],
+        );
+    });
+}
+
 /// A compute program in an `ACCC` part, as the AMD upscaler's are: `body`
 /// leaves its result in v0, stored to the raw UAV of the table at user data
 /// 4 (root parameter 1). Translated from the container's bytes.
