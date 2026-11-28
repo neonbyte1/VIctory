@@ -9824,3 +9824,93 @@ fn mul_and_mad_i24_clamp_the_full_result() {
         }
     }
 }
+
+#[test]
+fn spilled_lane_mask_restored_into_sop_and_select_matches_rdna2() {
+    let run_wave32 = |name: &str, shader: &HostShader, cases: &[([u32; 4], u32)]| {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let Ok((root, pso)) = host.compute_pipeline(shader) else {
+                // Inbox WARP rejects WaveSize(32) compute pipelines (`v_writelane_b32` /
+                // `waveActiveBallot` emit WaveSize(32)), including when `Host::new(false)`
+                // selects WARP via `VICTORY_WARP=1`.
+                let is_warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+                assert!(
+                    is_warp,
+                    "{label}: {name}: hardware adapter rejected Wave32 PSO"
+                );
+                continue;
+            };
+            for &(inputs, want) in cases {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 0) => inputs[u.dword as usize],
+                        (RootType::Table, 1) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(1)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: {name}: dispatch failed: {e}"));
+                assert_eq!(
+                    out[0][0], want,
+                    "{label}: {name}({inputs:?}) = {:#010x}, want {want:#010x}",
+                    out[0][0]
+                );
+            }
+        }
+    };
+
+    // 1. Compare v1 == v2 into vcc_lo, spill vcc_lo into v5 lane 0, restore
+    //    into s6, combine with exec_lo via s_and_b32 into s7, and select
+    //    between v3 (false) and v4 (true) via v_cndmask_b32.
+    let select_body: &[u32] = &[
+        vop3(0x0C2, 0x6A, vgpr(1), vgpr(2), 0)[0], // v_cmp_eq_u32_e64 vcc_lo, v1, v2
+        vop3(0x0C2, 0x6A, vgpr(1), vgpr(2), 0)[1],
+        vop3(0x361, 5, sgpr(0x6A), 0x80, 0)[0], // v_writelane_b32 v5, vcc_lo, 0
+        vop3(0x361, 5, sgpr(0x6A), 0x80, 0)[1],
+        vop3(0x360, 6, vgpr(5), 0x80, 0)[0], // v_readlane_b32 s6, v5, 0
+        vop3(0x360, 6, vgpr(5), 0x80, 0)[1],
+        sop2(0x0E, 7, 6, 0x7E), // s_and_b32 s7, s6, exec_lo
+        vop3(0x101, 0, vgpr(3), vgpr(4), sgpr(7))[0], // v_cndmask_b32_e64 v0, v3, v4, s7
+        vop3(0x101, 0, vgpr(3), vgpr(4), sgpr(7))[1],
+    ];
+    let select_shader = build_valu_cs(select_body);
+    let select_cases: &[([u32; 4], u32)] = &[
+        ([7, 7, 0x1111_2222, 0x3333_4444], 0x3333_4444),
+        ([7, 8, 0x1111_2222, 0x3333_4444], 0x1111_2222),
+        ([0, 0, 0xDEAD_BEEF, 0xCAFE_BABE], 0xCAFE_BABE),
+        ([0, 1, 0xDEAD_BEEF, 0xCAFE_BABE], 0xDEAD_BEEF),
+    ];
+    run_wave32("spilled mask select", &select_shader, select_cases);
+
+    // 2. Numeric bit-test on a restored mask (`s_and_b32 s7, s6, 1`) followed
+    //    by a scalar SCC consumer (`s_cselect_b32`) must preserve scalar SCC.
+    let dword_body: &[u32] = &[
+        vop3(0x0C2, 0x6A, vgpr(1), vgpr(2), 0)[0], // v_cmp_eq_u32_e64 vcc_lo, v1, v2
+        vop3(0x0C2, 0x6A, vgpr(1), vgpr(2), 0)[1],
+        vop3(0x361, 5, sgpr(0x6A), 0x80, 0)[0], // v_writelane_b32 v5, vcc_lo, 0
+        vop3(0x361, 5, sgpr(0x6A), 0x80, 0)[1],
+        vop3(0x360, 6, vgpr(5), 0x80, 0)[0], // v_readlane_b32 s6, v5, 0
+        vop3(0x360, 6, vgpr(5), 0x80, 0)[1],
+        sop2(0x0E, 7, 6, 0x81),            // s_and_b32 s7, s6, 1
+        sop2(0x0A, 7, 128 + 10, 128 + 20), // s_cselect_b32 s7, 10, 20
+        vop1(0x001, 0, sgpr(7)),           // v_mov_b32 v0, s7
+    ];
+    let dword_shader = build_valu_cs(dword_body);
+    let dword_cases: &[([u32; 4], u32)] = &[([42, 42, 0, 0], 10), ([42, 43, 0, 0], 20)];
+    run_wave32("restored scalar scc", &dword_shader, dword_cases);
+}

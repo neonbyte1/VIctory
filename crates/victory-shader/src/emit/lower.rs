@@ -2154,6 +2154,9 @@ impl<'a> Lower<'a> {
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
+        if let Some(&orig) = self.x.st.restored.get(&v) {
+            return self.mask_dword(orig);
+        }
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
