@@ -19,6 +19,7 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
     ".gitattributes",
+    ".git-blame-ignore-revs",
     ".editorconfig",
     ".victory-root",
     "pre-commit",
@@ -288,6 +289,10 @@ mod tests {
     fn accepts_source() {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
+        assert!(
+            check(".git-blame-ignore-revs", b"# formatting\n325e8a400\n").is_empty(),
+            "the fork's blame-ignore list"
+        );
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
     }
 
