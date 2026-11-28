@@ -46,7 +46,10 @@ fn copy_list(host: &Host, label: &str) -> (HostList, *mut u32) {
         input.cast::<u32>().add(1).write(0x5678);
     }
     for (i, offset) in [0, 4].into_iter().enumerate() {
-        list.note_op(|| format!("copy [fixture {label}-{i}]"));
+        list.note_pass(
+            || crate::passes::Key::class(crate::passes::Class::Copy),
+            || format!("copy [fixture {label}-{i}]"),
+        );
         // SAFETY: the resources are live and stay in upload and readback states.
         unsafe {
             list.list

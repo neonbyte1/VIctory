@@ -528,6 +528,32 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    through_lowering(container, |c, native, p, st, io, res| {
+        emit_with(c, native, p, st, io, res, options)
+    })
+}
+
+/// How [`translate_with`] lowers the program of `container` for `options`
+/// (diagnostics: what a program's host GPU time is spent in). It lowers the
+/// program again, as long as a translation takes.
+pub fn form_with(container: &[u8], options: Options) -> Result<Form, ShaderError> {
+    through_lowering(container, |c, native, p, st, io, res| {
+        lowered(c, native, p, st, io, res, options).map(|(_, form)| form)
+    })
+}
+
+/// The stages before lowering, then `then` with what they made.
+fn through_lowering<T>(
+    container: &[u8],
+    then: impl FnOnce(
+        &Container,
+        &NativeProgram,
+        &ir::Program,
+        &structure::Structured,
+        &io::Io,
+        &resource::Resources,
+    ) -> Result<T, ShaderError>,
+) -> Result<T, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -551,7 +577,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    then(&c, &native, &p, &st, &io, &res)
 }
 
 /// Emits a program whose earlier stages already ran, for `target` and
@@ -582,6 +608,101 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
+    let (l, _) = lowered(c, native, p, st, io, res, options)?;
+    Ok(HostShader {
+        stage: native.stage,
+        wave_size: l.wave_size,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        static_samplers: l
+            .samplers
+            .iter()
+            .enumerate()
+            .map(|(n, &w)| {
+                let mut s = StaticSampler::from_words(w);
+                if l.cmp_samplers >> n & 1 != 0 {
+                    s.make_comparison();
+                }
+                s
+            })
+            .collect(),
+        samplers: l.samplers,
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    })
+}
+
+/// How a program is lowered ([`form_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Form {
+    pub flow: Flow,
+    /// A console wave64 compute program run as two 32-lane host waves.
+    pub split: bool,
+    /// It has waterfall loops (a descriptor per lane): each lane loads its
+    /// own (`resource::Waterfall`).
+    pub waterfall: bool,
+    /// Discarded lanes are killed as the console kills them
+    /// (`structure::killing`).
+    pub killing: bool,
+}
+
+/// Whose control flow a lowered program follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Flow {
+    /// Each lane its own (the per-lane form).
+    PerLane,
+    /// The per-lane form, kept where the console flow would not lower.
+    PerLaneFallback,
+    /// The console wave's, one host wave being the console wave
+    /// (`lower::CONSOLE_FLOW`).
+    Console,
+    /// The console wave's, its two 32-lane halves exchanging through
+    /// group-shared memory at group barriers.
+    ConsoleHalves,
+    /// The console wave's, in a group of several console waves whose
+    /// halves meet on their own (pair meetings).
+    PairMeetings,
+}
+
+impl std::fmt::Display for Form {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.flow {
+            Flow::PerLane => "per-lane",
+            Flow::PerLaneFallback => "per-lane (console flow refused)",
+            Flow::Console => "console flow",
+            Flow::ConsoleHalves => "console flow in halves",
+            Flow::PairMeetings => "pair meetings",
+        })?;
+        if self.split && matches!(self.flow, Flow::PerLane | Flow::PerLaneFallback) {
+            f.write_str(", split")?;
+        }
+        if self.waterfall {
+            f.write_str(", waterfall")?;
+        }
+        if self.killing {
+            f.write_str(", killing")?;
+        }
+        Ok(())
+    }
+}
+
+/// [`emit_with`]'s lowering, and its [`Form`].
+fn lowered(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+) -> Result<(lower::Lowered, Form), ShaderError> {
     // (for every lowering of this program: the per-lane form, the console
     // flow, and the per-lane form again)
     let _pairs = lower::PairMeetings::set(options.pair_meetings);
@@ -655,7 +776,24 @@ pub fn emit_with(
         per_lane_only,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res, false, false)) {
+    // As `lower` decides: a console wave64 compute program split into two
+    // 32-lane host waves declares 32-lane waves; in the console flow it is
+    // split where the host has no 64-lane waves, its halves meeting on
+    // their own (pair meetings) in a group of several console waves.
+    let group = match &native.io {
+        crate::native::StageIo::Cs(cs) => Some(cs.threads.iter().product::<u32>()),
+        _ => None,
+    };
+    let split = |l: &lower::Lowered| group.is_some() && native.wave64 && l.wave_size == Some(32);
+    let halves = native.wave64 && !options.target.runs(64);
+    let pairs = halves && options.pair_meetings && group.is_some_and(|g| g > 64);
+    let form = |l: &lower::Lowered, flow, res: &resource::Resources, killing| Form {
+        flow,
+        split: split(l),
+        waterfall: !res.waterfall.compares.is_empty(),
+        killing,
+    };
+    Ok(match lower::lower(&parts(st, res, false, false)) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
             let console = structure::structure_console(p);
             let lowered = match &console {
@@ -669,10 +807,24 @@ pub fn emit_with(
                 }),
             };
             match lowered {
-                Ok(l) => l,
+                Ok(l) => {
+                    let flow = if pairs {
+                        Flow::PairMeetings
+                    } else if halves {
+                        Flow::ConsoleHalves
+                    } else {
+                        Flow::Console
+                    };
+                    let form = form(&l, flow, res, false);
+                    (l, form)
+                }
                 // What the console flow cannot lower keeps the per-lane form
                 // where that translates; else the console flow's reason.
-                Err(e) => lower::lower(&parts(st, res, false, true)).map_err(|_| e)?,
+                Err(e) => {
+                    let l = lower::lower(&parts(st, res, false, true)).map_err(|_| e)?;
+                    let form = form(&l, Flow::PerLaneFallback, res, false);
+                    (l, form)
+                }
             }
         }
         // Discarded lanes kept on as helpers can read what no surviving
@@ -681,37 +833,15 @@ pub fn emit_with(
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res, false, false))?
+            let l = lower::lower(&parts(&st, &res, false, false))?;
+            let form = form(&l, Flow::PerLane, &res, true);
+            (l, form)
         }
-        l => l?,
-    };
-    Ok(HostShader {
-        stage: native.stage,
-        wave_size: l.wave_size,
-        dxil: l.dxil,
-        user_data: l.user_data,
-        static_samplers: l
-            .samplers
-            .iter()
-            .enumerate()
-            .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
-                    s.make_comparison();
-                }
-                s
-            })
-            .collect(),
-        samplers: l.samplers,
-        root_cbvs: l.root_cbvs,
-        root_srvs: l.root_srvs,
-        root_uavs: l.root_uavs,
-        memory: l.memory,
-        memory_writes: l.memory_writes,
-        view_addresses: l.view_addresses,
-        heap: l.heap,
-        heap_writes: l.heap_writes,
-        view_marks: l.view_marks,
+        l => {
+            let l = l?;
+            let form = form(&l, Flow::PerLane, res, false);
+            (l, form)
+        }
     })
 }
 

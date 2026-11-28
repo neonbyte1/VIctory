@@ -59,6 +59,8 @@ pub mod list;
 #[cfg(windows)]
 mod memory;
 pub mod object;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod passes;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;

@@ -217,12 +217,15 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
             crate::pipeline::shaders_of(pipeline as This)
         ));
     }
-    list.note_op(|| {
-        format!(
-            "DROPPED {kind} ({why}) {}",
-            crate::pipeline::shaders_of(pipeline as This)
-        )
-    });
+    list.note_pass(
+        || crate::passes::Key::class(crate::passes::Class::Dropped),
+        || {
+            format!(
+                "DROPPED {kind} ({why}) {}",
+                crate::pipeline::shaders_of(pipeline as This)
+            )
+        },
+    );
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -1332,6 +1335,8 @@ impl State {
         self.bind_heaps(list, false);
         list.keep(resource);
         let gpu = visible.gpu(slot);
+        #[cfg(feature = "diagnostics")]
+        list.note_class(crate::passes::Class::Clear);
         // SAFETY: an open list; both slots view the live resource.
         list.crumbed(Crumb::Clear, Some("unordered access clear"), || unsafe {
             if float {
@@ -1415,7 +1420,10 @@ impl State {
         }
         crate::feeds::ran([], 0);
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_pass(
+            || self.pass_key(crate::passes::Class::Dispatch),
+            || self.op_text(format!("dispatch {x}x{y}x{z}"), true),
+        );
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
@@ -1425,6 +1433,13 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// What GPU pass timing charges a command of `class` with the bound
+    /// pipeline to (`crate::passes`).
+    #[cfg(feature = "diagnostics")]
+    fn pass_key(&self, class: crate::passes::Class) -> crate::passes::Key {
+        crate::passes::Key::of(class, self.pipeline as This)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1530,7 +1545,10 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
+                    list.note_pass(
+                        || self.pass_key(crate::passes::Class::Mesh),
+                        || self.op_text(format!("mesh {x}x{y}x{z}"), false),
+                    );
                     // SAFETY: an open list with everything set.
                     list.crumbed(Crumb::Mesh, None, || unsafe { l6.DispatchMesh(x, y, z) });
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1990,7 +2008,10 @@ impl State {
                 (vertices, first)
             };
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.note_pass(
+                || self.pass_key(crate::passes::Class::Draw),
+                || self.op_text(format!("draw {count}x{instances}"), false),
+            );
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
             // SAFETY: an open list with everything set.
@@ -2079,7 +2100,10 @@ impl State {
         let ran = !rects && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.note_pass(
+                || self.pass_key(crate::passes::Class::Indexed),
+                || self.op_text(format!("indexed {indices}x{instances}"), false),
+            );
             // SAFETY: an open list with everything set.
             list.crumbed(Crumb::Draw, None, || unsafe {
                 list.list
@@ -2115,12 +2139,15 @@ impl State {
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
-                list.note_op(|| {
-                    format!(
-                        "DROPPED indirect kind {kind} (skipped) {}",
-                        crate::pipeline::shaders_of(self.pipeline as This)
-                    )
-                });
+                list.note_pass(
+                    || crate::passes::Key::class(crate::passes::Class::Dropped),
+                    || {
+                        format!(
+                            "DROPPED indirect kind {kind} (skipped) {}",
+                            crate::pipeline::shaders_of(self.pipeline as This)
+                        )
+                    },
+                );
             }
             return false;
         }
@@ -2132,12 +2159,15 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let note = |what: &str| {
             crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-            list.note_op(|| {
-                format!(
-                    "DROPPED indirect kind {kind} max {max} ({what}) {}",
-                    crate::pipeline::shaders_of(pipeline)
-                )
-            });
+            list.note_pass(
+                || crate::passes::Key::class(crate::passes::Class::Dropped),
+                || {
+                    format!(
+                        "DROPPED indirect kind {kind} max {max} ({what}) {}",
+                        crate::pipeline::shaders_of(pipeline)
+                    )
+                },
+            );
         };
         #[cfg(not(feature = "diagnostics"))]
         let note = |_: &str| {};
@@ -2358,12 +2388,25 @@ impl State {
             (clamped, at, windowed)
         };
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            self.op_text(
-                format!("indirect kind {kind} max {max} at {arguments:#x}"),
-                kind == DISPATCH,
-            )
-        });
+        list.note_pass(
+            || {
+                use crate::passes::Class;
+                let class = match kind {
+                    DRAW => Class::IndirectDraw,
+                    INDEXED => Class::IndirectIndexed,
+                    DISPATCH => Class::IndirectDispatch,
+                    MESH => Class::IndirectMesh,
+                    _ => Class::Other,
+                };
+                self.pass_key(class)
+            },
+            || {
+                self.op_text(
+                    format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                    kind == DISPATCH,
+                )
+            },
+        );
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         list.crumbed(Crumb::Indirect, None, || unsafe {
