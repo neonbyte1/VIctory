@@ -7314,3 +7314,23 @@ fn v_cmp_class_f32_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn duplicate_branch_target_critical_edge_produces_valid_dxil() {
+    // Block 0 sets s6 = 7 and skips block 1 when s0 != 0. Block 1 sets
+    // s6 = 11 and ends with a conditional branch whose taken and fallthrough
+    // targets are both the join block.
+    let shader = build_valu_cs(&[
+        s_mov_b32(6, 0x80 + 7),
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 -> join
+        s_mov_b32(6, 0x80 + 11),
+        0xBF84_0000,             // s_cbranch_scc0 +0 -> join (taken == not_taken)
+        vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
+    ]);
+    let cases = [([0, 0, 0, 0], 11u32), ([1, 0, 0, 0], 7u32)];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        assert_eq!(got, cases[i].1, "{backend}: case {i}");
+    });
+}

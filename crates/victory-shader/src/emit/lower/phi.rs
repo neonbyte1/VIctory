@@ -248,6 +248,9 @@ impl Lower<'_> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                if incoming.iter().any(|&(_, prev)| prev == qb) {
+                    continue;
+                }
                 let x = match resolved[idx][n] {
                     Some(x) => x,
                     None => match (self.vals.get(&phi.args[n]).copied(), bit) {

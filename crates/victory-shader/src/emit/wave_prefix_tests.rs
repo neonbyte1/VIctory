@@ -420,6 +420,7 @@ fn build_prefix_cs(wave64: bool, float: bool, inclusive: bool, mode: Mode) -> Ho
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })
     .expect("lower");
@@ -779,6 +780,7 @@ fn wave_prefix_sum_f32_pixel_quad_all_backends() {
         outputs: vs_out,
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })
     .expect("vs lower");
@@ -891,6 +893,7 @@ fn wave_prefix_sum_f32_pixel_quad_all_backends() {
         outputs: ps_out,
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })
     .expect("ps lower");

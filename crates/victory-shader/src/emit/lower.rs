@@ -6088,6 +6088,9 @@ impl<'a> Lower<'a> {
                     }
                     let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    if incoming.iter().any(|&(_, prev)| prev == at) {
+                        continue;
+                    }
                     incoming.push((self.s.m.bool(j == 0), at));
                 }
                 let phi = self.s.m.phi(join, self.s.t.i1);
@@ -6242,6 +6245,9 @@ impl<'a> Lower<'a> {
                     }
                     let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    if incoming.iter().any(|&(_, prev)| prev == at) {
+                        continue;
+                    }
                     // No lane comes this way (`resource` gave it another
                     // edge's source): any index will do.
                     if self.never_taken(q, *block) {
@@ -6299,13 +6305,17 @@ impl<'a> Lower<'a> {
                 let join =
                     self.block[*block].ok_or("a per-lane descriptor chosen by control flow")?;
                 let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                let preds = &self.x.p.blocks[*block].preds;
+                for (&q, arg) in preds.iter().zip(args) {
                     if self.block[q].is_none() {
                         continue;
                     }
                     let tail =
                         self.tail[q].ok_or("a per-lane descriptor joined from a later block")?;
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    if incoming.iter().any(|&(_, prev)| prev == at) {
+                        continue;
+                    }
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
@@ -11400,16 +11410,21 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        let jump = |l: &mut Self, t: usize| {
+            if l.counters.contains_key(&t) && l.rpo[t] <= l.rpo[b] {
+                let ok = l.count_iteration(t, pred::IULT);
+                let abort = l.abort_block();
+                Term::CondBr(ok, l.block[t].expect("reachable"), abort)
+            } else {
+                l.enter_loop(b, t, l.cur);
+                Term::Br(l.block[t].expect("reachable"))
+            }
+        };
         let term = match self.x.st.exits[b] {
-            LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
-            }
-            LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
-                Term::Br(self.block[t].expect("reachable"))
-            }
+            LaneExit::Jump(t) => jump(self, t),
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } if taken == not_taken => jump(self, taken),
             LaneExit::Branch {
                 when,
                 taken,
@@ -13544,6 +13559,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn duplicate_branch_target_back_edge_produces_valid_dxil() {
+        // Entry (block 0) -> loop header (block 1) -> latch (block 2) -> back to
+        // block 1 via a degenerate Branch whose taken == not_taken.
+        let words = [
+            0xBE80_0380, // s_mov_b32 s0, 0
+            // header (word 1):
+            0x8100_8100, // s_add_i32 s0, s0, 1
+            0xBF0A_8300, // s_cmp_lt_u32 s0, 3
+            0xBF84_0002, // s_cbranch_scc0 -> exit (word 6)
+            // latch (word 4):
+            0xBF85_FFFC, // s_cbranch_scc1 -> header (word 1)
+            S_ENDPGM,
+            // exit (word 6):
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let mut p = ir::build(&native.code, false, 4).unwrap();
+        let mut st = structure::structure(&p).unwrap();
+        // Force the latch exit (block 2) into a degenerate Branch where both
+        // targets are the loop header (block 1) and mirror the duplicate pred.
+        let structure::LaneExit::Branch { taken, .. } = st.exits[2] else {
+            panic!("expected branch exit in latch, got {:?}", st.exits[2]);
+        };
+        st.exits[2] = structure::LaneExit::Branch {
+            when: structure::Bool::TRUE,
+            taken,
+            not_taken: taken,
+        };
+        let pos = p.blocks[taken]
+            .preds
+            .iter()
+            .position(|&pred| pred == 2)
+            .unwrap();
+        p.blocks[taken].preds.push(2);
+        for phi in &mut p.blocks[taken].phis {
+            let v = phi.args[pos];
+            phi.args.push(v);
+        }
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            target: super::super::Target::ANY,
+            view_marks: false,
+        })
+        .expect("lower degenerate back-edge");
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            let mut dxil = lowered.dxil;
+            v.validate(&mut dxil).expect("DXIL validation failed");
+        }
+        #[cfg(not(windows))]
+        let _ = lowered;
+    }
 }
 
 #[cfg(test)]
