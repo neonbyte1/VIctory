@@ -1054,10 +1054,21 @@ mod tests {
     }
 
     #[test]
-    fn a_delay_iat_ending_at_the_end_of_the_image_is_accepted() {
-        // Two 8-byte slots: the second ends exactly at SizeOfImage (0x2000).
-        let info = ImageInfo::parse(&delay_image(0x2000 - 16)).unwrap();
-        assert_eq!(info.delay_imports[0].entries[1].iat_slot_rva, 0x2000 - 8);
+    fn a_delay_iat_ending_at_the_file_backed_end_of_the_section_is_accepted() {
+        // Two 8-byte slots: the second ends exactly at the file-backed end of
+        // the section (0x1200; the section is RVA 0x1000..0x1200).
+        let info = ImageInfo::parse(&delay_image(0x1200 - 16)).unwrap();
+        assert_eq!(info.delay_imports[0].entries[1].iat_slot_rva, 0x1200 - 8);
+    }
+
+    #[test]
+    fn a_delay_iat_running_past_the_file_backed_section_is_rejected() {
+        // One byte past the file-backed end of the section: the second slot
+        // would end at 0x1201.
+        assert!(matches!(
+            ImageInfo::parse(&delay_image(0x1200 - 15)),
+            Err(PeError::Malformed(_))
+        ));
     }
 
     #[test]
