@@ -3415,10 +3415,13 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if name == "ds_swizzle_b32" {
-            // Bit 15 set: each lane of a quad picks a lane of it; else lanes
-            // of each group of 32 combine their index with and/or/xor masks.
-            let quad = offset & 0x8000 != 0
-                || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
+            // From 0xE000: an FFT order; from 0xC000: a rotation. Below, bit
+            // 15 set: each lane of a quad picks a lane of it; else lanes of
+            // each group of 32 combine their index with and/or/xor masks.
+            let (fft, rotate) = (offset >= 0xE000, (0xC000..0xE000).contains(&offset));
+            let quad = !(fft || rotate)
+                && (offset & 0x8000 != 0
+                    || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4);
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
@@ -3429,7 +3432,41 @@ impl<'a> Lower<'a> {
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
             let lane = self.lane_index();
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-            let src = if offset & 0x8000 != 0 {
+            let src = if fft || rotate {
+                // Both stay within the lane's group of 32.
+                let (low, high) = (k(self, 0x1F), k(self, !0x1F));
+                let mask = offset & 0x1F;
+                let i = self.s.m.bin(c, Bin::And, lane, low);
+                let j = if fft {
+                    // The 5 index bits reversed, shifted down by the number
+                    // of mask bits; the mask's bits stay the lane's own.
+                    let (top, m, i32t) = (k(self, 27), k(self, mask), self.s.t.i32);
+                    let down = k(self, mask.count_ones());
+                    let j = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[i]);
+                    let j = self.s.m.bin(c, Bin::LShr, j, top);
+                    let j = self.s.m.bin(c, Bin::LShr, j, down);
+                    let own = self.s.m.bin(c, Bin::And, i, m);
+                    self.s.m.bin(c, Bin::Or, j, own)
+                } else {
+                    // Left by bits 5-9 lanes (bit 10: right); the mask's
+                    // bits stay the lane's own. This is the ISA's
+                    // pseudocode, which RDNA2 hardware follows; its
+                    // examples for mask 1 list other lanes.
+                    let n = offset >> 5 & 0x1F;
+                    let n = if offset & 0x400 != 0 {
+                        n.wrapping_neg()
+                    } else {
+                        n
+                    };
+                    let (n, m, rest) = (k(self, n), k(self, mask), k(self, !mask & 0x1F));
+                    let j = self.s.m.bin(c, Bin::Add, i, n);
+                    let j = self.s.m.bin(c, Bin::And, j, rest);
+                    let own = self.s.m.bin(c, Bin::And, i, m);
+                    self.s.m.bin(c, Bin::Or, j, own)
+                };
+                let group = self.s.m.bin(c, Bin::And, lane, high);
+                self.s.m.bin(c, Bin::Or, group, j)
+            } else if offset & 0x8000 != 0 {
                 let (three, one) = (k(self, 3), k(self, 1));
                 let sel = self.s.m.bin(c, Bin::And, lane, three);
                 let sh = self.s.m.bin(c, Bin::Shl, sel, one);
