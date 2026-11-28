@@ -63,7 +63,7 @@ git switch stack/nvidia-wine
 cargo build --profile diag -p victory --features diagnostics
 ```
 
-**Linux**: follow `docs/linux-wine.md` on branch `docs/linux-wine` (#3291): GE-Proton11-14's vkd3d-proton and DXVK, a dedicated prefix, headless gamescope, the xwin cross-build.
+**Linux**: follow `docs/linux-wine.md` on branch `docs/linux-wine` (#3291): GE-Proton11-14's vkd3d-proton and DXVK, a dedicated prefix, headless gamescope, the xwin cross-build. This fork's packaged version of the same setup, with the build/queue/gate scripts, is [linux.md](linux.md).
 
 The title itself: your own legal dump of the Xbox Series build 1.0.2.1 (blake3 `b99f876b74d4a77f…`); we compare only runs of that build.
 

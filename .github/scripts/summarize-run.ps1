@@ -13,7 +13,7 @@ function Fmt([double]$V) { return $V.ToString('0.0', [Globalization.CultureInfo]
 
 $esc = [char]27
 $ansi = [regex]($esc + '\[[0-9;]*m')
-$frameRe = [regex]'([\d.]+) fps, ([\d.]+) ms/title frame \(([\d.]+) preparing.*?; ([\d.]+) on the GPU; ([\d.]+) copying back.*?dropped (\d+) without'
+$frameRe = [regex]'([\d.]+) fps, ([\d.]+) ms/(?:title )?frame \(([\d.]+) preparing.*?; ([\d.]+) on the GPU; ([\d.]+) copying back.*?dropped (\d+) without'
 $vramRe = [regex]'video memory: (\d+) MB of a (\d+) MB budget'
 $gpuRe = [regex]'host GPU name=(.+?) vendor=\S+ driver="?([^" ]+)"? dedicated_mib=(\d+)'
 $crashRe = [regex]'(?i)device removed|panicked|access violation|unhandled exception|crashes\.log|fatal'

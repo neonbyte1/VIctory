@@ -20,7 +20,7 @@ A *terminal* is a window where you type commands. On Windows open **PowerShell**
 3. Install **Git** (`winget install --id Git.Git -e`) or skip it and use "Download ZIP" below.
 4. Close PowerShell and open it again so it finds the new tools.
 
-**Linux (Wine/Proton)**: the program itself is a Windows program. You build the Windows version with the cross-compile steps in the README ("Tests on a Linux host, under Wine") and run it in Wine with vkd3d-proton (Wine's own Direct3D 12 is too old). This is harder; if you get stuck, open a "Hardware" issue and tell us your distribution and what failed, that is useful by itself. The summarizer for logs is `.github/scripts/summarize-run.sh` (needs `python3`).
+**Linux (Wine/Proton)**: the program itself is a Windows program. You build the Windows version with the cross-compile steps in the README ("Tests on a Linux host, under Wine") and run it in Wine with vkd3d-proton (Wine's own Direct3D 12 is too old). This is harder; if you get stuck, open a "Hardware" issue and tell us your distribution and what failed, that is useful by itself. The packaged Linux harness (prerequisites, build, measurements, device tests) is [linux.md](linux.md). The summarizer for logs is `.github/scripts/summarize-run.sh` (needs `python3`).
 
 ## 2. Get the code
 
