@@ -395,6 +395,15 @@ const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
     row_pitch: 0,
 };
 
+/// The buffer footprint format of a depth or stencil plane in a two-plane texture.
+pub(crate) fn planar_depth_copy_format(format: u32, plane: u32) -> Option<u32> {
+    match (format, plane) {
+        (19..=22 | 44..=47, 0) => (39, 512, mip), // DXGI_FORMAT_R32_TYPELESS
+        (19..=22 | 44..=47, 1) => (60, 512, mip), // DXGI_FORMAT_R8_TYPELESS
+        _ => None,
+    }
+}
+
 /// One subresource's upload footprint (offset 0), row count and unpadded row size.
 fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32, u64)> {
     const PITCH: u64 = 256;
@@ -3946,6 +3955,181 @@ pub(crate) mod tests {
         for object in [upload, allocator, queue, image, source] {
             slot::<Release>(object, 0x10)(object);
         }
+    }
+
+    /// The depth and stencil planes of an array mip have different row formats.
+    #[cfg(windows)]
+    #[test]
+    fn depth_and_stencil_planes_reach_the_guest_buffer() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let iid = &object::IUNKNOWN;
+        let (mut queue, mut allocator) = (null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, iid, &mut allocator),
+            S_OK
+        );
+        let release = |object: This| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        let create = |desc: &ResourceDesc, state| {
+            let mut object = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    desc,
+                    state,
+                    null.cast(),
+                    iid,
+                    &mut object
+                ),
+                S_OK
+            );
+            object
+        };
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        const DEPTH_WRITE: u32 = 0x10;
+        let mut failures = Vec::new();
+        for (storage, view) in [(45, 45), (44, 45), (20, 20), (19, 20)] {
+            let mut desc = texture(8, 4, storage, 2);
+            desc.depth_or_array_size = 2;
+            desc.flags = 2; // ALLOW_DEPTH_STENCIL
+            let image = create(&desc, DEPTH_WRITE);
+            let target = create(&buffer(4096), 0);
+            let (out, _) = buffer_bytes(target).unwrap();
+            // SAFETY: the guest target buffer holds 4096 bytes.
+            unsafe { out.write_bytes(0xee, 4096) };
+            let mut list = null;
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list,),
+                S_OK
+            );
+            let texture = host_resource(image).unwrap();
+            let dsv = host.dsv(
+                &texture,
+                Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                    Format: DXGI_FORMAT(view),
+                    ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                        Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
+                            MipSlice: 1,
+                            FirstArraySlice: 1,
+                            ArraySize: 1,
+                        },
+                    },
+                    ..Default::default()
+                }),
+            );
+            let host_list = crate::list::host_list(list).unwrap();
+            // Track the fixture's native clears before readback sets COPY_SOURCE.
+            crate::list::ensure_state(host_list, image, DEPTH_WRITE);
+            let native = &host_list.list;
+            let flags = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+            let left = RECT {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 2,
+            };
+            // SAFETY: a live DSV into the selected mip and array slice.
+            unsafe {
+                native.ClearDepthStencilView(dsv, flags, 0.75, 0x91, None);
+                native.ClearDepthStencilView(dsv, flags, 0.25, 0x37, Some(&[left]));
+            }
+            let (left, right) = if view == 45 {
+                (0x0040_0000u32, 0x00bf_ffffu32)
+            } else {
+                (0.25_f32.to_bits(), 0.75_f32.to_bits())
+            };
+            let depth_row: Vec<_> = [left, left, right, right]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let stencil_row = [0x37, 0x37, 0x91, 0x91];
+            let mut expected = vec![0xeeu8; 4096];
+            let copy = slot::<Copy>(list, 0x80);
+            for (index, start, format, row) in [
+                (3, 512, 39, depth_row.as_slice()),
+                (7, 1536, 60, stencil_row.as_slice()),
+            ] {
+                let mut footprint = NO_FOOTPRINT;
+                copyable_footprints(
+                    null,
+                    &desc,
+                    index,
+                    1,
+                    start,
+                    &mut footprint,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(
+                    footprint,
+                    PlacedFootprint {
+                        offset: start,
+                        format,
+                        width: 4,
+                        height: 2,
+                        depth: 1,
+                        row_pitch: 512,
+                    }
+                );
+                let from = Location {
+                    resource: image,
+                    kind: 0,
+                    footprint: PlacedFootprint {
+                        offset: u64::from(index),
+                        ..footprint
+                    },
+                };
+                let to = Location {
+                    resource: target,
+                    kind: 1,
+                    footprint,
+                };
+                copy(list, &to, 0, 0, 0, &from, null.cast());
+                for at in [start as usize, start as usize + 512] {
+                    expected[at..at + row.len()].copy_from_slice(row);
+                }
+            }
+            assert_eq!(
+                slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+                S_OK
+            );
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+            // SAFETY: the guest buffer still lives and the submission has run.
+            let actual = unsafe { std::slice::from_raw_parts(out, 4096) };
+            if actual != expected {
+                failures.push((storage, actual.iter().all(|&byte| byte == 0xee)));
+            }
+            for object in [list, image, target] {
+                release(object);
+            }
+        }
+        release(allocator);
+        release(queue);
+        assert!(
+            failures.is_empty(),
+            "(format, untouched buffer): {failures:?}"
+        );
     }
 
     /// A texture region copied into a title buffer through our list and
