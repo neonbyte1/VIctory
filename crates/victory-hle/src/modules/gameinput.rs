@@ -170,6 +170,65 @@ fn with_mouse(pad: PadState, (x, y): (f32, f32)) -> PadState {
     }
 }
 
+/// A scripted key: when it starts, how long it is held, and its code.
+#[cfg(any(test, feature = "diagnostics"))]
+type Scripted = (Duration, Duration, u8);
+
+/// [`scripted`]: `at:key[:hold]` entries, the hold 0.2 s when not given. A
+/// screen that samples its input slower than the hold ignores the key, which
+/// reads exactly like a screen that ignores input.
+#[cfg(any(test, feature = "diagnostics"))]
+fn parse_scripted(list: &str) -> Vec<Scripted> {
+    const DEFAULT_HOLD: Duration = Duration::from_millis(200);
+    list.split(',')
+        .filter_map(|entry| {
+            let mut parts = entry.split(':');
+            let at = parts.next()?;
+            let key = parts.next()?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            let hold = parts
+                .next()
+                .and_then(|h| Duration::try_from_secs_f64(h.trim().parse().ok()?).ok())
+                .unwrap_or(DEFAULT_HOLD);
+            Some((
+                Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                hold,
+                vk,
+            ))
+        })
+        .collect()
+}
+
+/// The keys still held at `now`: a key is held from its `at` for `hold`.
+/// The comparison goes through `checked_sub` rather than `at + hold`, so
+/// a pair whose sum leaves `Duration`'s range cannot panic, and a `hold`
+/// of zero keeps the key for the default instead of dropping it in
+/// silence (a lost press is what this switch exists to rule out).
+#[cfg(any(test, feature = "diagnostics"))]
+fn held(keys: &[Scripted], now: Duration) -> Vec<u8> {
+    const DEFAULT_HOLD: Duration = Duration::from_millis(200);
+    keys.iter()
+        .filter(|&&(at, hold, _)| {
+            now.checked_sub(at)
+                .is_some_and(|age| age < if hold.is_zero() { DEFAULT_HOLD } else { hold })
+        })
+        .map(|&(_, _, vk)| vk)
+        .collect()
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -1683,43 +1742,22 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<hold>],...` holds each
+    /// key for that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// `Left`, `Right` (the stand-in pad's table maps them to buttons). The
+    /// hold is in seconds, 0.2 by default: a screen that samples its input
+    /// slowly misses a hold shorter than its sampling, which looks exactly
+    /// like a screen that ignores input.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<Scripted>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+            (Instant::now(), parse_scripted(&list))
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        held(keys, now)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -2304,6 +2342,43 @@ mod tests {
         assert_eq!((Motors::speed(0.5), Motors::speed(1.0)), (32767, 65535));
     }
 
+    /// `VICTORY_KEYS` entries carry a hold now, and keep 0.2 s when they do
+    /// not: a screen that samples slower than the hold ignores the key, which
+    /// reads exactly like a screen that ignores input.
+    #[test]
+    fn a_scripted_key_holds_for_its_own_time_or_a_fifth_of_a_second() {
+        let keys = parse_scripted("100:Enter:0.8,105:Down,110:Z:1.5,broken,,7:Enter:notatime");
+        assert_eq!(
+            keys,
+            [
+                (Duration::from_secs(100), Duration::from_millis(800), 0x0D),
+                (Duration::from_secs(105), Duration::from_millis(200), 0x28),
+                (Duration::from_secs(110), Duration::from_millis(1500), b'Z'),
+                // A hold that does not parse falls back rather than dropping
+                // the key: the run matters more than the exact time.
+                (Duration::from_secs(7), Duration::from_millis(200), 0x0D),
+            ]
+        );
+    }
+
+    /// The window itself, not just the parse: a key with a long hold is still
+    /// down 350 ms in and up after it, a zero hold keeps the default, and a
+    /// pair whose sum leaves `Duration`'s range does not panic.
+    #[test]
+    fn a_scripted_key_is_held_exactly_its_window() {
+        let keys = parse_scripted("100:Enter:0.8,200:X:0,300:Z:1e19");
+        let at = |secs: f64| Duration::try_from_secs_f64(secs).unwrap();
+        assert_eq!(held(&keys, at(99.0)), Vec::<u8>::new());
+        assert_eq!(held(&keys, at(100.0)), vec![0x0D]);
+        assert_eq!(held(&keys, at(100.35)), vec![0x0D], "still down");
+        assert_eq!(held(&keys, at(100.8)), Vec::<u8>::new(), "released");
+        // A zero hold falls back to the default rather than dropping the key.
+        assert_eq!(held(&keys, at(200.1)), vec![b'X']);
+        assert_eq!(held(&keys, at(200.25)), Vec::<u8>::new());
+        // An absurd hold does not panic on the sum.
+        assert_eq!(held(&keys, at(300.5)), vec![b'Z']);
+    }
+
     #[test]
     fn scripted_keys_merge_into_connected_host_pad() {
         let (hub, host) = fake();
@@ -2699,3 +2774,7 @@ mod tests {
         assert_eq!(press_order(&[], b"AA"), b"A");
     }
 }
+
+
+
+
