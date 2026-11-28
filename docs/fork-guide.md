@@ -69,6 +69,7 @@ The title itself: your own legal dump of the Xbox Series build 1.0.2.1 (blake3 `
 
 ## 5. How we measure (so results compare)
 
+- **Every card we have measures.** A change counts once it's measured on more than one machine where it can matter: today the RTX 5090 (Linux/Wine, neonbyte1), the RTX 4080 (Windows, DieQuelle, #2), the RTX 4070 SUPER (Linux/Wine, muleyo, #28), and the RTX 2060 for screens and stability. A task issue names the change and the arms; whoever has a free machine claims a run of it. For anything that touches VRAM, the GPU path or Windows, a gain on one card is a note, not a result.
 - **Scene:** prison yard after the intro, **Series X profile**, the title's own 2560×1440, ray tracing on. Lower profiles, resolutions or switched-off features never count as gains.
 - **Run:** 420 s with a warm shader cache. The first ~250 s are intro and cutscene and can't be skipped (scripted button presses didn't work).
 - **Number:** the **median of the last 30** `victory_gpu::host: N fps, N ms/frame (…preparing…; …on the GPU; …copying back…)` lines, plus their minimum. Logs have ANSI colours: strip them first (`sed 's/\x1b\[[0-9;]*m//g'`).
