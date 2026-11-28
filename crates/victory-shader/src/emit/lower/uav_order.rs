@@ -47,7 +47,9 @@ fn access(i: &Inst) -> Option<(bool, bool)> {
 /// where one may have read or written, since the last title barrier
 /// (`s_barrier`, a group barrier with a UAV fence when the program writes
 /// UAVs). Earlier means on some path from the entry, around loops too.
-pub(super) fn meetings(p: &Program) -> HashSet<(usize, usize)> {
+/// With `raw` (`VICTORY_UAV_ORDER=raw`, [`super::super::uav_order_raw`]):
+/// only a read where an earlier access may have written.
+pub(super) fn meetings(p: &Program, raw: bool) -> HashSet<(usize, usize)> {
     const READ: u8 = 1;
     const WRITE: u8 = 2;
     // What happened since the last barrier, at a block's end.
@@ -56,7 +58,7 @@ pub(super) fn meetings(p: &Program) -> HashSet<(usize, usize)> {
             if i.name() == "s_barrier" {
                 since = 0;
             } else if let Some((r, w)) = access(i) {
-                if r && since & WRITE != 0 || w && since != 0 {
+                if r && since & WRITE != 0 || !raw && w && since != 0 {
                     out.insert((b, n));
                     since = 0;
                 }
@@ -110,10 +112,10 @@ impl Lower<'_> {
 #[cfg(test)]
 mod tests {
     /// The byte offsets of the instructions the halves meet before.
-    fn marked(words: &[u32]) -> Vec<usize> {
+    fn marked(words: &[u32], raw: bool) -> Vec<usize> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, true, 8).unwrap();
-        let mut at: Vec<usize> = super::meetings(&p)
+        let mut at: Vec<usize> = super::meetings(&p, raw)
             .into_iter()
             .map(|(b, i)| p.blocks[b].insts[i].machine.offset)
             .collect();
@@ -125,7 +127,8 @@ mod tests {
     const LOAD: [u32; 2] = [0xE030_1000, 0x8001_0203]; // buffer_load_dword v2, v3, s[4:7], 0 offen
 
     /// A read after a write, then (past a title barrier) a write after a
-    /// read; the read right after the barrier needs nothing.
+    /// read; the read right after the barrier needs nothing. Reads after
+    /// writes alone: the first only.
     #[test]
     fn conflicts_since_the_last_barrier() {
         let words = [
@@ -137,7 +140,8 @@ mod tests {
             &[0xBF81_0000], // s_endpgm
         ]
         .concat();
-        assert_eq!(marked(&words), [8, 28]);
+        assert_eq!(marked(&words, false), [8, 28]);
+        assert_eq!(marked(&words, true), [8]);
     }
 
     /// In a loop, a load meets the store of the iteration before.
@@ -155,15 +159,16 @@ mod tests {
             ],
         ]
         .concat();
-        assert_eq!(marked(&words), [4, 12]);
+        assert_eq!(marked(&words, false), [4, 12]);
+        assert_eq!(marked(&words, true), [4]);
     }
 
     /// Loads alone, or stores after nothing, need no meeting.
     #[test]
     fn no_conflict_no_meeting() {
         let loads = [&LOAD[..], &LOAD, &[0xBF81_0000]].concat();
-        assert!(marked(&loads).is_empty());
+        assert!(marked(&loads, false).is_empty());
         let store = [&STORE[..], &[0xBF81_0000]].concat();
-        assert!(marked(&store).is_empty());
+        assert!(marked(&store, false).is_empty());
     }
 }

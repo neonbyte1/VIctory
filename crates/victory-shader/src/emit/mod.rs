@@ -306,6 +306,18 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Whether the halves of a console wave in the console flow meet only
+/// before a UAV read after a possible write (`VICTORY_UAV_ORDER=raw`, for
+/// A/B runs), not before every UAV access that conflicts with an earlier
+/// one (the default, `all`; `lower::uav_order`). The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn uav_order_raw() -> bool {
+    static RAW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("VICTORY_UAV_ORDER").is_ok_and(|v| v.trim().eq_ignore_ascii_case("raw"))
+    });
+    *RAW
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {

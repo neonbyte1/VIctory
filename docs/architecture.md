@@ -112,7 +112,8 @@ group barriers for cross-half exchanges and shared LDS accesses. A UAV
 access that conflicts with an earlier one (either of them writing), with no
 title barrier between them, gets its own meeting of the halves with a UAV
 fence: a group barrier, or a pair meeting where a group holds several
-console waves (`emit/lower/uav_order.rs`).
+console waves (`emit/lower/uav_order.rs`). `VICTORY_UAV_ORDER=raw` keeps
+only those before reads after writes (for A/B runs).
 `ds_permute_b32`, which is not translated yet, and whole-wave sections in
 partial groups can prevent splitting (`ds_bpermute_b32` does not: it
 gathers within each 32-lane half).
