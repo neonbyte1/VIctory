@@ -408,7 +408,9 @@ fn same_key(a: &KeyState, b: &KeyState) -> bool {
 impl Latch {
     /// `value` from the host, with the presses since the last read held.
     fn hold(&mut self, value: Value, now: u64, enabled: bool) -> Value {
-        let reader = self.read.is_some_and(|t| now.saturating_sub(t) < LATCH_IDLE);
+        let reader = self
+            .read
+            .is_some_and(|t| now.saturating_sub(t) < LATCH_IDLE);
         if !enabled || !reader {
             self.buttons.clear();
             self.keys.clear();
@@ -422,7 +424,10 @@ impl Latch {
                     let pressed = pad.buttons & !before;
                     // The same buttons tapped again before a read are one
                     // press: queued twice, they stayed down for two reads.
-                    if pressed != 0 && self.buttons.back() != Some(&pressed) && self.buttons.len() < LATCH_QUEUE {
+                    if pressed != 0
+                        && self.buttons.back() != Some(&pressed)
+                        && self.buttons.len() < LATCH_QUEUE
+                    {
                         self.buttons.push_back(pressed);
                     }
                 }
@@ -431,10 +436,14 @@ impl Latch {
                         Some(Value::Keys(raw)) => raw,
                         _ => &[],
                     };
-                    let pressed: Vec<KeyState> =
-                        keys.iter().filter(|k| !before.iter().any(|b| same_key(b, k))).copied().collect();
+                    let pressed: Vec<KeyState> = keys
+                        .iter()
+                        .filter(|k| !before.iter().any(|b| same_key(b, k)))
+                        .copied()
+                        .collect();
                     let again = self.keys.back().is_some_and(|last| {
-                        last.len() == pressed.len() && last.iter().all(|l| pressed.iter().any(|p| same_key(l, p)))
+                        last.len() == pressed.len()
+                            && last.iter().all(|l| pressed.iter().any(|p| same_key(l, p)))
                     });
                     if !pressed.is_empty() && !again && self.keys.len() < LATCH_QUEUE {
                         self.keys.push_back(pressed);
@@ -459,8 +468,9 @@ impl Latch {
             Value::Keys(mut keys) => {
                 let first: &[KeyState] = self.keys.front().map_or(&[], |k| k);
                 let later = self.keys.iter().skip(1).flatten();
-                let later: Vec<&KeyState> =
-                    later.filter(|l| !first.iter().any(|f| same_key(f, l))).collect();
+                let later: Vec<&KeyState> = later
+                    .filter(|l| !first.iter().any(|f| same_key(f, l)))
+                    .collect();
                 keys.retain(|k| !later.iter().any(|l| same_key(l, k)));
                 for key in first {
                     if !keys.iter().any(|k| same_key(k, key)) {
@@ -485,12 +495,24 @@ impl Latch {
                 if let Some(&first) = self.buttons.front()
                     && first & !raw.buttons != 0
                 {
-                    tracing::info!(buttons = format_args!("{:#x}", first & !raw.buttons), "a tap kept for the title's read (released before it)");
+                    tracing::info!(
+                        buttons = format_args!("{:#x}", first & !raw.buttons),
+                        "a tap kept for the title's read (released before it)"
+                    );
                 }
             }
             Some(Value::Keys(raw)) => {
-                for key in self.keys.front().into_iter().flatten().filter(|k| !raw.iter().any(|r| same_key(r, k))) {
-                    tracing::info!(virtual_key = key.virtual_key, "a key tap kept for the title's read (released before it)");
+                for key in self
+                    .keys
+                    .front()
+                    .into_iter()
+                    .flatten()
+                    .filter(|k| !raw.iter().any(|r| same_key(r, k)))
+                {
+                    tracing::info!(
+                        virtual_key = key.virtual_key,
+                        "a key tap kept for the title's read (released before it)"
+                    );
                 }
             }
             None => {}
@@ -1090,7 +1112,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -1124,9 +1149,10 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
     let state = hub.state();
     // A slot has a reading after its first connection. Its history also
     // keeps the device known if it later disconnects.
-    let known = hub.devices.iter().find(|device| {
-        device.info.id == *id && !state.slots[device.index].history.is_empty()
-    });
+    let known = hub
+        .devices
+        .iter()
+        .find(|device| device.info.id == *id && !state.slots[device.index].history.is_empty());
     match known {
         Some(device) => {
             // SAFETY: checked non-null.
@@ -1963,7 +1989,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState {
@@ -1975,7 +2010,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -2071,7 +2109,10 @@ mod tests {
         }
         hub.poll();
 
-        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(
             pad(r),

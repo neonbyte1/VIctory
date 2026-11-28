@@ -115,7 +115,11 @@ pub(crate) fn host<'a>(this: This, kind: u32, first: u32, count: u32) -> Option<
                 NodeMask: 0,
             };
             // SAFETY: plain object creation.
-            if let Err(e) = unsafe { crate::host::host()?.device.CreateQueryHeap(&host_desc, &mut made) } {
+            if let Err(e) = unsafe {
+                crate::host::host()?
+                    .device
+                    .CreateQueryHeap(&host_desc, &mut made)
+            } {
                 tracing::warn!(error = %e, ?desc, "no host query heap: stand-in results");
                 return None;
             }
@@ -267,8 +271,15 @@ mod tests {
 
     fn heap(kind: u32, count: u32) -> This {
         let mut heap = std::ptr::null();
-        let desc = Desc { kind, count, nodes: 0 };
-        assert_eq!(create(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap), S_OK);
+        let desc = Desc {
+            kind,
+            count,
+            nodes: 0,
+        };
+        assert_eq!(
+            create(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap),
+            S_OK
+        );
         heap
     }
 
@@ -322,7 +333,10 @@ mod tests {
 
     /// Closes the list and submits it (run and waited for with a host GPU).
     fn run(queue: This, list: This) {
-        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
     }
 
@@ -357,8 +371,20 @@ mod tests {
                 let mut code: Option<ID3DBlob> = None;
                 // SAFETY: the source and names live through the call.
                 unsafe {
-                    D3DCompile(source.as_ptr().cast(), source.len(), None, None, None, s!("main"), target, 0, 0, &mut code, None)
-                        .unwrap();
+                    D3DCompile(
+                        source.as_ptr().cast(),
+                        source.len(),
+                        None,
+                        None,
+                        None,
+                        s!("main"),
+                        target,
+                        0,
+                        0,
+                        &mut code,
+                        None,
+                    )
+                    .unwrap();
                 }
                 code.unwrap()
             };
@@ -373,19 +399,30 @@ mod tests {
             let ps = compile("float4 main() : SV_Target { return 1; }", s!("ps_5_0"));
             // SAFETY: the blobs' own bytes.
             let bytes = |b: &ID3DBlob| unsafe {
-                D3D12_SHADER_BYTECODE { pShaderBytecode: b.GetBufferPointer(), BytecodeLength: b.GetBufferSize() }
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: b.GetBufferPointer(),
+                    BytecodeLength: b.GetBufferSize(),
+                }
             };
             let mut blob: Option<ID3DBlob> = None;
             // SAFETY: plain serialization and creation; the descriptions
             // point at live data.
             unsafe {
-                D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)
-                    .unwrap();
+                D3D12SerializeRootSignature(
+                    &D3D12_ROOT_SIGNATURE_DESC::default(),
+                    D3D_ROOT_SIGNATURE_VERSION_1,
+                    &mut blob,
+                    None,
+                )
+                .unwrap();
                 let blob = blob.unwrap();
                 let root: ID3D12RootSignature = device
                     .CreateRootSignature(
                         0,
-                        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()),
+                        std::slice::from_raw_parts(
+                            blob.GetBufferPointer().cast::<u8>(),
+                            blob.GetBufferSize(),
+                        ),
                     )
                     .unwrap();
                 let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
@@ -401,7 +438,10 @@ mod tests {
                     },
                     PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
                     NumRenderTargets: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
                     ..Default::default()
                 };
                 desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
@@ -410,7 +450,10 @@ mod tests {
                 let mut target: Option<ID3D12Resource> = None;
                 device
                     .CreateCommittedResource(
-                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
                         D3D12_HEAP_FLAG_NONE,
                         &D3D12_RESOURCE_DESC {
                             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -419,7 +462,10 @@ mod tests {
                             DepthOrArraySize: 1,
                             MipLevels: 1,
                             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
                             Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                             ..Default::default()
                         },
@@ -428,7 +474,11 @@ mod tests {
                         &mut target,
                     )
                     .unwrap();
-                Triangle { root, pso, target: target.unwrap() }
+                Triangle {
+                    root,
+                    pso,
+                    target: target.unwrap(),
+                }
             }
         }
 
@@ -443,12 +493,31 @@ mod tests {
             let size = Self::SIZE as i32;
             // Cut away: a rectangle beside the target (the driver here does not
             // always cut everything for an empty one).
-            let rect = if scissor { RECT { left: 0, top: 0, right: size, bottom: size } } else { RECT { left: size, top: size, right: size + 1, bottom: size + 1 } };
+            let rect = if scissor {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: size,
+                    bottom: size,
+                }
+            } else {
+                RECT {
+                    left: size,
+                    top: size,
+                    right: size + 1,
+                    bottom: size + 1,
+                }
+            };
             // SAFETY: an open list; our live objects, alive until it ran.
             unsafe {
                 let l = &list.list;
                 l.OMSetRenderTargets(1, Some(&rtv), false, None);
-                l.RSSetViewports(&[D3D12_VIEWPORT { Width: size as f32, Height: size as f32, MaxDepth: 1.0, ..Default::default() }]);
+                l.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: size as f32,
+                    Height: size as f32,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
                 l.RSSetScissorRects(&[rect]);
                 l.SetGraphicsRootSignature(&self.root);
                 l.SetPipelineState(&self.pso);
@@ -492,8 +561,21 @@ mod tests {
         // Left running: the host list ends it at close.
         begin(list, occlusion, OCCLUSION, 7);
         // Results at 8-byte steps from 16, statistics at 128.
-        for (index, kind) in [(0, OCCLUSION), (1, BINARY_OCCLUSION), (2, OCCLUSION), (3, BINARY_OCCLUSION)] {
-            resolve(list, occlusion, kind, index, 1, buffer, 16 + 8 * u64::from(index));
+        for (index, kind) in [
+            (0, OCCLUSION),
+            (1, BINARY_OCCLUSION),
+            (2, OCCLUSION),
+            (3, BINARY_OCCLUSION),
+        ] {
+            resolve(
+                list,
+                occlusion,
+                kind,
+                index,
+                1,
+                buffer,
+                16 + 8 * u64::from(index),
+            );
         }
         resolve(list, statistics, PIPELINE_STATISTICS, 1, 1, buffer, 128);
         run(queue, list);
@@ -625,7 +707,11 @@ mod tests {
         slot::<Mark>(list, END)(list, occlusion, OCCLUSION, 0);
         slot::<Resolve>(list, RESOLVE)(list, occlusion, OCCLUSION, 0, 1, buffer, 8);
         run(queue, list);
-        assert_eq!(read(data, 1), u64::from(Triangle::SIZE * Triangle::SIZE), "samples passed");
+        assert_eq!(
+            read(data, 1),
+            u64::from(Triangle::SIZE * Triangle::SIZE),
+            "samples passed"
+        );
         for word in [0, 2, 7] {
             assert_eq!(read(data, word), 0xeeee_eeee_eeee_eeee, "word {word}");
         }
@@ -652,10 +738,15 @@ mod tests {
         let (begin, end) = (slot::<Mark>(list, BEGIN), slot::<Mark>(list, END));
         let resolve = slot::<Resolve>(list, RESOLVE);
         // `DrawInstanced` with nothing bound: recorded, not run.
-        let title_draw = || slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60)(list, 3, 1, 0, 0);
+        let title_draw =
+            || slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60)(list, 3, 1, 0, 0);
         // 0, 1: a cut-away host draw and a title draw not run. 2: the
         // cut-away draw alone, begun after the title draw.
-        for (index, kind, missed) in [(0, OCCLUSION, true), (1, BINARY_OCCLUSION, true), (2, OCCLUSION, false)] {
+        for (index, kind, missed) in [
+            (0, OCCLUSION, true),
+            (1, BINARY_OCCLUSION, true),
+            (2, OCCLUSION, false),
+        ] {
             begin(list, occlusion, kind, index);
             triangle.draw(list, false);
             if missed {
@@ -676,7 +767,11 @@ mod tests {
         assert_eq!(read(data, 0), 1 << 20, "stand-in samples");
         assert_eq!(read(data, 1), 1, "stand-in visible");
         assert_eq!(read(data, 2), 0, "measured: nothing passed");
-        assert_eq!((read(data, 8), read(data, 9)), (3, 1), "measured statistics");
+        assert_eq!(
+            (read(data, 8), read(data, 9)),
+            (3, 1),
+            "measured statistics"
+        );
         for object in [buffer, statistics, occlusion, list, allocator, queue] {
             release(object);
         }
@@ -713,7 +808,10 @@ mod tests {
         // The calibration is good to microseconds: 1 ms of slack.
         let slack = crate::queue::TIMESTAMP_FREQUENCY / 1000;
         assert!(before.saturating_sub(slack) <= first, "{before} {first}");
-        assert!(first <= second && second <= stand_in && stand_in <= after, "{first} {second} {stand_in} {after}");
+        assert!(
+            first <= second && second <= stand_in && stand_in <= after,
+            "{first} {second} {stand_in} {after}"
+        );
         assert_eq!(read(data, 0), 0xeeee_eeee_eeee_eeee);
         for object in [buffer, stamps, list, allocator, queue] {
             release(object);

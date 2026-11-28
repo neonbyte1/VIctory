@@ -85,9 +85,16 @@ fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Ve
         .map(|i| {
             let (mip, slice) = (i % mips, i / mips);
             let m = layout.mips.get(mip as usize)?;
-            let (z0, z1) = if d.dimension == Dimension::Tex3d { (0, m.depth.max(1) - 1) } else { (slice, slice) };
+            let (z0, z1) = if d.dimension == Dimension::Tex3d {
+                (0, m.depth.max(1) - 1)
+            } else {
+                (slice, slice)
+            };
             let first = layout.offset(mip, 0, 0, z0).ok()?;
-            let last = layout.offset(mip, m.width.max(1) - 1, m.height.max(1) - 1, z1).ok()? + u64::from(d.element_bytes);
+            let last = layout
+                .offset(mip, m.width.max(1) - 1, m.height.max(1) - 1, z1)
+                .ok()?
+                + u64::from(d.element_bytes);
             let (from, to) = (first / block * block, last.div_ceil(block) * block);
             Some((from as usize, (to.min(layout.size)) as usize))
         })
@@ -150,7 +157,8 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let taken = {
         let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
         let i = b.free.iter().position(|e| e.0 == class);
-        i.and_then(|i| b.free.remove(i)).inspect(|_| b.free_bytes -= class)
+        i.and_then(|i| b.free.remove(i))
+            .inspect(|_| b.free_bytes -= class)
     };
     // Made without the pool's lock (refreshes run on several threads).
     let e = match taken {
@@ -162,7 +170,11 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         }
     };
     let made = (e.1.clone(), e.2 as *mut u8);
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).used.push(e);
+    BUFFERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .used
+        .push(e);
     Some(made)
 }
 
@@ -181,7 +193,11 @@ struct Chunks {
 // SAFETY: the mappings are persistent mappings of the upload buffers.
 unsafe impl Send for Chunks {}
 
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks {
+    all: Vec::new(),
+    current: 0,
+    used: 0,
+});
 
 const CHUNK: u64 = 32 << 20;
 /// Chunks kept between submissions (more are made while one needs them).
@@ -237,7 +253,10 @@ pub(crate) fn cached_staging_bytes() -> Option<(u64, usize)> {
 /// get its upload.
 pub(crate) fn host_writes(list: &HostList, resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+        list.defer_host(move || {
+            copy.host_written
+                .store(true, std::sync::atomic::Ordering::Relaxed)
+        });
     }
 }
 
@@ -355,7 +374,12 @@ impl AliasPlanCache {
 
     #[cfg(test)]
     fn clear(&self) {
-        if let Some(map) = self.entries.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(map) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
             map.clear();
         }
         self.computations
@@ -495,7 +519,11 @@ fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) 
     // SAFETY: live resources.
     let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
     let Some(plan) = plans.get_or_compute(&host.device, &da, &db) else {
-        once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
+        once!(
+            ?da,
+            ?db,
+            "an aliased texture not copied: its layouts differ on the host"
+        );
         return false;
     };
     let Some(buffer) = host.default_buffer(plan.total) else {
@@ -505,23 +533,33 @@ fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) 
     crate::texture::host_writes(list, to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
-    let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: a borrowed pointer the copy does not release.
-        pResource: unsafe { std::mem::transmute_copy(r) },
-        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
-    };
+    let place =
+        |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+        };
     let sub = |r: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: as above.
         pResource: unsafe { std::mem::transmute_copy(r) },
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: i,
+        },
     };
     let l = &list.list;
     // SAFETY: an open list; live resources in the states named.
     unsafe {
         for i in 0..plan.n {
-            l.CopyTextureRegion(&place(&buffer, plan.fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
+            l.CopyTextureRegion(
+                &place(&buffer, plan.fa[i as usize]),
+                0,
+                0,
+                0,
+                &sub(&a, i),
+                None,
+            );
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
@@ -529,7 +567,14 @@ fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) 
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
         for i in 0..plan.n {
-            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, plan.fb[i as usize]), None);
+            l.CopyTextureRegion(
+                &sub(&b, i),
+                0,
+                0,
+                0,
+                &place(&buffer, plan.fb[i as usize]),
+                None,
+            );
         }
     }
     static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
@@ -566,11 +611,21 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         #[cfg(feature = "diagnostics")]
         {
             static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-            if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(resource as usize) {
+            if SEEN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_default()
+                .insert(resource as usize)
+            {
                 let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
                 // SAFETY: a live resource.
                 let desc = unsafe { texture.GetDesc() };
-                tracing::debug!(?resource, ?memory, ?desc, "a sampled texture keeps what the host copied into it: not uploaded from title memory");
+                tracing::debug!(
+                    ?resource,
+                    ?memory,
+                    ?desc,
+                    "a sampled texture keeps what the host copied into it: not uploaded from title memory"
+                );
             }
         }
         return;
@@ -578,7 +633,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if !list.first_use(texture.as_raw() as usize) {
         return;
     }
-    let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource)) else {
+    let (Some(staging), Some(copy)) = (
+        staging(resource, texture),
+        crate::resource::host_copy(resource),
+    ) else {
         return;
     };
     // Each list recorded the copy before (run perf7: 149 textures uploaded
@@ -608,10 +666,22 @@ pub(crate) fn record_uploads(
     }
     let mut readable = Vec::with_capacity(items.len());
     for &(staging, copy, (buffer, at, subresources)) in items {
-        copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
+        copies(
+            list,
+            &copy.texture,
+            staging,
+            (buffer, *at),
+            subresources,
+            String::new,
+        );
         list.keep(buffer);
-        staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        staging
+            .uploads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        staging.copied.fetch_add(
+            subresources.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(b) = list.move_texture(copy, SHADER_RESOURCE) {
             readable.push(b);
         }
@@ -627,17 +697,18 @@ pub(crate) fn record_uploads(
 /// meanwhile).
 #[cfg(test)]
 pub(crate) fn uploads(resource: This) -> u64 {
-    let staging = crate::resource::host_copy(resource).and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    let staging = crate::resource::host_copy(resource)
+        .and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
     staging.map_or(0, |s| s.uploads.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The subresources those uploads copied (tests, as [`uploads`]).
 #[cfg(test)]
 pub(crate) fn copied(resource: This) -> u64 {
-    let staging = crate::resource::host_copy(resource).and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    let staging = crate::resource::host_copy(resource)
+        .and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
     staging.map_or(0, |s| s.copied.load(std::sync::atomic::Ordering::Relaxed))
 }
-
 
 /// Records the copy of `subresources` of `buffer` (laid out as `staging`
 /// says) into `texture` (in the copy destination state); `name` names it
@@ -720,7 +791,10 @@ pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 /// fewer than two.
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get() / 4)
+        .clamp(1, 4)
+        .min(n);
     if threads < 2 {
         (0..n).for_each(f);
         return;
@@ -744,7 +818,9 @@ pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
 /// changed on several threads at once (reading title memory and detiling
 /// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
-pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
+pub(crate) fn refresh_all(
+    work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)],
+) -> Vec<Option<Upload>> {
     if work.is_empty() {
         return Vec::new();
     }
@@ -810,7 +886,8 @@ impl Staging {
                     .unwrap_or(1)
             });
             if *EVERY > 1 {
-                return (crate::frame::current() + ((self.memory as usize >> 16) as u64)).is_multiple_of(*EVERY);
+                return (crate::frame::current() + ((self.memory as usize >> 16) as u64))
+                    .is_multiple_of(*EVERY);
             }
         }
         true
@@ -876,7 +953,12 @@ impl Staging {
                     #[cfg(feature = "diagnostics")]
                     let _census = crate::census::as_kind(crate::census::Kind::Texture, 0);
                     // SAFETY: inside the buffer of the texture's size.
-                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
+                    crate::host::copy_mapped(
+                        unsafe { read.as_mut_ptr().add(a) },
+                        self.memory.wrapping_add(a),
+                        b - a,
+                        false,
+                    );
                     (bytes, _) = (bytes + b - a, done.push((a, b)));
                 }
             }
@@ -891,7 +973,10 @@ impl Staging {
                 .filter(|&i| {
                     let (a, b) = span(i);
                     let (a0, b0) = (start + a, start + b);
-                    if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
+                    if ranges
+                        .iter()
+                        .any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0))
+                    {
                         last.hashes[i] = None;
                         return true;
                     }
@@ -999,9 +1084,11 @@ impl Staging {
             // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
             // keeping the slice strictly inside the mapped staging buffer even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+            let linear =
+                unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
             if let Err(e) =
-                plane.layout
+                plane
+                    .layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
@@ -1025,7 +1112,10 @@ static RETAINED_SCRATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 #[cfg(feature = "diagnostics")]
 impl Drop for ScratchCache {
     fn drop(&mut self) {
-        RETAINED_SCRATCH.fetch_sub(self.0.get_mut().capacity(), std::sync::atomic::Ordering::Relaxed);
+        RETAINED_SCRATCH.fetch_sub(
+            self.0.get_mut().capacity(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -1054,10 +1144,12 @@ impl Drop for Scratch {
             SCRATCH.with(|cache| {
                 let retained = std::mem::take(&mut self.0);
                 #[cfg(feature = "diagnostics")]
-                RETAINED_SCRATCH.fetch_add(retained.capacity(), std::sync::atomic::Ordering::Relaxed);
+                RETAINED_SCRATCH
+                    .fetch_add(retained.capacity(), std::sync::atomic::Ordering::Relaxed);
                 let previous = cache.0.replace(retained);
                 #[cfg(feature = "diagnostics")]
-                RETAINED_SCRATCH.fetch_sub(previous.capacity(), std::sync::atomic::Ordering::Relaxed);
+                RETAINED_SCRATCH
+                    .fetch_sub(previous.capacity(), std::sync::atomic::Ordering::Relaxed);
                 drop(previous);
             });
         }
@@ -1110,8 +1202,7 @@ fn committed_kind(at: *const u8, len: usize) -> Committed {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        let unreadable = info.Protect == 0
-            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
+        let unreadable = info.Protect == 0 || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
         if n == 0 || info.State != MEM_COMMIT || unreadable {
             return Committed::No;
         }
@@ -1156,7 +1247,11 @@ pub(crate) fn staging_for(
         );
         return None;
     };
-    if layout.planes.iter().any(|plane| plane.layout.desc.swizzle.xor()) {
+    if layout
+        .planes
+        .iter()
+        .any(|plane| plane.layout.desc.swizzle.xor())
+    {
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
@@ -1214,7 +1309,11 @@ pub(crate) fn staging_for(
     }
     // Both D3D12 copies and mapped CPU pointers use these offsets.
     if footprints.iter().any(|f| f.Offset >= total) {
-        once!(?desc, total, "texture upload footprint outside its staging buffer");
+        once!(
+            ?desc,
+            total,
+            "texture upload footprint outside its staging buffer"
+        );
         return None;
     }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
@@ -1224,9 +1323,18 @@ pub(crate) fn staging_for(
         .iter()
         .flat_map(|plane| {
             let offset = plane.offset as usize;
-            let mut ranges = spans(&plane.layout, subresources_per_plane, u32::from(d.MipLevels));
-            ranges.resize(subresources_per_plane as usize, (0, plane.layout.size as usize));
-            ranges.into_iter().map(move |(a, b)| (offset + a, offset + b))
+            let mut ranges = spans(
+                &plane.layout,
+                subresources_per_plane,
+                u32::from(d.MipLevels),
+            );
+            ranges.resize(
+                subresources_per_plane as usize,
+                (0, plane.layout.size as usize),
+            );
+            ranges
+                .into_iter()
+                .map(move |(a, b)| (offset + a, offset + b))
         })
         .collect();
     let tracked = crate::watch::track(memory as usize, layout_size, true);
@@ -1411,7 +1519,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn subresource_len_stays_inside_staging_total() {
         // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
@@ -1441,7 +1548,10 @@ mod tests {
             DepthOrArraySize: 1,
             MipLevels: 2,
             Format: DXGI_FORMAT_BC4_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             ..Default::default()
         };
         let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
@@ -1484,8 +1594,14 @@ mod tests {
         };
         assert!(!committed(usize::MAX as *const u8, 16));
         // SAFETY: reserving and committing one private page for the test, freed below.
-        let noaccess =
-            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS) };
+        let noaccess = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_NOACCESS,
+            )
+        };
         assert!(!noaccess.is_null());
         assert!(!committed(noaccess.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
@@ -1493,8 +1609,14 @@ mod tests {
 
         // Negative control: a readable committed page still passes.
         // SAFETY: reserving and committing one private page for the test, freed below.
-        let rw =
-            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let rw = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
         assert!(!rw.is_null());
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
@@ -1674,7 +1796,9 @@ mod tests {
         assert!(first.total > 0);
         assert_eq!(plans.len(), 1);
         assert_eq!(
-            plans.computations.load(std::sync::atomic::Ordering::Relaxed),
+            plans
+                .computations
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
 
@@ -1684,19 +1808,31 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(plans.len(), 1);
         assert_eq!(
-            plans.computations.load(std::sync::atomic::Ordering::Relaxed),
+            plans
+                .computations
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
 
         // Incompatible dimensions/bytes-per-row: `None` is also cached cleanly.
         let small = tex2d_desc(4, 4, 42, 1, 4);
         let mismatch = tex2d_desc(8, 8, 28, 1, 0);
-        assert!(plans.get_or_compute(&host.device, &small, &mismatch).is_none());
+        assert!(
+            plans
+                .get_or_compute(&host.device, &small, &mismatch)
+                .is_none()
+        );
         assert_eq!(plans.len(), 2);
-        assert!(plans.get_or_compute(&host.device, &small, &mismatch).is_none());
+        assert!(
+            plans
+                .get_or_compute(&host.device, &small, &mismatch)
+                .is_none()
+        );
         assert_eq!(plans.len(), 2);
         assert_eq!(
-            plans.computations.load(std::sync::atomic::Ordering::Relaxed),
+            plans
+                .computations
+                .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
 
@@ -1886,7 +2022,9 @@ mod tests {
         );
         assert_eq!(PLANS.len(), 2);
         assert_eq!(
-            PLANS.computations.load(std::sync::atomic::Ordering::Relaxed),
+            PLANS
+                .computations
+                .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
         assert!(!is_host_written(to.0));
@@ -1895,7 +2033,14 @@ mod tests {
         host.execute(&[&list]);
         assert!(is_host_written(to.0));
         assert!(is_host_written(to_bc.0));
-        verify_readback(&readback, fb[0], rb[0], sb[0] as usize, total_b, &expected_1);
+        verify_readback(
+            &readback,
+            fb[0],
+            rb[0],
+            sb[0] as usize,
+            total_b,
+            &expected_1,
+        );
         verify_readback(
             &readback_bc,
             fb_bc[0],
@@ -1936,13 +2081,22 @@ mod tests {
             0x3C,
         );
         assert_eq!(
-            PLANS.computations.load(std::sync::atomic::Ordering::Relaxed),
+            PLANS
+                .computations
+                .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
         list.close();
         list2.close();
         host.execute(&[&list, &list2]);
-        verify_readback(&readback, fb[0], rb[0], sb[0] as usize, total_b, &expected_2);
+        verify_readback(
+            &readback,
+            fb[0],
+            rb[0],
+            sb[0] as usize,
+            total_b,
+            &expected_2,
+        );
         verify_readback(
             &readback_bc,
             fb_bc[0],

@@ -124,15 +124,30 @@ impl Heaps {
     }
 
     /// A range of `size` bytes: in a heap with room, else in a new heap.
-    fn allocate(&mut self, device: &ID3D12Device, size: u64, align: u64) -> Option<(ID3D12Heap, Placement)> {
+    fn allocate(
+        &mut self,
+        device: &ID3D12Device,
+        size: u64,
+        align: u64,
+    ) -> Option<(ID3D12Heap, Placement)> {
         for h in &mut self.heaps {
             if let Some(offset) = take(&mut h.free, size, align) {
-                return Some((h.heap.clone(), Placement { heap: h.id, offset, size }));
+                return Some((
+                    h.heap.clone(),
+                    Placement {
+                        heap: h.id,
+                        offset,
+                        size,
+                    },
+                ));
             }
         }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: HEAP,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
             Alignment: ALIGN,
             Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
         };
@@ -146,8 +161,19 @@ impl Heaps {
         let mut free = BTreeMap::new();
         free.insert(0, HEAP);
         let offset = take(&mut free, size, align)?;
-        self.heaps.push(Heap { heap: heap.clone(), id, free });
-        Some((heap, Placement { heap: id, offset, size }))
+        self.heaps.push(Heap {
+            heap: heap.clone(),
+            id,
+            free,
+        });
+        Some((
+            heap,
+            Placement {
+                heap: id,
+                offset,
+                size,
+            },
+        ))
     }
 }
 
@@ -158,7 +184,10 @@ pub(crate) fn fits(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
         | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
         | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
         | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS.0;
-    if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || desc.Flags.0 & USES != 0 || desc.SampleDesc.Count > 1 {
+    if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+        || desc.Flags.0 & USES != 0
+        || desc.SampleDesc.Count > 1
+    {
         return false;
     }
     // SAFETY: a plain query.
@@ -168,7 +197,10 @@ pub(crate) fn fits(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
 
 /// Room for a texture of `desc` in a heap ([`fits`] first): the heap and
 /// the placement, which the texture gives back with [`free`].
-pub(crate) fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Heap, Placement)> {
+pub(crate) fn place(
+    device: &ID3D12Device,
+    desc: &D3D12_RESOURCE_DESC,
+) -> Option<(ID3D12Heap, Placement)> {
     // SAFETY: a plain query.
     let info = unsafe { device.GetResourceAllocationInfo(0, &[*desc]) };
     let size = info.SizeInBytes.next_multiple_of(ALIGN);
@@ -181,7 +213,10 @@ pub(crate) fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> Option
 /// A range [`place`] gave whose texture could not be made there.
 pub(crate) fn unplace(p: Placement) {
     let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(h) = heaps.as_mut().and_then(|hs| hs.heaps.iter_mut().find(|h| h.id == p.heap)) {
+    if let Some(h) = heaps
+        .as_mut()
+        .and_then(|hs| hs.heaps.iter_mut().find(|h| h.id == p.heap))
+    {
         give(&mut h.free, p.offset, p.size);
     }
 }
@@ -209,7 +244,9 @@ pub(crate) fn free_bytes() -> u64 {
 /// what nothing holds now), for the statistics line.
 pub(crate) fn stats() -> (usize, u64, u64) {
     let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(h) = heaps.as_mut() else { return (0, 0, 0) };
+    let Some(h) = heaps.as_mut() else {
+        return (0, 0, 0);
+    };
     h.reap();
     let free: u64 = h.heaps.iter().flat_map(|h| h.free.values()).sum();
     (h.heaps.len(), h.heaps.len() as u64 * HEAP - free, free)
@@ -241,7 +278,10 @@ mod tests {
             DepthOrArraySize: 1,
             MipLevels: 9,
             Format: DXGI_FORMAT_BC1_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             ..Default::default()
         };
         assert!(fits(&host.device, &desc));
@@ -249,7 +289,17 @@ mod tests {
         let (heap, a) = heaps.allocate(&host.device, ALIGN, ALIGN).unwrap();
         let mut texture: Option<ID3D12Resource> = None;
         // SAFETY: a range of the heap, our out pointer.
-        unsafe { host.device.CreatePlacedResource(&heap, a.offset(), &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture) }.unwrap();
+        unsafe {
+            host.device.CreatePlacedResource(
+                &heap,
+                a.offset(),
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut texture,
+            )
+        }
+        .unwrap();
         let texture = texture.unwrap();
         let held = texture.clone();
         heaps.pending.push((texture, a));
@@ -272,9 +322,17 @@ mod tests {
         assert_eq!((a, b, c), (0, 3 * k, 5 * k));
         assert_eq!(take(&mut free, 2 * k, k), None, "one 64 KiB range left");
         give(&mut free, b, 2 * k);
-        assert_eq!(take(&mut free, 3 * k, k), None, "two ranges of 2 and 1, not joined");
+        assert_eq!(
+            take(&mut free, 3 * k, k),
+            None,
+            "two ranges of 2 and 1, not joined"
+        );
         give(&mut free, c, 4 * k);
-        assert_eq!(free, BTreeMap::from([(3 * k, 7 * k)]), "joined with both neighbours");
+        assert_eq!(
+            free,
+            BTreeMap::from([(3 * k, 7 * k)]),
+            "joined with both neighbours"
+        );
         give(&mut free, a, 3 * k);
         assert_eq!(free, BTreeMap::from([(0, 10 * k)]));
         // An aligned range inside a free one keeps the padding before it.

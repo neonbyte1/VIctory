@@ -75,7 +75,11 @@ fn selects_from_independently_written_mask_words() {
             lanes_max: 32,
         };
         for target in [wave32_only, super::super::Target::ANY] {
-            let options = super::super::Options { target, pair_meetings, ..super::super::Options::default() };
+            let options = super::super::Options {
+                target,
+                pair_meetings,
+                ..super::super::Options::default()
+            };
             let result = super::super::emit_with(&c, &native, &p, &st, &io, &res, options);
             if uses_select && threads > 64 && !target.runs(64) {
                 assert!(matches!(

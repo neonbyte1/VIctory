@@ -85,7 +85,11 @@ impl CpuMem {
         if ptr.is_null() {
             None
         } else {
-            Some(Arc::new(Self { ptr, layout: Some(layout), _shared: None }))
+            Some(Arc::new(Self {
+                ptr,
+                layout: Some(layout),
+                _shared: None,
+            }))
         }
     }
 
@@ -154,7 +158,12 @@ struct Backing {
     gpu: u64,
 }
 
-fn alloc_backing(size: u64, max_vram_single: u64, arena_owned: bool, label: impl FnOnce() -> String) -> Option<Backing> {
+fn alloc_backing(
+    size: u64,
+    max_vram_single: u64,
+    arena_owned: bool,
+    label: impl FnOnce() -> String,
+) -> Option<Backing> {
     let h = host()?;
     let (buffer, cpu, data, vram) = if let Some(v) = try_vram_shadow(size, max_vram_single) {
         let Some(cpu) = CpuMem::new(size) else {
@@ -247,7 +256,9 @@ impl Sub {
     /// Whether its shaders may write page `page` (a title address on a
     /// page boundary) through marked ranges.
     fn marks_page(&self, page: usize) -> bool {
-        self.pending.iter().any(|&(a, e, marked)| marked && a < page + PAGE && page < e)
+        self.pending
+            .iter()
+            .any(|&(a, e, marked)| marked && a < page + PAGE && page < e)
     }
 }
 
@@ -256,7 +267,10 @@ fn sub_of(subs: &mut Vec<Sub>, owner: u64) -> &mut Sub {
     match subs.iter().position(|s| s.owner == owner) {
         Some(i) => &mut subs[i],
         None => {
-            subs.push(Sub { owner, ..Sub::default() });
+            subs.push(Sub {
+                owner,
+                ..Sub::default()
+            });
             subs.last_mut().expect("just pushed")
         }
     }
@@ -333,7 +347,12 @@ impl Shadow {
         {
             h.flush_test_vram_uploads();
             // SAFETY: `self.data.add(at)` is valid for `4 * n` bytes.
-            h.test_readback_buffer(&self.buffer, self.base + at as u64, unsafe { self.data.add(at) }, (4 * n) as u64);
+            h.test_readback_buffer(
+                &self.buffer,
+                self.base + at as u64,
+                unsafe { self.data.add(at) },
+                (4 * n) as u64,
+            );
         }
         // SAFETY: inside the mapping (checked); the GPU is done with it.
         unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<u32>(), n).to_vec() }
@@ -351,7 +370,12 @@ impl Shadow {
             && let Some(h) = host()
         {
             h.flush_test_vram_uploads();
-            h.test_upload_buffer(&self.buffer, self.base + at as u64, bytes.as_ptr(), bytes.len() as u64);
+            h.test_upload_buffer(
+                &self.buffer,
+                self.base + at as u64,
+                bytes.as_ptr(),
+                bytes.len() as u64,
+            );
         }
     }
 
@@ -459,7 +483,9 @@ impl Shadow {
         {
             t.own_bytes(b.data);
         }
-        let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
+        let marks = tracked
+            .as_ref()
+            .and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
             buffer: b.buffer,
             cpu: b.cpu,
@@ -517,9 +543,20 @@ impl Shadow {
     /// `marked`: the shaders mark the pages they write through this copy's
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+    pub(crate) fn gpu_writes(
+        self: &Arc<Self>,
+        list: &HostList,
+        address: u64,
+        len: u64,
+        marked: bool,
+    ) {
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+        list.defer_gpu_write(
+            self,
+            address as usize,
+            len as usize,
+            marked && self.marked(),
+        );
     }
 
     /// At submission `owner`'s preparing, after the range's refresh: a
@@ -548,8 +585,9 @@ impl Shadow {
             t.arm_keeping(address, address + len, |pn| {
                 let page = pn * PAGE;
                 // SAFETY: a whole page inside the mapping, read only here.
-                (page >= start && page + PAGE <= end)
-                    .then(|| unsafe { std::slice::from_raw_parts(self.data.add(page - start), PAGE) })
+                (page >= start && page + PAGE <= end).then(|| unsafe {
+                    std::slice::from_raw_parts(self.data.add(page - start), PAGE)
+                })
             });
             return;
         }
@@ -558,7 +596,8 @@ impl Shadow {
             return;
         }
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host =
+            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let segments = &mut sub.segments;
         let mut i = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
         let mut cur = from;
@@ -586,7 +625,10 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         if added > 0 {
-            crate::copystat::add(crate::copystat::C::SnapshotUs, started.elapsed().as_micros() as u64);
+            crate::copystat::add(
+                crate::copystat::C::SnapshotUs,
+                started.elapsed().as_micros() as u64,
+            );
             crate::copystat::add(crate::copystat::C::SnapshotBytes, added as u64);
             crate::copystat::snapshot(self.start, self.len, added as u64);
         }
@@ -647,7 +689,8 @@ impl Shadow {
         let start = self.start as usize;
         if back && from < to {
             #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
+            let _timed =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -707,7 +750,10 @@ impl Shadow {
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if let Some(t) = &self.tracked {
-                let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
+                let whole: Vec<usize> = synced
+                    .into_iter()
+                    .filter(|p| (first..last).contains(p))
+                    .collect();
                 t.taken(&whole);
             }
         }
@@ -745,12 +791,21 @@ impl Shadow {
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, owner: u64, page: usize, unchanged: &std::collections::HashSet<usize>) -> usize {
+    pub(crate) fn copy_back_marked(
+        &self,
+        owner: u64,
+        page: usize,
+        unchanged: &std::collections::HashSet<usize>,
+    ) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
         #[cfg(feature = "diagnostics")]
-        crate::census::marked(page / PAGE, self as *const Shadow as usize, (self.start as usize, self.len as usize));
+        crate::census::marked(
+            page / PAGE,
+            self as *const Shadow as usize,
+            (self.start as usize, self.len as usize),
+        );
         let written = self.copy_back_marked_page(t, page, unchanged);
         self.rearm_for_later(t, owner, &[page]);
         written
@@ -824,7 +879,9 @@ impl Shadow {
     /// Whether the copy tracks its memory and holds the title page at
     /// `page` whole: such pages go back in runs ([`copy_back_marks`]).
     fn holds_whole(&self, page: usize) -> bool {
-        self.tracked.is_some() && page >= self.start as usize && page + PAGE <= (self.start + self.len) as usize
+        self.tracked.is_some()
+            && page >= self.start as usize
+            && page + PAGE <= (self.start + self.len) as usize
     }
 
     /// [`Shadow::copy_back_marked`] of `pages`, consecutive 64 KiB title
@@ -842,10 +899,19 @@ impl Shadow {
         debug_assert!(pages.iter().all(|&p| self.holds_whole(p)));
         // SAFETY: whole pages inside the mapping; only the submitting
         // thread writes it, and not meanwhile.
-        let host = unsafe { std::slice::from_raw_parts(self.data.add(pages[0] - self.start as usize), pages.len() * PAGE) };
+        let host = unsafe {
+            std::slice::from_raw_parts(
+                self.data.add(pages[0] - self.start as usize),
+                pages.len() * PAGE,
+            )
+        };
         #[cfg(feature = "diagnostics")]
         for &page in pages {
-            crate::census::marked(page / PAGE, self as *const Shadow as usize, (self.start as usize, self.len as usize));
+            crate::census::marked(
+                page / PAGE,
+                self as *const Shadow as usize,
+                (self.start as usize, self.len as usize),
+            );
         }
         let back = copy_back_run(t, pages, host, unchanged);
         self.rearm_for_later(t, owner, pages);
@@ -856,7 +922,13 @@ impl Shadow {
             for &pn in &back.offered {
                 let mirror = self.data as usize + (pn * PAGE - self.start as usize);
                 let range = (self.start as usize, self.len as usize);
-                crate::census::offer(pn, self as *const Shadow as usize, range, mirror, &crate::watch::mappings(pn));
+                crate::census::offer(
+                    pn,
+                    self as *const Shadow as usize,
+                    range,
+                    mirror,
+                    &crate::watch::mappings(pn),
+                );
             }
         }
         back
@@ -865,7 +937,9 @@ impl Shadow {
     /// Whether the title wrote none of the copy's memory since the copy took
     /// it (tracked memory only): a refresh ([`plan`]) would copy nothing.
     pub(crate) fn clean(&self) -> bool {
-        self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
+        self.tracked
+            .as_ref()
+            .is_some_and(crate::watch::Tracked::clean)
     }
 
     /// Its tracker's bit: `crate::watch::clean_bit` of it is
@@ -891,7 +965,9 @@ impl Shadow {
         match plan(owner, self, address, len) {
             Plan::Done(copied) => Ok(copied),
             Plan::Refused(o) => Err(o),
-            Plan::Take(planned) => Ok(refresh_planned(&[planned]).pop().map_or(0, |(copied, _)| copied)),
+            Plan::Take(planned) => Ok(refresh_planned(&[planned])
+                .pop()
+                .map_or(0, |(copied, _)| copied)),
         }
     }
 
@@ -940,11 +1016,21 @@ impl Shadow {
     /// `runs` and `unmapped`: the copy's pages taken by the batch's one take
     /// ([`refresh_planned`]); `untracked`: its parts off the runtime's
     /// memory, copied whole.
-    fn copy_taken(&self, owner: u64, busy: bool, runs: crate::watch::Runs, unmapped: crate::watch::Runs, untracked: &[(usize, usize)]) -> usize {
+    fn copy_taken(
+        &self,
+        owner: u64,
+        busy: bool,
+        runs: crate::watch::Runs,
+        unmapped: crate::watch::Runs,
+        untracked: &[(usize, usize)],
+    ) -> usize {
         let start = self.start as usize;
         let mut subs = busy.then(|| self.subs.lock().unwrap_or_else(|e| e.into_inner()));
         let mut sync_before = |a: usize, b: usize| {
-            let Some(sub) = subs.as_mut().and_then(|s| s.iter_mut().find(|s| s.owner == owner)) else {
+            let Some(sub) = subs
+                .as_mut()
+                .and_then(|s| s.iter_mut().find(|s| s.owner == owner))
+            else {
                 return;
             };
             let (a, b) = (a - start, b - start);
@@ -1001,7 +1087,8 @@ impl Shadow {
     }
 
     pub(crate) fn vram_readback(&self) -> Option<(usize, u64, u64, u64)> {
-        self.vram.then_some((self.data as usize, self.base, self.start, self.len))
+        self.vram
+            .then_some((self.data as usize, self.base, self.start, self.len))
     }
 
     fn queue_vram_upload(&self, off: u64, len: u64) {
@@ -1027,7 +1114,8 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         #[cfg(feature = "diagnostics")]
-        let _refresh = crate::census::as_kind(crate::census::Kind::Refresh, self as *const Shadow as usize);
+        let _refresh =
+            crate::census::as_kind(crate::census::Kind::Refresh, self as *const Shadow as usize);
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         self.queue_vram_upload((from - start) as u64, (to - from) as u64);
         if let Some(t) = &self.tracked {
@@ -1114,7 +1202,10 @@ pub(crate) fn plan(owner: u64, shadow: &Shadow, address: usize, len: usize) -> P
     {
         return Plan::Refused(o);
     }
-    let forbidden: Vec<(usize, usize, u64)> = others.iter().map(|&(a, e, o)| (a / PAGE, e.div_ceil(PAGE), o)).collect();
+    let forbidden: Vec<(usize, usize, u64)> = others
+        .iter()
+        .map(|&(a, e, o)| (a / PAGE, e.div_ceil(PAGE), o))
+        .collect();
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let pages = tracked.written(from, to);
@@ -1168,15 +1259,23 @@ pub(crate) fn refresh_planned(plans: &[Planned<'_>]) -> Vec<(usize, u64)> {
         .collect();
     let taken = crate::watch::take_written(&asks);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+    crate::copystat::add(
+        crate::copystat::C::WatchUs,
+        started.elapsed().as_micros() as u64,
+    );
     plans
         .iter()
         .zip(taken)
         .map(|(p, (runs, unmapped))| {
             let started = std::time::Instant::now();
-            let copied = p.shadow.copy_taken(p.owner, p.busy, runs, unmapped, &p.untracked);
+            let copied = p
+                .shadow
+                .copy_taken(p.owner, p.busy, runs, unmapped, &p.untracked);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::Unchanged, (p.to - p.from).saturating_sub(copied) as u64);
+            crate::copystat::add(
+                crate::copystat::C::Unchanged,
+                (p.to - p.from).saturating_sub(copied) as u64,
+            );
             (copied, started.elapsed().as_micros() as u64)
         })
         .collect()
@@ -1299,7 +1398,8 @@ unsafe impl Send for Bitmap {}
 // SAFETY: as above.
 unsafe impl Sync for Bitmap {}
 
-static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
+static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] =
+    [const { std::sync::OnceLock::new() }; 2];
 
 fn existing_bitmap(memory: bool) -> Option<&'static Bitmap> {
     BITMAPS[usize::from(memory)].get().and_then(Option::as_ref)
@@ -1320,10 +1420,19 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
             // SAFETY: our mapped buffer of `bytes` bytes.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             let vram = (!h.is_uma())
-                .then(|| Some((h.default_uav_buffer(bytes)?, h.default_uav_buffer(u64::from(WRITE_WORDS) * 4)?)))
+                .then(|| {
+                    Some((
+                        h.default_uav_buffer(bytes)?,
+                        h.default_uav_buffer(u64::from(WRITE_WORDS) * 4)?,
+                    ))
+                })
                 .flatten();
             // SAFETY: a live buffer.
-            let gpu = unsafe { vram.as_ref().map_or(&buffer, |v| &v.0).GetGPUVirtualAddress() };
+            let gpu = unsafe {
+                vram.as_ref()
+                    .map_or(&buffer, |v| &v.0)
+                    .GetGPUVirtualAddress()
+            };
             Some(Bitmap {
                 _buffer: buffer,
                 vram,
@@ -1363,7 +1472,10 @@ pub(crate) fn has_vram_bitmaps() -> bool {
 /// are taken only with nothing in flight after the submission
 /// (`crate::host`).
 pub(crate) fn captures_write_marks() -> bool {
-    let mut maps = [false, true].into_iter().filter_map(existing_bitmap).peekable();
+    let mut maps = [false, true]
+        .into_iter()
+        .filter_map(existing_bitmap)
+        .peekable();
     maps.peek().is_some() && maps.all(|b| b.vram.is_some())
 }
 
@@ -1382,7 +1494,10 @@ pub(crate) fn write_marks_bytes() -> u64 {
 /// dword; the last marking submission's were captured after it), and the
 /// read marks as the CPU left them, so that clears of slots it forgot reach
 /// the copy the shaders mark in.
-pub(crate) fn sync_bitmaps_pre(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList, bytes: u64) {
+pub(crate) fn sync_bitmaps_pre(
+    list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+    bytes: u64,
+) {
     let reads = u64::from(victory_shader::emit::VIEW_READS / 8);
     let last = u64::from(WRITE_WORDS - 1) * 4;
     for b in [false, true].into_iter().filter_map(existing_bitmap) {
@@ -1390,7 +1505,13 @@ pub(crate) fn sync_bitmaps_pre(list: &windows::Win32::Graphics::Direct3D12::ID3D
             // SAFETY: live bitmap buffers: the read marks from `reads` on,
             // the write marks (and the zeros) below it.
             unsafe {
-                list.CopyBufferRegion(vram, reads, &b._buffer, reads, u64::from(victory_shader::emit::HEAP_VIEWS / 8));
+                list.CopyBufferRegion(
+                    vram,
+                    reads,
+                    &b._buffer,
+                    reads,
+                    u64::from(victory_shader::emit::HEAP_VIEWS / 8),
+                );
                 if bytes > 0 {
                     list.CopyBufferRegion(vram, 0, zeros, 0, bytes);
                 }
@@ -1402,12 +1523,22 @@ pub(crate) fn sync_bitmaps_pre(list: &windows::Win32::Graphics::Direct3D12::ID3D
 
 /// In the list run after a marking submission's own: its read marks into
 /// system memory, where the CPU takes and clears them.
-pub(crate) fn sync_bitmaps_post(list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList) {
+pub(crate) fn sync_bitmaps_post(
+    list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+) {
     let reads = u64::from(victory_shader::emit::VIEW_READS / 8);
     for b in [false, true].into_iter().filter_map(existing_bitmap) {
         if let Some((vram, _)) = &b.vram {
             // SAFETY: live bitmap buffers, the read marks from `reads` on.
-            unsafe { list.CopyBufferRegion(&b._buffer, reads, vram, reads, u64::from(victory_shader::emit::HEAP_VIEWS / 8)) };
+            unsafe {
+                list.CopyBufferRegion(
+                    &b._buffer,
+                    reads,
+                    vram,
+                    reads,
+                    u64::from(victory_shader::emit::HEAP_VIEWS / 8),
+                )
+            };
         }
     }
 }
@@ -1468,7 +1599,9 @@ impl WriteMarks {
         for (into, at) in marks.0.iter_mut().zip(placed) {
             let Some(at) = at else { continue };
             // SAFETY: as the caller says.
-            let words = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u32, (bytes / 4) as usize) };
+            let words = unsafe {
+                std::slice::from_raw_parts((data + at as usize) as *const u32, (bytes / 4) as usize)
+            };
             if into.len() < words.len() {
                 into.resize(words.len(), 0);
             }
@@ -1486,11 +1619,14 @@ impl WriteMarks {
         let used = (write_marks_bytes() / 4) as usize;
         let mut marks = WriteMarks::default();
         for (into, memory) in marks.0.iter_mut().zip([false, true]) {
-            let Some(b) = existing_bitmap(memory) else { continue };
+            let Some(b) = existing_bitmap(memory) else {
+                continue;
+            };
             // SAFETY: the mapped bitmap's write marks; the GPU is done with
             // them (`crate::host` takes them with nothing in flight after
             // the submission where shaders mark in system memory).
-            let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, WRITE_WORDS as usize) };
+            let bits =
+                unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, WRITE_WORDS as usize) };
             // Marks of offsets past the bitmap land in its last bit, no copy's.
             bits[WRITE_WORDS as usize - 1] = 0;
             if bits[..used].iter().any(|&w| w != 0) {
@@ -1729,7 +1865,13 @@ pub(crate) fn copy_back_marks(
     let counts = crate::watch::thread_counts();
     let items: Vec<(usize, usize, bool)> = pages
         .iter()
-        .map(|(copy, page)| (Arc::as_ptr(copy) as usize, *page, runs_on() && copy.holds_whole(*page)))
+        .map(|(copy, page)| {
+            (
+                Arc::as_ptr(copy) as usize,
+                *page,
+                runs_on() && copy.holds_whole(*page),
+            )
+        })
         .collect();
     for (range, run) in mark_runs(&items, RUN_PAGES) {
         let copy = &pages[range.start].0;
@@ -1768,9 +1910,15 @@ pub(crate) fn copy_back_marks(
             add(C::MarkBridged, back.bridged as u64);
             add(C::MarkThrough, back.through as u64);
             add(C::LazyAgain, back.again as u64);
-            for (c, us) in [C::MarkPreUs, C::MarkWaitUs, C::MarkProtectUs, C::MarkWriteUs, C::MarkVerifyUs]
-                .into_iter()
-                .zip(back.us)
+            for (c, us) in [
+                C::MarkPreUs,
+                C::MarkWaitUs,
+                C::MarkProtectUs,
+                C::MarkWriteUs,
+                C::MarkVerifyUs,
+            ]
+            .into_iter()
+            .zip(back.us)
             {
                 add(c, us);
             }
@@ -1800,7 +1948,14 @@ impl MarkKind {
         let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
         // SAFETY: room for one answer; no reset, so nothing changes.
         let pool = unsafe {
-            GetWriteWatch(0, page as *const _, PAGE, (&raw mut found).cast(), &mut count, &mut granularity) == 0
+            GetWriteWatch(
+                0,
+                page as *const _,
+                PAGE,
+                (&raw mut found).cast(),
+                &mut count,
+                &mut granularity,
+            ) == 0
         };
         Self(!pool, pages, crate::watch::thread_counts().1)
     }
@@ -1881,7 +2036,10 @@ fn diff_runs(new: &[u8], old: &[u8], max: usize, out: &mut Vec<(u32, u32)>) {
                     if x == 0 {
                         continue;
                     }
-                    (w + x.trailing_zeros() as usize / 8, w + 8 - x.leading_zeros() as usize / 8)
+                    (
+                        w + x.trailing_zeros() as usize / 8,
+                        w + 8 - x.leading_zeros() as usize / 8,
+                    )
                 } else {
                     let differs = |k: &usize| new[*k] != old[*k];
                     let Some(a) = (w..we).find(differs) else {
@@ -2072,7 +2230,10 @@ fn copy_back_run(
     // Before the lease: what the shaders changed of each page.
     let mut plans: Vec<Plan> = Vec::with_capacity(pages.len());
     for (i, &page) in pages.iter().enumerate() {
-        let plan = if crate::watch::owner() && !t.changed(page / PAGE) && crate::watch::maybe_lazy(page / PAGE) {
+        let plan = if crate::watch::owner()
+            && !t.changed(page / PAGE)
+            && crate::watch::maybe_lazy(page / PAGE)
+        {
             // Lazy and held as current (`VICTORY_OWNER`): this copy's again,
             // or another's this one takes over; bytes kept at arming
             // (`crate::watch::Tracked::arm_keeping`) stay for the case it is
@@ -2103,7 +2264,10 @@ fn copy_back_run(
     // title's stays guarded, so no protection changes and no check after
     // (asked before the lease: the runtime's lock is taken around calls in
     // here).
-    let alias: Vec<Option<usize>> = pages.iter().map(|&page| crate::watch::writable_alias(page)).collect();
+    let alias: Vec<Option<usize>> = pages
+        .iter()
+        .map(|&page| crate::watch::writable_alias(page))
+        .collect();
     #[cfg(test)]
     run_hook(0, pages[0]);
     #[cfg(feature = "diagnostics")]
@@ -2202,7 +2366,8 @@ fn copy_back_run(
             _ => None,
         })
         .collect();
-    let (through, opened): (Vec<usize>, Vec<usize>) = written.iter().partition(|&&pn| alias[pn - first].is_some());
+    let (through, opened): (Vec<usize>, Vec<usize>) =
+        written.iter().partition(|&&pn| alias[pn - first].is_some());
     back.through = through.len();
     // Between the pages opened, those not written are opened too, so that
     // one protection change covers the run each way (the shaders leave
@@ -2271,7 +2436,10 @@ fn copy_back_run(
         back.bridged += usize::from(bridged);
         let opened = (a < b && alias[i].is_none()) || bridged;
         // Under the lease: no look at lazy pages (an opened page is none).
-        if !opened || crate::host::read_raw((pn * PAGE) as *const u8, &mut title) && title[..] == *host_page(i) {
+        if !opened
+            || crate::host::read_raw((pn * PAGE) as *const u8, &mut title)
+                && title[..] == *host_page(i)
+        {
             taken.push(pn);
             #[cfg(feature = "diagnostics")]
             if a < b && alias[i].is_some() {
@@ -2359,7 +2527,11 @@ impl Flight {
                 Some(*max)
             })
             .collect();
-        self.owners.push(Flying { owner, ranges: merged, ends });
+        self.owners.push(Flying {
+            owner,
+            ranges: merged,
+            ends,
+        });
     }
 
     /// Submission `owner` completed: what it wrote is in title memory.
@@ -2372,7 +2544,12 @@ impl Flight {
     /// writes there is a bottom-of-pipe write ([`LABEL`]).
     pub(crate) fn crossing(&self, start: usize, end: usize, copy: usize) -> Option<(u64, bool)> {
         let mut latest: Option<(u64, bool)> = None;
-        for Flying { owner, ranges, ends } in &self.owners {
+        for Flying {
+            owner,
+            ranges,
+            ends,
+        } in &self.owners
+        {
             if latest.is_some_and(|l| l.0 >= *owner) {
                 continue;
             }
@@ -2462,7 +2639,9 @@ pub(crate) fn refresh_where_needed<T>(
 /// The registry as it is now, if anything is in flight: for callers asking
 /// [`Flight::crossing`] of many ranges at once (one lock for all).
 pub(crate) fn flight_now() -> Option<Flight> {
-    FLYING.load(AtomicOrdering::Acquire).then(|| flight().clone())
+    FLYING
+        .load(AtomicOrdering::Acquire)
+        .then(|| flight().clone())
 }
 
 struct Entry {
@@ -2510,7 +2689,10 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    if buffers()
+        .remove(&(start, resource))
+        .is_some_and(|e| e.shadow.is_some())
+    {
         changed();
     }
 }
@@ -2520,7 +2702,12 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// (the longest entry's length) below `end`. Big buffers hold many smaller
 /// ones (a heap's placed buffers), so the one holding an address past
 /// those can be any number of entries back.
-fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: u64) -> Option<(u64, usize)> {
+fn enclosing(
+    map: &BTreeMap<(u64, usize), Entry>,
+    span: u64,
+    address: u64,
+    end: u64,
+) -> Option<(u64, usize)> {
     let lowest = end.saturating_sub(span);
     if lowest > address {
         return None;
@@ -2623,7 +2810,8 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
 /// Asks for, and copies made of, views off their copy's elements, the
 /// copies' bytes and the largest (diagnostics).
 #[cfg(feature = "diagnostics")]
-static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static VIEWS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Logs [`VIEWS`] per frame over `frames`.
 #[cfg(feature = "diagnostics")]
@@ -2641,7 +2829,11 @@ pub(crate) fn log_views(frames: f64) {
         let a = arena();
         // SAFETY: live buffers.
         let size = |c: &Chunk| unsafe { c.buffer.GetDesc() }.Width;
-        let held: u64 = a.chunks.iter().map(|c| size(c) - c.free.values().sum::<u64>()).sum();
+        let held: u64 = a
+            .chunks
+            .iter()
+            .map(|c| size(c) - c.free.values().sum::<u64>())
+            .sum();
         (a.chunks.len(), held)
     };
     if asks > 0 {
@@ -2662,12 +2854,16 @@ pub(crate) fn log_views(frames: f64) {
 /// new copy of the same bytes took the refreshes). With the size the map
 /// is next pruned of dead entries at.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(usize, BTreeMap<(u64, u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(usize, BTreeMap<(u64, u64, u64), std::sync::Weak<Shadow>>)> =
+    Mutex::new((0, BTreeMap::new()));
 
 fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (prune_at, map) = &mut *guard;
-    if let Some(shadow) = map.get(&(address, len, element)).and_then(std::sync::Weak::upgrade) {
+    if let Some(shadow) = map
+        .get(&(address, len, element))
+        .and_then(std::sync::Weak::upgrade)
+    {
         return Some(shadow);
     }
     // Ring positions change every frame: entries die by the hundred.
@@ -2746,7 +2942,11 @@ impl Arena {
                 (start + len <= at + n).then_some((at, n, start))
             })
         };
-        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.free).map(|f| (c, f)));
+        let found = self
+            .chunks
+            .iter()
+            .enumerate()
+            .find_map(|(c, chunk)| fits(&chunk.free).map(|f| (c, f)));
         let (chunk, (at, n, start)) = match found {
             Some(found) => found,
             None => {
@@ -2765,7 +2965,14 @@ impl Arena {
                 (c, fits(&self.chunks[c].free)?)
             }
         };
-        let Chunk { buffer, cpu, vram, data, gpu, free } = &mut self.chunks[chunk];
+        let Chunk {
+            buffer,
+            cpu,
+            vram,
+            data,
+            gpu,
+            free,
+        } = &mut self.chunks[chunk];
         free.remove(&at);
         if start > at {
             free.insert(at, start - at);
@@ -2773,7 +2980,11 @@ impl Arena {
         if at + n > start + len {
             free.insert(start + len, at + n - start - len);
         }
-        let slice = Slice { chunk, offset: start, len };
+        let slice = Slice {
+            chunk,
+            offset: start,
+            len,
+        };
         let backing = Backing {
             buffer: buffer.clone(),
             cpu: cpu.clone(),
@@ -2788,7 +2999,9 @@ impl Arena {
 
     /// A run goes back, joined to its free neighbours.
     fn give_back(&mut self, slice: Slice) {
-        let Some(chunk) = self.chunks.get_mut(slice.chunk) else { return };
+        let Some(chunk) = self.chunks.get_mut(slice.chunk) else {
+            return;
+        };
         let free = &mut chunk.free;
         let (mut at, mut n) = (slice.offset, slice.len);
         if let Some((&before, &m)) = free.range(..at).next_back()
@@ -2806,8 +3019,17 @@ impl Arena {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    let mut all: Vec<Arc<Shadow>> = buffers()
+        .values()
+        .filter_map(|e| e.shadow.clone())
+        .collect();
+    all.extend(
+        LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned(),
+    );
     all
 }
 
@@ -2869,7 +3091,8 @@ pub(crate) mod tests {
         unsafe {
             data.cast::<u32>().write_volatile(1 << (n % 32));
             let into = b.vram.as_ref().map_or(&b._buffer, |v| &v.0);
-            list.list.CopyBufferRegion(into, u64::from(n / 32) * 4, &up, 0, 4);
+            list.list
+                .CopyBufferRegion(into, u64::from(n / 32) * 4, &up, 0, 4);
         }
         list.keep(&up);
         Some(())
@@ -2895,8 +3118,15 @@ pub(crate) mod tests {
         copy.writing(0, p, len, false);
         // SAFETY: (all title reads and writes below) bytes of our pool.
         unsafe { title(PAGE + 20).write_volatile(0x55) };
-        assert!(copy.update(0, p + PAGE + 16, 16).unwrap() > 0, "the title's write is copied");
-        assert_eq!(host(PAGE + 20), 0x55, "the title's constant reaches the copy");
+        assert!(
+            copy.update(0, p + PAGE + 16, 16).unwrap() > 0,
+            "the title's write is copied"
+        );
+        assert_eq!(
+            host(PAGE + 20),
+            0x55,
+            "the title's constant reaches the copy"
+        );
         // The shaders run: one byte written. The title writes meanwhile.
         copy.write_host((p + 10) as u64, &[0xaa]);
         // SAFETY: a byte of our pool.
@@ -2904,8 +3134,16 @@ pub(crate) mod tests {
         copy.copy_back(0, p, len);
         // SAFETY: bytes of our pool.
         unsafe {
-            assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
-            assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
+            assert_eq!(
+                title(10).read_volatile(),
+                0xaa,
+                "the shader's write goes back"
+            );
+            assert_eq!(
+                title(PAGE + 20).read_volatile(),
+                0x66,
+                "the title's later write stays"
+            );
         }
         unregister(p, p as u64);
     }
@@ -2919,8 +3157,8 @@ pub(crate) mod tests {
     fn bytes_off_the_runtimes_memory_are_copied_at_each_use() {
         use crate::watch::tests::{MEM_WRITE_WATCH, free};
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
-            VirtualAlloc, VirtualFree, VirtualQuery,
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
         };
         // A pool page and a plain one right after it, in two pages found free
         // (other tests allocate meanwhile: tried again if taken).
@@ -2929,10 +3167,16 @@ pub(crate) mod tests {
                 // SAFETY: a fresh reservation, released at once; then
                 // allocations where it was, freed below.
                 unsafe {
-                    let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE)
+                        as usize;
                     VirtualFree(p as *mut _, 0, MEM_RELEASE);
                     let at = |q: usize, kind: u32| {
-                        VirtualAlloc(q as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | kind, PAGE_READWRITE) as usize
+                        VirtualAlloc(
+                            q as *const _,
+                            PAGE,
+                            MEM_RESERVE | MEM_COMMIT | kind,
+                            PAGE_READWRITE,
+                        ) as usize
                     };
                     let (pool, plain) = (at(p, MEM_WRITE_WATCH), at(p + PAGE, 0));
                     if p != 0 && pool == p && plain == p + PAGE {
@@ -2966,9 +3210,17 @@ pub(crate) mod tests {
         // SAFETY: as above.
         unsafe { word.write_volatile(0x5678) };
         copy.update(0, pool, len).unwrap();
-        assert_eq!(copy.read_host(word as u64, 1), [0x5678], "the title's change reaches the copy");
+        assert_eq!(
+            copy.read_host(word as u64, 1),
+            [0x5678],
+            "the title's change reaches the copy"
+        );
         assert_eq!(protection(pool), PAGE_READONLY, "the pool is guarded");
-        assert_eq!(protection(plain), PAGE_READWRITE, "the plain allocation is not");
+        assert_eq!(
+            protection(plain),
+            PAGE_READWRITE,
+            "the plain allocation is not"
+        );
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
@@ -3019,18 +3271,38 @@ pub(crate) mod tests {
         copy.writing(0, p + PAGE, 2 * PAGE, false);
         copy.writing(0, p + PAGE, PAGE, false);
         copy.writing(0, p + 80, 8, false);
-        assert_eq!(bytes(&copy), 72 + 2 * PAGE + 100, "merged where they overlap or touch");
+        assert_eq!(
+            bytes(&copy),
+            72 + 2 * PAGE + 100,
+            "merged where they overlap or touch"
+        );
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
-        assert_eq!(copy.copy_back(0, p + 16, 64), 64, "the range's part of the piece");
-        assert_eq!(copy.copy_back(0, p + PAGE, 2 * PAGE), PAGE, "the piece written");
+        assert_eq!(
+            copy.copy_back(0, p + 16, 64),
+            64,
+            "the range's part of the piece"
+        );
+        assert_eq!(
+            copy.copy_back(0, p + PAGE, 2 * PAGE),
+            PAGE,
+            "the piece written"
+        );
         assert_eq!(copy.copy_back(0, p + PAGE, PAGE), 0, "compared once");
         assert_eq!(copy.copy_back(0, p + 3 * PAGE, 100), 0);
         assert_eq!(copy.copy_back(0, p + 80, 8), 0);
         // SAFETY: our pool.
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
-        assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
+        assert_eq!(
+            [
+                title(p + 20),
+                title(p + 21),
+                title(p + 22),
+                title(p + PAGE + 5)
+            ],
+            [1, 2, 3, 9]
+        );
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
     }
@@ -3051,7 +3323,10 @@ pub(crate) mod tests {
             return; // no host GPU here
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
-        assert_eq!(copy.mark_entry(p as u64 + PAGE as u64 + 8), Some((base as u32 + 1, 8)));
+        assert_eq!(
+            copy.mark_entry(p as u64 + PAGE as u64 + 8),
+            Some((base as u32 + 1, 8))
+        );
         copy.update(0, p, len).unwrap();
         copy.writing(0, p, len, true);
         assert!(copy.segments(0).is_empty(), "no snapshot");
@@ -3076,10 +3351,20 @@ pub(crate) mod tests {
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
-        assert_eq!((read(PAGE + 20), read(PAGE + 40)), (0xbb, 0x11), "both writers' bytes, page 1");
-        assert_eq!((read(2 * PAGE + 30), read(2 * PAGE + 50)), (0, 0x22), "page 2 not marked");
+        assert_eq!(
+            (read(PAGE + 20), read(PAGE + 40)),
+            (0xbb, 0x11),
+            "both writers' bytes, page 1"
+        );
+        assert_eq!(
+            (read(2 * PAGE + 30), read(2 * PAGE + 50)),
+            (0, 0x22),
+            "page 2 not marked"
+        );
         // SAFETY: dwords of the mapped bitmap.
-        let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
+        let left: u32 = (base / 32..=(base + 1) / 32)
+            .map(|w| unsafe { *bits.add(w) })
+            .fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(0, p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
@@ -3116,9 +3401,18 @@ pub(crate) mod tests {
         copy_back_marks(0, &WriteMarks::take_ram(), &[], false, &Default::default());
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
-        assert!((0..PAGE).all(|at| read(at) == 0xee), "page 0 went back whole");
-        assert_eq!((read(PAGE + 20), read(PAGE + 40)), (0xbb, 0x11), "both writers' bytes, page 1");
-        let stale = (PAGE..len).filter(|&at| at != PAGE + 20 && at != PAGE + 40).find(|&at| read(at) != 0);
+        assert!(
+            (0..PAGE).all(|at| read(at) == 0xee),
+            "page 0 went back whole"
+        );
+        assert_eq!(
+            (read(PAGE + 20), read(PAGE + 40)),
+            (0xbb, 0x11),
+            "both writers' bytes, page 1"
+        );
+        let stale = (PAGE..len)
+            .filter(|&at| at != PAGE + 20 && at != PAGE + 40)
+            .find(|&at| read(at) != 0);
         assert_eq!(stale, None, "a byte of page 1 the first page's buffer left");
         unregister(p, p as u64);
     }
@@ -3131,7 +3425,9 @@ pub(crate) mod tests {
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
-        let (Some(copy), Some(others), Some(memory)) = (find(p as u64, len as u64), bitmap(false), bitmap(true)) else {
+        let (Some(copy), Some(others), Some(memory)) =
+            (find(p as u64, len as u64), bitmap(false), bitmap(true))
+        else {
             unregister(p, p as u64);
             return; // no host GPU here
         };
@@ -3149,8 +3445,12 @@ pub(crate) mod tests {
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
-        // SAFETY: a dword of the mapped bitmap.
-        assert_eq!(unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32), 0, "cleared");
+        assert_eq!(
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32),
+            0,
+            "cleared"
+        );
         unregister(p, p as u64);
     }
 
@@ -3169,7 +3469,8 @@ pub(crate) mod tests {
         unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
         register(p, p as u64, len as u64);
         register(p + 1, p as u64, PAGE as u64);
-        let (Some(outer), Some(inner)) = (find(p as u64, len as u64), find(p as u64 + 16, 16)) else {
+        let (Some(outer), Some(inner)) = (find(p as u64, len as u64), find(p as u64 + 16, 16))
+        else {
             unregister(p + 1, p as u64);
             unregister(p, p as u64);
             return; // no host GPU here
@@ -3184,15 +3485,27 @@ pub(crate) mod tests {
             c.keep_writes(0, start as usize, n as usize);
         }
         crate::memory::drop_withheld(p + 16, 4);
-        assert_eq!((byte(&outer), byte(&inner)), (0x22, 0x22), "frame N: the GPU's copies keep it");
+        assert_eq!(
+            (byte(&outer), byte(&inner)),
+            (0x22, 0x22),
+            "frame N: the GPU's copies keep it"
+        );
         crate::memory::log_frame();
         for c in [&outer, &inner] {
             let (start, n) = c.range();
             c.update(0, start as usize, n as usize).unwrap();
         }
-        assert_eq!((byte(&outer), byte(&inner)), (0x11, 0x11), "frame N+1: title memory's bytes");
-        // SAFETY: as above.
-        assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
+        assert_eq!(
+            (byte(&outer), byte(&inner)),
+            (0x11, 0x11),
+            "frame N+1: title memory's bytes"
+        );
+        assert_eq!(
+            // SAFETY: as above.
+            unsafe { ((p + 16) as *const u8).read_volatile() },
+            0x11,
+            "title memory untouched"
+        );
         unregister(p + 1, p as u64);
         unregister(p, p as u64);
     }
@@ -3220,7 +3533,10 @@ pub(crate) mod tests {
         for (at, v) in [(20, 0x55), (24, 0x44), (40, 0x11), (PAGE + 20, 0x55)] {
             write(at, v);
         }
-        assert!(copy.update(0, p + 16, 16).unwrap() > 0 && copy.update(0, p + PAGE + 16, 16).unwrap() > 0);
+        assert!(
+            copy.update(0, p + 16, 16).unwrap() > 0
+                && copy.update(0, p + PAGE + 16, 16).unwrap() > 0
+        );
         copy.write_host((p + 10) as u64, &[0xaa]);
         copy.write_host((p + 24) as u64, &[0x00]);
         copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
@@ -3260,7 +3576,11 @@ pub(crate) mod tests {
         assert_eq!(copy.copy_back_marked(0, p, &unchanged), 0);
         assert_eq!(read(), 0, "title memory not written");
         assert_eq!(copy.copy_back_marked(0, p, &Default::default()), PAGE);
-        assert_eq!(read(), 0xaa, "not named unchanged: the difference goes back");
+        assert_eq!(
+            read(),
+            0xaa,
+            "not named unchanged: the difference goes back"
+        );
         copy.copy_back(0, p, PAGE);
         unregister(p, p as u64);
     }
@@ -3273,9 +3593,17 @@ pub(crate) mod tests {
         m.give_back(0, 3);
         assert_eq!(m.take(1), Some(0), "first fit");
         m.give_back(3, 2);
-        assert_eq!(m.free.iter().collect::<Vec<_>>(), [(&1, &4)], "3-4 joins the free 1-2");
+        assert_eq!(
+            m.free.iter().collect::<Vec<_>>(),
+            [(&1, &4)],
+            "3-4 joins the free 1-2"
+        );
         m.give_back(0, 1);
-        assert_eq!(m.free.iter().collect::<Vec<_>>(), [(&0, &5)], "and 0 joins them");
+        assert_eq!(
+            m.free.iter().collect::<Vec<_>>(),
+            [(&0, &5)],
+            "and 0 joins them"
+        );
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
@@ -3305,13 +3633,18 @@ pub(crate) mod tests {
         // memory the mirror holds what the copy held before the submission).
         let (up, up_ptr) = host.upload_buffer(8).expect("upload bit and word");
         // SAFETY: mapped 8-byte upload buffer.
-        unsafe { up_ptr.cast::<[u32; 2]>().write_volatile([1u32 << (base % 32), 0x1337_c0de]) };
+        unsafe {
+            up_ptr
+                .cast::<[u32; 2]>()
+                .write_volatile([1u32 << (base % 32), 0x1337_c0de])
+        };
         list.keep(&up);
         // Set the VIEW_WRITES mark bit directly on GPU (or RAM when UMA) without Step::GpuWrite.
         let word_off = ((base / 32) * 4) as u64;
         // SAFETY: open command list and valid buffer regions.
         unsafe {
-            list.list.CopyBufferRegion(&copy.buffer, copy.base, &up, 4, 4);
+            list.list
+                .CopyBufferRegion(&copy.buffer, copy.base, &up, 4, 4);
             if let Some((vram, _)) = &b.vram {
                 list.list.CopyBufferRegion(vram, word_off, &up, 0, 4);
             } else {
@@ -3339,7 +3672,9 @@ pub(crate) mod tests {
     /// page the title wrote meanwhile goes back at once by its saved bytes.
     #[test]
     fn lazy_view_marked_pages_go_back_at_the_first_touch() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{LazyOn, own_alias, raw, section_views};
         if !runs_on() {
             return; // page by page (`VICTORY_MARK_RUNS=0`): nothing goes lazy
@@ -3366,17 +3701,37 @@ pub(crate) mod tests {
         copy_back_marks(0, &WriteMarks::take_ram(), &[], false, &Default::default());
         // SAFETY: (all) bytes of the runtime's own view.
         let old = |at: usize| unsafe { ((own + at) as *const u8).read_volatile() };
-        assert_eq!((raw(p + 10), old(10)), (None, 0), "page 0 lazy: nothing written");
-        assert_eq!((raw(p + PAGE + 20), raw(p + PAGE + 40)), (Some(0xbb), Some(0x11)), "page 1 at once");
+        assert_eq!(
+            (raw(p + 10), old(10)),
+            (None, 0),
+            "page 0 lazy: nothing written"
+        );
+        assert_eq!(
+            (raw(p + PAGE + 20), raw(p + PAGE + 40)),
+            (Some(0xbb), Some(0x11)),
+            "page 1 at once"
+        );
         // The shaders write page 0 again before anyone touched it.
         copy.write_host((p + 12) as u64, &[0xab]);
         mark_written(b, base);
         copy_back_marks(0, &WriteMarks::take_ram(), &[], false, &Default::default());
-        assert_eq!((raw(p + 10), old(10), old(12)), (None, 0, 0), "still lazy, not copied");
+        assert_eq!(
+            (raw(p + 10), old(10), old(12)),
+            (None, 0, 0),
+            "still lazy, not copied"
+        );
         // SAFETY: bytes of the title's view (no access: the handler gives them).
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
-        assert_eq!((read(10), read(12), read(14)), (0xaa, 0xab, 0), "the first read finds both writes");
-        assert_eq!(copy.update(0, p, PAGE), Ok(0), "the copy holds the page as title memory does");
+        assert_eq!(
+            (read(10), read(12), read(14)),
+            (0xaa, 0xab, 0),
+            "the first read finds both writes"
+        );
+        assert_eq!(
+            copy.update(0, p, PAGE),
+            Ok(0),
+            "the copy holds the page as title memory does"
+        );
         copy.copy_back(0, p, len);
         unregister(p, p as u64);
     }
@@ -3387,7 +3742,9 @@ pub(crate) mod tests {
     /// and a second submission's write before that read is what it finds.
     #[test]
     fn vram_lazy_view_writes_go_back_at_the_first_read() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{LazyOn, own_alias, raw, section_views};
         let Some(host) = host() else {
             return; // no host GPU here
@@ -3410,13 +3767,24 @@ pub(crate) mod tests {
             let list = host.new_list().unwrap();
             let (up, up_ptr) = host.upload_buffer(8).expect("upload bit and word");
             // SAFETY: mapped 8-byte upload buffer.
-            unsafe { up_ptr.cast::<[u32; 2]>().write_volatile([1u32 << (base % 32), value]) };
+            unsafe {
+                up_ptr
+                    .cast::<[u32; 2]>()
+                    .write_volatile([1u32 << (base % 32), value])
+            };
             list.keep(&up);
             let word_off = ((base / 32) * 4) as u64;
             // SAFETY: open command list and valid buffer regions.
             unsafe {
-                list.list.CopyBufferRegion(&copy.buffer, copy.base, &up, 4, 4);
-                list.list.CopyBufferRegion(b.vram.as_ref().map_or(&b._buffer, |(vram, _)| vram), word_off, &up, 0, 4);
+                list.list
+                    .CopyBufferRegion(&copy.buffer, copy.base, &up, 4, 4);
+                list.list.CopyBufferRegion(
+                    b.vram.as_ref().map_or(&b._buffer, |(vram, _)| vram),
+                    word_off,
+                    &up,
+                    0,
+                    4,
+                );
             }
             list.close();
             host.execute(&[&list]);
@@ -3426,7 +3794,11 @@ pub(crate) mod tests {
         submit(0x1337_c0de);
         assert_eq!((raw(p), old()), (None, 0), "lazy: nothing written yet");
         submit(0x2222_2222);
-        assert_eq!((raw(p), old()), (None, 0), "written again before any touch: still lazy");
+        assert_eq!(
+            (raw(p), old()),
+            (None, 0),
+            "written again before any touch: still lazy"
+        );
         // SAFETY: the title's view (no access: the handler gives it).
         assert_eq!(unsafe { (p as *const u32).read_volatile() }, 0x2222_2222);
         unregister(p, p as u64);
@@ -3461,10 +3833,16 @@ pub(crate) mod tests {
         {
             let segs = copy.segments(0);
             for w in segs.windows(2) {
-                assert!(w[0].0 + w[0].1 <= w[1].0, "segments must stay sorted and disjoint");
+                assert!(
+                    w[0].0 + w[0].1 <= w[1].0,
+                    "segments must stay sorted and disjoint"
+                );
             }
             let total: usize = segs.iter().map(|(_, n)| n).sum();
-            assert_eq!(total, len, "overlapping writing calls must not re-copy bytes");
+            assert_eq!(
+                total, len,
+                "overlapping writing calls must not re-copy bytes"
+            );
         }
         copy.write_host((p + 10) as u64, &[0xaa]);
         copy.write_host((p + PAGE - 4) as u64, &[0xbb]);
@@ -3511,7 +3889,10 @@ pub(crate) mod tests {
         let reached = || {
             let mut added = Vec::new();
             refresh_where_needed(
-                [("C", c_copy, p, 2 * PAGE, c.bit()), ("E", e_copy, p, PAGE, e.bit())],
+                [
+                    ("C", c_copy, p, 2 * PAGE, c.bit()),
+                    ("E", e_copy, p, PAGE, e.bit()),
+                ],
                 |item, _, _, clean| added.push((item, clean)),
             );
             added
@@ -3519,18 +3900,34 @@ pub(crate) mod tests {
         let none: [(&str, bool); 0] = [];
         assert_eq!(reached(), none, "nothing in flight: both clean, passed by");
         fly(R, vec![(p + 0x100, p + 0x200, c_copy)]);
-        assert_eq!(reached(), [("E", true)], "R writes through C: E is refreshed, C holds R's writes");
+        assert_eq!(
+            reached(),
+            [("E", true)],
+            "R writes through C: E is refreshed, C holds R's writes"
+        );
         fly(R + 1, vec![(p + PAGE + 8, p + PAGE + 16, LABEL)]);
-        assert_eq!(reached(), [("C", true), ("E", true)], "R+1's label lies in C's memory");
+        assert_eq!(
+            reached(),
+            [("C", true), ("E", true)],
+            "R+1's label lies in C's memory"
+        );
         land(R + 1);
         fly(R + 1, vec![(p + PAGE, p + PAGE + 64, AFTER)]);
-        assert_eq!(reached(), [("C", true), ("E", true)], "so does R+1's named work after");
+        assert_eq!(
+            reached(),
+            [("C", true), ("E", true)],
+            "so does R+1's named work after"
+        );
         land(R + 1);
         land(R);
         assert_eq!(reached(), none, "landed: both clean again");
         // SAFETY: a byte of our pool (the title writes it).
         unsafe { (p as *mut u8).write_volatile(1) };
-        assert_eq!(reached(), [("C", false), ("E", false)], "written by the title: refreshed as before");
+        assert_eq!(
+            reached(),
+            [("C", false), ("E", false)],
+            "written by the title: refreshed as before"
+        );
         drop((c, e));
         crate::watch::tests::free(p);
     }
@@ -3546,16 +3943,44 @@ pub(crate) mod tests {
         assert!(f.is_empty());
         // Submission 3 writes [0x1000, 0x9000) through copy 1 (twice, merged)
         // and a label at 0x20000; 5 writes [0x4000, 0x5000) through copy 2.
-        f.fly(3, vec![(0x1000, 0x6000, 1), (0x5000, 0x9000, 1), (0x2_0000, 0x2_0008, LABEL), (0x10, 0x10, 1)]);
+        f.fly(
+            3,
+            vec![
+                (0x1000, 0x6000, 1),
+                (0x5000, 0x9000, 1),
+                (0x2_0000, 0x2_0008, LABEL),
+                (0x10, 0x10, 1),
+            ],
+        );
         f.fly(5, vec![(0x4000, 0x5000, 2)]);
         f.fly(6, Vec::new());
         assert_eq!(f.crossing(0x8000, 0x8100, 1), None, "the same copy");
-        assert_eq!(f.crossing(0x8000, 0x8100, 2), Some((3, false)), "another copy");
-        assert_eq!(f.crossing(0x8000, 0x8100, 0), Some((3, false)), "a title read");
-        assert_eq!(f.crossing(0x4800, 0x4900, 9), Some((5, false)), "the latest");
-        assert_eq!(f.crossing(0x4800, 0x4900, 2), Some((3, false)), "the latest through another copy");
+        assert_eq!(
+            f.crossing(0x8000, 0x8100, 2),
+            Some((3, false)),
+            "another copy"
+        );
+        assert_eq!(
+            f.crossing(0x8000, 0x8100, 0),
+            Some((3, false)),
+            "a title read"
+        );
+        assert_eq!(
+            f.crossing(0x4800, 0x4900, 9),
+            Some((5, false)),
+            "the latest"
+        );
+        assert_eq!(
+            f.crossing(0x4800, 0x4900, 2),
+            Some((3, false)),
+            "the latest through another copy"
+        );
         assert_eq!(f.crossing(0x9000, 0x1_0000, 2), None, "ends are exclusive");
-        assert_eq!(f.crossing(0x1_fff8, 0x2_0001, 1), Some((3, true)), "a bottom-of-pipe write");
+        assert_eq!(
+            f.crossing(0x1_fff8, 0x2_0001, 1),
+            Some((3, true)),
+            "a bottom-of-pipe write"
+        );
         assert_eq!(f.crossing(0x10, 0x20, 2), None, "empty ranges are dropped");
         f.land(5);
         assert_eq!(f.crossing(0x4800, 0x4900, 9), Some((3, false)));
@@ -3587,7 +4012,11 @@ pub(crate) mod tests {
         // Submission 2 is prepared meanwhile; the title wrote page 0.
         // SAFETY: (title writes and reads below) bytes of our pool.
         unsafe { title(200).write_volatile(0x55) };
-        assert_eq!(copy.update(2, p, PAGE), Err(1), "page 0 changed under submission 1's range");
+        assert_eq!(
+            copy.update(2, p, PAGE),
+            Err(1),
+            "page 0 changed under submission 1's range"
+        );
         assert_eq!(copy.update(2, p + PAGE, PAGE), Ok(0), "page 1 unchanged");
         copy.writing(2, p + 128, 64, false);
         assert_eq!(copy.segments(1), [(0, 64)]);
@@ -3660,7 +4089,10 @@ mod run_tests {
     fn fill(p: usize, len: usize) {
         // SAFETY: bytes of our pool or view, read-write (not taken yet).
         let title = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, len) };
-        title.iter_mut().enumerate().for_each(|(k, b)| *b = pattern(k));
+        title
+            .iter_mut()
+            .enumerate()
+            .for_each(|(k, b)| *b = pattern(k));
     }
 
     fn title_bytes(p: usize, len: usize) -> Vec<u8> {
@@ -3697,7 +4129,14 @@ mod run_tests {
         ];
         assert_eq!(
             mark_runs(&items, 2),
-            [(0..2, true), (2..3, true), (3..4, true), (4..5, true), (5..6, false), (6..8, true)]
+            [
+                (0..2, true),
+                (2..3, true),
+                (3..4, true),
+                (4..5, true),
+                (5..6, false),
+                (6..8, true)
+            ]
         );
         assert_eq!(mark_runs(&items, 32)[0], (0..3, true));
         assert!(mark_runs(&[], 32).is_empty());
@@ -3729,14 +4168,23 @@ mod run_tests {
             diff_runs(&new, &old, usize::MAX, &mut out);
             assert_eq!(out[0], (1, 2));
             let runs = &out[1..];
-            let inside = |k: usize| runs.iter().any(|&(a, b)| (a as usize..b as usize).contains(&k));
+            let inside = |k: usize| {
+                runs.iter()
+                    .any(|&(a, b)| (a as usize..b as usize).contains(&k))
+            };
             assert!(changed.iter().all(|&k| inside(k)), "{changed:?}: {runs:?}");
             assert!(runs.windows(2).all(|r| r[0].1 < r[1].0), "{runs:?}");
             for &(a, b) in runs {
                 let (a, b) = (a as usize, b as usize);
-                assert!(new[a] != old[a] && new[b - 1] != old[b - 1], "{changed:?}: {runs:?}");
+                assert!(
+                    new[a] != old[a] && new[b - 1] != old[b - 1],
+                    "{changed:?}: {runs:?}"
+                );
                 for w in (a / 8 * 8..b).step_by(8) {
-                    assert!(new[w..w + 8] != old[w..w + 8], "an unchanged word in a run: {runs:?}");
+                    assert!(
+                        new[w..w + 8] != old[w..w + 8],
+                        "an unchanged word in a run: {runs:?}"
+                    );
                 }
             }
         }
@@ -3747,7 +4195,10 @@ mod run_tests {
         let mut out = Vec::new();
         diff_runs(&new, &old, 4, &mut out);
         assert!(out.len() <= 4, "{}", out.len());
-        assert!((0..PAGE).step_by(64).all(|k| out.iter().any(|&(a, b)| (a as usize..b as usize).contains(&k))));
+        assert!((0..PAGE).step_by(64).all(|k| {
+            out.iter()
+                .any(|&(a, b)| (a as usize..b as usize).contains(&k))
+        }));
     }
 
     /// A run writes what the shaders changed, with one protection change
@@ -3765,10 +4216,20 @@ mod run_tests {
         host[2 * PAGE + 8..3 * PAGE - 8].fill(0x11);
         host[3 * PAGE..].fill(0x55);
         let back = copy_back_run(&t, &pages_at(p, 4), &host, &Default::default());
-        assert_eq!(title_bytes(p, 4 * PAGE), host, "title memory holds the copy");
-        assert_eq!((back.written, back.misses, back.merged, back.kept), (4, 0, 0, 0));
+        assert_eq!(
+            title_bytes(p, 4 * PAGE),
+            host,
+            "title memory holds the copy"
+        );
+        assert_eq!(
+            (back.written, back.misses, back.merged, back.kept),
+            (4, 0, 0, 0)
+        );
         assert_eq!(back.diff_runs, 4);
-        assert_eq!(back.protects, 2, "one protection change each way for the run");
+        assert_eq!(
+            back.protects, 2,
+            "one protection change each way for the run"
+        );
         assert!((0..4).all(|k| !t.changed(p / PAGE + k)), "taken");
         // SAFETY: a byte of our pool, guarded again: the handler opens it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(9) };
@@ -3799,10 +4260,19 @@ mod run_tests {
         });
         let back = copy_back_run(&t, &pages_at(p, 4), &host, &Default::default());
         unhook();
-        assert_eq!((back.written, back.bridged, back.misses, back.protects), (2, 2, 1, 2));
+        assert_eq!(
+            (back.written, back.bridged, back.misses, back.protects),
+            (2, 2, 1, 2)
+        );
         let title = title_bytes(p, 4 * PAGE);
-        assert_eq!((title[100], title[3 * PAGE + 100], title[2 * PAGE + 64]), (host[100], host[3 * PAGE + 100], 0x5c));
-        assert_eq!([0, 1, 2, 3].map(|k| t.changed(p / PAGE + k)), [false, false, true, false]);
+        assert_eq!(
+            (title[100], title[3 * PAGE + 100], title[2 * PAGE + 64]),
+            (host[100], host[3 * PAGE + 100], 0x5c)
+        );
+        assert_eq!(
+            [0, 1, 2, 3].map(|k| t.changed(p / PAGE + k)),
+            [false, false, true, false]
+        );
         // Guarded again, the bridged page counts a write.
         // SAFETY: a byte of our pool.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(9) };
@@ -3842,7 +4312,9 @@ mod run_tests {
         fill(p, 2 * PAGE);
         let host = title_bytes(p, 2 * PAGE);
         assert!(!t.take(p, p + 2 * PAGE).is_empty());
-        let unchanged = [host.as_ptr() as usize, host[PAGE..].as_ptr() as usize].into_iter().collect();
+        let unchanged = [host.as_ptr() as usize, host[PAGE..].as_ptr() as usize]
+            .into_iter()
+            .collect();
         let back = copy_back_run(&t, &pages_at(p, 2), &host, &unchanged);
         assert_eq!((back.written, back.protects), (0, 0));
         assert!(!t.changed(p / PAGE) && !t.changed(p / PAGE + 1));
@@ -3872,10 +4344,17 @@ mod run_tests {
         unhook();
         let title = title_bytes(p, 2 * PAGE);
         assert_eq!(title[5000], 0x5c, "the title's write stays");
-        assert_eq!(&title[100..200], &host[100..200], "the shaders' bytes went back");
+        assert_eq!(
+            &title[100..200],
+            &host[100..200],
+            "the shaders' bytes went back"
+        );
         assert_eq!(&title[PAGE..], &host[PAGE..]);
         assert_eq!((back.written, back.misses), (2, 1));
-        assert!(t.changed(p / PAGE) && !t.changed(p / PAGE + 1), "only the page the title wrote stays changed");
+        assert!(
+            t.changed(p / PAGE) && !t.changed(p / PAGE + 1),
+            "only the page the title wrote stays changed"
+        );
         drop(t);
         free(p);
     }
@@ -3909,10 +4388,17 @@ mod run_tests {
             assert_eq!(title[300], 0x5c, "the title's write stays");
             if armed {
                 assert_eq!((back.merged, back.kept, back.written), (1, 0, 1));
-                assert_eq!(&title[100..200], &host[100..200], "the shaders' bytes went back");
+                assert_eq!(
+                    &title[100..200],
+                    &host[100..200],
+                    "the shaders' bytes went back"
+                );
             } else {
                 assert_eq!((back.merged, back.kept, back.written), (0, 1, 0));
-                assert!((100..200).all(|k| title[k] == pattern(k)), "the title's page as it was");
+                assert!(
+                    (100..200).all(|k| title[k] == pattern(k)),
+                    "the title's page as it was"
+                );
             }
             assert!(t.changed(p / PAGE) && !t.changed(p / PAGE + 1));
             drop(t);
@@ -3946,12 +4432,25 @@ mod run_tests {
         });
         let back = copy_back_run(&t, &[a], &host, &Default::default());
         unhook();
-        writer.lock().unwrap().take().expect("the writer ran").join().unwrap();
+        writer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the writer ran")
+            .join()
+            .unwrap();
         assert_eq!((back.written, back.misses), (1, 0));
         let title = title_bytes(a, PAGE);
         assert_eq!(title[100], 0x5c, "the title's write lands last");
-        assert_eq!(&title[101..108], &host[101..108], "the shaders' other bytes went back");
-        assert!(t.changed(a / PAGE), "the page changed after the run took it");
+        assert_eq!(
+            &title[101..108],
+            &host[101..108],
+            "the shaders' other bytes went back"
+        );
+        assert!(
+            t.changed(a / PAGE),
+            "the page changed after the run took it"
+        );
     }
 
     /// Three views of one fresh section of `pages` pages: the title's
@@ -3959,7 +4458,9 @@ mod run_tests {
     /// and the runtime's own (`c`), which copy-back is told to write
     /// through for `a`'s pages.
     fn three_views(pages: usize) -> (usize, usize, usize) {
-        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+        };
         // Per thread: the tests run in parallel, and one test's views would
         // otherwise answer another's alias question (its pages' `through`).
         thread_local! {
@@ -3968,7 +4469,14 @@ mod run_tests {
         let len = pages * PAGE;
         // SAFETY: a pagefile section mapped three times; the test keeps them.
         let [a, b, c] = unsafe {
-            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            );
             assert!(!section.is_null());
             [(); 3].map(|()| MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize)
         };
@@ -3995,7 +4503,9 @@ mod run_tests {
     /// write there counts), and nothing is checked after.
     #[test]
     fn a_run_writes_view_pages_through_our_own_mapping() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _eager = crate::watch::LazySuspended::set();
         let (a, b, _) = three_views(3);
         let t = crate::watch::track_copy(a, 3 * PAGE, true).expect("views are tracked");
@@ -4005,8 +4515,15 @@ mod run_tests {
         host[100..200].fill(0xaa);
         host[2 * PAGE + 7] ^= 1;
         let back = copy_back_run(&t, &pages_at(a, 3), &host, &Default::default());
-        assert_eq!((back.written, back.through, back.protects, back.misses), (2, 2, 0, 0));
-        assert_eq!(title_bytes(a, 3 * PAGE), host, "title memory holds the copy");
+        assert_eq!(
+            (back.written, back.through, back.protects, back.misses),
+            (2, 2, 0, 0)
+        );
+        assert_eq!(
+            title_bytes(a, 3 * PAGE),
+            host,
+            "title memory holds the copy"
+        );
         assert!((0..3).all(|k| !t.changed(a / PAGE + k)), "taken");
         // SAFETY: a byte of the title's other view, still guarded.
         unsafe { ((b + 2 * PAGE + 8) as *mut u8).write_volatile(9) };
@@ -4023,7 +4540,9 @@ mod run_tests {
     /// mapping too.
     #[test]
     fn a_title_write_during_a_write_through_our_mapping_lands_after_it() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _eager = crate::watch::LazySuspended::set();
         let (a, b, _) = three_views(2);
         let t = crate::watch::track_copy(a, 2 * PAGE, true).expect("views are tracked");
@@ -4039,21 +4558,42 @@ mod run_tests {
                 let mut w = slot.lock().unwrap();
                 // SAFETY: a byte of a title view, guarded: the handler
                 // waits for the lease, then opens it.
-                w.push(std::thread::spawn(move || unsafe { ((a + 100) as *mut u8).write_volatile(0x5c) }));
+                w.push(std::thread::spawn(move || unsafe {
+                    ((a + 100) as *mut u8).write_volatile(0x5c)
+                }));
                 // SAFETY: a byte of the same view's other mapping, guarded
                 // the same way.
-                w.push(std::thread::spawn(move || unsafe { ((b + PAGE + 100) as *mut u8).write_volatile(0x5d) }));
+                w.push(std::thread::spawn(move || unsafe {
+                    ((b + PAGE + 100) as *mut u8).write_volatile(0x5d)
+                }));
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         });
         let back = copy_back_run(&t, &pages_at(a, 2), &host, &Default::default());
         unhook();
-        writers.lock().unwrap().drain(..).for_each(|w| w.join().unwrap());
-        assert_eq!((back.written, back.through, back.protects, back.misses), (2, 2, 0, 0));
+        writers
+            .lock()
+            .unwrap()
+            .drain(..)
+            .for_each(|w| w.join().unwrap());
+        assert_eq!(
+            (back.written, back.through, back.protects, back.misses),
+            (2, 2, 0, 0)
+        );
         let title = title_bytes(a, 2 * PAGE);
-        assert_eq!((title[100], title[PAGE + 100]), (0x5c, 0x5d), "the title's writes land last");
-        assert_eq!((&title[101..108], &title[PAGE + 101..PAGE + 108]), (&host[101..108], &host[PAGE + 101..PAGE + 108]));
-        assert!(t.changed(a / PAGE) && t.changed(a / PAGE + 1), "both pages changed after the run took them");
+        assert_eq!(
+            (title[100], title[PAGE + 100]),
+            (0x5c, 0x5d),
+            "the title's writes land last"
+        );
+        assert_eq!(
+            (&title[101..108], &title[PAGE + 101..PAGE + 108]),
+            (&host[101..108], &host[PAGE + 101..PAGE + 108])
+        );
+        assert!(
+            t.changed(a / PAGE) && t.changed(a / PAGE + 1),
+            "both pages changed after the run took them"
+        );
     }
 
     /// `VICTORY_LAZY_VIEWS`: view pages the shaders changed and the title
@@ -4064,7 +4604,9 @@ mod run_tests {
     /// other page them.
     #[test]
     fn lazy_views_a_page_shaders_wrote_is_not_copied_until_touched() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{LazyOn, raw};
         let _on = LazyOn::set();
         let (a, b, c) = three_views(3);
@@ -4075,15 +4617,39 @@ mod run_tests {
         host[100..200].fill(0xaa);
         host[2 * PAGE + 7] ^= 1;
         let back = copy_back_run(&t, &pages_at(a, 3), &host, &Default::default());
-        assert_eq!((back.written, back.through, back.lazy, back.misses), (0, 0, 2, 0), "{back:?}");
+        assert_eq!(
+            (back.written, back.through, back.lazy, back.misses),
+            (0, 0, 2, 0),
+            "{back:?}"
+        );
         // SAFETY: (both) bytes of the runtime's own view.
         let own = |at: usize| unsafe { ((c + at) as *const u8).read_volatile() };
-        assert_eq!((own(100), own(2 * PAGE + 7)), (pattern(100), pattern(2 * PAGE + 7)), "nothing written");
-        assert_eq!((raw(a + 100), raw(b + 100), raw(a + 2 * PAGE)), (None, None, None), "no access");
-        assert_eq!(raw(a + PAGE), Some(pattern(PAGE)), "the page the shaders left");
-        // SAFETY: a byte of the title's view, without access: the handler gives it.
-        assert_eq!(unsafe { ((a + 150) as *const u8).read_volatile() }, 0xaa, "the first read finds the GPU's bytes");
-        assert_eq!(title_bytes(a, 3 * PAGE), host, "a kernel read gives the other page them");
+        assert_eq!(
+            (own(100), own(2 * PAGE + 7)),
+            (pattern(100), pattern(2 * PAGE + 7)),
+            "nothing written"
+        );
+        assert_eq!(
+            (raw(a + 100), raw(b + 100), raw(a + 2 * PAGE)),
+            (None, None, None),
+            "no access"
+        );
+        assert_eq!(
+            raw(a + PAGE),
+            Some(pattern(PAGE)),
+            "the page the shaders left"
+        );
+        assert_eq!(
+            // SAFETY: a byte of the title's view, without access: the handler gives it.
+            unsafe { ((a + 150) as *const u8).read_volatile() },
+            0xaa,
+            "the first read finds the GPU's bytes"
+        );
+        assert_eq!(
+            title_bytes(a, 3 * PAGE),
+            host,
+            "a kernel read gives the other page them"
+        );
         assert!((0..3).all(|k| !t.changed(a / PAGE + k)), "taken");
     }
 
@@ -4091,7 +4657,9 @@ mod run_tests {
     /// read, compared or written: the first touch finds both writes.
     #[test]
     fn lazy_views_a_page_marked_again_before_any_touch_is_never_copied() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{LazyOn, raw};
         let _on = LazyOn::set();
         let (a, b, c) = three_views(1);
@@ -4104,10 +4672,18 @@ mod run_tests {
         assert_eq!((back.written, back.lazy, back.again), (0, 1, 0));
         host[12] = 0xab;
         let back = copy_back_run(&t, &[a], &host, &Default::default());
-        assert_eq!((back.written, back.lazy, back.again, back.diff_bytes), (0, 0, 1, 0), "nothing copied");
+        assert_eq!(
+            (back.written, back.lazy, back.again, back.diff_bytes),
+            (0, 0, 1, 0),
+            "nothing copied"
+        );
         // SAFETY: (both) bytes of the runtime's own view.
         let own = |at: usize| unsafe { ((c + at) as *const u8).read_volatile() };
-        assert_eq!((own(10), own(12)), (pattern(10), pattern(12)), "never written in between");
+        assert_eq!(
+            (own(10), own(12)),
+            (pattern(10), pattern(12)),
+            "never written in between"
+        );
         assert_eq!(raw(a), None, "still lazy");
         // SAFETY: (both) bytes of the title's other view, without access: the handler gives them.
         let read = |at: usize| unsafe { ((b + at) as *const u8).read_volatile() };
@@ -4121,7 +4697,9 @@ mod run_tests {
     /// at its next refresh.
     #[test]
     fn lazy_views_a_directstorage_write_lands_over_the_shaders_bytes() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::LazyOn;
         let _on = LazyOn::set();
         let (a, b, c) = three_views(1);
@@ -4139,9 +4717,15 @@ mod run_tests {
         drop(crate::watch::writing(a, PAGE));
         drop(crate::watch::writing(b, PAGE));
         let title = title_bytes(a, PAGE);
-        assert_eq!((&title[96..104], &title[104..108]), (&[0x77; 8][..], &[0xaa; 4][..]));
+        assert_eq!(
+            (&title[96..104], &title[104..108]),
+            (&[0x77; 8][..], &[0xaa; 4][..])
+        );
         assert_eq!(title[..96], host[..96]);
-        assert!(t.changed(a / PAGE), "the copy takes the streamed bytes next");
+        assert!(
+            t.changed(a / PAGE),
+            "the copy takes the streamed bytes next"
+        );
     }
 
     /// Two copies of one view page, both written by shaders: the page is not
@@ -4153,7 +4737,9 @@ mod run_tests {
     /// copy's whole page over it).
     #[test]
     fn lazy_views_a_page_another_copy_holds_goes_back_at_once() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::watch::{lazy_checks, tests::LazyOn};
         let _on = LazyOn::set();
         let (a, _, _) = three_views(1);
@@ -4172,9 +4758,17 @@ mod run_tests {
         second[20] = 0xbb;
         let back = copy_back_run(&u, &[a], &second, &Default::default());
         assert_eq!((back.written, back.merged), (1, 1));
-        assert_eq!(lazy_checks().1, missed, "nothing written behind a lazy page's back");
+        assert_eq!(
+            lazy_checks().1,
+            missed,
+            "nothing written behind a lazy page's back"
+        );
         let title = title_bytes(a, PAGE);
-        assert_eq!((title[10], title[20], title[30]), (0xaa, 0xbb, pattern(30)), "both copies' bytes");
+        assert_eq!(
+            (title[10], title[20], title[30]),
+            (0xaa, 0xbb, pattern(30)),
+            "both copies' bytes"
+        );
     }
 
     /// Two title views `a` and `b` of one fresh section (reported as showing
@@ -4194,7 +4788,10 @@ mod run_tests {
         crate::watch::set_writable_alias(|at| {
             AT.with(|s| {
                 let [a, b, len, c] = [0, 1, 2, 3].map(|k| s[k].get());
-                [a, b].into_iter().find(|v| (*v..v + len).contains(&at)).map(|v| at - v + c)
+                [a, b]
+                    .into_iter()
+                    .find(|v| (*v..v + len).contains(&at))
+                    .map(|v| at - v + c)
             })
         });
         (a, b, c)
@@ -4233,7 +4830,9 @@ mod run_tests {
     /// title's first read finds both writes.
     #[test]
     fn owner_two_copies_writing_disjoint_bytes_in_turn_both_land() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{OwnerOn, raw};
         let _on = OwnerOn::set();
         let (a, b, c) = owner_views(1);
@@ -4254,15 +4853,34 @@ mod run_tests {
         assert_eq!(hb, ha, "B is given A's bytes");
         hb[2048..2176].fill(0xbb);
         let back = copy_back_run(&tb, &[b], &hb, &Default::default());
-        assert_eq!((back.taken_over, back.written, back.through, back.protects), (1, 0, 0, 0), "{back:?}");
+        assert_eq!(
+            (back.taken_over, back.written, back.through, back.protects),
+            (1, 0, 0, 0),
+            "{back:?}"
+        );
         #[cfg(feature = "diagnostics")]
-        assert_eq!(crate::watch::thread_counts().1, protects, "no protection change since A's copy-back");
+        assert_eq!(
+            crate::watch::thread_counts().1,
+            protects,
+            "no protection change since A's copy-back"
+        );
         assert!(ta.changed(a / PAGE) && !tb.changed(b / PAGE));
-        // SAFETY: the runtime's own view: title memory still holds the old bytes.
-        assert_eq!(unsafe { (c as *const u8).read_volatile() }, pattern(0), "nothing written");
+        assert_eq!(
+            // SAFETY: the runtime's own view: title memory still holds the old bytes.
+            unsafe { (c as *const u8).read_volatile() },
+            pattern(0),
+            "nothing written"
+        );
         assert!(!ta.take(a, a + PAGE).is_empty());
         assert_eq!(served(a), hb, "A is given B's bytes");
-        assert_eq!((title_read(a + 5), title_read(b + 2050), title_read(a + 3000)), (0xaa, 0xbb, pattern(3000)));
+        assert_eq!(
+            (
+                title_read(a + 5),
+                title_read(b + 2050),
+                title_read(a + 3000)
+            ),
+            (0xaa, 0xbb, pattern(3000))
+        );
         assert_eq!(title_bytes(a, PAGE), hb, "both writes in title memory");
     }
 
@@ -4281,7 +4899,9 @@ mod run_tests {
     /// (copies in video memory, `crate::watch::Tracked::own_bytes`) alike.
     #[test]
     fn owner_two_copies_in_flight_together_keep_both_writes() {
-        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::watch::tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::OwnerOn;
         let _on = OwnerOn::set();
         for (case, own) in (0..3).flat_map(|case| [(case, false), (case, true)]) {

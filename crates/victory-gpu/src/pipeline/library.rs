@@ -182,7 +182,11 @@ const SOFTWARE_LIBRARY_FILE: &str = "host-pipelines-warp.bin";
 
 /// The library file of a host on the software adapter or on hardware.
 fn library_file(software: bool) -> &'static str {
-    if software { SOFTWARE_LIBRARY_FILE } else { LIBRARY_FILE }
+    if software {
+        SOFTWARE_LIBRARY_FILE
+    } else {
+        LIBRARY_FILE
+    }
 }
 
 /// The library file of this run's host.
@@ -194,7 +198,11 @@ fn host_library_file() -> &'static str {
 /// is tagged with its library's bytes, so one list for both was replaced by
 /// whichever pre-built last and refused by the other.
 fn prebuilt_file(software: bool) -> &'static str {
-    if software { SOFTWARE_PREBUILT_FILE } else { PREBUILT_FILE }
+    if software {
+        SOFTWARE_PREBUILT_FILE
+    } else {
+        PREBUILT_FILE
+    }
 }
 
 /// Whether this run's host is on the software adapter (WARP).
@@ -232,7 +240,10 @@ fn library() -> Option<&'static Shared> {
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
-            library.map(|l| Shared { loads: l.library.clone(), state: Mutex::new(l) })
+            library.map(|l| Shared {
+                loads: l.library.clone(),
+                state: Mutex::new(l),
+            })
         })
         .as_ref()
 }
@@ -278,7 +289,9 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
                     prebuilt_changed: false,
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                tracing::info!(error = %e, "host pipeline library rejected; starting an empty one")
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -344,7 +357,10 @@ fn tag(blob: &[u8]) -> String {
 /// The pre-build's list as saved: the tag it holds for, then its keys.
 fn list(tag: &str, keys: &HashSet<String>) -> String {
     let keys = keys.iter().map(String::as_str);
-    std::iter::once(tag).chain(keys).collect::<Vec<_>>().join("\n")
+    std::iter::once(tag)
+        .chain(keys)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The keys of a saved list, if it holds for `tag` (else none).
@@ -359,7 +375,13 @@ fn listed(list: &[u8], tag: &str) -> HashSet<String> {
 
 /// Whether the pre-build has the title pipeline `key` in the library.
 pub(crate) fn prebuilt(key: &str) -> bool {
-    library().is_some_and(|l| l.state.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key))
+    library().is_some_and(|l| {
+        l.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prebuilt
+            .contains(key)
+    })
 }
 
 /// The pre-build has the title pipeline `key` in the library now.
@@ -374,7 +396,11 @@ pub(crate) fn note_prebuilt(key: String) {
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
     let mut h = blake3::Hasher::new();
-    for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
+    for part in [kind.as_bytes(), root]
+        .into_iter()
+        .chain(code.iter().copied())
+        .chain([state.as_bytes()])
+    {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
@@ -401,7 +427,10 @@ pub(crate) fn pipeline(
     LAST.set(Some((name.to_owned(), true)));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create().map(|pso| PipelineState { pso, in_library: false });
+        return create().map(|pso| PipelineState {
+            pso,
+            in_library: false,
+        });
     };
     let _held = NAMES.hold(name);
     // Outside the lock: loads take up to seconds, and a save holds the lock
@@ -409,7 +438,10 @@ pub(crate) fn pipeline(
     // does, which is never dropped.
     if let Ok(pso) = load(&library.loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(PipelineState { pso, in_library: true });
+        return Ok(PipelineState {
+            pso,
+            in_library: true,
+        });
     }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
@@ -461,7 +493,10 @@ pub(crate) fn save(now: bool) {
         let size = unsafe { l.library.GetSerializedSize() };
         let Some(mut bytes) = zeroed(size) else {
             // Left for a later save: the pending changes stay marked.
-            tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
+            tracing::warn!(
+                bytes = size,
+                "no memory to serialise the host pipeline library; saved later"
+            );
             dirty.restore(&mut l.added, &mut l.prebuilt_changed, &USED_CHANGED);
             return;
         };
@@ -482,13 +517,18 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let first = first().as_ref().map(|f| f.list_at_most(FIRST_MAX)).unwrap_or_default();
+    let first = first()
+        .as_ref()
+        .map(|f| f.list_at_most(FIRST_MAX))
+        .unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(host_library_file()), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(FIRST_FILE), first.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(prebuilt_file(host_software())), list.as_bytes()),
+            Some(list) => {
+                write_atomically(&dir.join(prebuilt_file(host_software())), list.as_bytes())
+            }
             None => Ok(()),
         });
     let (created, distinct) = created();
@@ -525,7 +565,11 @@ struct Dirty {
 
 impl Dirty {
     /// The marks, cleared; none if nothing changed.
-    fn take(added: &mut u64, prebuilt_changed: &mut bool, used_changed: &AtomicBool) -> Option<Dirty> {
+    fn take(
+        added: &mut u64,
+        prebuilt_changed: &mut bool,
+        used_changed: &AtomicBool,
+    ) -> Option<Dirty> {
         let dirty = Dirty {
             added: std::mem::take(added),
             prebuilt_changed: std::mem::take(prebuilt_changed),
@@ -581,7 +625,10 @@ static CREATED: Mutex<(u64, Option<HashSet<String>>)> = Mutex::new((0, None));
 pub(crate) fn note_created(key: &str) {
     let mut created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
     created.0 += 1;
-    created.1.get_or_insert_with(HashSet::new).insert(key.to_owned());
+    created
+        .1
+        .get_or_insert_with(HashSet::new)
+        .insert(key.to_owned());
 }
 
 /// Title pipelines created so far, and how many distinct ones.
@@ -608,7 +655,10 @@ impl Used {
         for (place, key) in listed.lines().filter(|l| !l.is_empty()).enumerate() {
             before.entry(key.to_owned()).or_insert(place);
         }
-        Used { before, now: HashSet::new() }
+        Used {
+            before,
+            now: HashSet::new(),
+        }
     }
 
     /// The list to keep: this run's keys, then earlier runs' others, most
@@ -619,7 +669,11 @@ impl Used {
 
     /// As [`Used::list`], at most `max` keys.
     fn list_at_most(&self, max: usize) -> Vec<String> {
-        let mut earlier: Vec<_> = self.before.iter().filter(|(k, _)| !self.now.contains(*k)).collect();
+        let mut earlier: Vec<_> = self
+            .before
+            .iter()
+            .filter(|(k, _)| !self.now.contains(*k))
+            .collect();
         earlier.sort_unstable_by_key(|&(_, &place)| place);
         let earlier = earlier.into_iter().map(|(k, _)| k);
         self.now.iter().chain(earlier).take(max).cloned().collect()
@@ -675,7 +729,10 @@ pub(crate) fn wanted_first(key: &str) -> bool {
 /// A presented image waits for the title pipeline with `key`: listed if
 /// this run has listed fewer than [`FIRST_MAX`].
 pub(crate) fn note_hurried(key: &str) {
-    if first().get_or_insert_with(Used::default).note_at_most(key, FIRST_MAX) {
+    if first()
+        .get_or_insert_with(Used::default)
+        .note_at_most(key, FIRST_MAX)
+    {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -693,7 +750,11 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
-    if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
+    if used()
+        .get_or_insert_with(Used::default)
+        .now
+        .insert(key.to_owned())
+    {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -717,7 +778,11 @@ mod tests {
         let keys = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
         let (hw, warp) = (keys(&["a", "b"]), keys(&["c"]));
         std::fs::write(dir.path().join(prebuilt_file(false)), list("hw-tag", &hw)).unwrap();
-        std::fs::write(dir.path().join(prebuilt_file(true)), list("warp-tag", &warp)).unwrap();
+        std::fs::write(
+            dir.path().join(prebuilt_file(true)),
+            list("warp-tag", &warp),
+        )
+        .unwrap();
         let read = |software| std::fs::read(dir.path().join(prebuilt_file(software))).unwrap();
         assert_eq!(listed(&read(false), "hw-tag"), hw);
         assert_eq!(listed(&read(true), "warp-tag"), warp);
@@ -745,7 +810,8 @@ mod tests {
     fn warp_cache_save_and_reload_preserve_hardware_files() {
         const STEP: &str = "VICTORY_TEST_WARP_CACHE_STEP";
         const CACHE: &str = "VICTORY_TEST_WARP_CACHE_DIR";
-        const NAME: &str = "pipeline::library::tests::warp_cache_save_and_reload_preserve_hardware_files";
+        const NAME: &str =
+            "pipeline::library::tests::warp_cache_save_and_reload_preserve_hardware_files";
         const KEY: &str = "synthetic-warp-cache-key";
         const NO_LIBRARY: &str = "WARP pipeline libraries unavailable";
         const HARDWARE_BLOB: &[u8] = b"synthetic bytes from a different adapter";
@@ -806,7 +872,10 @@ mod tests {
             HARDWARE_INDEX.len(),
             hardware_index_after.len(),
         );
-        assert!(hardware_after == HARDWARE_BLOB, "WARP save replaced the hardware file");
+        assert!(
+            hardware_after == HARDWARE_BLOB,
+            "WARP save replaced the hardware file"
+        );
         assert!(
             hardware_index_after == HARDWARE_INDEX,
             "WARP save replaced the hardware prebuilt list",
@@ -836,13 +905,25 @@ mod tests {
     /// This run's keys stay in the list; earlier runs' fill it up to the cap.
     #[test]
     fn the_early_list_keeps_this_run_first() {
-        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
-        let before = keys(0..EARLY_MAX).into_iter().enumerate().map(|(i, k)| (k, i)).collect();
-        let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
+        let keys =
+            |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
+        let before = keys(0..EARLY_MAX)
+            .into_iter()
+            .enumerate()
+            .map(|(i, k)| (k, i))
+            .collect();
+        let used = Used {
+            before,
+            now: keys(EARLY_MAX - 10..EARLY_MAX + 10),
+        };
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
         assert!(used.now.iter().all(|k| list.contains(k)));
-        assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
+        assert_eq!(
+            list.iter().collect::<HashSet<_>>().len(),
+            EARLY_MAX,
+            "no key twice"
+        );
     }
 
     /// The list of pipelines to start first is kept the same way, under
@@ -897,12 +978,25 @@ mod tests {
     fn a_failed_save_leaves_its_changes_to_the_next() {
         let (mut added, mut prebuilt, used) = (3u64, true, AtomicBool::new(true));
         let dirty = Dirty::take(&mut added, &mut prebuilt, &used).expect("changes");
-        assert_eq!((added, prebuilt, used.load(Ordering::Relaxed)), (0, false, false), "taken");
-        assert!(Dirty::take(&mut added, &mut prebuilt, &used).is_none(), "nothing more to save");
+        assert_eq!(
+            (added, prebuilt, used.load(Ordering::Relaxed)),
+            (0, false, false),
+            "taken"
+        );
+        assert!(
+            Dirty::take(&mut added, &mut prebuilt, &used).is_none(),
+            "nothing more to save"
+        );
         added = 2; // pipelines stored while the save wrote
         dirty.restore(&mut added, &mut prebuilt, &used);
-        assert_eq!((added, prebuilt, used.load(Ordering::Relaxed)), (5, true, true));
-        assert!(Dirty::take(&mut added, &mut prebuilt, &used).is_some(), "the next save writes them");
+        assert_eq!(
+            (added, prebuilt, used.load(Ordering::Relaxed)),
+            (5, true, true)
+        );
+        assert!(
+            Dirty::take(&mut added, &mut prebuilt, &used).is_some(),
+            "the next save writes them"
+        );
     }
 
     /// The pre-build's list holds only for the library bytes it was
@@ -977,14 +1071,21 @@ mod tests {
                 "RWStructuredBuffer<uint> b : register(u0);\n\
                  [numthreads(1, 1, 1)] void main() {{ b[0] = b[1] * {i} + {i}; }}"
             );
-            let code = crate::compute::compile(&source, s!("library"), s!("main"), s!("cs_5_1"), 0).ok()?;
+            let code = crate::compute::compile(&source, s!("library"), s!("main"), s!("cs_5_1"), 0)
+                .ok()?;
             Some(crate::compute::bytes(&code).to_vec())
         };
         let Some(codes) = (0..2 * N).map(shader).collect::<Option<Vec<_>>>() else {
             return; // no shader compiler here
         };
-        let params = [crate::compute::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0)];
-        let root = crate::compute::root_signature(&host.device, &params, D3D12_ROOT_SIGNATURE_FLAG_NONE).unwrap();
+        let params = [crate::compute::root_view(
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            0,
+            0,
+        )];
+        let root =
+            crate::compute::root_signature(&host.device, &params, D3D12_ROOT_SIGNATURE_FLAG_NONE)
+                .unwrap();
         struct Shared(ID3D12Device1, ID3D12RootSignature, ID3D12PipelineLibrary1);
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Shared {}
@@ -1150,10 +1251,12 @@ mod tests {
 
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let library =
+            open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());

@@ -1671,7 +1671,13 @@ fn conversion_probes() -> Vec<Probe> {
         0xBF80_0000,
         0x7FC0_0000,
     ]);
-    for m in [NONE, M { clamp: true, ..NONE }] {
+    for m in [
+        NONE,
+        M {
+            clamp: true,
+            ..NONE
+        },
+    ] {
         p.push(probe(
             vop3(0x18A, 5, [v(1), 0, 0], m),
             exact.clone(),
@@ -2361,9 +2367,12 @@ fn packed_fused_f16_rounds_each_half_once() {
     ] {
         let mut words = vop3p(0x0E, 5, [v(1), v(2), v(3)], select[0], select[1], neg);
         words[0] |= u32::from(clamp) << 15;
-        probes.push(probe(words, inputs.clone(), Kind::Halves { ulps: 0 }, move |i| {
-            expected(i, select, neg, clamp)
-        }));
+        probes.push(probe(
+            words,
+            inputs.clone(),
+            Kind::Halves { ulps: 0 },
+            move |i| expected(i, select, neg, clamp),
+        ));
     }
     let copy_addend = vop1(0x01, 5, v(3));
     let fmac = vop3(0x13C, 5, [v(1), v(2), 0], NONE);
@@ -2371,9 +2380,12 @@ fn packed_fused_f16_rounds_each_half_once() {
         vec![copy_addend, vop2(0x3C, 5, v(1), 2)],
         vec![copy_addend, fmac[0], fmac[1]],
     ] {
-        probes.push(probe(words, inputs.clone(), Kind::Halves { ulps: 0 }, move |i| {
-            expected(i, [0, 7], [0, 0], false)
-        }));
+        probes.push(probe(
+            words,
+            inputs.clone(),
+            Kind::Halves { ulps: 0 },
+            move |i| expected(i, [0, 7], [0, 0], false),
+        ));
     }
     assert_clean(check(&probes));
 }
@@ -3418,6 +3430,8 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
     assert_clean(check(&[
         probe(plain, inputs.clone(), INT, |i| vec![i[0], 0, 0, 0]),
         probe(more, inputs.clone(), INT, |i| vec![i[0], 0, 0, i[0]]),
-        probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
+        probe(masked, inputs, INT, |i| {
+            vec![if i[0] > i[1] { 0 } else { OLD }]
+        }),
     ]));
 }

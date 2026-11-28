@@ -481,7 +481,8 @@ fn sockaddr(addr: SocketAddr) -> ([u8; 28], i32) {
 /// False, with the bind's error, if it cannot be.
 fn bound_to_loopback(s: Socket, to: SocketAddr) -> bool {
     use std::net::{Ipv4Addr, Ipv6Addr};
-    let getsockname = host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut u8, *mut i32) -> i32);
+    let getsockname =
+        host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut u8, *mut i32) -> i32);
     let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
     let (mut name, mut len) = ([0u8; 28], 28i32);
     // Bound already, or no socket (the send fails as it would have).
@@ -491,11 +492,17 @@ fn bound_to_loopback(s: Socket, to: SocketAddr) -> bool {
     let home: IpAddr = match to.ip() {
         IpAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
         // A dual-stack socket sending to 127.0.0.1.
-        IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(),
+        IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => {
+            Ipv4Addr::LOCALHOST.to_ipv6_mapped().into()
+        }
         IpAddr::V6(_) => Ipv6Addr::LOCALHOST.into(),
     };
     let (local, len) = sockaddr((home, 0).into());
-    host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32)(s, local.as_ptr(), len) == 0
+    host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32)(
+        s,
+        local.as_ptr(),
+        len,
+    ) == 0
 }
 
 /// A datagram send to `to` (of `to_len` bytes) may go ahead: loopback, on a
@@ -1220,7 +1227,8 @@ mod tests {
     fn local(s: Socket) -> Option<SocketAddr> {
         let getsockname = host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut u8, *mut i32) -> i32);
         let (mut name, mut len) = ([0u8; 28], 28i32);
-        (getsockname(s, name.as_mut_ptr(), &mut len) == 0).then(|| socket_addr(name.as_ptr(), len))?
+        (getsockname(s, name.as_mut_ptr(), &mut len) == 0)
+            .then(|| socket_addr(name.as_ptr(), len))?
     }
 
     /// A datagram socket that sends before it is bound was bound by the host
@@ -1238,12 +1246,19 @@ mod tests {
         let u = socket(23, 2, 17);
         assert_eq!(sendto(u, b"x".as_ptr(), 1, 0, to.as_ptr(), to_len), 1);
         let bound = local(u).expect("bound by its send");
-        assert_eq!(bound.ip(), IpAddr::from(std::net::Ipv6Addr::LOCALHOST), "bound to {bound}");
+        assert_eq!(
+            bound.ip(),
+            IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+            "bound to {bound}"
+        );
         close(u);
 
         let u = socket(2, 2, 17);
         assert_eq!(local(u), None, "not bound before its first send");
-        assert_eq!(sendto(u, b"x".as_ptr(), 1, 0, v4(HOME, port).as_ptr(), 16), 1);
+        assert_eq!(
+            sendto(u, b"x".as_ptr(), 1, 0, v4(HOME, port).as_ptr(), 16),
+            1
+        );
         let bound = local(u).expect("bound by its send");
         assert!(bound.ip().is_loopback(), "bound to {bound}, not loopback");
         close(u);
@@ -1259,7 +1274,10 @@ mod tests {
         let msg = Msg(to.as_ptr(), 16, &data, 1, Buf(0, std::ptr::null()), 0);
         let mut sent = 0u32;
         let null = std::ptr::null_mut();
-        assert_eq!(WSASendMsg(u, (&raw const msg).cast(), 0, &mut sent, null, null), 0);
+        assert_eq!(
+            WSASendMsg(u, (&raw const msg).cast(), 0, &mut sent, null, null),
+            0
+        );
         let bound = local(u).expect("bound by its send");
         assert!(bound.ip().is_loopback(), "bound to {bound}, not loopback");
         close(u);
@@ -1272,7 +1290,11 @@ mod tests {
         // The machine's address on its default route (a connected datagram
         // socket sends nothing); none without a network.
         let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-        let lan = match probe.connect("192.0.2.1:9").ok().and_then(|_| probe.local_addr().ok()) {
+        let lan = match probe
+            .connect("192.0.2.1:9")
+            .ok()
+            .and_then(|_| probe.local_addr().ok())
+        {
             Some(SocketAddr::V4(a)) if !a.ip().is_loopback() && !a.ip().is_unspecified() => *a.ip(),
             _ => return, // no network here
         };
@@ -1280,7 +1302,8 @@ mod tests {
         let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
         let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
         let setsockopt = host!("ws2_32.dll", "setsockopt": extern "system" fn(Socket, i32, i32, *const u32, i32) -> i32);
-        let recv = host!("ws2_32.dll", "recv": extern "system" fn(Socket, *mut u8, i32, i32) -> i32);
+        let recv =
+            host!("ws2_32.dll", "recv": extern "system" fn(Socket, *mut u8, i32, i32) -> i32);
 
         let u = socket(2, 2, 17);
         let home = v4(HOME, peer.local_addr().unwrap().port());
@@ -1295,6 +1318,9 @@ mod tests {
         let mut buf = [0u8; 8];
         let got = recv(u, buf.as_mut_ptr(), 8, 0);
         close(u);
-        assert!(got <= 0, "a datagram to {lan}:{port} reached the title's socket");
+        assert!(
+            got <= 0,
+            "a datagram to {lan}:{port} reached the title's socket"
+        );
     }
 }

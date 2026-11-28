@@ -319,7 +319,10 @@ impl Journal {
                 .0;
         }
         st.shared += 1;
-        Gate { journal: self, alone: false }
+        Gate {
+            journal: self,
+            alone: false,
+        }
     }
 
     /// Waits until no other pipeline holds the gate, then holds it alone; if
@@ -333,7 +336,10 @@ impl Journal {
                 st.waiting_alone -= 1;
                 st.alone = true;
                 st.since = Some(Instant::now());
-                return Gate { journal: self, alone: true };
+                return Gate {
+                    journal: self,
+                    alone: true,
+                };
             }
             if !st.blocks(self.alone_for) {
                 st.waiting_alone -= 1;
@@ -342,7 +348,10 @@ impl Journal {
                 }
                 st.shared += 1;
                 self.gate_changed.notify_all();
-                return Gate { journal: self, alone: false };
+                return Gate {
+                    journal: self,
+                    alone: false,
+                };
             }
             let wait = st.left(self.alone_for);
             st = self
@@ -407,7 +416,8 @@ impl GateState {
     }
 
     fn left(&self, alone_for: Duration) -> Duration {
-        self.since.map_or(alone_for, |t| alone_for.saturating_sub(t.elapsed()))
+        self.since
+            .map_or(alone_for, |t| alone_for.saturating_sub(t.elapsed()))
             + Duration::from_millis(1)
     }
 }
@@ -671,7 +681,10 @@ mod tests {
                 waited
             });
             let waited = other.join().unwrap();
-            assert!(waited >= std::time::Duration::from_millis(150), "{waited:?}");
+            assert!(
+                waited >= std::time::Duration::from_millis(150),
+                "{waited:?}"
+            );
             assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
             drop(slow);
         });
@@ -745,7 +758,9 @@ mod tests {
             let _ = done.send(());
         });
         assert!(
-            finished.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            finished
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
             "a nested pipeline deadlocked on the gate"
         );
     }

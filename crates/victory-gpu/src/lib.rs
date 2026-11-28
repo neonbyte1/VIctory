@@ -35,18 +35,18 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+pub mod dxgi;
 #[cfg(windows)]
 mod early;
-pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
 #[cfg(windows)]
 mod feeds;
 pub mod fence;
 pub mod frame;
-mod hold;
 #[cfg(windows)]
 mod fx;
+mod hold;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -91,6 +91,6 @@ pub use copystat::CountingAlloc;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
-    UnseenWriting, Writing as KernelWrite, set_writable_alias, title_memory_aliased, title_memory_remapped,
-    title_memory_unmapped, unseen_writing, writing as kernel_will_write,
+    UnseenWriting, Writing as KernelWrite, set_writable_alias, title_memory_aliased,
+    title_memory_remapped, title_memory_unmapped, unseen_writing, writing as kernel_will_write,
 };

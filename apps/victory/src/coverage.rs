@@ -69,7 +69,10 @@ fn failures(reader: impl BufRead) -> Result<(Failures, usize, usize)> {
                 // Current tracing fields follow the Display-formatted error.
                 // Strip the metadata suffix, but keep older logs without it.
                 let error = s.trim_end_matches(FAILURE);
-                error.rsplit_once(" cached=").map_or(error, |(reason, _)| reason).trim()
+                error
+                    .rsplit_once(" cached=")
+                    .map_or(error, |(reason, _)| reason)
+                    .trim()
             })
             .filter(|s| !s.is_empty());
         match (hash, error) {
@@ -178,9 +181,14 @@ pub(crate) fn run(log: &Path, paths: Vec<PathBuf>) -> Result<()> {
     let emitted = matched.values().filter(|r| r.is_ok()).count();
     println!("matched / offline emitted: {emitted}");
     println!("matched / offline failed:  {}", matched.len() - emitted);
-    println!("not found in scanned data:  {}", wanted.len() - matched.len());
+    println!(
+        "not found in scanned data:  {}",
+        wanted.len() - matched.len()
+    );
     println!("skipped entries or records: {skipped}");
-    println!("Not found means no matching byte extent was discovered, not that a shader is absent.");
+    println!(
+        "Not found means no matching byte extent was discovered, not that a shader is absent."
+    );
 
     let mut reasons = BTreeMap::<&str, usize>::new();
     for (hash, errors) in &wanted {
@@ -229,7 +237,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn current_runtime_fields_do_not_split_identical_reasons() {
         let log = format!(
@@ -265,9 +272,18 @@ mod tests {
         for (input, expected) in [
             ("GFX10 code at 0x0: unsupported", "unsupported"),
             ("GFX10 code at 0xAbCd: op: detail", "op: detail"),
-            ("GFX10 code at 0x: unsupported", "GFX10 code at 0x: unsupported"),
-            ("GFX10 code at 0xGG: unsupported", "GFX10 code at 0xGG: unsupported"),
-            ("GFX10 code at 12: unsupported", "GFX10 code at 12: unsupported"),
+            (
+                "GFX10 code at 0x: unsupported",
+                "GFX10 code at 0x: unsupported",
+            ),
+            (
+                "GFX10 code at 0xGG: unsupported",
+                "GFX10 code at 0xGG: unsupported",
+            ),
+            (
+                "GFX10 code at 12: unsupported",
+                "GFX10 code at 12: unsupported",
+            ),
             ("GFX10 code at 0x12", "GFX10 code at 0x12"),
             ("other reason", "other reason"),
             ("", ""),
@@ -317,7 +333,10 @@ mod tests {
         let mut bytes = container();
         bytes.extend_from_slice(&[0; 8]);
         assert_eq!(candidates(&bytes, false), [Some(&bytes[..32]), None]);
-        assert_eq!(candidates(&bytes, true), [Some(&bytes[..32]), Some(bytes.as_slice())]);
+        assert_eq!(
+            candidates(&bytes, true),
+            [Some(&bytes[..32]), Some(bytes.as_slice())]
+        );
         assert_eq!(candidates(&bytes[..20], true), [None, None]);
         bytes[0x18..0x1c].copy_from_slice(&100u32.to_le_bytes());
         assert_eq!(candidates(&bytes, true), [None, None]);
@@ -329,7 +348,9 @@ mod tests {
         let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
         let wanted = Failures::from([(hash.clone(), BTreeSet::new())]);
         let mut matched = Matches::new();
-        probe(b"unrelated", &wanted, &mut matched, |_| panic!("not requested"));
+        probe(b"unrelated", &wanted, &mut matched, |_| {
+            panic!("not requested")
+        });
         probe(&bytes, &wanted, &mut matched, |_| Ok(()));
         probe(&bytes, &wanted, &mut matched, |_| panic!("already matched"));
         assert_eq!(status(&matched, &hash), Status::OfflineEmitted);

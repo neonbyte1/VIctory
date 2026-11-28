@@ -1188,21 +1188,21 @@ fn nested_exec_masks_keep_shared_visibility_results_across_halves() {
                 0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
                 0xBF88_0002, // s_cbranch_execz init_done
                 0xD838_0100,
-                0x0006_0501, // ds_write2_b32 v1, v5, v6 offset1:1
-                0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
-                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-                0xBF8A_0000, // s_barrier
-                0x8F0E_8601, // s_lshl_b32 s14, s1, 6
-                0x4A0E_000E, // v_add_nc_u32 v7, s14, v0
-                0x7E0A_0281, // v_mov_b32 v5, 1
-                0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
-                0x020C_0A82, // v_cndmask_b32 v6, 2, v5, vcc
-                0x7D88_0080 | end, // v_cmp_gt_u32 vcc, end, v0
-                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
-                0xBF88_0008, // s_cbranch_execz outer_done
+                0x0006_0501,         // ds_write2_b32 v1, v5, v6 offset1:1
+                0x88FE_0A7E,         // s_or_b64 exec, exec, s[10:11]
+                0xBF8C_C07F,         // s_waitcnt lgkmcnt(0)
+                0xBF8A_0000,         // s_barrier
+                0x8F0E_8601,         // s_lshl_b32 s14, s1, 6
+                0x4A0E_000E,         // v_add_nc_u32 v7, s14, v0
+                0x7E0A_0281,         // v_mov_b32 v5, 1
+                0x7D88_00A0,         // v_cmp_gt_u32 vcc, 32, v0
+                0x020C_0A82,         // v_cndmask_b32 v6, 2, v5, vcc
+                0x7D88_0080 | end,   // v_cmp_gt_u32 vcc, end, v0
+                0xBE8A_246A,         // s_and_saveexec_b64 s[10:11], vcc
+                0xBF88_0008,         // s_cbranch_execz outer_done
                 0x7D86_0080 | start, // v_cmp_le_u32 vcc, start, v0
-                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
-                0xBF88_0004, // s_cbranch_execz inner_done
+                0xBE8C_246A,         // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004,         // s_cbranch_execz inner_done
                 0xD81C_0000,
                 0x0000_0701, // ds_min_u32 v1, v7
                 0xD828_0004,

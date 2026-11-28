@@ -124,7 +124,12 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
         key.update(s.stage.as_bytes());
         key.update(s.hash.as_bytes());
     }
-    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
+    key.update(
+        graphics
+            .map(|g| g.describe())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     key.finalize().to_hex()[..32].to_owned()
 }
 
@@ -156,7 +161,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_built(key: &str) {
     if let Some((name, loaded)) = super::library::LAST.take() {
-        log("built", key, || format!("{name}\t{}", if loaded { "loaded" } else { "made" }));
+        log("built", key, || {
+            format!("{name}\t{}", if loaded { "loaded" } else { "made" })
+        });
     }
 }
 
@@ -176,9 +183,13 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
     };
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     if log.is_none() {
-        *log = std::fs::File::create(path).ok().map(|f| (f, HashSet::new()));
+        *log = std::fs::File::create(path)
+            .ok()
+            .map(|f| (f, HashSet::new()));
     }
-    let Some((file, seen)) = log.as_mut() else { return };
+    let Some((file, seen)) = log.as_mut() else {
+        return;
+    };
     if seen.insert(format!("{what} {key}")) {
         let _ = writeln!(file, "{what}\t{key}\t{}", rest());
     }
@@ -364,7 +375,10 @@ fn hurried(p: &Pending) -> bool {
 }
 
 fn count_waiting() {
-    PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+    PEAK.fetch_max(
+        WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+        Ordering::Relaxed,
+    );
 }
 
 /// Which queue `p` goes into now (true: the one draws wait for), if any.
@@ -415,14 +429,19 @@ fn wait_within(waits: &Waits, budget: Duration, p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
 /// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) = (
+    Mutex::new([VecDeque::new(), VecDeque::new()]),
+    Condvar::new(),
+);
 
 /// Stack of each pipeline worker: room for the driver's shader compiler,
 /// which runs on it (reserved address space; committed only as used).
@@ -558,10 +577,16 @@ mod tests {
         }
         let null = std::ptr::null();
         let allocator_iid = guid(
-            0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
         );
         let list_iid = guid(
-            0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
         );
         let (mut allocator, mut list) = (null, null);
         assert_eq!(
@@ -582,7 +607,11 @@ mod tests {
             // independent of timing and the driver's graphics pipeline cache.
             assert_eq!(
                 crate::pipeline::hand_out(
-                    vec![], None, &[], &crate::pipeline::PIPELINE_IIDS[0], &mut pipeline,
+                    vec![],
+                    None,
+                    &[],
+                    &crate::pipeline::PIPELINE_IIDS[0],
+                    &mut pipeline,
                 ),
                 S_OK
             );
@@ -592,19 +621,21 @@ mod tests {
             } else {
                 draw(list, items, instances, 0, 0);
             }
-            let used = crate::pipeline::pipeline(pipeline).host.used.load(Ordering::Relaxed);
+            let used = crate::pipeline::pipeline(pipeline)
+                .host
+                .used
+                .load(Ordering::Relaxed);
             select(list, null);
             release(pipeline);
             used
         };
-        let empty = [
-            (false, 0, 1),
-            (false, 3, 0),
-            (true, 0, 1),
-            (true, 3, 0),
-        ].map(|(indexed, items, instances)| demand(indexed, items, instances));
+        let empty = [(false, 0, 1), (false, 3, 0), (true, 0, 1), (true, 3, 0)]
+            .map(|(indexed, items, instances)| demand(indexed, items, instances));
         let nonempty = [demand(false, 3, 1), demand(true, 3, 1)];
-        assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), S_OK);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> i32>(list, 0x48)(list),
+            S_OK
+        );
         release(list);
         release(allocator);
         assert_eq!(empty, [false; 4]);
@@ -671,9 +702,14 @@ mod tests {
             let (completed, consumed) = std::sync::mpsc::channel();
             threads.spawn(move || {
                 urgent_started.send(()).unwrap();
-                assert_eq!(enqueue(pending, true, || panic!("counted twice")), Some(true));
+                assert_eq!(
+                    enqueue(pending, true, || panic!("counted twice")),
+                    Some(true)
+                );
                 // An available worker can take and finish the promoted entry now.
-                completed.send(waiting.fetch_sub(1, Ordering::Relaxed)).unwrap();
+                completed
+                    .send(waiting.fetch_sub(1, Ordering::Relaxed))
+                    .unwrap();
             });
             attempting.recv().unwrap();
 
@@ -683,7 +719,10 @@ mod tests {
             let previous = before_count
                 .or_else(|_| consumed.recv_timeout(Duration::from_secs(10)))
                 .expect("promoted pipeline finished");
-            assert_eq!(previous, 1, "a worker finished before the pipeline was counted");
+            assert_eq!(
+                previous, 1,
+                "a worker finished before the pipeline was counted"
+            );
             assert_eq!(waiting.load(Ordering::Relaxed), 0);
         });
     }
@@ -882,10 +921,7 @@ mod tests {
         crate::pipeline::library::note_used(&warm.key);
         early(&warm);
         assert_eq!(
-            (
-                cold.queued.is_completed(),
-                warm.queued.is_completed()
-            ),
+            (cold.queued.is_completed(), warm.queued.is_completed()),
             (false, false)
         );
         assert!(matches!(cold.made.get(), Some(None)));

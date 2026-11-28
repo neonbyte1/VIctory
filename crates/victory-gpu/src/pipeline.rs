@@ -112,14 +112,19 @@ impl ShaderCache {
     /// The cache lock prevents another lookup from racing with eviction.
     fn trim_idle(&mut self) {
         let before = self.entries.len();
-        self.entries.retain(|_, shader| Arc::strong_count(shader) > 1);
+        self.entries
+            .retain(|_, shader| Arc::strong_count(shader) > 1);
         let removed = before - self.entries.len();
         if removed != 0 {
             // Avoid retaining a large table after a substantial sweep.
             if self.entries.capacity() > self.entries.len().saturating_mul(2).max(256) {
                 self.entries.shrink_to_fit();
             }
-            tracing::debug!(removed, remaining = self.entries.len(), "idle shaders trimmed");
+            tracing::debug!(
+                removed,
+                remaining = self.entries.len(),
+                "idle shaders trimmed"
+            );
         }
     }
 }
@@ -131,11 +136,16 @@ static SHADERS: Mutex<Option<ShaderCache>> = Mutex::new(None);
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     static TRIM: OnceLock<bool> = OnceLock::new();
     let trim = *TRIM.get_or_init(|| {
-        matches!(std::env::var("VICTORY_TRIM_IDLE_SHADERS").as_deref(), Ok("1"))
+        matches!(
+            std::env::var("VICTORY_TRIM_IDLE_SHADERS").as_deref(),
+            Ok("1")
+        )
     });
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders.get_or_insert_with(ShaderCache::default).get(full, stage, bytes, trim)
+    shaders
+        .get_or_insert_with(ShaderCache::default)
+        .get(full, stage, bytes, trim)
 }
 
 impl Shader {
@@ -180,8 +190,8 @@ pub(crate) struct Translated {
 
 #[cfg(all(windows, any(feature = "diagnostics", test)))]
 mod timing {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     #[derive(Default)]
@@ -197,7 +207,10 @@ mod timing {
         }
 
         fn snapshot(&self) -> (u64, u64) {
-            (self.calls.load(Ordering::Relaxed), self.us.load(Ordering::Relaxed))
+            (
+                self.calls.load(Ordering::Relaxed),
+                self.us.load(Ordering::Relaxed),
+            )
         }
     }
 
@@ -259,10 +272,7 @@ mod timing {
     }
 
     #[cfg(feature = "diagnostics")]
-    pub(super) fn shader_lookup<T>(
-        cell: &OnceLock<T>,
-        initialize: impl FnOnce() -> T,
-    ) -> &T {
+    pub(super) fn shader_lookup<T>(cell: &OnceLock<T>, initialize: impl FnOnce() -> T) -> &T {
         lookup(cell, initialize, &INITIALIZE, &WAIT)
     }
 
@@ -296,7 +306,10 @@ mod timing {
             let init = Counter::default();
             let wait = Counter::default();
             assert_eq!(*lookup(&cell, || None::<u32>, &init, &wait), None);
-            assert_eq!(*lookup(&cell, || panic!("must not retry"), &init, &wait), None);
+            assert_eq!(
+                *lookup(&cell, || panic!("must not retry"), &init, &wait),
+                None
+            );
             assert_eq!(init.snapshot().0, 1);
             assert_eq!(wait.snapshot(), (0, 0));
         }
@@ -326,7 +339,10 @@ mod timing {
             let wait = Counter::default();
             assert_eq!(*lookup(&cell, || 42, &init, &wait), 42);
             let before = init.snapshot();
-            assert_eq!(*lookup(&cell, || panic!("must not retry"), &init, &wait), 42);
+            assert_eq!(
+                *lookup(&cell, || panic!("must not retry"), &init, &wait),
+                42
+            );
             assert_eq!(init.snapshot(), before);
             assert_eq!(wait.snapshot(), (0, 0));
         }
@@ -351,34 +367,34 @@ impl Shader {
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         let initialize = || {
-                let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
-                let ms = started.elapsed().as_millis() as u64;
-                let (user_ms, kernel_ms) = thread_cpu_since(cpu);
-                match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
-                        "shader translated"
-                    ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
-                }
-                done.ok()
+            let (started, cpu) = (std::time::Instant::now(), thread_cpu());
+            let (done, cached) = translate(&self.container);
+            let ms = started.elapsed().as_millis() as u64;
+            let (user_ms, kernel_ms) = thread_cpu_since(cpu);
+            match &done {
+                Ok(t) => tracing::info!(
+                    stage = self.stage,
+                    hash = %self.hash,
+                    user_data = t.host.user_data.len(),
+                    samplers = t.host.samplers.len(),
+                    cached,
+                    ms,
+                    user_ms,
+                    kernel_ms,
+                    "shader translated"
+                ),
+                Err(e) => tracing::warn!(
+                    stage = self.stage,
+                    hash = %self.hash,
+                    error = %e,
+                    cached,
+                    ms,
+                    user_ms,
+                    kernel_ms,
+                    "shader does not translate; its pipelines' draws are dropped"
+                ),
+            }
+            done.ok()
         };
         #[cfg(feature = "diagnostics")]
         let result = timing::shader_lookup(&self.translated, initialize);
@@ -402,7 +418,10 @@ impl Shader {
 fn thread_cpu() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let mut t = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
     let [created, exited, kernel, user] = &mut t;
     // SAFETY: four times of our own thread into our own variables.
     unsafe { GetThreadTimes(GetCurrentThread(), created, exited, kernel, user) };
@@ -424,7 +443,10 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let target = crate::shader_cache::host_target();
     let (host, cached) = crate::shader_cache::host_shader(container, target);
-    (host.and_then(|host| with_resources(container, host)), cached)
+    (
+        host.and_then(|host| with_resources(container, host)),
+        cached,
+    )
 }
 
 #[cfg(windows)]
@@ -591,7 +613,10 @@ pub(crate) fn hurry_feeders(feeders: &[Waited]) {
     let hurried: Vec<_> = feeders.iter().rev().filter(|w| make::hurry(w)).collect();
     if !hurried.is_empty() {
         let shaders: Vec<_> = hurried.iter().rev().map(|w| w.shaders()).collect();
-        tracing::info!(?shaders, "made first: passes the presented image reads wait for them");
+        tracing::info!(
+            ?shaders,
+            "made first: passes the presented image reads wait for them"
+        );
     }
 }
 
@@ -701,7 +726,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -923,7 +951,13 @@ fn read_stream(
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8, which the
             // slice does not promise to be aligned.
-            let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
+            let code = unsafe {
+                stream
+                    .as_ptr()
+                    .add(at + 8)
+                    .cast::<Bytecode>()
+                    .read_unaligned()
+            };
             shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
@@ -1029,7 +1063,11 @@ impl Prebuild {
 
     /// Its shaders and state as a diagnostics build logs them.
     pub fn describe(&self) -> String {
-        let state = self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
+        let state = self
+            .graphics
+            .as_ref()
+            .map(|g| g.describe())
+            .unwrap_or_default();
         format!("{:?}\t{state}", self.shaders)
     }
 
@@ -1052,10 +1090,12 @@ impl Prebuild {
         library::save(false);
         match made {
             Some(_) => Ok(()),
-            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
-                Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
-            }),
+            None => Err(
+                match self.shaders.iter().find(|s| s.translated().is_none()) {
+                    Some(s) => format!("{} shader does not translate", s.stage),
+                    None => "the host refuses it".into(),
+                },
+            ),
         }
     }
 }
@@ -1101,14 +1141,16 @@ mod tests {
     fn a_stream_of_any_alignment_is_read() {
         let mut backing = [0u64; 5];
         // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
-        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
+        let stream =
+            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
         stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
         stream[8..16].copy_from_slice(&0x1000usize.to_le_bytes());
         stream[16..24].copy_from_slice(&7usize.to_le_bytes());
         assert_ne!(stream.as_ptr() as usize % 8, 0);
         let seen = std::cell::RefCell::new(Vec::new());
         read_stream(stream, |stage, code| {
-            seen.borrow_mut().push((stage, code.code as usize, code.size));
+            seen.borrow_mut()
+                .push((stage, code.code as usize, code.size));
             None
         });
         assert_eq!(*seen.borrow(), [("vertex", 0x1000, 7)]);
@@ -1200,8 +1242,16 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let host = emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY)
-            .unwrap();
+        let host = emit::emit(
+            &c,
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+            victory_shader::emit::Target::ANY,
+        )
+        .unwrap();
         Shader::for_test(
             "compute",
             Translated {
@@ -1307,7 +1357,11 @@ mod tests {
                 bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
                 drop(cache.get(blake3::hash(&bytes), "compute", &bytes, trim));
             }
-            cache.entries.values().map(|shader| shader.container.len()).sum::<usize>()
+            cache
+                .entries
+                .values()
+                .map(|shader| shader.container.len())
+                .sum::<usize>()
         };
         // Synthetic payloads only; no shader translation or GPU is involved.
         assert_eq!(retained(false), SHADER_TRIM_INTERVAL * 64 * 1024);
@@ -1424,10 +1478,16 @@ mod tests {
             element[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
         }
         let mut stream = vec![0u8; 0x2b0];
-        let put = |s: &mut Vec<u8>, at: usize, v: u64| {
-            s[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
-        let kinds = [(0x10, 1), (0x28, 2), (0x40, 3), (0x58, 4), (0x70, 5), (0x88, 8)];
+        let put =
+            |s: &mut Vec<u8>, at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let kinds = [
+            (0x10, 1),
+            (0x28, 2),
+            (0x40, 3),
+            (0x58, 4),
+            (0x70, 5),
+            (0x88, 8),
+        ];
         for (at, kind) in kinds.into_iter().chain([(0x210, 21), (0x250, 17)]) {
             put(&mut stream, at, kind);
         }
@@ -1451,7 +1511,10 @@ mod tests {
             stream: stream.as_ptr(),
         };
         let mut p = std::ptr::null();
-        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
         // SAFETY: the stream points at live code and elements.
         let pre = unsafe { Prebuild::graphics(&stream) };
         let title = pipeline(p);

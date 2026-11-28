@@ -145,7 +145,9 @@ impl Bitmap {
         crate::host::name(&resource, || "title memory written pages".into());
         // SAFETY: `data` is a newly mapped shared buffer of at least `BITMAP_WORDS` dwords.
         unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, BITMAP_WORDS) };
-        let vram = (!h.is_uma()).then(|| h.default_uav_buffer(BITMAP_BYTES)).flatten();
+        let vram = (!h.is_uma())
+            .then(|| h.default_uav_buffer(BITMAP_BYTES))
+            .flatten();
         // SAFETY: `resource` / `vram` is a live D3D12 buffer.
         let gpu = unsafe { vram.as_ref().unwrap_or(&resource).GetGPUVirtualAddress() };
         Some(Self {
@@ -339,7 +341,10 @@ struct Stats {
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
 
 fn stats<R>(f: impl FnOnce(&mut Stats) -> R) -> R {
-    f(STATS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+    f(STATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_default())
 }
 
 /// `bytes` of a range shaders wrote through a view did not go back into
@@ -413,7 +418,10 @@ pub(crate) fn drop_withheld(address: usize, len: usize) {
     if SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed) {
         crate::watch::retake(address, len);
     } else {
-        DROPPED.lock().unwrap_or_else(|e| e.into_inner()).push((address, len));
+        DROPPED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((address, len));
     }
 }
 
@@ -450,12 +458,18 @@ pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
     let s = stats(std::mem::take);
-    if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
+    if s.uses.is_empty()
+        && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0
+    {
         return;
     }
     let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
     uses.sort_by(|a, b| b.1.cmp(a.1));
-    let uses: Vec<String> = uses.iter().take(32).map(|(p, n)| format!("{n} {p}")).collect();
+    let uses: Vec<String> = uses
+        .iter()
+        .take(32)
+        .map(|(p, n)| format!("{n} {p}"))
+        .collect();
     let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
@@ -623,7 +637,10 @@ impl Shared {
             }
             keep
         });
-        let (mut named, mut slots) = (Vec::with_capacity(copies.len()), Vec::with_capacity(copies.len()));
+        let (mut named, mut slots) = (
+            Vec::with_capacity(copies.len()),
+            Vec::with_capacity(copies.len()),
+        );
         let mut left_out = false;
         for c in copies {
             let key = Arc::as_ptr(&c) as usize;
@@ -649,7 +666,11 @@ impl Shared {
         // for `TABLE_DWORDS` dwords; no submission runs.
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
         let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
-        tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+        tracing::debug!(
+            copies = ranges.len(),
+            blocks = blocks.len() - 1,
+            "title memory page table"
+        );
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
@@ -681,7 +702,9 @@ pub(crate) fn prepare(key: usize, add: impl FnMut(&Arc<Shadow>, usize, usize, bo
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
-        let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
+        let (_, s) = shared
+            .iter_mut()
+            .find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
         if s.generation != now {
             s.rewrite(heap, now);
@@ -696,7 +719,13 @@ pub(crate) fn prepare(key: usize, add: impl FnMut(&Arc<Shadow>, usize, usize, bo
     let entries = layout.iter().flat_map(|l| {
         l.copies.iter().zip(&l.bits).map(|(c, bit)| {
             let (start, len) = c.range();
-            (c, Arc::as_ptr(c) as usize, start as usize, len as usize, *bit)
+            (
+                c,
+                Arc::as_ptr(c) as usize,
+                start as usize,
+                len as usize,
+                *bit,
+            )
         })
     });
     crate::shadow::refresh_where_needed(entries, add);
@@ -756,7 +785,12 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let probe_bitmap = Arc::clone(&pooled);
     let probe_precise = Arc::clone(&precise);
     list.defer_vram_probe(move |reads| {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        let Layout {
+            copies,
+            blocks,
+            owner,
+            ..
+        } = &*layout(key);
         let precise = probe_precise.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and its readback finished.
         let marks =
@@ -776,8 +810,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let at = (l1 << 28 | page << 16) as u64;
                 if let Some(&k) = owner.get(entry)
                     && k != NO_OWNER
-                    && !precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n)
-                    && let Some((cpu_ptr, vram_base, start, buf_len)) = copies[k as usize].vram_readback()
+                    && !precise
+                        .iter()
+                        .any(|&(a, n)| a < at + (1 << 16) && at < a + n)
+                    && let Some((cpu_ptr, vram_base, start, buf_len)) =
+                        copies[k as usize].vram_readback()
                 {
                     let s = at.max(start);
                     let e = (at + (1 << 16)).min(start + buf_len);
@@ -803,7 +840,12 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         has_missed(marks, &l)
     });
     list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        let Layout {
+            copies,
+            blocks,
+            owner,
+            ..
+        } = &*layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
@@ -827,7 +869,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 };
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
-                    Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                    Some(_)
+                        if precise
+                            .iter()
+                            .any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&k) if k != NO_OWNER => writes.push((k as usize, at)),
                     _ => {
                         pages += 1;
@@ -840,7 +885,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1),
         // nor while any list using title memory misses ([`withholding`]).
-        let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
+        let withheld = if pages + regions > 0 || withholding() {
+            writes.len() as u64
+        } else {
+            0
+        };
         if withheld > 0 {
             for &(_, at) in &writes {
                 drop_withheld(at as usize, 1 << 16);
@@ -876,7 +925,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Graphics::Direct3D12::{D3D12_DESCRIPTOR_RANGE_TYPE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_DESCRIPTOR_RANGE_TYPE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    };
 
     /// Writes of lists using title memory are held back from a frame with a
     /// miss through the next one, then go back again.
@@ -922,8 +974,14 @@ mod tests {
         assert_eq!(look_up(&dwords, 0x9000_0000).0, 100);
         assert_eq!(look_up(&dwords, 0x200_0000_0000).0, 100);
         // Entries map back to their copy and page.
-        let entry = |a: u64| blocks.iter().position(|&l| l == (a >> 28) as usize).unwrap() * BLOCK
-            + (a >> 16 & 0xFFF) as usize;
+        let entry = |a: u64| {
+            blocks
+                .iter()
+                .position(|&l| l == (a >> 28) as usize)
+                .unwrap()
+                * BLOCK
+                + (a >> 16 & 0xFFF) as usize
+        };
         assert_eq!(owner[entry(0x42_0000)], Some(1));
         assert_eq!(owner[entry(0xd_1234_0000)], Some(2));
         assert_eq!(blocks.len(), 3, "null, low 256 MiB, the high buffer's");
@@ -933,12 +991,17 @@ mod tests {
     /// named, the rest read as missing; the table fits its buffer.
     #[test]
     fn a_full_table_names_the_largest_copies() {
-        let copies: Vec<(u64, u64)> = (0..CAPACITY as u64 + 2).map(|k| (k << 28, 0x1_0000 + k)).collect();
+        let copies: Vec<(u64, u64)> = (0..CAPACITY as u64 + 2)
+            .map(|k| (k << 28, 0x1_0000 + k))
+            .collect();
         let pairs: Vec<u32> = (0..copies.len() as u32).map(|k| 10 + 2 * k).collect();
         let (dwords, blocks, _) = table(&copies, &pairs, 4);
         assert_eq!(blocks.len(), CAPACITY + 1);
         assert_eq!(dwords.len(), LEVEL1 + (CAPACITY + 1) * BLOCK * 2);
-        assert_eq!(look_up(&dwords, (CAPACITY as u64 + 1) << 28).0, pairs[CAPACITY + 1]);
+        assert_eq!(
+            look_up(&dwords, (CAPACITY as u64 + 1) << 28).0,
+            pairs[CAPACITY + 1]
+        );
         assert_eq!(look_up(&dwords, 0).0, 4, "the smallest copy is left out");
     }
 
@@ -1076,7 +1139,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::compute::constants(0, constants),
         ];
         let host = crate::host::host().unwrap();
-        compute(&host.device, windows::core::s!("memory"), source, D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, &params).unwrap()
+        compute(
+            &host.device,
+            windows::core::s!("memory"),
+            source,
+            D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES,
+            &params,
+        )
+        .unwrap()
     }
 
     /// A copy that found no view slots at a rewrite is tried again at the
@@ -1084,7 +1154,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     #[test]
     fn a_copy_without_view_slots_is_named_when_slots_come_back() {
         use crate::watch::PAGE;
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -1098,14 +1170,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         let memory = (0..256u64)
             .map(|k| 0x40_0000_0000 + (k << 28))
             // SAFETY: a fresh allocation where nothing is mapped, or none.
-            .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .map(|hint| unsafe {
+                VirtualAlloc(
+                    hint as *const _,
+                    PAGE,
+                    MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize)
             .find(|&p| p != 0)
             .expect("memory below 2^40");
         crate::shadow::register(memory, memory as u64, PAGE as u64);
         let copy = crate::shadow::find(memory as u64, PAGE as u64).unwrap();
         let now = crate::shadow::generation();
         s.rewrite(&heap, now);
-        assert!(!s.pairs.contains_key(&(Arc::as_ptr(&copy) as usize)), "no slots for it");
+        assert!(
+            !s.pairs.contains_key(&(Arc::as_ptr(&copy) as usize)),
+            "no slots for it"
+        );
         assert_ne!(s.generation, now, "so the next submission rewrites again");
         // Slots come back (a list was reset): the copy is named, and the
         // table is then up to date. (Other tests' copies are named too:
@@ -1148,11 +1230,20 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Title memory (below 2^40, as the runtime places it): 1, 2 and
         // (from the second submission on) 1 page, write-watched as its pools.
         let pool = |pages: usize| -> usize {
-            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
             (0..256u64)
                 .map(|k| 0x40_0000_0000 + (k << 28))
                 // SAFETY: a fresh allocation where nothing is mapped, or none.
-                .map(|hint| unsafe { VirtualAlloc(hint as *const _, pages * PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+                .map(|hint| unsafe {
+                    VirtualAlloc(
+                        hint as *const _,
+                        pages * PAGE,
+                        MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    )
+                } as usize)
                 .find(|&p| p != 0)
                 .expect("memory below 2^40")
         };
@@ -1165,7 +1256,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
         // Each list reads 4 dwords at its address into its 16 bytes of `out`.
         let record = |reads: [usize; 2]| -> Vec<Map> {
-            let maps: Vec<Map> = lists.iter().map(|l| bind(l, OURS).expect("a page table")).collect();
+            let maps: Vec<Map> = lists
+                .iter()
+                .map(|l| bind(l, OURS).expect("a page table"))
+                .collect();
             for (k, (list, &address)) in lists.iter().zip(&reads).enumerate() {
                 let constants = [address as u32, (address >> 32) as u32, 16 * k as u32];
                 // SAFETY: an open list, live objects of ours.
@@ -1175,7 +1269,8 @@ void main(uint3 id : SV_DispatchThreadID) {
                     list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
                     list.list.SetComputeRootShaderResourceView(1, maps[k].table);
                     list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
-                    list.list.SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+                    list.list
+                        .SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
                     list.list.SetPipelineState(&pso);
                     list.list.Dispatch(1, 1, 1);
                 }
@@ -1200,9 +1295,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         fill(memory[0] + 16, 0x100);
         fill(memory[1] + PAGE, 0x200);
         host.execute(&[&lists[0], &lists[1]]);
-        assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
+        assert_eq!(
+            read(),
+            [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]
+        );
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        assert!(
+            pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18,
+            "past the dynamic slots"
+        );
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {
@@ -1212,8 +1313,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         fill(memory[2] + 32, 0x300);
         fill(memory[0] + 16, 0x400);
         host.execute(&[&lists[0], &lists[1]]);
-        assert_eq!(read(), [0x300, 0x301, 0x302, 0x303, 0x400, 0x401, 0x402, 0x403]);
-        assert_eq!((pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap()), pairs, "views kept");
+        assert_eq!(
+            read(),
+            [0x300, 0x301, 0x302, 0x303, 0x400, 0x401, 0x402, 0x403]
+        );
+        assert_eq!(
+            (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap()),
+            pairs,
+            "views kept"
+        );
         assert!(pair_of(OURS, &c).is_some());
         for (&p, copy) in memory.iter().zip([a, b, c]) {
             crate::shadow::unregister(p, p as u64);
@@ -1262,12 +1370,17 @@ void main() {
     fn a_submission_that_missed_leaves_the_copies_at_once() {
         let _guard = gpu_test_lock();
         use crate::watch::PAGE;
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
         let write = pipeline(WRITE, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 5);
-        let ((write_root, writer), (read_root, reader)) = (write, pipeline(SOURCE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 3));
+        let ((write_root, writer), (read_root, reader)) = (
+            write,
+            pipeline(SOURCE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 3),
+        );
         let (out, out_cpu) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };
@@ -1275,7 +1388,14 @@ void main() {
         let p = (0..256u64)
             .map(|k| 0x50_0000_0000 + (k << 28))
             // SAFETY: a fresh allocation where nothing is mapped, or none.
-            .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .map(|hint| unsafe {
+                VirtualAlloc(
+                    hint as *const _,
+                    PAGE,
+                    MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize)
             .find(|&p| p != 0)
             .expect("memory below 2^40");
         let at = p + 16;
@@ -1296,8 +1416,14 @@ void main() {
                 list.list.SetComputeRootSignature(root);
                 list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
                 list.list.SetComputeRootShaderResourceView(1, map.table);
-                list.list.SetComputeRootUnorderedAccessView(2, uav.unwrap_or(map.dirty));
-                list.list.SetComputeRoot32BitConstants(3, constants.len() as u32, constants.as_ptr().cast(), 0);
+                list.list
+                    .SetComputeRootUnorderedAccessView(2, uav.unwrap_or(map.dirty));
+                list.list.SetComputeRoot32BitConstants(
+                    3,
+                    constants.len() as u32,
+                    constants.as_ptr().cast(),
+                    0,
+                );
                 list.list.SetPipelineState(pso);
                 list.list.Dispatch(1, 1, 1);
             }
@@ -1308,11 +1434,22 @@ void main() {
         let write = |value: u32, miss: bool| {
             // Memory no copy holds, in a 256 MiB region with no block.
             let missing: u64 = if miss { 0xff_f000_0000 } else { 0 };
-            let constants = [at as u32, (at >> 32) as u32, value, missing as u32, (missing >> 32) as u32];
+            let constants = [
+                at as u32,
+                (at >> 32) as u32,
+                value,
+                missing as u32,
+                (missing >> 32) as u32,
+            ];
             submit(&write_root, &writer, None, &constants);
         };
         let read = || -> u32 {
-            submit(&read_root, &reader, Some(out_gpu), &[at as u32, (at >> 32) as u32, 0]);
+            submit(
+                &read_root,
+                &reader,
+                Some(out_gpu),
+                &[at as u32, (at >> 32) as u32, 0],
+            );
             // SAFETY: the mapped output, the GPU done with it.
             unsafe { out_cpu.cast::<u32>().read_volatile() }
         };
@@ -1322,13 +1459,20 @@ void main() {
         assert_eq!(title(), 0x11, "nothing went back");
         // Observe the retake through the next dispatch. Another submission
         // may refresh the copy before this read.
-        assert_eq!(read(), 0x11, "the next submission reads title memory's bytes");
+        assert_eq!(
+            read(),
+            0x11,
+            "the next submission reads title memory's bytes"
+        );
         // Unless another test ends a frame meanwhile (its retake is right).
         let frame = FRAMES.load(std::sync::atomic::Ordering::Relaxed);
         write(0x44, false);
         let kept = read();
         if FRAMES.load(std::sync::atomic::Ordering::Relaxed) == frame {
-            assert_eq!(kept, 0x44, "a submission that missed nothing keeps its writes");
+            assert_eq!(
+                kept, 0x44,
+                "a submission that missed nothing keeps its writes"
+            );
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
@@ -1340,7 +1484,9 @@ void main() {
     fn separate_memory_bind_submissions_keep_their_own_bitmaps() {
         let _guard = gpu_test_lock();
         use crate::watch::PAGE;
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
@@ -1348,7 +1494,14 @@ void main() {
         let p = (0..256u64)
             .map(|k| 0x50_0000_0000 + (k << 28))
             // SAFETY: a fresh allocation where nothing is mapped, or none.
-            .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .map(|hint| unsafe {
+                VirtualAlloc(
+                    hint as *const _,
+                    PAGE,
+                    MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize)
             .find(|&p| p != 0)
             .expect("memory below 2^40");
         let at = p + 16;
@@ -1362,7 +1515,13 @@ void main() {
         // Record L1 with no missed region, and L2 with an unmapped region-1 miss.
         let c1 = [at as u32, (at >> 32) as u32, 0x22, 0, 0];
         let missing: u64 = 0xff_f000_0000;
-        let c2 = [at as u32, (at >> 32) as u32, 0x33, missing as u32, (missing >> 32) as u32];
+        let c2 = [
+            at as u32,
+            (at >> 32) as u32,
+            0x33,
+            missing as u32,
+            (missing >> 32) as u32,
+        ];
         // SAFETY: open lists with live test pipeline and heaps.
         unsafe {
             for (l, map, c) in [(&l1, &map1, &c1), (&l2, &map2, &c2)] {
@@ -1371,7 +1530,8 @@ void main() {
                 l.list.SetComputeRootDescriptorTable(0, views.gpu(0));
                 l.list.SetComputeRootShaderResourceView(1, map.table);
                 l.list.SetComputeRootUnorderedAccessView(2, map.dirty);
-                l.list.SetComputeRoot32BitConstants(3, c.len() as u32, c.as_ptr().cast(), 0);
+                l.list
+                    .SetComputeRoot32BitConstants(3, c.len() as u32, c.as_ptr().cast(), 0);
                 l.list.SetPipelineState(&writer);
                 l.list.Dispatch(1, 1, 1);
                 l.close();
@@ -1383,7 +1543,11 @@ void main() {
         host.execute(&[&l2]);
         let after_l2 = stats(|s| s.missed_regions);
         assert_eq!(after_l1, before, "L1 must not report L2's miss");
-        assert_eq!(after_l2, before + 1, "L2 must keep its own bitmap across L1's execute");
+        assert_eq!(
+            after_l2,
+            before + 1,
+            "L2 must keep its own bitmap across L1's execute"
+        );
         crate::shadow::unregister(p, p as u64);
     }
 
@@ -1393,7 +1557,9 @@ void main() {
     fn vram_page_table_writes_go_back_to_title() {
         let _guard = gpu_test_lock();
         use crate::watch::PAGE;
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
@@ -1401,7 +1567,14 @@ void main() {
         let p = (0..256u64)
             .map(|k| 0x50_0000_0000 + (k << 28))
             // SAFETY: a fresh allocation where nothing is mapped, or none.
-            .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .map(|hint| unsafe {
+                VirtualAlloc(
+                    hint as *const _,
+                    PAGE,
+                    MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize)
             .find(|&p| p != 0)
             .expect("memory below 2^40");
         let at = p + 16;
@@ -1422,7 +1595,12 @@ void main() {
             list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
             list.list.SetComputeRootShaderResourceView(1, map.table);
             list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
-            list.list.SetComputeRoot32BitConstants(3, constants.len() as u32, constants.as_ptr().cast(), 0);
+            list.list.SetComputeRoot32BitConstants(
+                3,
+                constants.len() as u32,
+                constants.as_ptr().cast(),
+                0,
+            );
             list.list.SetPipelineState(&writer);
             list.list.Dispatch(1, 1, 1);
         }

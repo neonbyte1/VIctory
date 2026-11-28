@@ -208,10 +208,10 @@
 //!   console never exports them).
 
 mod bitcode;
-#[cfg(test)]
-mod census_tests;
 #[cfg(all(test, windows))]
 mod bvh_tests;
+#[cfg(test)]
+mod census_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod crosslane_tests;
@@ -227,18 +227,18 @@ mod fuzz_tests;
 pub mod host;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
+mod lower;
 #[cfg(all(test, windows))]
 mod pair_meeting_tests;
-mod lower;
 #[cfg(test)]
 mod random_tests;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
-mod sampler;
 #[cfg(all(test, windows))]
 mod quad_tests;
+mod sampler;
 #[cfg(all(test, windows))]
 mod semantics_tests;
 mod shader;
@@ -402,7 +402,10 @@ fn compute_dispatch_group_spreading_decision() {
         ((65_535, 1, 1, true), (0, 65_535, 65_535, 1, 1)),
         ((65_536, 1, 1, true), (32_768, 65_536, 32_768, 1, 2)),
         ((65_537, 2, 1, true), (32_769, 65_537, 32_769, 2, 2)),
-        ((70_000, 131_072, 1, true), (35_000, 70_000, 35_000, 65_535, 2)),
+        (
+            (70_000, 131_072, 1, true),
+            (35_000, 70_000, 35_000, 65_535, 2),
+        ),
         ((65_537, 0, 1, true), (0, 65_537, 65_535, 0, 1)),
         ((65_537, 1, 0, true), (0, 65_537, 65_535, 1, 0)),
         ((65_537, 1, 2, true), (0, 65_537, 65_535, 1, 2)),
@@ -1344,8 +1347,8 @@ mod tests {
     #[cfg(windows)]
     fn packed_clip_signature(experimental: bool) -> Vec<u8> {
         let mut s = Shader::new(false);
-        let el = |name: &str, index: u32, kind: u8, row: u32, col: u8, cols: u8, usage: u8| {
-            SigElement {
+        let el =
+            |name: &str, index: u32, kind: u8, row: u32, col: u8, cols: u8, usage: u8| SigElement {
                 name: name.into(),
                 index,
                 kind,
@@ -1356,8 +1359,7 @@ mod tests {
                 cols,
                 usage,
                 half: false,
-            }
-        };
+            };
         let position = el("SV_Position", 0, 3, 0, 0, 4, 15);
         let clip0 = el("SV_ClipDistance", 0, 6, 1, 0, 1, 1);
         let texcoord = el("TEXCOORD", 0, 0, 2, 0, 2, 3);
@@ -1534,10 +1536,7 @@ mod tests {
         let mut experimental = triangle_mesh_with_lds(TRIANGLE, 16).unwrap().dxil;
         v.validate(&mut experimental)
             .unwrap_or_else(|e| panic!("unused mesh lds: {e}"));
-        eprintln!(
-            "unused mesh lds validated bytes={}",
-            experimental.len()
-        );
+        eprintln!("unused mesh lds validated bytes={}", experimental.len());
     }
 
     /// A triangle mesh program on the host GPU and on WARP (where they have
@@ -2219,7 +2218,9 @@ mod tests {
             let st = crate::structure::structure(&p).unwrap();
             let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
-            super::emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap().dxil
+            super::emit(&c, &native, &p, &st, &io, &res, Target::ANY)
+                .unwrap()
+                .dxil
         };
         let (Some(low), Some(high)) = (
             dump_dxil(&dump(false, 0, false)),
@@ -2329,7 +2330,14 @@ mod tests {
         native: &crate::NativeProgram,
         target: Target,
     ) -> Result<super::HostShader, crate::ShaderError> {
-        emit_for_options(native, target, Options { target, ..Options::default() })
+        emit_for_options(
+            native,
+            target,
+            Options {
+                target,
+                ..Options::default()
+            },
+        )
     }
 
     /// [`emit_for`] without pair meetings: the off-switch's rule (a group of
@@ -2338,7 +2346,15 @@ mod tests {
         native: &crate::NativeProgram,
         target: Target,
     ) -> Result<super::HostShader, crate::ShaderError> {
-        emit_for_options(native, target, Options { target, pair_meetings: false, ..Options::default() })
+        emit_for_options(
+            native,
+            target,
+            Options {
+                target,
+                pair_meetings: false,
+                ..Options::default()
+            },
+        )
     }
 
     fn emit_for_options(
@@ -2356,7 +2372,15 @@ mod tests {
         let res = crate::resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
         let io = crate::io::raise(&p, native)?;
         let st = st?;
-        super::emit_with(&c, native, &p, &st, &io, &res, Options { target, ..options })
+        super::emit_with(
+            &c,
+            native,
+            &p,
+            &st,
+            &io,
+            &res,
+            Options { target, ..options },
+        )
     }
 
     const NVIDIA: Target = Target {
@@ -2817,7 +2841,10 @@ mod tests {
                 view_marks: false,
             })
             .expect("lower");
-            assert_eq!(lowered.samplers, vec![[0x3088, 0x0054_0100, 0x1400_0080, 0x8000_0000]; 2]);
+            assert_eq!(
+                lowered.samplers,
+                vec![[0x3088, 0x0054_0100, 0x1400_0080, 0x8000_0000]; 2]
+            );
             assert_eq!(lowered.cmp_samplers, if cmp_first { 0b01 } else { 0b10 });
             let mut host = super::HostShader {
                 stage: native.stage,
@@ -2851,8 +2878,7 @@ mod tests {
             if let Ok(mut v) = super::validator::Validator::load(
                 super::validator::Validator::default_path().as_deref(),
             ) {
-                v.validate(&mut host.dxil)
-                    .expect("DXIL validation failed");
+                v.validate(&mut host.dxil).expect("DXIL validation failed");
             } else {
                 eprintln!("no dxil.dll; validation skipped");
             }
@@ -2885,8 +2911,16 @@ mod tests {
                         },
                     )
                     .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-                assert_eq!(f32::from_bits(out[0][0]), 0.5, "{label} plain sample (cmp_first={cmp_first})");
-                assert_eq!(f32::from_bits(out[0][1]), 1.0, "{label} cmp sample (cmp_first={cmp_first})");
+                assert_eq!(
+                    f32::from_bits(out[0][0]),
+                    0.5,
+                    "{label} plain sample (cmp_first={cmp_first})"
+                );
+                assert_eq!(
+                    f32::from_bits(out[0][1]),
+                    1.0,
+                    "{label} cmp sample (cmp_first={cmp_first})"
+                );
                 tested_orders += 1;
             }
         }

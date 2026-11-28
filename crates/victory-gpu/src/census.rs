@@ -206,7 +206,15 @@ impl State {
         Some((home, e, page != home))
     }
 
-    fn sample(&mut self, what: N, home: usize, e: &Entry, at: usize, by: usize, by_range: (usize, usize)) {
+    fn sample(
+        &mut self,
+        what: N,
+        home: usize,
+        e: &Entry,
+        at: usize,
+        by: usize,
+        by_range: (usize, usize),
+    ) {
         if self.samples.len() < SAMPLES {
             self.samples.push(Sample {
                 what,
@@ -222,7 +230,10 @@ impl State {
 
     /// The offered pages showing in `[at, at + len)`.
     fn found(&self, at: usize, len: usize) -> Vec<usize> {
-        self.at.range(at / PAGE..at.saturating_add(len).div_ceil(PAGE)).map(|(&k, _)| k).collect()
+        self.at
+            .range(at / PAGE..at.saturating_add(len).div_ceil(PAGE))
+            .map(|(&k, _)| k)
+            .collect()
     }
 }
 
@@ -230,21 +241,35 @@ impl State {
 /// `range`, start and length) went back clean after its shaders changed
 /// it; `mirror` is the copy's 64 KiB of it, valid until [`drop_copy`] of
 /// the copy; `others` the other page numbers showing it.
-pub(crate) fn offer(page: usize, copy: usize, range: (usize, usize), mirror: usize, others: &[usize]) {
+pub(crate) fn offer(
+    page: usize,
+    copy: usize,
+    range: (usize, usize),
+    mirror: usize,
+    others: &[usize],
+) {
     let mut s = state();
     // A page shown here offered before ends (by another copy at another
     // mapping, which `marked` saw first unless its copy-back went page by
     // page).
     for &p in std::iter::once(&page).chain(others) {
         if let Some((home, e, elsewhere)) = s.take(p) {
-            let n = if e.copy == copy { N::Again } else if elsewhere { N::OtherCopyElsewhere } else { N::OtherCopy };
+            let n = if e.copy == copy {
+                N::Again
+            } else if elsewhere {
+                N::OtherCopyElsewhere
+            } else {
+                N::OtherCopy
+            };
             ended_by(n, &e);
             if n != N::Again {
                 s.sample(n, home, &e, p, copy, range);
             }
         }
     }
-    let shown: Vec<usize> = std::iter::once(page).chain(others.iter().copied()).collect();
+    let shown: Vec<usize> = std::iter::once(page)
+        .chain(others.iter().copied())
+        .collect();
     for &p in &shown {
         s.at.insert(p, page);
     }
@@ -327,7 +352,11 @@ pub(crate) fn touch(at: usize, len: usize) {
         count(n);
         // Under the lock: the copy's bytes live until `drop_copy` of it,
         // which waits for it.
-        count(if same_as_title(home, e.mirror) { N::Equal } else { N::Differ });
+        count(if same_as_title(home, e.mirror) {
+            N::Equal
+        } else {
+            N::Differ
+        });
         if let Some(e) = s.entries.get_mut(&home) {
             e.served = true;
         }
@@ -373,7 +402,14 @@ pub(crate) fn written(at: usize, len: usize, writer: Writer) {
             continue;
         };
         let (n, by) = match writer {
-            Writer::Title(rip) => (if elsewhere { N::TitleWriteElsewhere } else { N::TitleWrite }, rip),
+            Writer::Title(rip) => (
+                if elsewhere {
+                    N::TitleWriteElsewhere
+                } else {
+                    N::TitleWrite
+                },
+                rip,
+            ),
             Writer::Kernel => (
                 match kind {
                     Kind::Own if elsewhere => N::OwnWriteElsewhere,
@@ -429,7 +465,12 @@ pub(crate) fn drop_copy(copy: usize) {
         return;
     }
     let mut s = state();
-    let found: Vec<usize> = s.entries.iter().filter(|(_, e)| e.copy == copy).map(|(&k, _)| k).collect();
+    let found: Vec<usize> = s
+        .entries
+        .iter()
+        .filter(|(_, e)| e.copy == copy)
+        .map(|(&k, _)| k)
+        .collect();
     for page in found {
         if let Some((_, e, _)) = s.take(page) {
             ended_by(N::Gone, &e);
@@ -441,8 +482,8 @@ pub(crate) fn drop_copy(copy: usize) {
 /// the region of title memory.
 fn place(at: usize, code: bool) -> String {
     use windows_sys::Win32::System::LibraryLoader::{
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
-        GetModuleHandleExW,
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameW, GetModuleHandleExW,
     };
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     if code {
@@ -451,7 +492,8 @@ fn place(at: usize, code: bool) -> String {
         // taken.
         let found = unsafe {
             GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 at as *const u16,
                 &mut module,
             )
@@ -461,7 +503,8 @@ fn place(at: usize, code: bool) -> String {
         }
         let mut name = [0u16; 260];
         // SAFETY: a module handle just found and a sized buffer.
-        let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+        let n =
+            unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
         let name = String::from_utf16_lossy(&name[..n]);
         let name = name.rsplit(['\\', '/']).next().unwrap_or(&name);
         return format!("{name}+{:#x}", at - module as usize);
@@ -482,7 +525,10 @@ pub(crate) fn lines(frames: f64) -> Vec<String> {
     if !on() {
         return Vec::new();
     }
-    let c: Vec<f64> = COUNTS.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let c: Vec<f64> = COUNTS
+        .iter()
+        .map(|a| a.swap(0, Relaxed) as f64 / frames)
+        .collect();
     let n = |k: N| c[k as usize];
     let mut out = vec![format!(
         "  owner census per frame: {:.1} offered (whole view pages of copies in video memory gone back clean), {} live; \
@@ -518,7 +564,10 @@ pub(crate) fn lines(frames: f64) -> Vec<String> {
         n(N::Equal),
         n(N::Differ),
     )];
-    let a: Vec<f64> = AFTER.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
+    let a: Vec<f64> = AFTER
+        .iter()
+        .map(|a| a.swap(0, Relaxed) as f64 / frames)
+        .collect();
     let a = |k: N| a[k as usize];
     out.push(format!(
         "  owner census after a served read, per frame: ended by {:.1} marked again by the same copy, {:.1} another copy \
@@ -545,8 +594,13 @@ pub(crate) fn lines(frames: f64) -> Vec<String> {
     for s in samples {
         let by = match s.what {
             N::TitleWrite | N::TitleWriteElsewhere => format!("instruction {}", place(s.by, true)),
-            N::OtherCopy | N::OtherCopyElsewhere => format!("copy {:#x} of {:#x}+{:#x}", s.by, s.by_range.0, s.by_range.1),
-            N::RefreshOwn | N::Refresh | N::RefreshElsewhere => format!("refresh of copy {:#x}", s.by),
+            N::OtherCopy | N::OtherCopyElsewhere => format!(
+                "copy {:#x} of {:#x}+{:#x}",
+                s.by, s.by_range.0, s.by_range.1
+            ),
+            N::RefreshOwn | N::Refresh | N::RefreshElsewhere => {
+                format!("refresh of copy {:#x}", s.by)
+            }
             _ => String::new(),
         };
         out.push(format!(
@@ -571,7 +625,8 @@ mod tests {
     }
 
     #[test]
-    fn the_first_touch_of_an_offered_page_is_counted_once_by_kind_and_mapping_and_followed_after_a_read() {
+    fn the_first_touch_of_an_offered_page_is_counted_once_by_kind_and_mapping_and_followed_after_a_read()
+     {
         let p = crate::watch::tests::pool(4);
         let (page, next, far) = (p / PAGE, p / PAGE + 1, p / PAGE + 3);
         // SAFETY: the pool's pages, ours.
@@ -590,7 +645,10 @@ mod tests {
             touch(p, 2 * PAGE);
             touch(p, PAGE);
         }
-        assert_eq!((delta(N::Refresh), delta(N::Equal), delta(N::Differ)), (1, 1, 0));
+        assert_eq!(
+            (delta(N::Refresh), delta(N::Equal), delta(N::Differ)),
+            (1, 1, 0)
+        );
 
         // Bytes that differ from title memory are told apart.
         offer(next, copy, range, other.as_ptr() as usize, &[]);
@@ -617,7 +675,10 @@ mod tests {
         written(far * PAGE + 5, 1, Writer::Title(0));
         offer(page, copy, range, mirror.as_ptr() as usize, &[far]);
         written(p + 5, 1, Writer::Title(0));
-        assert_eq!((delta(N::TitleWriteElsewhere), delta(N::TitleWrite)), (1, 1));
+        assert_eq!(
+            (delta(N::TitleWriteElsewhere), delta(N::TitleWrite)),
+            (1, 1)
+        );
 
         // Our copy-back writes through the kernel at another mapping; the
         // HLE's DirectStorage writes pages; a mapping made later is watched.
@@ -632,7 +693,10 @@ mod tests {
             let _k = as_kind(Kind::StoragePages, 0);
             written(far * PAGE, PAGE, Writer::Kernel);
         }
-        assert_eq!((delta(N::OwnWriteElsewhere), delta(N::StoragePages)), (1, 1));
+        assert_eq!(
+            (delta(N::OwnWriteElsewhere), delta(N::StoragePages)),
+            (1, 1)
+        );
 
         // Followed past a served read: what ends it then is counted apart.
         let after = |n: N| AFTER[n as usize].load(Relaxed);
@@ -653,7 +717,11 @@ mod tests {
             touch(p, PAGE);
         }
         assert_eq!(
-            (delta(N::RefreshElsewhere), after(N::OtherCopyElsewhere) - elsewhere, after(N::RefreshOwn) - own),
+            (
+                delta(N::RefreshElsewhere),
+                after(N::OtherCopyElsewhere) - elsewhere,
+                after(N::RefreshOwn) - own
+            ),
             (2, 1, 1)
         );
 

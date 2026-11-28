@@ -326,7 +326,9 @@ fn absent_title_dlls(
     for module in imported {
         let dll = module.dll.as_str();
         if wanted(dll)
-            && !mapped.iter().any(|(name, _)| name.eq_ignore_ascii_case(dll))
+            && !mapped
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(dll))
             && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll))
         {
             absent.push(dll.to_owned());

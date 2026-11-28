@@ -425,7 +425,7 @@ fn v_add_sub_nc_i16_wrap_and_saturate_with_op_sel() {
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [
-            0xBE90_0000 | opcode << 8,   // s_quadmask s16, s0 (pairs for b64)
+            0xBE90_0000 | opcode << 8, // s_quadmask s16, s0 (pairs for b64)
             sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
             sop2(0x1e, 18, 18, 144),   // s_lshl_b32 s18, s18, 16
             sop2(0x10, 16, 16, 18),    // s_or_b32 s16, s16, s18
@@ -558,12 +558,12 @@ fn is_f16_nan(bits: u16) -> bool {
 #[test]
 fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
     let shader = build_valu_cs(&[
-        0xBF06_0100,            // s_cmp_eq_u32 s0, s1
-        0xBF85_0002,            // s_cbranch_scc1 -> the s2 = 1 path
-        s_mov_b32(2, 128),      // s2 = 0
-        0xBF82_0002,            // s_branch -> the join
-        s_mov_b32(2, 129),      // s2 = 1
-        0xBF85_0000,            // s_cbranch_scc1 -> the following instruction
+        0xBF06_0100,             // s_cmp_eq_u32 s0, s1
+        0xBF85_0002,             // s_cbranch_scc1 -> the s2 = 1 path
+        s_mov_b32(2, 128),       // s2 = 0
+        0xBF82_0002,             // s_branch -> the join
+        s_mov_b32(2, 129),       // s2 = 1
+        0xBF85_0000,             // s_cbranch_scc1 -> the following instruction
         vop1(0x001, 0, sgpr(2)), // join: v0 = s2
     ]);
     run_cases(
@@ -773,14 +773,14 @@ fn shift_add_and_align_take_sign_bit_modifiers() {
     // (RDNA2: boykopovar/AnyPS5#25964 on gfx1036 and gfx1201, #25799).
     // (op, NEG bits, ABS bits, inputs v1..v3, result)
     let cases: &[(u16, u32, u32, [u32; 3], u32)] = &[
-        (0x346, 4, 0, [5, 2, 1], 0x8000_0015),          // lshl_add: neg(src2)
-        (0x347, 0, 1, [0x8000_0003, 1, 0], 4),          // add_lshl: abs(src0)
-        (0x14E, 2, 0, [0, 1, 31], 1),                   // alignbit: neg(src1)
-        (0x14F, 2, 0, [0, 0x00FF_FFFF, 3], 0x80),       // alignbyte: neg(src1)
-        (0x14E, 0, 2, [0, 0x8000_0000, 31], 0),         // alignbit: abs(src1)
+        (0x346, 4, 0, [5, 2, 1], 0x8000_0015),    // lshl_add: neg(src2)
+        (0x347, 0, 1, [0x8000_0003, 1, 0], 4),    // add_lshl: abs(src0)
+        (0x14E, 2, 0, [0, 1, 31], 1),             // alignbit: neg(src1)
+        (0x14F, 2, 0, [0, 0x00FF_FFFF, 3], 0x80), // alignbyte: neg(src1)
+        (0x14E, 0, 2, [0, 0x8000_0000, 31], 0),   // alignbit: abs(src1)
         // abs and neg on one source: abs clears bit 31, then neg sets it
         // (-|x|, as on a float); the other order would give 4 and 0x15
-        (0x347, 1, 1, [3, 1, 0], 0x8000_0004),          // add_lshl: -|src0|
+        (0x347, 1, 1, [3, 1, 0], 0x8000_0004), // add_lshl: -|src0|
         (0x346, 4, 4, [5, 2, 0x8000_0001], 0x8000_0015), // lshl_add: -|src2|
     ];
     for &(op, neg, abs, [a, b, c], want) in cases {
@@ -789,7 +789,10 @@ fn shift_add_and_align_take_sign_bit_modifiers() {
         w[1] |= neg << 29;
         let shader = build_valu_cs(&w);
         run_cases(&shader, &[[a, b, c, 0]], |backend, _, _, got| {
-            assert_eq!(got, want, "{backend}: op {op:#x} neg {neg} abs {abs} of {a:#x}, {b:#x}, {c:#x} = {got:#010x}, want {want:#010x}");
+            assert_eq!(
+                got, want,
+                "{backend}: op {op:#x} neg {neg} abs {abs} of {a:#x}, {b:#x}, {c:#x} = {got:#010x}, want {want:#010x}"
+            );
         });
     }
 }
@@ -839,7 +842,11 @@ fn tbuffer_d16_loads_saturate_32_bit_integers() {
     for &(format, stored, want) in cases {
         let shader = tbuffer_load_of_v1(x, format);
         run_cases(&shader, &[[stored, 0, 0, 0]], |backend, _, _, got| {
-            assert_eq!(got & 0xFFFF, want, "{backend}: d16_x format {format} of {stored:#x} = {got:#010x}, want low half {want:#06x}");
+            assert_eq!(
+                got & 0xFFFF,
+                want,
+                "{backend}: d16_x format {format} of {stored:#x} = {got:#010x}, want low half {want:#06x}"
+            );
         });
     }
 }
@@ -878,7 +885,9 @@ fn normalized_codes(bits: u32) -> Vec<u32> {
     if bits <= 10 {
         return (0..1 << bits).collect();
     }
-    let edges = [1, 2, 3, 255, 256, 257, 261, 265, 269, 511, 512, 1000, 0x7FFF, 0x8000, 0x8001, 0xFFFE];
+    let edges = [
+        1, 2, 3, 255, 256, 257, 261, 265, 269, 511, 512, 1000, 0x7FFF, 0x8000, 0x8001, 0xFFFE,
+    ];
     (0..=0xFFFF).step_by(257).chain(edges).collect()
 }
 
@@ -892,9 +901,19 @@ fn normalized_buffer_formats_load_correctly_rounded_quotients() {
     let x = 0;
     // (format, bits, signed): 8_UNORM, 16_UNORM, 8_SNORM, 16_SNORM,
     // 2_10_10_10_UNORM and _SNORM.
-    for (format, bits, signed) in [(1u8, 8u32, false), (7, 16, false), (2, 8, true), (8, 16, true), (50, 10, false), (51, 10, true)] {
+    for (format, bits, signed) in [
+        (1u8, 8u32, false),
+        (7, 16, false),
+        (2, 8, true),
+        (8, 16, true),
+        (50, 10, false),
+        (51, 10, true),
+    ] {
         let shader = tbuffer_load_of_v1(x, format);
-        let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
+        let cases: Vec<[u32; 4]> = normalized_codes(bits)
+            .iter()
+            .map(|&a| [a, 0, 0, 0])
+            .collect();
         run_cases(&shader, &cases, |backend, _, [a, ..], got| {
             let want = if signed {
                 let top = (1i32 << (bits - 1)) - 1;
@@ -904,7 +923,10 @@ fn normalized_buffer_formats_load_correctly_rounded_quotients() {
                 (a as f32 / ((1u32 << bits) - 1) as f32).to_bits()
             };
             let sign = if signed { "signed" } else { "unsigned" };
-            assert_eq!(got, want, "{backend}: {bits}-bit {sign} normalized {a:#x} loads as {got:#010x}, want {want:#010x}");
+            assert_eq!(
+                got, want,
+                "{backend}: {bits}-bit {sign} normalized {a:#x} loads as {got:#010x}, want {want:#010x}"
+            );
         });
     }
 }
@@ -924,7 +946,10 @@ fn normalized_codes_truncate_back_to_themselves() {
         body.extend([0x07 << 25 | 0xFF, scale]);
         body.push(vop1(0x07, 0, vgpr(0)));
         let shader = build_valu_cs(&body);
-        let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
+        let cases: Vec<[u32; 4]> = normalized_codes(bits)
+            .iter()
+            .map(|&a| [a, 0, 0, 0])
+            .collect();
         run_cases(&shader, &cases, |backend, _, [a, ..], got| {
             assert_eq!(got, a, "{backend}: {bits}-bit code {a} comes back as {got}");
         });
@@ -1003,10 +1028,10 @@ fn v_med3_f32_matches_rdna2_with_nan() {
 fn check_half_fma_nearest_even(body: [u32; 2]) {
     let cases = [
         ([0x6600, 0x3956, 0x0400, 0], 0x6401), // 1024.5 plus 2^-14
-        ([0x6600, 0x3956, 0, 0], 0x6400), // exact tie, even
+        ([0x6600, 0x3956, 0, 0], 0x6400),      // exact tie, even
         ([0xe600, 0x3956, 0x8400, 0], 0xe401), // negative midpoint plus a negative tail
         ([0x6700, 0x3894, 0x8400, 0], 0x6401), // 1025.5 minus 2^-14
-        ([0x6700, 0x3894, 0, 0], 0x6402), // exact tie, even
+        ([0x6700, 0x3894, 0, 0], 0x6402),      // exact tie, even
     ];
     let inputs = cases.map(|(input, _)| input);
     run_cases(&build_valu_cs(&body), &inputs, |backend, i, _, got| {
@@ -1051,7 +1076,10 @@ fn fused_half_keeps_subnormal_operands() {
                 if let Some(expected) = cases[i].1 {
                     assert_eq!(value, expected, "{device} {form} {rounding} row {i}");
                 } else {
-                    assert!(value & 0x7fff > 0x7c00, "{device} {form} {rounding} row {i}: {value:04x}");
+                    assert!(
+                        value & 0x7fff > 0x7c00,
+                        "{device} {form} {rounding} row {i}: {value:04x}"
+                    );
                 }
             });
         }
@@ -1129,7 +1157,10 @@ fn half_fma_clamps_in_both_rounding_modes() {
         ([0x7e00, 0x3c00, 0, 0], [0; 2]),                // NaN
     ];
     let inputs = cases.map(|(input, _)| input);
-    for (i, (label, mode)) in [("nearest-even", 0), ("toward zero", 3)].into_iter().enumerate() {
+    for (i, (label, mode)) in [("nearest-even", 0), ("toward zero", 3)]
+        .into_iter()
+        .enumerate()
+    {
         let shader = build_valu_cs(&[0xba80_0881, mode, op | 1 << 15, src]);
         run_cases(&shader, &inputs, |backend, case, input, got| {
             assert_eq!(
@@ -1621,12 +1652,19 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
 
     let mut cases: Vec<u32> = (0..16).collect();
     // Bits above the low nibble are ignored.
-    cases.extend([0xABCD_EF05, 0xFFFF_FFF8, 0x1234_5670, 0x8000_000F, 0x0000_00F7]);
+    cases.extend([
+        0xABCD_EF05,
+        0xFFFF_FFF8,
+        0x1234_5670,
+        0x8000_000F,
+        0x0000_00F7,
+    ]);
     let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [x, 0, 0, 0]).collect();
     run_cases(&shader, &inputs, |backend, i, inp, got| {
         let want = nibble(cases[i]).to_bits();
         assert_eq!(
-            got, want,
+            got,
+            want,
             "{backend}: v_cvt_off_f32_i4({:#010x}) = {got:#010x} ({:?}), want {want:#010x}",
             inp[0],
             f32::from_bits(got),
@@ -2959,14 +2997,23 @@ fn resinfo_a16_reads_the_low_mip_half() {
     let views = [View::Mipped(8, 4, 3, &texels), View::RawUav(2)];
     let used = [(4, ResourceType::Srv, 0, 8), (4, ResourceType::Uav, 8, 4)];
     let mut observed = Vec::new();
-    for (a16, mip) in [(false, 1), (true, 2), (true, 0x1234_0001), (true, 0x5678_0002)] {
+    for (a16, mip) in [
+        (false, 1),
+        (true, 2),
+        (true, 0x1234_0001),
+        (true, 0x5678_0002),
+    ] {
         // s[8:15] is the texture at heap slot 0; s[20:23] is the output at slot 1.
         let mut words = vec![
             s_mov_b32(5, 0x80),
-            0xf40c_0202, 0xfa00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
-            0xf408_0502, 0xfa00_0020, // s_load_dwordx4 s[20:23], s[4:5], 0x20
-            vop1(1, 0, 255), mip, // v0 holds the mip operand
-            0xf038_0308, 0x0002_1400 | (a16 as u32) << 30, // image_get_resinfo width/height
+            0xf40c_0202,
+            0xfa00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xf408_0502,
+            0xfa00_0020, // s_load_dwordx4 s[20:23], s[4:5], 0x20
+            vop1(1, 0, 255),
+            mip, // v0 holds the mip operand
+            0xf038_0308,
+            0x0002_1400 | (a16 as u32) << 30, // image_get_resinfo width/height
         ];
         words.extend(buffer_store_dword(20, 20, 0));
         words.extend(buffer_store_dword(21, 20, 4));
@@ -3130,12 +3177,22 @@ fn s_bfe_64_extracts_and_sets_scc() {
     for &(src, off, width, signed, want) in cases {
         let op = if signed { 0x2A } else { 0x29 };
         let inputs = [[src as u32, (src >> 32) as u32, field(off, width), 0]];
-        let what = format!("s_bfe_{}64({src:#018x}, {off}, {width})", ["u", "i"][signed as usize]);
+        let what = format!(
+            "s_bfe_{}64({src:#018x}, {off}, {width})",
+            ["u", "i"][signed as usize]
+        );
         run_cases(&lo(op), &inputs, |backend, _, _, got| {
-            assert_eq!(got, want as u32, "{backend}: {what} low dword = {got:#010x}");
+            assert_eq!(
+                got, want as u32,
+                "{backend}: {what} low dword = {got:#010x}"
+            );
         });
         run_cases(&hi(op), &inputs, |backend, _, _, got| {
-            assert_eq!(got, (want >> 32) as u32, "{backend}: {what} high dword = {got:#010x}");
+            assert_eq!(
+                got,
+                (want >> 32) as u32,
+                "{backend}: {what} high dword = {got:#010x}"
+            );
         });
         run_cases(&scc(op), &inputs, |backend, _, _, got| {
             assert_eq!(got, (want != 0) as u32, "{backend}: {what} SCC = {got}");
@@ -3168,7 +3225,10 @@ fn s_bfm_b64_builds_a_mask_and_keeps_scc() {
     for &(width, off, want) in cases {
         let inputs = [[width, off, 0, 0]];
         run_cases(&lo, &inputs, |backend, _, _, got| {
-            assert_eq!(got, want as u32, "{backend}: s_bfm_b64({width}, {off}) low = {got:#010x}");
+            assert_eq!(
+                got, want as u32,
+                "{backend}: s_bfm_b64({width}, {off}) low = {got:#010x}"
+            );
         });
         run_cases(&hi, &inputs, |backend, _, _, got| {
             assert_eq!(
@@ -3180,12 +3240,14 @@ fn s_bfm_b64_builds_a_mask_and_keeps_scc() {
         // SCC keeps the compare's value whether or not the mask is empty.
         for s3 in [0u32, 1] {
             run_cases(&scc, &[[width, off, 0, s3]], |backend, _, _, got| {
-                assert_eq!(got, s3, "{backend}: s_bfm_b64({width}, {off}) changed SCC {s3} to {got}");
+                assert_eq!(
+                    got, s3,
+                    "{backend}: s_bfm_b64({width}, {off}) changed SCC {s3} to {got}"
+                );
             });
         }
     }
 }
-
 
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
@@ -4752,16 +4814,17 @@ fn lane_mask_phi_whole_read_and_readlane_execute_correctly() {
     // 1. Per-lane join where given(m, e) == Bool::TRUE inside the taken arm
     // (`s2 = vcc_lo` under `v0 < s0`), then read as a whole mask and via `v_readlane_b32`.
     let mut vcc_words = vec![
-        0x7D88_0000,            // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
-        s_mov_b32(2, 0x80),     // s2 = 0
-        0xBE87_3C6A,            // s_and_saveexec_b32 s7, vcc_lo
-        0xBF88_0001,            // s_cbranch_execz +1
-        s_mov_b32(2, 0x6A),     // s2 = vcc_lo
-        s_mov_b32(0x7E, 7),     // exec_lo = s7
+        0x7D88_0000,        // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
+        s_mov_b32(2, 0x80), // s2 = 0
+        0xBE87_3C6A,        // s_and_saveexec_b32 s7, vcc_lo
+        0xBF88_0001,        // s_cbranch_execz +1
+        s_mov_b32(2, 0x6A), // s2 = vcc_lo
+        s_mov_b32(0x7E, 7), // exec_lo = s7
     ];
     pack_whole_and_lanes(&mut vcc_words);
     let vcc_shader = build_wave32_cs(&vcc_words);
-    let mask_of = |n: u32| u32::try_from(1u64.checked_shl(n).map_or(0u64, |v| v - 1)).unwrap_or(u32::MAX);
+    let mask_of =
+        |n: u32| u32::try_from(1u64.checked_shl(n).map_or(0u64, |v| v - 1)).unwrap_or(u32::MAX);
     let vcc_cases: Vec<([u32; 4], Vec<u32>)> = [0, 1, 7, 16, 31, 32]
         .into_iter()
         .map(|n| {
@@ -4769,27 +4832,38 @@ fn lane_mask_phi_whole_read_and_readlane_execute_correctly() {
             ([n, 0, 0, 0], expected(m))
         })
         .collect();
-    dispatch_wave32("per_lane_vcc_whole_mask_and_readlane", &vcc_shader, true, &vcc_cases);
+    dispatch_wave32(
+        "per_lane_vcc_whole_mask_and_readlane",
+        &vcc_shader,
+        true,
+        &vcc_cases,
+    );
 
     // 2. Per-lane join assigning a distinct sub-mask (`v0 < s1`) under `v0 < s0`.
     let mut sub_words = vec![
-        0x7D88_0000,                            // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
-        s_mov_b32(2, 0x80),                     // s2 = 0
-        0xBE87_3C6A,                            // s_and_saveexec_b32 s7, vcc_lo
-        0xBF88_0002,                            // s_cbranch_execz +2
-        0xD4C4_0002,                            // v_cmp_gt_u32 s2, s1, v0 (v0 < s1)
+        0x7D88_0000,        // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
+        s_mov_b32(2, 0x80), // s2 = 0
+        0xBE87_3C6A,        // s_and_saveexec_b32 s7, vcc_lo
+        0xBF88_0002,        // s_cbranch_execz +2
+        0xD4C4_0002,        // v_cmp_gt_u32 s2, s1, v0 (v0 < s1)
         u32::from(sgpr(1)) | (u32::from(vgpr(0)) << 9),
-        s_mov_b32(0x7E, 7),                     // exec_lo = s7
+        s_mov_b32(0x7E, 7), // exec_lo = s7
     ];
     pack_whole_and_lanes(&mut sub_words);
     let sub_shader = build_wave32_cs(&sub_words);
-    let sub_cases: Vec<([u32; 4], Vec<u32>)> = [(0, 16), (16, 0), (16, 8), (8, 24), (32, 1), (32, 32)]
-        .into_iter()
-        .map(|(a, b)| {
-            let k = a.min(b);
-            let m = if k >= 32 { u32::MAX } else { mask_of(k) };
-            ([a, b, 0, 0], expected(m))
-        })
-        .collect();
-    dispatch_wave32("per_lane_submask_whole_mask_and_readlane", &sub_shader, true, &sub_cases);
+    let sub_cases: Vec<([u32; 4], Vec<u32>)> =
+        [(0, 16), (16, 0), (16, 8), (8, 24), (32, 1), (32, 32)]
+            .into_iter()
+            .map(|(a, b)| {
+                let k = a.min(b);
+                let m = if k >= 32 { u32::MAX } else { mask_of(k) };
+                ([a, b, 0, 0], expected(m))
+            })
+            .collect();
+    dispatch_wave32(
+        "per_lane_submask_whole_mask_and_readlane",
+        &sub_shader,
+        true,
+        &sub_cases,
+    );
 }

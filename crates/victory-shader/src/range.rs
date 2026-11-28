@@ -447,9 +447,9 @@ mod tests {
         ] {
             let p = build_words(&[
                 vop2(0x16, 1, 128 + shift, 0), // v_lshrrev_b32 v1, shift, v0
-                vop1(0x02, 0, V + 1),         // v_readfirstlane_b32 s0, v1
+                vop1(0x02, 0, V + 1),          // v_readfirstlane_b32 s0, v1
                 M0_S0,
-                vop1(0x43, 4, V + 8),         // v_movrels_b32 v4, v8
+                vop1(0x43, 4, V + 8), // v_movrels_b32 v4, v8
                 S_ENDPGM,
             ]);
             let reads = vgprs(&p.blocks[0].insts[3].reads);
@@ -470,7 +470,7 @@ mod tests {
 
         // A variable shift can be zero, even if its upper bound is small.
         let p = build_words(&[
-            vop2(0x1B, 2, 159, 3),    // v_and_b32 v2, 31, v3
+            vop2(0x1B, 2, 159, 3),   // v_and_b32 v2, 31, v3
             vop2(0x16, 1, V + 2, 0), // v_lshrrev_b32 v1, v2, v0
             vop1(0x02, 0, V + 1),
             M0_S0,

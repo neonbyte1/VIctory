@@ -1833,7 +1833,12 @@ mod tests {
                 r
             })
             .collect();
-        let src = stream(&t, &[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2, &records);
+        let src = stream(
+            &t,
+            &[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4],
+            2,
+            &records,
+        );
         let mut dst = vec![0u8; blocks * 16];
         decode(6, &src, &mut dst, &t).unwrap();
         for i in 255..blocks {
@@ -1858,7 +1863,12 @@ mod tests {
                 r
             })
             .collect();
-        let src = stream(&t, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2, &records);
+        let src = stream(
+            &t,
+            &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4],
+            2,
+            &records,
+        );
         let mut dst = vec![0u8; blocks * 16];
         decode(7, &src, &mut dst, &t).unwrap();
         for i in 255..blocks {

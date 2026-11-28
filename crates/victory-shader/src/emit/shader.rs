@@ -43,7 +43,10 @@ static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// any translation: a translated shader keeps the limit it was made with
 /// (a shader cache keys its entries by [`view_heap_limit`]).
 pub fn set_view_heap_limit(views: u32) {
-    VIEW_LIMIT.store(views.clamp(16, HEAP_VIEWS), std::sync::atomic::Ordering::Relaxed);
+    VIEW_LIMIT.store(
+        views.clamp(16, HEAP_VIEWS),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// The view-heap size translated shaders clamp their indices below.
@@ -651,7 +654,13 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { view_heap_limit() } - 1);
+        let last = self.m.i32(
+            if sampler {
+                HEAP_SAMPLERS
+            } else {
+                view_heap_limit()
+            } - 1,
+        );
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -699,7 +708,11 @@ impl Shader {
             (flags::TYPED_UAV_LOADS, uses.typed_uav_loads),
             (flags::ROVS, uses.rovs),
         ] {
-            self.flags = if used { self.flags | flag } else { self.flags & !flag };
+            self.flags = if used {
+                self.flags | flag
+            } else {
+                self.flags & !flag
+            };
         }
         // UAVs outside pixel and compute programs (the write and read marks
         // of vertex, geometry and mesh programs), as DXC counts them: UAV
@@ -1054,7 +1067,12 @@ impl Shader {
         let tables: Vec<V> = [self.memory, self.view_addresses, self.view_marks]
             .into_iter()
             .flatten()
-            .chain(self.root_srvs.iter().filter(|r| r.0 == VIEW_STRIDES).map(|r| r.1))
+            .chain(
+                self.root_srvs
+                    .iter()
+                    .filter(|r| r.0 == VIEW_STRIDES)
+                    .map(|r| r.1),
+            )
             .collect();
         self.m.reuse(&tables);
         let bitcode = self.m.write();
@@ -1199,7 +1217,9 @@ mod tests {
 
     fn check_uav_load_flags(texture: bool, rov: bool) {
         let path = Validator::default_path();
-        let mut validator = path.as_deref().map(|path| Validator::load(Some(path)).unwrap());
+        let mut validator = path
+            .as_deref()
+            .map(|path| Validator::load(Some(path)).unwrap());
         for (store, read) in [(false, false), (true, false), (true, true)] {
             let mut s = Shader::new(rov);
             if !rov {
@@ -1219,17 +1239,29 @@ mod tests {
             let props0 = kind | 0x1000 | if rov { 0x2000 } else { 0 };
             let h = s.heap_handle(b, zero, false, false, (props0, 0x409));
             let (load, load_op, load_args) = if texture {
-                ("textureLoad.f32", 66, vec![h, iu, zero, zero, iu, iu, iu, iu])
+                (
+                    "textureLoad.f32",
+                    66,
+                    vec![h, iu, zero, zero, iu, iu, iu, iu],
+                )
             } else {
                 ("bufferLoad.f32", 68, vec![h, zero, iu])
             };
             let r = s.op(b, load, Attr::ReadOnly, s.t.res_ret, load_op, &load_args);
             if store {
                 // A store keeps the annotation alive even if it ignores the load.
-                let v = if read { s.m.extract(b, r, 0) } else { s.m.f32(0) };
+                let v = if read {
+                    s.m.extract(b, r, 0)
+                } else {
+                    s.m.f32(0)
+                };
                 let mask = s.m.i8(0xF);
                 let (name, op, args) = if texture {
-                    ("textureStore.f32", 67, vec![h, zero, zero, iu, v, v, v, v, mask])
+                    (
+                        "textureStore.f32",
+                        67,
+                        vec![h, zero, zero, iu, v, v, v, v, mask],
+                    )
                 } else {
                     ("bufferStore.f32", 69, vec![h, zero, iu, v, v, v, v, mask])
                 };
@@ -1247,7 +1279,8 @@ mod tests {
             let part = container.part(FourCC::SFI0).unwrap();
             let features = u64::from_le_bytes(part.data.try_into().unwrap());
             if let Some(v) = validator.as_mut() {
-                v.validate(&mut dxil).unwrap_or_else(|e| panic!("{case}: {e}"));
+                v.validate(&mut dxil)
+                    .unwrap_or_else(|e| panic!("{case}: {e}"));
             }
             assert_eq!(features & 0x800 != 0, read, "{case}: typed UAV loads");
             assert_eq!(features & 0x1000 != 0, rov && store, "{case}: ROVs");
@@ -1277,7 +1310,14 @@ mod tests {
         let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
         let iu = s.m.undef(s.t.i32);
         let i32t = s.t.i32;
-        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
+        s.op(
+            b,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, or, zero, iu, iu, one],
+        );
         s.m.terminate(b, Term::Ret);
         s.finish()
     }
