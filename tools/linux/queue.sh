@@ -92,9 +92,10 @@ while :; do
   mv "$j" "$VICTORY_QUEUE_DIR/done/"
 
   echo "RUNQ start $tag exe=$exe sha=$(sha256sum "$exe" 2>/dev/null | cut -c1-12) env=[$envs]"
-  # envs is split on purpose: it is validated as KEY=VAL words above.
+  # envs is split on purpose: it is validated as KEY=VAL words above. It
+  # comes after the capture default so a job can override it.
   # shellcheck disable=SC2086
-  env $envs VICTORY_EXE="$exe" VICTORY_CAPTURE_FRAMES="${VICTORY_CAPTURE_FRAMES:-1500,1700}" \
+  env VICTORY_CAPTURE_FRAMES="${VICTORY_CAPTURE_FRAMES:-1500,1700}" $envs VICTORY_EXE="$exe" \
     "$S/capped.sh" "$S/run-game.sh" "$tag" "$dur" | grep -E '^(RESULT|RUN )'
   if [ -f "$VICTORY_RUNS_DIR/$tag/log.txt" ]; then
     "$S/runstat.sh" "$tag" 2>&1 | sed 's/^/RUNQ done /'

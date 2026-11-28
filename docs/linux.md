@@ -125,6 +125,17 @@ Measurements are 420 s runs of the yard scene with the Series X profile and
 ray tracing on. Compare only runs from the same build, machine and settings,
 always with an adjacent control (A-B-A-B).
 
+**First boot by hand, once.** A fresh profile opens the legal notices with
+the cursor on a list entry, then asks you to tick the agreement boxes; the
+queue's Enter presses can't do that, and accepting is yours to do anyway.
+Start the game once in a visible window (`wine victory.exe run …` from your
+desktop session), accept, and reach the world. After that the queue's default
+keys get through on their own.
+
+**Silent runs.** Headless runs still play the game's sound on your speakers.
+For quiet runs, load a null sink (`pactl load-module module-null-sink
+sink_name=victory_null`) and start the queue with `PULSE_SINK=victory_null`.
+
 **Start the queue once** in its own terminal:
 
 ```sh

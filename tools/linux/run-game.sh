@@ -158,7 +158,8 @@ setsid bash -c '
     # run.pid is written a moment after this watcher starts; look at it only
     # after the grace sleep, and give up quietly if the run never started.
     [ -s "$5" ] || exit 0
-    gs=$(pgrep -P "$(cat "$5")" -x gamescope)
+    # gamescope 3.17 on some systems names its process gamescope-wl.
+    gs=$(pgrep -P "$(cat "$5")" -x "gamescope(-wl)?")
     [ -n "$gs" ] && kill -INT "$gs"
   fi
   kill "$jl" 2>/dev/null
