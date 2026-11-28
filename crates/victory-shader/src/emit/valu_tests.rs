@@ -5615,6 +5615,7 @@ fn indexed_cbv_loads_match_their_byte_addresses() {
                         (RootType::Table, 0) => 0,
                         (RootType::Table, 1) => 32,
                         (RootType::Constants, 2) => dynamic_offset,
+                        (RootType::Constants, super::DISPATCH_SLOT) => 0,
                         other => panic!("unexpected user data {other:?}"),
                     };
                 }
