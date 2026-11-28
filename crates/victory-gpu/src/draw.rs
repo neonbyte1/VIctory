@@ -1182,7 +1182,7 @@ impl State {
         };
         self.dynamic
             .push((std::ptr::from_ref(heap) as usize, slot, 1));
-        let Some((at, resource)) = visible.make_clear_at(slot, &view) else {
+        let Some((at, resource)) = visible.make_clear_at(slot, &view, float) else {
             once!("an unordered access clear of a view the host cannot make");
             return;
         };

@@ -583,10 +583,11 @@ impl HostHeap {
         &self,
         index: u32,
         view: &View,
+        float: bool,
     ) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
         let host = host()?;
         let at = host.cpu_view();
-        let kept = make(view, at, true)??;
+        let kept = make(view, at, For::Clear { float })??;
         // SAFETY: the source is CPU-only, and the destination is this list's dynamic slot.
         unsafe {
             host.device.CopyDescriptorsSimple(
@@ -1681,7 +1682,7 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-    for_clear: bool,
+    for_: For,
 ) -> Option<Kept> {
     if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
         return None;
@@ -1731,13 +1732,17 @@ fn buffer_uav(
             return None;
         }
         // Translated shaders skip the rounded prefix using VIEW_STRIDES.
-        // Native clears have no shader to add the bias. A typed dword UAV
-        // can start at the actual word and keep the original logical length.
+        // Native clears have no shader to add the bias: their private view is
+        // typed over the view's own words, R32_FLOAT for a float clear and
+        // R32_UINT otherwise (vkd3d-proton leaves a raw view's float clear a
+        // no-op).
         let bias = offset & (RAW_VIEW_ALIGN - 1);
-        let (format, flags, bias) = if for_clear && bias != 0 {
-            (DXGI_FORMAT_R32_UINT, D3D12_BUFFER_UAV_FLAG_NONE, 0)
-        } else {
-            (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_UAV_FLAG_RAW, bias)
+        let (format, flags, bias) = match for_ {
+            For::Clear { float } if float => {
+                (DXGI_FORMAT_R32_FLOAT, D3D12_BUFFER_UAV_FLAG_NONE, 0)
+            }
+            For::Clear { .. } => (DXGI_FORMAT_R32_UINT, D3D12_BUFFER_UAV_FLAG_NONE, 0),
+            For::Slot => (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_UAV_FLAG_RAW, bias),
         };
         let aligned = offset - bias;
         let raw_dwords = total_bytes.checked_add(bias)? / 4;
@@ -1806,7 +1811,7 @@ fn make_marked(
 ) -> (Option<Kept>, Option<(u32, u32)>, u32) {
     MARK.with(|m| m.set(None));
     RAW_BIAS.with(|b| b.set(0));
-    let kept = make(view, at, false);
+    let kept = make(view, at, For::Slot);
     (
         kept,
         MARK.with(std::cell::Cell::take),
@@ -1925,7 +1930,7 @@ pub(crate) fn typed_store(format: u32) -> bool {
 /// the host resource it views, if it can.
 #[cfg(test)]
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    make(view, at, false).flatten().map(|k| k.0)
+    make(view, at, For::Slot).flatten().map(|k| k.0)
 }
 
 /// Shader-readable depth plane 0 format for each typed depth format promoted to
@@ -2110,9 +2115,20 @@ fn default_uav_desc(
     }
 }
 
+/// What a view is made for: a slot shaders read or write, or a native
+/// unordered clear. A clear's private view is typed over the view's own
+/// words: vkd3d-proton leaves `ClearUnorderedAccessViewFloat` of a raw
+/// (`R32_TYPELESS`) UAV a no-op, and a typed range needs no `VIEW_STRIDES`
+/// bias.
+#[derive(Clone, Copy)]
+enum For {
+    Slot,
+    Clear { float: bool },
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_clear: bool) -> Option<Kept> {
+fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_: For) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -2186,7 +2202,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_clear: bool) -> Option
             let Some(copy) = crate::resource::host_copy(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at, for_clear)
+                        buffer_uav(data as u64, len, uav_desc(desc), at, for_)
                     }
                     _ => None,
                 };
@@ -2250,7 +2266,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_clear: bool) -> Option
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at, for_clear);
+                return make(&view, at, for_);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -2261,7 +2277,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_clear: bool) -> Option
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at, for_clear)
+                buffer_uav(address, len, uav_desc(words), at, for_)
             } else {
                 buffer_srv(address, len, srv_desc(words), at)
             }
