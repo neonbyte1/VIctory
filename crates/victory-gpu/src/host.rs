@@ -3122,7 +3122,8 @@ impl HostList {
     }
 
     /// A mapped readback buffer of `size` bytes, alive until the list is
-    /// reset.
+    /// reset (the pipeline host test's staging reads).
+    #[cfg(test)]
     pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.mapped_buffer(size, true)?;
         name(&buffer, || format!("list readback {size:#x}"));
