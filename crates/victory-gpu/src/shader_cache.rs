@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, Target, UavOrder, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -64,6 +64,17 @@ fn build() -> &'static [u8; 32] {
                 limit,
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
+        }
+        match victory_shader::emit::uav_order() {
+            UavOrder::Raw => {
+                tracing::info!(
+                    "VICTORY_UAV_ORDER=raw: halves meet only before UAV reads after writes"
+                );
+            }
+            UavOrder::Off => {
+                tracing::info!("VICTORY_UAV_ORDER=off: halves do not keep UAV accesses in order");
+            }
+            UavOrder::All => {}
         }
         crate::descriptor::host::probe_view_limit();
         key(
@@ -129,7 +140,12 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
     match CACHE.get() {
         Some(cache) => cached(
             cache,
-            &host_key(build(), target, pair_meetings),
+            &host_key(
+                build(),
+                target,
+                pair_meetings,
+                victory_shader::emit::uav_order(),
+            ),
             container,
             translate,
         ),
@@ -139,13 +155,23 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
 
 /// The part of an entry's key before the container: the build, and the
 /// host's wave sizes (a translation for one host's waves is not another's),
-/// and pair meetings when asked for (keys without them stay as they were).
-fn host_key(build: &[u8; 32], target: Target, pair_meetings: bool) -> [u8; 32] {
+/// and pair meetings and `VICTORY_UAV_ORDER` other than `all` when asked
+/// for (keys without them stay as they were).
+fn host_key(build: &[u8; 32], target: Target, pair_meetings: bool, uav: UavOrder) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
     if pair_meetings {
         h.update(b"pair meetings");
+    }
+    match uav {
+        UavOrder::Raw => {
+            h.update(b"uav order raw");
+        }
+        UavOrder::Off => {
+            h.update(b"uav order off");
+        }
+        UavOrder::All => {}
     }
     *h.finalize().as_bytes()
 }
@@ -577,23 +603,30 @@ mod tests {
             lanes_min: 32,
             lanes_max: 64,
         };
+        let all = UavOrder::All;
         assert_eq!(
-            host_key(&build, nvidia, false),
-            host_key(&build, nvidia, false)
+            host_key(&build, nvidia, false, all),
+            host_key(&build, nvidia, false, all)
         );
         assert_ne!(
-            host_key(&build, nvidia, false),
-            host_key(&build, rdna, false)
+            host_key(&build, nvidia, false, all),
+            host_key(&build, rdna, false, all)
         );
         assert_ne!(
-            host_key(&build, nvidia, false),
-            host_key(&[8; 32], nvidia, false)
+            host_key(&build, nvidia, false, all),
+            host_key(&[8; 32], nvidia, false, all)
         );
         // Pair meetings change the translation of the builder's programs.
         assert_ne!(
-            host_key(&build, nvidia, false),
-            host_key(&build, nvidia, true)
+            host_key(&build, nvidia, false, all),
+            host_key(&build, nvidia, true, all)
         );
+        // So do meetings only before UAV reads after writes, or none.
+        let raw = host_key(&build, nvidia, true, UavOrder::Raw);
+        let off = host_key(&build, nvidia, true, UavOrder::Off);
+        assert_ne!(host_key(&build, nvidia, true, all), raw);
+        assert_ne!(host_key(&build, nvidia, true, all), off);
+        assert_ne!(raw, off);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

@@ -27,6 +27,7 @@ mod code_table;
 mod dot2;
 mod marks;
 mod phi;
+mod uav_order;
 
 #[cfg(test)]
 pub(crate) use marks::per_lane_marks;
@@ -272,6 +273,51 @@ fn meeting_polls() -> u32 {
         return n;
     }
     MEETING_POLLS
+}
+
+/// The used-resource entry of `native` a descriptor loaded from a table (or
+/// built around a root descriptor) falls in; `scalar` holds the scalar
+/// loads' addresses ([`Resources::scalar`]).
+fn used_resource<'n>(
+    native: &'n NativeProgram,
+    scalar: &HashMap<Site, Address>,
+    src: &Source,
+) -> Option<&'n UsedResource> {
+    if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } = src
+    {
+        return used_resource(native, scalar, args.first()?);
+    }
+    if let Source::LanePhi { args, .. } = src {
+        return args
+            .iter()
+            .flatten()
+            .find_map(|a| used_resource(native, scalar, a));
+    }
+    if let Source::Built { address, .. } = src {
+        let rp = native.layout.get(address.param)?;
+        return native
+            .used
+            .iter()
+            .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
+    }
+    let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
+        return None;
+    };
+    let a = scalar.get(load)?;
+    let rp = native.layout.get(a.param)?;
+    if rp.root != RootType::Table {
+        return None;
+    }
+    let dword = (a.offset / 4) + u32::from(*first);
+    native
+        .used
+        .iter()
+        .filter(|u| {
+            u.root == RootType::Table
+                && u.user_data == rp.user_data
+                && u.table_offset_dwords <= dword
+        })
+        .max_by_key(|u| u.table_offset_dwords)
 }
 
 /// Whether each block holding an `s_barrier` runs exactly once on every
@@ -543,6 +589,9 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Console flow in halves: UAV accesses the halves meet before
+    /// (`uav_order`), as `(block, index)`.
+    uav_order: HashSet<(usize, usize)>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -1009,6 +1058,7 @@ impl<'a> Lower<'a> {
         let mut split = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
+        let mut uav_sites = HashSet::new();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1116,11 +1166,13 @@ impl<'a> Lower<'a> {
             // reason it stops with.
             let needs_wave64 =
                 (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
-            if needs_wave64 && !x.target.runs(64) {
-                let group: u32 = cs.threads.iter().product();
+            let group: u32 = cs.threads.iter().product();
+            // What keeps a program out of the console flow on a host
+            // without 64-lane waves.
+            let blocked = || {
                 // (whole console waves: every host wave is a whole half)
                 let pairs_fit = group.is_multiple_of(64);
-                no_console_flow = if group > 64 && !(PAIR_MEETINGS.get() && pairs_fit) {
+                if group > 64 && !(PAIR_MEETINGS.get() && pairs_fit) {
                     Some(SEVERAL_CONSOLE_WAVES)
                 } else if group > 64 && !barriers_once(p) {
                     Some("a title barrier not met once by every console wave of a group in halves")
@@ -1128,13 +1180,16 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
-                } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
+                } else if group != 64
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 {
                     Some("a whole-wave section of a wave64 on a host without 64-lane waves")
                 } else {
                     None
-                };
+                }
+            };
+            if needs_wave64 && !x.target.runs(64) {
+                no_console_flow = blocked();
                 wants_console_flow = no_console_flow.is_none() && x.target.runs(32);
             }
             // On a host that runs the console's wave size: lane reads and
@@ -1165,6 +1220,34 @@ impl<'a> Lower<'a> {
                     .iter()
                     .any(|e| matches!(*e, LaneExit::Branch { when, .. } if !uniform(when)))
                 && !insts().any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32");
+            // Every form runs a console wave as two host waves on a host
+            // without 64-lane waves; only the console flow keeps them at
+            // the same place, where they can meet before a UAV access that
+            // conflicts with an earlier one (`uav_order`). Other forms take
+            // it for such an access where it can lower them.
+            let mode = super::uav_order();
+            if mode != super::UavOrder::Off
+                && x.native.wave64
+                && !x.target.runs(64)
+                && x.target.runs(32)
+                && writes_uavs
+                && group > 32
+            {
+                let tid = |c: u8| {
+                    x.io.inputs
+                        .iter()
+                        .find(|i| i.1 == Input::ThreadIdInGroup(c))
+                        .map(|i| i.0)
+                };
+                let g = uav_order::Group {
+                    native: x.native,
+                    res: x.res,
+                    tids: [tid(0), tid(1), tid(2)],
+                    threads: cs.threads,
+                };
+                uav_sites = uav_order::meetings(p, &g, mode == super::UavOrder::Raw);
+            }
+            wants_console_flow |= !uav_sites.is_empty() && !x.console_cf && blocked().is_none();
             if x.console_cf {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
@@ -1339,6 +1422,11 @@ impl<'a> Lower<'a> {
             root_memory,
             flat: None,
             no_barrier,
+            uav_order: if x.console_cf && split {
+                uav_sites
+            } else {
+                HashSet::new()
+            },
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -4970,6 +5058,9 @@ impl<'a> Lower<'a> {
         if self.pairs.is_some() {
             self.exchange_first(inst);
         }
+        if self.uav_order.contains(&(b, i)) {
+            self.order_uavs();
+        }
         let effect = matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. })
                 && (!name.starts_with("global_load_")
@@ -7189,42 +7280,7 @@ impl<'a> Lower<'a> {
 
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
-            src
-        {
-            return self.used_kind(args.first()?);
-        }
-        if let Source::LanePhi { args, .. } = src {
-            return args.iter().flatten().find_map(|a| self.used_kind(a));
-        }
-        if let Source::Built { address, .. } = src {
-            let rp = self.x.native.layout.get(address.param)?;
-            return self
-                .x
-                .native
-                .used
-                .iter()
-                .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
-        }
-        let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
-            return None;
-        };
-        let a = self.scalar.get(load)?;
-        let rp = self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table {
-            return None;
-        }
-        let dword = (a.offset / 4) + u32::from(*first);
-        self.x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)
+        used_resource(self.x.native, &self.scalar, src)
     }
 
     /// A handle for the descriptor `src` read at `site`; the heap index of
@@ -13412,9 +13468,15 @@ impl<'a> Lower<'a> {
     /// wave reads the counter (one dword all lanes share) until it reaches
     /// the next even number, at most [`MEETING_POLLS`] times.
     fn meet(&mut self) {
+        self.meet_fenced(8);
+    }
+
+    /// [`Self::meet`] with the barrier flags `fence` (memory fences only)
+    /// around it.
+    fn meet_fenced(&mut self, fence: u32) {
         let (counter, ..) = self.pair_slots.expect("pair meetings");
         let (i1t, i32t, void) = (self.s.t.i1, self.s.t.i32, self.s.t.void);
-        let (fence, zero, one) = (self.s.m.i32(8), self.s.m.i32(0), self.s.m.i32(1));
+        let (fence, zero, one) = (self.s.m.i32(fence), self.s.m.i32(0), self.s.m.i32(1));
         let c = self.cur;
         self.s
             .op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);

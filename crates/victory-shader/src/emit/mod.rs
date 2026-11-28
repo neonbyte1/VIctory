@@ -309,6 +309,34 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// How the halves of a console wave keep its UAV accesses in order on a
+/// host without 64-lane waves (`lower::uav_order`), from
+/// `VICTORY_UAV_ORDER` (for A/B runs). The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UavOrder {
+    /// `off`: not at all, as before the halves kept it.
+    Off,
+    /// `raw`: before a UAV read after a possible write only.
+    Raw,
+    /// The default: before every UAV access that conflicts with an
+    /// earlier one.
+    All,
+}
+
+/// The `VICTORY_UAV_ORDER` of this process ([`UavOrder`]).
+pub fn uav_order() -> UavOrder {
+    static MODE: std::sync::LazyLock<UavOrder> = std::sync::LazyLock::new(|| {
+        let mode = std::env::var("VICTORY_UAV_ORDER").unwrap_or_default();
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "raw" => UavOrder::Raw,
+            "off" => UavOrder::Off,
+            _ => UavOrder::All,
+        }
+    });
+    *MODE
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
