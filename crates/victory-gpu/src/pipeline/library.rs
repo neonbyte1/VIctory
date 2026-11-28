@@ -141,7 +141,7 @@ const KEPT: usize = 2;
 /// [`KEPT`] (by modification time).
 fn keyed(dir: &Path) -> PathBuf {
     let path = dir.join(victory_shader::SOURCE_HASH);
-    let Ok(entries) = std::fs::read_dir(keyed(&dir)) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return path;
     };
     let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
