@@ -4723,6 +4723,24 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Sub, m, one);
                 (self.s.m.bin(c, Bin::Shl, m, b), None)
             }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let lo16 = if name == "s_pack_hh_b32_b16" {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    let low_mask = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(c, Bin::And, a, low_mask)
+                };
+                let hi16 = if name == "s_pack_ll_b32_b16" {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let hi_mask = self.s.m.i32(0xFFFF_0000);
+                    self.s.m.bin(c, Bin::And, b, hi_mask)
+                };
+                (self.s.m.bin(c, Bin::Or, lo16, hi16), None)
+            }
             _ => return Err(name),
         };
         self.set(lo, Val::I32(r));

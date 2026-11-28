@@ -763,6 +763,89 @@ fn scalar_wqm_expands_nibbles_and_sets_scc() {
     }
 }
 
+#[test]
+fn scalar_pack_b16_halves_and_preserves_scc() {
+    let inputs = [
+        [0x1234_5678, 0xABCD_EF01, 0, 0],
+        [0x0000_FFFF, 0xFFFF_0000, 0, 0],
+        [0x8000_0001, 0xDEAD_BEEF, 0, 0],
+        [0x4242_4242, 0x4242_4242, 0, 0],
+    ];
+    for (op, expected) in [
+        (
+            0x32u8,
+            (|a: u32, b: u32| (a & 0xFFFF) | (b << 16)) as fn(u32, u32) -> u32,
+        ),
+        (0x33, |a, b| (a & 0xFFFF) | (b & 0xFFFF_0000)),
+        (0x34, |a, b| (a >> 16) | (b & 0xFFFF_0000)),
+    ] {
+        let shader = build_valu_cs(&[
+            sop2(op, 12, 0, 1),       // s_pack_*_b32_b16 s12, s0, s1
+            vop1(0x001, 0, sgpr(12)), // v_mov_b32 v0, s12
+        ]);
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            let want = expected(inp[0], inp[1]);
+            assert_eq!(
+                got, want,
+                "{backend}: op {op:#x}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    // Inline integer constants (5 = 133, -1 = 193), NULL (125 = 0), 32-bit literals (255),
+    // and inline f32 constant 1.0 (242 = 0x3F80_0000, per SOP2_32 SSrc_b32).
+    type ImmCase<'a> = (&'a [u32], fn(u32) -> u32);
+    let imm_cases: &[ImmCase<'_>] = &[
+        (&[sop2(0x32, 12, 133, 193)], |_| 0xFFFF_0005),
+        (&[sop2(0x33, 12, 193, 0)], |a| (a & 0xFFFF_0000) | 0xFFFF),
+        (&[sop2(0x34, 12, 125, 0)], |a| a & 0xFFFF_0000),
+        (&[sop2(0x32, 12, 255, 0), 0xABCD_1234], |a| {
+            (a << 16) | 0x1234
+        }),
+        (&[sop2(0x33, 12, 0, 255), 0xABCD_1234], |a| {
+            0xABCD_0000 | (a & 0xFFFF)
+        }),
+        (&[sop2(0x34, 12, 255, 0), 0xABCD_1234], |a| {
+            (a & 0xFFFF_0000) | 0xABCD
+        }),
+        (&[sop2(0x32, 12, 242, 0)], |a| a << 16),
+        (&[sop2(0x33, 12, 0, 242)], |a| 0x3F80_0000 | (a & 0xFFFF)),
+        (&[sop2(0x34, 12, 242, 0)], |a| (a & 0xFFFF_0000) | 0x3F80),
+    ];
+    for (words, expected) in imm_cases {
+        let mut body = words.to_vec();
+        body.push(vop1(0x001, 0, sgpr(12)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &inputs[..2], |backend, _, inp, got| {
+            let want = expected(inp[0]);
+            assert_eq!(
+                got, want,
+                "{backend}: {words:08x?} got {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+
+    // SCC is preserved across all three s_pack_*_b32_b16 variants (neither cleared on a
+    // zero result when SCC=1 nor set on a nonzero result when SCC=0).
+    let scc_shader = build_valu_cs(&[
+        0xBF06_0100,              // s_cmp_eq_u32 s0, s1
+        sop2(0x32, 12, 128, 128), // s_pack_ll_b32_b16 s12, 0, 0 -> 0
+        sop2(0x33, 13, 0, 1),     // s_pack_lh_b32_b16 s13, s0, s1
+        sop2(0x34, 14, 0, 1),     // s_pack_hh_b32_b16 s14, s0, s1 -> nonzero
+        sop2(0x0A, 15, 129, 130), // s_cselect_b32 s15, 1, 2
+        vop1(0x001, 0, sgpr(15)), // v_mov_b32 v0, s15
+    ]);
+    run_cases(
+        &scc_shader,
+        &[[7, 7, 0, 0], [0x1234_5678, 0x9ABC_DEF0, 0, 0]],
+        |backend, _, inp, got| {
+            let want = if inp[0] == inp[1] { 1 } else { 2 };
+            assert_eq!(got, want, "{backend}: SCC clobbered for {inp:?}");
+        },
+    );
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }

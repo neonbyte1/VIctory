@@ -1647,5 +1647,27 @@ mod tests {
         assert_eq!(vgprs(&swap.writes), [1, 2, 3]);
         assert!(swap.read(Reg::S(M0)).is_some());
     }
+    #[test]
+    fn scalar_pack_does_not_clobber_scc() {
+        let p = build_words(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0x9902_0100, // s_pack_ll_b32_b16 s2, s0, s1
+                0x9983_0100, // s_pack_lh_b32_b16 s3, s0, s1
+                0x9A04_0100, // s_pack_hh_b32_b16 s4, s0, s1
+                0x8505_8081, // s_cselect_b32 s5, 1, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [cmp, ll, lh, hh, csel, _] = &p.blocks[0].insts[..] else {
+            panic!("{:?}", p.blocks[0].insts);
+        };
+        for pack in [ll, lh, hh] {
+            assert_eq!(pack.read(Reg::Scc), None, "{}", pack.name());
+            assert_eq!(pack.write(Reg::Scc), None, "{}", pack.name());
+        }
+        assert_eq!(csel.read(Reg::Scc), cmp.write(Reg::Scc));
+    }
 }
 
