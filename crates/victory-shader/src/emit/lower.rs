@@ -2346,6 +2346,63 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// RDNA2 requires 1 ULP and exact +0 at unity (ISA, p. 141). Near unity, DXIL Log has
+    /// a looser absolute bound. For |x - 1| <= 1/8 we split t = x - 1 so C1 * hi is
+    /// exact in binary32, and group the degree-eight terms into even and odd Horner
+    /// chains in t * t. The ordered select retains DXIL Log outside the band.
+    fn log_f32(&mut self, x: V) -> V {
+        let c = self.cur;
+
+        // t = x - 1, its high part with the low twelve fraction bits cleared, and the exact remainder.
+        let one = self.s.m.f32(0x3F80_0000);
+        let t = self.s.m.bin(c, Bin::Sub, x, one);
+        let keep_high = self.s.m.i32(0xFFFF_F000);
+        let t_bits = self.as_int(t);
+        let high_bits = self.s.m.bin(c, Bin::And, t_bits, keep_high);
+        let hi = self.as_float(high_bits);
+        let lo = self.s.m.bin(c, Bin::Sub, t, hi);
+
+        // Split log2(e) into C1 and D, then use the Taylor coefficients b8 through b2.
+        let c1 = self.s.m.f32(0x3FB8_B000);
+        let (b8, b7, b6, b5, b4, b3, b2, d) = (
+            self.s.m.f32(0xBE38_AA3B),
+            self.s.m.f32(0x3E53_0BB1),
+            self.s.m.f32(0xBE76_384F),
+            self.s.m.f32(0x3E93_BB63),
+            self.s.m.f32(0xBEB8_AA3B),
+            self.s.m.f32(0x3EF6_384F),
+            self.s.m.f32(0xBF38_AA3B),
+            self.s.m.f32(0xB938_9AD4),
+        );
+
+        // H = even(t*t) + t * odd(t*t), then (C1 * hi) + ((t * H) + (C1 * lo)): one rounding at full
+        // magnitude, and at x == 1 the zeros of these products add to +0 under ties-to-even.
+        let q = self.s.m.bin(c, Bin::Mul, t, t);
+        let (mut even, mut odd) = (b7, b8);
+        for (ce, co) in [(b5, b6), (b3, b4), (d, b2)] {
+            let pe = self.s.m.bin(c, Bin::Mul, q, even);
+            let po = self.s.m.bin(c, Bin::Mul, q, odd);
+            even = self.s.m.bin(c, Bin::Add, pe, ce);
+            odd = self.s.m.bin(c, Bin::Add, po, co);
+        }
+        let odd = self.s.m.bin(c, Bin::Mul, t, odd);
+        let h = self.s.m.bin(c, Bin::Add, even, odd);
+        let series = self.s.m.bin(c, Bin::Mul, t, h);
+        let carried = self.s.m.bin(c, Bin::Mul, c1, lo);
+        let correction = self.s.m.bin(c, Bin::Add, series, carried);
+        let kept = self.s.m.bin(c, Bin::Mul, c1, hi);
+        let near_one = self.s.m.bin(c, Bin::Add, kept, correction);
+
+        // Ordered <= on |t|: a NaN, an infinity and everything outside the band keep DXIL's answer.
+        let clear_sign = self.s.m.i32(0x7FFF_FFFF);
+        let magnitude_bits = self.s.m.bin(c, Bin::And, t_bits, clear_sign);
+        let magnitude = self.as_float(magnitude_bits);
+        let band = self.s.m.f32(0x3E00_0000); // 1/8, inclusive at both ends
+        let inside_band = self.s.m.cmp(c, pred::OLE, magnitude, band);
+        let host_log = self.unary(23, x); // DXIL's own answer: kept outside the band exactly as before
+        self.s.m.select(c, inside_band, near_one, host_log)
+    }
+
     /// A 32-bit denormal as the console's float mode reads it: a zero of its
     /// sign, decided on the bits (the host's own denormal mode varies).
     fn ftz(&mut self, f: V) -> V {
@@ -7429,6 +7486,9 @@ impl<'a> Lower<'a> {
                         let flushed = self.ftz(a);
                         self.unary(op, flushed)
                     }
+                    // RDNA2 holds `v_log_f32` to 1 ULP and to exact +0 at the input 1.0; DXIL's bound
+                    // near unity is absolute only, so that one instruction gets its own lowering.
+                    23 => self.log_f32(a),
                     _ => self.unary(op, a),
                 };
                 float(self, r)

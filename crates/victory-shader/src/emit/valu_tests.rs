@@ -8121,3 +8121,462 @@ fn s_buffer_load_truncates_terms_independently() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// The near-unity accuracy contract for `v_log_f32`. Inside |x - 1| <= 1/8 the translated operation
+/// has to land within one ULP of the mathematical result, counted in that result's own binade (RDNA2
+/// ISA, `V_LOG_F32`, printed page 141), and at exactly 1.0 it has to return bit-exact positive zero,
+/// which is what the same entry documents.
+///
+/// The independent runtime reference had an observed error below 6e-9 binary32 ULP over the band.
+/// Its conservative error bound is 2.24e-8 ULP. The guard keeps the reference's uncertainty
+/// within one binade and narrows the acceptance window by more than the reference error.
+///
+/// `log2(1 + t)` in binary64 from the atanh identity: with `z = t / (2 + t)`, which stays within 1/15
+/// over this band, the value is `(2 * z) * (1 + z^2/3 + z^2/5 + ... + z^2/15) / ln 2`, the sum built
+/// by Horner in `z^2`. The subtraction and the `2 + t` are exact for a binary32 operand, the omitted
+/// relative tail is under 9.0e-21, and only ordinary binary64 arithmetic and the standard `LN_2` are
+/// used - no platform logarithm, whose precision Rust leaves unspecified, and no fixed point.
+fn log2_reference(t: f64) -> f64 {
+    let z = t / (2.0 + t);
+    let square = z * z;
+    let mut series = 1.0_f64 / 15.0;
+    for divisor in [13.0_f64, 11.0, 9.0, 7.0, 5.0, 3.0, 1.0] {
+        series = 1.0 / divisor + square * series;
+    }
+    (2.0 * z * series) / std::f64::consts::LN_2
+}
+
+/// The binary32 grid step a nonzero reference `y` has - `2^(floor(log2 |y|) - 23)` - and the lower
+/// edge of its binade, read from the binary64 exponent. Nonzero in-band reference magnitudes
+/// lie between 2^-24 and 2^-2, so the reference and step are normal binary64 values.
+fn reference_grid(y: f64) -> (f64, f64) {
+    let exponent = ((y.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+    (2f64.powi(exponent - 23), 2f64.powi(exponent))
+}
+
+/// The operands of the corrected band, in increasing binary32 encoding order, by the deterministic
+/// integer recipe below: the 152 encodings from the earlier narrow-band regression, 33
+/// encodings spread over each of the two extensions out to 1/8, clusters within two steps of every
+/// old and new band edge and of the |x - 1| = 2^-4 marks, the six binade-transition anchors with
+/// their immediate neighbours, and the encodings named by the upstream report and by the accuracy
+/// sweeps. 260 of them in all, none of them 1.0. These loops choose runtime operands only; every
+/// expectation is `log2_reference`'s, so adding coverage here cannot bias what it checks.
+fn log_in_band_inputs() -> Vec<u32> {
+    const CENTER: i64 = 0x3f80_0000; // 1.0
+    const OLD_LO: i64 = 0x3f7c_0000; // 1 - 2^-6, the previous edge
+    const OLD_HI: i64 = 0x3f82_0000; // 1 + 2^-6
+    const LO: i64 = 0x3f60_0000; // 1 - 1/8
+    const HI: i64 = 0x3f90_0000; // 1 + 1/8
+    let keep = |set: &mut std::collections::BTreeSet<u32>, at: i64| {
+        assert!(
+            (LO..=HI).contains(&at) && at != CENTER,
+            "recipe operand {at:#010x} is not a nonzero operand of the corrected band"
+        );
+        set.insert(at as u32);
+    };
+    // The published fixture: each old half band's edge and its next two inward encodings, 29 inner
+    // grid points, the first 34 encodings out from unity, and power-of-two offsets.
+    let mut legacy = std::collections::BTreeSet::new();
+    for (side, edge, top_power) in [(-1, OLD_LO, 15), (1, OLD_HI, 16)] {
+        let span = (CENTER - edge).abs();
+        for i in 0..=2 {
+            keep(&mut legacy, edge - side * i);
+        }
+        for k in 1..=29 {
+            keep(&mut legacy, CENTER + side * ((span * k + 15) / 30));
+        }
+        for i in 1..=34 {
+            keep(&mut legacy, CENTER + side * i);
+        }
+        for e in 6..=top_power {
+            keep(&mut legacy, CENTER + side * (1 << e));
+        }
+    }
+    assert_eq!(
+        legacy.len(),
+        152,
+        "the recreated fixture is not the published 152 inputs"
+    );
+    let mut set = legacy;
+    for (start, end) in [(LO, OLD_LO), (OLD_HI, HI)] {
+        for k in 0..=32 {
+            keep(&mut set, start + (((end - start) * k + 16) / 32));
+        }
+    }
+    for edge in [LO, HI, OLD_LO, OLD_HI, 0x3f70_0000, 0x3f88_0000] {
+        for i in -2..=2 {
+            let at = edge + i;
+            if (LO..=HI).contains(&at) {
+                keep(&mut set, at);
+            }
+        }
+    }
+    for anchor in [
+        0x3f6a_c0c7,
+        0x3f8b_95c2,
+        0x3f75_257d,
+        0x3f85_aac3,
+        0x3f7d_3e0c,
+        0x3f81_64d2,
+    ] {
+        for i in -1..=1 {
+            keep(&mut set, anchor + i);
+        }
+    }
+    for at in [
+        0x3f83_9333,
+        0x3f85_5333,
+        0x3f7c_2956,
+        0x3f7d_553a,
+        0x3f60_0fbc,
+        0x3f8f_d878,
+        0x3f7e_3274,
+        0x3f8c_ba39,
+    ] {
+        keep(&mut set, at);
+    }
+    assert_eq!(
+        set.len(),
+        260,
+        "the in-band recipe is not the qualified 260 inputs"
+    );
+    for at in [
+        LO,
+        HI,
+        OLD_LO,
+        OLD_HI,
+        OLD_LO - 1,
+        OLD_HI + 1,
+        0x3f83_9333,
+        0x3f85_5333,
+    ] {
+        assert!(
+            set.contains(&(at as u32)),
+            "the recipe is missing {at:#010x}"
+        );
+    }
+    set.into_iter().collect()
+}
+
+/// Operands for the fallback diagnostics: 32 deterministic encodings spread over each side, from the
+/// first encoding outside the band to |x - 1| = 1/4. Their distance from the reference is printed per
+/// adapter and never asserted - outside the correction this translator runs the host's own `Log`, and
+/// the reviewers asked for the measured gap rather than a claim about it.
+fn log_fallback_probe_inputs() -> Vec<u32> {
+    let mut probes = Vec::new();
+    for (start, end) in [(0x3f5f_ffff_i64, 0x3f40_0000), (0x3f90_0001, 0x3fa0_0000)] {
+        for k in 0..=31 {
+            probes.push((start + (end - start) * k / 31) as u32);
+        }
+    }
+    probes
+}
+
+/// How closely one translated `v_log_f32` result outside the corrected interval is held. The
+/// in-band operands above carry their own 1 ULP window against `log2_reference`, because there the
+/// guest's bound against an unrounded reference is what must hold.
+#[derive(Clone, Copy, Debug)]
+enum Held {
+    /// Direct3D's published bound for `log` alone - absolute 2^-21 on inputs in [0.5, 2], relative
+    /// 2^-21 elsewhere. Used outside the corrected interval, where this translator still runs DXIL's
+    /// `Log`. The host bound applies to these assertions. Separate fallback probes report
+    /// the remaining gap in guest ULPs.
+    HostPublishedBound,
+    /// Special results both the guest and D3D state exactly: `log(+-0) = -inf`, `log(+inf) = +inf`.
+    NegativeInfinity,
+    PositiveInfinity,
+    /// An operation with no defined result; any NaN is acceptable since payload and sign are free.
+    AnyNan,
+}
+
+/// Inputs outside the corrected interval plus special values, each with how closely it is held.
+/// RDNA2 flushes a denormal input to zero before taking its logarithm, and this translator does not
+/// do that for `v_log_f32`: both subnormal rows therefore assert the negative infinity both adapters
+/// were already measured producing, which pins down present host behaviour rather than claiming the
+/// subnormal case has been corrected. Held to the host's published bound outside the interval, these
+/// rows record the gap to the guest's 1 ULP; they are not evidence that the correction makes the
+/// host's logarithm faithful to the guest anywhere beyond the corrected interval. The operands that
+/// the wider 1/8 band has swallowed - the two old edges, their outward neighbours and the
+/// |x - 1| = 2^-4 and 2^-3 marks - are accuracy cases now, made by the recipe above.
+const LOG_BEYOND_INTERVAL_ROWS: &[(u32, Held)] = &[
+    // The first two encodings outside each new edge; the inside neighbours are covered above.
+    (0x3f5f_fffe, Held::HostPublishedBound), // two steps below 1 - 1/8
+    (0x3f5f_ffff, Held::HostPublishedBound), // one step below it
+    (0x3f90_0001, Held::HostPublishedBound), // one step above 1 + 1/8
+    (0x3f90_0002, Held::HostPublishedBound), // two steps above it
+    // Ordinary values with exact references that both the guest and this host get right today.
+    (0x3f00_0000, Held::HostPublishedBound), // 0.5 -> -1 exactly
+    (0x4000_0000, Held::HostPublishedBound), // 2.0 -> +1 exactly
+    (0x3eaa_aaab, Held::HostPublishedBound), // a third: log2(1/3) = -1.5849...
+    (0x4110_0000, Held::HostPublishedBound), // 9.0: log2 is 3.1699...
+    (0x7f7f_ffff, Held::HostPublishedBound), // the largest finite float: a little under 128
+    // A denormal argument arrives at the host's Log already read as a zero of its sign on both
+    // adapters here (measured before and after this change alike), which is also what RDNA2's own
+    // flush-to-zero leaves behind, so both land on -inf. The `transcendental` model in
+    // semantics_tests reads them the same way through ftz.
+    (0x0040_0000, Held::NegativeInfinity), // a positive subnormal -> -inf
+    (0x8040_0000, Held::NegativeInfinity), // a negative subnormal: flushed to zero first, so also -inf
+    // Signed zeros and infinities with results both the guest and D3D state exactly: -inf for
+    // log(+0) and log(-0), +inf for log(+inf). This host agrees today; holding both zero rows keeps
+    // a future flush-to-zero change from passing unnoticed as an unrelated one.
+    (0x0000_0000, Held::NegativeInfinity), // log(+0) = -inf
+    (0x8000_0000, Held::NegativeInfinity), // log(-0) = -inf
+    (0x7f80_0000, Held::PositiveInfinity), // log(+inf) = +inf
+    (0xff80_0000, Held::AnyNan),           // log(-inf): no result
+    (0xc120_0000, Held::AnyNan),           // log(-10.0)
+    // A NaN operand fails the ordered band test and reaches the host's own `Log`.
+    (0x7fc0_0000, Held::AnyNan), // log(NaN)
+];
+
+/// Inputs whose answer must be bit-exact positive zero: `V_LOG_F32` documents exact +0 at the input
+/// 1.0. Every nonzero operand of the corrected band has a reference away from zero, so its window
+/// excludes a zero result; this list holds only the one point where zero is the right answer.
+const LOG_EXACT_POSITIVE_ZERO_INPUTS: &[u32] = &[0x3f80_0000];
+
+/// Direct3D's published bound for `log`: an absolute error of 2^-21 on inputs in [0.5, 2] and a
+/// relative one elsewhere (SM4 `log`, and the same rule in the D3D functional specification). This
+/// is what the host promises; it is deliberately wider than the guest's 1 ULP near unity.
+fn within_published_log_bound(input_bits: u32, actual_bits: u32) -> bool {
+    let x = f64::from(f32::from_bits(input_bits));
+    let got = f64::from(f32::from_bits(actual_bits));
+    if !x.is_finite() || !got.is_finite() {
+        return false;
+    }
+    let want = x.log2();
+    let room = if (0.5..=2.0).contains(&x.abs()) {
+        2f64.powi(-21)
+    } else {
+        2f64.powi(-21) * want.abs()
+    };
+    (got - want).abs() <= room
+}
+
+#[test]
+fn v_log_f32_near_unity_meets_rdna2_one_ulp() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let verbose = std::env::var("VICTORY_LOG_F32_VERBOSE").as_deref() == Ok("1");
+
+    // One `v_log_f32 v0, v1`. The operand arrives as a root constant, so every input reaches the
+    // operation as a runtime VGPR value nothing can fold away at translate time.
+    let shader = build_valu_cs(&[vop1(0x27, 0, vgpr(1))]);
+
+    // The operand set and its reference are decided before any device exists: a bad recipe is a build
+    // problem of this test, not something a backend gets to answer for.
+    let in_band = log_in_band_inputs();
+    let probes = log_fallback_probe_inputs();
+
+    match validator::Validator::default_path() {
+        Some(path) => match validator::Validator::load(Some(path.as_path())) {
+            Ok(mut loaded) => {
+                let mut copy = shader.dxil.clone();
+                if let Err(error) = loaded.validate(&mut copy) {
+                    panic!("near-unity logarithm DXIL rejected: {error}");
+                }
+                println!("VIC6 VALIDATOR PASS {}", path.display());
+            }
+            Err(error) => println!("VIC6 VALIDATOR UNAVAILABLE {error}"),
+        },
+        None => println!("VIC6 VALIDATOR NO dxil.dll FOUND, SKIPPED"),
+    }
+
+    // Every backend answers before anything fails: one adapter being off must not hide what the
+    // other did.
+    let mut open_problems: Vec<String> = Vec::new();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(error) => {
+                println!("VIC6 BACKEND {label} UNAVAILABLE {error}, skipped");
+                continue;
+            }
+        };
+
+        // Name the adapter every verdict below came from: `Host::new(false)` takes DXGI's default
+        // hardware device unless VICTORY_WARP is set, so a description and LUID are what tell a real
+        // GPU from WARP standing in. The flags field marks software devices (0x2).
+        let identity = (|| -> Result<String, String> {
+            use windows::Win32::Graphics::Dxgi::{
+                CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+            };
+            // SAFETY: the device supplies its own adapter LUID for a DXGI lookup.
+            unsafe {
+                let luid = host.device.GetAdapterLuid();
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
+                let adapter: IDXGIAdapter1 =
+                    factory.EnumAdapterByLuid(luid).map_err(|e| e.to_string())?;
+                let desc = adapter.GetDesc1().map_err(|e| e.to_string())?;
+                Ok(format!(
+                    "name={} vendor={:04x} device={:04x} flags={:#x} luid={:08x}:{:08x}",
+                    String::from_utf16_lossy(&desc.Description).trim_end_matches('\0'),
+                    desc.VendorId,
+                    desc.DeviceId,
+                    desc.Flags,
+                    luid.HighPart,
+                    luid.LowPart
+                ))
+            }
+        })();
+        match identity {
+            Ok(text) => println!("VIC6 ADAPTER {label} {text}"),
+            Err(error) => println!("VIC6 ADAPTER {label} UNKNOWN {error}"),
+        }
+        // How this back end treats an explicit multiply-add, from a separate `v_fma_f32` probe: it
+        // reports whether the lowered FMad survived as one FMad instruction. That is context about
+        // the host, not evidence about this correction - the correction emits no FMad, and this probe
+        // cannot say whether the compiler contracted its muls and adds. Either answer is acceptable
+        // there: the qualified bound covers local contraction of a multiply into the add after it,
+        // which changes the rounding inside the Horner steps on a few of the 3,145,729 in-band
+        // operands, and the products that carry the leading term stay exact either way.
+        match host.fuses_fmad() {
+            Ok(fused) => println!(
+                "VIC6 FMAD {label} {}",
+                if fused { "fuses" } else { "keeps separate" }
+            ),
+            Err(error) => println!("VIC6 FMAD {label} UNKNOWN {error}"),
+        }
+
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // One dispatch per input, the operand as a root constant. `VICTORY_WARP=1` would make the
+        // "hardware" label WARP; the adapter line above is what shows that did not happen here.
+        let run = |input: u32| -> Result<u32, String> {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                match (u.root, u.slot) {
+                    (RootType::Constants, 0) => ud[u.index as usize] = input,
+                    (RootType::Table, 1) => {}
+                    other => return Err(format!("unexpected user data {other:?}")),
+                }
+            }
+            host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .map(|out| out[0][0])
+        };
+
+        let mut problems: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        let mut worst_ulp = 0f64; // in-band, in the reference's own binade ULP
+        let mut ambiguous = 0usize; // references whose 1 ULP window this test cannot decide
+
+        for &input in &in_band {
+            let got = run(input)
+                .unwrap_or_else(|e| panic!("{label}: dispatch at {input:08x} failed: {e}"));
+            if verbose {
+                println!("VIC6 BITS {label} {input:08x} {got:08x}");
+            }
+            checked += 1;
+            // The binary32 operand converts exactly, so `t` is exact, and the reference is the
+            // mathematical result to about 6e-9 of a binary32 ULP.
+            let reference = log2_reference(f64::from(f32::from_bits(input)) - 1.0);
+            let (step, binade) = reference_grid(reference);
+            // A guard of 2^-24 ULP exceeds the reference error bound. Accept only when the
+            // uncertainty stays in one binade and the distance is at most one ULP minus the guard.
+            let guard = step * 2f64.powi(-24);
+            let magnitude = reference.abs();
+            if !(magnitude - guard > binade && magnitude + guard < 2.0 * binade) {
+                ambiguous += 1;
+                problems.push(format!(
+                    "{input:08x}: reference {reference:e} sits within its guard {guard:e} of the binade edge {binade:e}, so its 1 ULP window is undecidable here"
+                ));
+                continue;
+            }
+            let answer = f32::from_bits(got);
+            let distance = (f64::from(answer) - reference).abs();
+            worst_ulp = worst_ulp.max(distance / step);
+            if !answer.is_finite() {
+                problems.push(format!(
+                    "{input:08x}: reference {reference:e} has a non-finite answer {got:08x}"
+                ));
+            } else if distance > step - guard {
+                problems.push(format!(
+                    "{input:08x}: off by {:.6} ULP, over the one grid step {step:e} of reference {reference:e}",
+                    distance / step
+                ));
+            }
+        }
+
+        for &input in LOG_EXACT_POSITIVE_ZERO_INPUTS {
+            let got = run(input)
+                .unwrap_or_else(|e| panic!("{label}: dispatch at {input:08x} failed: {e}"));
+            if verbose {
+                println!("VIC6 BITS {label} {input:08x} {got:08x}");
+            }
+            checked += 1;
+            if got != 0x0000_0000 {
+                problems.push(format!("{input:08x}: expected bit-exact +0, got {got:08x}"));
+            }
+        }
+
+        for &(input, held) in LOG_BEYOND_INTERVAL_ROWS {
+            let got = run(input)
+                .unwrap_or_else(|e| panic!("{label}: dispatch at {input:08x} failed: {e}"));
+            if verbose {
+                println!("VIC6 BITS {label} {input:08x} {got:08x}");
+            }
+            checked += 1;
+            let ok = match held {
+                Held::HostPublishedBound => within_published_log_bound(input, got),
+                Held::NegativeInfinity => f32::from_bits(got) == f32::NEG_INFINITY,
+                Held::PositiveInfinity => f32::from_bits(got) == f32::INFINITY,
+                Held::AnyNan => f32::from_bits(got).is_nan(),
+            };
+            if !ok {
+                problems.push(format!(
+                    "{input:08x}: {held:?} expectation missed by result {got:08x}"
+                ));
+            }
+        }
+
+        // What the host's own `Log` costs just outside the band, reported per adapter and not
+        // asserted: the guest asks 1 ULP of every input and only the band is corrected.
+        let mut probe_worst_ulp = 0f64;
+        let mut probe_over_one = 0usize;
+        for &input in &probes {
+            let got = run(input)
+                .unwrap_or_else(|e| panic!("{label}: dispatch at {input:08x} failed: {e}"));
+            let reference = log2_reference(f64::from(f32::from_bits(input)) - 1.0);
+            let (step, _) = reference_grid(reference);
+            let ulp = (f64::from(f32::from_bits(got)) - reference).abs() / step;
+            probe_over_one += usize::from(ulp > 1.0);
+            probe_worst_ulp = probe_worst_ulp.max(ulp);
+            if verbose {
+                println!("VIC6 FALLBACK {label} {input:08x} {got:08x} {ulp:.4}");
+            }
+        }
+
+        let violation_count = problems.len();
+        println!(
+            "VIC6 SUMMARY {label} checked={checked} in_band={} unity={} outside={} probes={} violations={violation_count} worst_in_band_ulp={worst_ulp:.6} ambiguous_references={ambiguous} probe_worst_ulp={probe_worst_ulp:.4} probe_over_one_ulp={probe_over_one}",
+            in_band.len(),
+            LOG_EXACT_POSITIVE_ZERO_INPUTS.len(),
+            LOG_BEYOND_INTERVAL_ROWS.len(),
+            probes.len(),
+        );
+        if !problems.is_empty() {
+            open_problems.push(format!(
+                "{label}: {} of {checked} logarithm results missed their bound; first few: {}",
+                problems.len(),
+                problems.join("; ")
+            ));
+        }
+        ran += 1;
+    }
+    println!("VIC6 BACKENDS ran={ran} in_band={}", in_band.len());
+    // An unavailable backend is skipped, as in other GPU tests. The adapter and backend
+    // summaries show which devices actually ran.
+    if !open_problems.is_empty() {
+        panic!("{}", open_problems.join("\n"));
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
