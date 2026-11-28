@@ -6015,6 +6015,77 @@ mod title_copies {
     }
 }
 
+/// The cap on bytes of title-memory copies in video memory: the given
+/// percentage (a whole number 0-25 from `VICTORY_VRAM_COPY_PERCENT`; unset:
+/// 25, as before) of `budget`, the local DXGI budget in bytes. Returns the
+/// cap in bytes and whether the setting was refused (the cap then still uses
+/// 25 %).
+fn vram_copy_cap(budget: u64, setting: Option<&str>) -> (u64, bool) {
+    let (percent, refused) = match setting {
+        None => (25_u64, false),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(p) if p <= 25 => (p, false),
+            _ => (25, true),
+        },
+    };
+    // `budget * percent` fits in u128, and the cap (at most a quarter of the
+    // budget) always fits back in u64.
+    let cap = (u128::from(budget) * u128::from(percent) / 100) as u64;
+    (cap, refused)
+}
+
+#[cfg(test)]
+mod vram_copy_cap_tests {
+    use super::vram_copy_cap;
+
+    /// A budget in bytes with a clean quarter, tenth and half (12 GB).
+    const BUDGET: u64 = 12_000_000_000;
+
+    #[test]
+    fn unset_is_25_percent() {
+        assert_eq!(vram_copy_cap(BUDGET, None), (BUDGET / 4, false));
+    }
+
+    #[test]
+    fn twenty_five_is_the_old_quarter() {
+        assert_eq!(vram_copy_cap(BUDGET, Some("25")), (BUDGET / 4, false));
+    }
+
+    #[test]
+    fn zero_is_no_copies() {
+        assert_eq!(vram_copy_cap(BUDGET, Some("0")), (0, false));
+    }
+
+    #[test]
+    fn a_value_between() {
+        assert_eq!(vram_copy_cap(BUDGET, Some("10")), (BUDGET / 10, false));
+    }
+
+    #[test]
+    fn refused_values_fall_back_to_25() {
+        for value in ["", "abc", "-5", "26", " 12", "12 ", "12%", "12x"] {
+            assert_eq!(
+                vram_copy_cap(BUDGET, Some(value)),
+                (BUDGET / 4, true),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_budget_caps_to_zero() {
+        assert_eq!(vram_copy_cap(0, None), (0, false));
+        assert_eq!(vram_copy_cap(0, Some("25")), (0, false));
+        assert_eq!(vram_copy_cap(0, Some("10")), (0, false));
+    }
+
+    #[test]
+    fn a_huge_budget_does_not_overflow() {
+        assert_eq!(vram_copy_cap(u64::MAX, Some("25")), (u64::MAX / 4, false));
+        assert_eq!(vram_copy_cap(u64::MAX, Some("10")), (u64::MAX / 10, false));
+    }
+}
+
 impl Host {
     /// Whether the host adapter uses unified memory architecture (APUs, WARP).
     pub(crate) fn is_uma(&self) -> bool {
@@ -6044,9 +6115,25 @@ impl Host {
             let Some([local, _]) = video_memory() else {
                 return 0;
             };
-            // Cap at 25% of local DXGI budget (~2.5-3.0 GB on a 12 GB card) so
-            // streaming textures never get evicted.
-            ((local.1 * 1_000_000.0) as u64) / 4
+            // Cap the video-memory copies at `VICTORY_VRAM_COPY_PERCENT` of the
+            // local DXGI budget (25 %, ~2.5-3.0 GB on a 12 GB card, when unset)
+            // so streaming textures never get evicted.
+            let budget = (local.1 * 1_000_000.0) as u64;
+            let setting = std::env::var("VICTORY_VRAM_COPY_PERCENT").ok();
+            let (cap, refused) = vram_copy_cap(budget, setting.as_deref());
+            if refused {
+                tracing::warn!(
+                    value = setting.as_deref().unwrap_or_default(),
+                    "VICTORY_VRAM_COPY_PERCENT: not a whole number 0-25, using 25"
+                );
+            } else if let Some(value) = setting.as_deref() {
+                tracing::info!(
+                    percent = value.parse::<u64>().unwrap_or(25),
+                    cap_mb = cap as f64 / 1_000_000.0,
+                    "VICTORY_VRAM_COPY_PERCENT: video-memory copies capped at this share of the local budget"
+                );
+            }
+            cap
         })
     }
 
