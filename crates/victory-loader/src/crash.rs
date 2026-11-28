@@ -627,12 +627,127 @@ fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+/// Debugging aid: `VICTORY_TITLE_ASSERTS=<n>` continues past up to `n`
+/// `int3` asserts in title code, where the first one ends the process.
+/// Each skip is logged with its address and the title's last debug output.
+///
+/// A title asserts where a check it believes it cannot recover from
+/// failed, so a run that gets past one is not a run to trust. It is how the
+/// next thing that needs work is found, though: the check is taken as
+/// passed, its caller keeps the value it computed, and the title goes on to
+/// the next failure instead of the same one.
+fn asserts_left() -> &'static std::sync::atomic::AtomicUsize {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicUsize;
+    static LEFT: OnceLock<AtomicUsize> = OnceLock::new();
+    LEFT.get_or_init(|| {
+        let n = std::env::var("VICTORY_TITLE_ASSERTS")
+            .ok()
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        AtomicUsize::new(n)
+    })
+}
+
+/// Skips `0xcc`, the byte a compiler emits for `__debugbreak`, at `at`: the
+/// `int3` is taken as a no-op the title asked for rather than a fault. A
+/// debugger's breakpoint is not that: it patches the code, and the byte
+/// there is the instruction it replaced, so it is left alone.
+fn skip_assert_at(at: usize, code: i32, left: &std::sync::atomic::AtomicUsize) -> bool {
+    if code != EXCEPTION_BREAKPOINT {
+        return false;
+    }
+    // The switch is off by default and the budget usually runs out: say so
+    // before the byte read and the module lookup, which together are the
+    // expensive part of an exception that is not ours to skip. `take_budget`
+    // re-checks atomically at the end, so this cannot spend a budget that is
+    // not there.
+    if left.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
+    // SAFETY: the CPU fetched the instruction at `at`, so its byte is
+    // readable.
+    if unsafe { (at as *const u8).read() } != 0xcc {
+        return false;
+    }
+    // Only the title's own image: a `0xcc` in a host DLL (ntdll's
+    // `DbgBreakPoint`, a CRT `__debugbreak`, a Rust debug assert, the D3D12
+    // debug layer) is not the title's to spend, and continuing past one would
+    // hide a real fault in code we did not write.
+    if !in_title_image(at) {
+        return false;
+    }
+    take_budget(left)
+}
+
+/// Spends one of the assertions the title may skip. The budget is taken in the
+/// same step it is checked, so two threads at the last assert cannot both pass
+/// a zero check and wrap the counter to `usize::MAX`.
+fn take_budget(left: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering;
+    left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+/// Whether `address` lies in the title's own image, which the loader maps under
+/// a name starting `victory-image-` ([`crate::prepare`]).
+fn in_title_image(address: usize) -> bool {
+    let mut module: HMODULE = std::ptr::null_mut();
+    // SAFETY: looks up the module containing `address`; no reference taken.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            address as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 {
+        return false;
+    }
+    let mut path = [0u16; 260];
+    // SAFETY: `module` is a loaded module; the buffer length is passed.
+    let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    let path = String::from_utf16_lossy(&path[..len as usize]);
+    let name = path.rsplit('\\').next().unwrap_or(&path);
+    name.starts_with("victory-image-")
+}
+
+/// [`skip_assert_at`] on the exception being dispatched, moving `rip` past
+/// the skipped `int3`. Returns whether it was skipped.
+unsafe fn past_assert(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: the system passes valid exception pointers.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        let context = &mut *(*info).ContextRecord;
+        let at = record.ExceptionAddress as usize;
+        if !skip_assert_at(at, record.ExceptionCode, asserts_left()) {
+            return false;
+        }
+        // The next instruction: read before the exception, so an `int3`
+        // that is the first byte of a debugger's patch is not skipped.
+        context.Rip = at as u64 + 1;
+        // The title's last debug output with it: asserts in a bring-up
+        // build usually say what they were checking on the lines before.
+        eprint!(
+            "VIctory: past a title assert at {} ({} left)\n{}",
+            locate(at),
+            asserts_left().load(std::sync::atomic::Ordering::Relaxed),
+            title_output()
+        );
+    }
+    true
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers, for this thread.
     if unsafe { recover_unwind_fault(info) || emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
-    // SAFETY: as above.
+    // SAFETY: the system passes valid exception pointers.
+    if unsafe { past_assert(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: the system passes valid exception pointers.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     if FATAL.contains(&code) {
         let to_file =
@@ -910,6 +1025,42 @@ mod tests {
             }
         }
         assert!(seen.is_empty());
+    }
+
+    /// The byte decides, and the budget is spent only where it is: a
+    /// compiler's `int3` is skipped while the budget lasts, a debugger's
+    /// patched code is not, and neither is any other exception.
+    #[test]
+    fn a_title_int3_is_skipped_while_the_budget_lasts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CODE: [u8; 4] = [0xcc, 0x90, 0xcc, 0xcc];
+        let at = CODE.as_ptr() as usize;
+        let left = AtomicUsize::new(2);
+        // A `0xcc` outside the title's image is somebody else's breakpoint (a
+        // host DLL's), and the title's budget is not spent on it.
+        assert!(!skip_assert_at(at, EXCEPTION_BREAKPOINT, &left));
+        assert_eq!(left.load(Ordering::Relaxed), 2, "not spent");
+        // A debugger's breakpoint: the byte is the instruction it replaced.
+        assert!(!skip_assert_at(at + 1, EXCEPTION_BREAKPOINT, &left));
+        assert_eq!(left.load(Ordering::Relaxed), 2, "not spent");
+        // Another kind of exception is not ours to skip.
+        assert!(!skip_assert_at(
+            at + 2,
+            EXCEPTION_ILLEGAL_INSTRUCTION,
+            &left
+        ));
+        assert_eq!(left.load(Ordering::Relaxed), 2, "not spent");
+        // The budget itself: one spent per skip, and never wrapped.
+        assert!(take_budget(&left));
+        assert_eq!(left.load(Ordering::Relaxed), 1);
+        assert!(take_budget(&left));
+        assert_eq!(left.load(Ordering::Relaxed), 0);
+        assert!(!take_budget(&left), "the budget is spent");
+        assert_eq!(
+            left.load(Ordering::Relaxed),
+            0,
+            "a second thread at the last assert wraps it no further"
+        );
     }
 
     #[test]
