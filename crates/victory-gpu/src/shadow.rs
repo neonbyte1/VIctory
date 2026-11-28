@@ -497,6 +497,15 @@ impl Shadow {
         self.marks.is_some()
     }
 
+    /// Shaders wrote the copy's bytes through this submission, past the
+    /// guards: a lazy page of it holds bytes that are not the page's any more
+    /// ([`crate::watch::withheld`] forgets it rather than giving it back).
+    pub(crate) fn wrote_over(&self) {
+        if let Some(t) = &self.tracked {
+            t.note_gpu_writes();
+        }
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -541,6 +550,9 @@ impl Shadow {
         let mut subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
         let sub = sub_of(&mut subs, owner);
         sub.pending.insert((address, address + len, marked));
+        // Its shaders may write the copy over a lazy page of it: that page's
+        // earlier bytes are then no longer the copy's (`crate::watch::withheld`).
+        self.wrote_over();
         if marked && let Some(t) = &self.tracked {
             // The copy's bytes of pages another copy's shaders' bytes stay
             // with are kept as they are now (`crate::watch::Tracked::arm_keeping`).
@@ -1703,9 +1715,12 @@ pub(crate) fn copy_back_marks(
         })
     };
     // Held back: dropped from the copies (`crate::memory::drop_withheld`).
+    // The copy's shaders wrote the page through a view: what a lazy page of
+    // it held before is not its bytes now (`crate::watch::withheld`).
     if !held.is_empty() {
         let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+        for (copy, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            copy.wrote_over();
             crate::memory::drop_withheld(page, PAGE);
         }
     }
@@ -1716,6 +1731,14 @@ pub(crate) fn copy_back_marks(
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    {
+        let mut bumped = std::collections::HashSet::new();
+        for (copy, _) in &pages {
+            if bumped.insert(Arc::as_ptr(copy) as usize) {
+                copy.wrote_over();
+            }
+        }
+    }
     let pages: Vec<(Arc<Shadow>, usize)> = pages
         .into_iter()
         .filter(|(copy, page)| {
@@ -2173,7 +2196,9 @@ fn copy_back_run(
     // View pages the shaders changed and the title did not: lazy instead of
     // written (`VICTORY_LAZY_VIEWS`), but not while a miss withholds what
     // shaders write (a lazy page written again would lose its earlier bytes
-    // with the withheld ones, `crate::watch::forget_lazy`).
+    // with the withheld ones, `crate::watch::withheld`, and a copy-back
+    // would put them in title memory while the lists that missed need the
+    // copies to hold title memory's bytes).
     if crate::watch::lazy_views() && !crate::memory::withholding() {
         let offer: Vec<crate::watch::LazyView> = pages
             .iter()
@@ -4333,5 +4358,154 @@ mod run_tests {
             tb.disarm();
             drop((ta, tb));
         }
+    }
+
+    /// `VICTORY_OWNER`: a submission whose writes stay out of title memory
+    /// (`crate::memory::drop_withheld`) does not take an earlier copy's
+    /// lazy page with them, one it did not write: that page goes back, and
+    /// the title reads its bytes (with the switch off they would be in title
+    /// memory already).
+    #[test]
+    fn withheld_ranges_keep_an_earlier_copy_s_lazy_page() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::watch::tests::{OwnerOn, raw};
+        let _on = OwnerOn::set();
+        let (a, b, _) = owner_views(1);
+        let t = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
+        let u = crate::watch::track_copy(b, PAGE, true).expect("views are tracked");
+        fill(a, PAGE);
+        let mut ha = title_bytes(a, PAGE);
+        assert!(!t.take(a, a + PAGE).is_empty() && !u.take(b, b + PAGE).is_empty());
+        // An earlier submission wrote bytes 0-127; the page stays with this
+        // copy, the title's mappings keep no access to it.
+        ha[..128].fill(0xaa);
+        let back = copy_back_run(&t, &[a], &ha, &Default::default());
+        assert_eq!((back.lazy, back.written), (1, 0), "{back:?}");
+        assert_eq!(raw(a), None, "no access at the title's mapping");
+        // A submission whose writes are withheld covers the page: its shaders
+        // wrote another range of it, nothing of this one.
+        crate::memory::forget_misses();
+        crate::memory::drop_withheld(a, PAGE);
+        assert_eq!(title_read(a + 5), 0xaa, "the earlier bytes");
+        assert_eq!(title_bytes(a, PAGE), ha, "the page as left");
+        crate::memory::log_frame();
+        drop((t, u));
+    }
+
+    /// `VICTORY_OWNER`: the same submission writes the page through another
+    /// copy, and its writes are withheld: the other copy's bytes stay in it
+    /// and the earlier copy's lazy page goes back, so the title reads those
+    /// and not the withheld submission's.
+    #[test]
+    fn withheld_writes_elsewhere_do_not_drop_an_earlier_copy_s_lazy_page() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::watch::tests::OwnerOn;
+        let _on = OwnerOn::set();
+        let (a, b, _) = owner_views(1);
+        let t = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
+        let u = crate::watch::track_copy(b, PAGE, true).expect("views are tracked");
+        fill(a, PAGE);
+        let mut ha = title_bytes(a, PAGE);
+        assert!(!t.take(a, a + PAGE).is_empty() && !u.take(b, b + PAGE).is_empty());
+        ha[..128].fill(0xaa);
+        assert_eq!(copy_back_run(&t, &[a], &ha, &Default::default()).lazy, 1);
+        // The withheld submission's shaders write bytes 2048-2175 through the
+        // other copy (`Shadow::writing` arms it), and its copy-back does not
+        // happen: `crate::memory::drop_withheld` is all that is left of it.
+        let mut hb = served(b);
+        assert_eq!(hb, ha, "the other copy is given this one's bytes");
+        arm(&u, b, &hb);
+        hb[2048..2176].fill(0xbb);
+        u.disarm();
+        crate::memory::forget_misses();
+        crate::memory::drop_withheld(a, PAGE);
+        assert_eq!(title_read(a + 5), 0xaa, "the earlier bytes");
+        assert_eq!(title_read(a + 2050), pattern(2050), "withheld out");
+        crate::memory::log_frame();
+        drop((t, u));
+    }
+
+    /// `VICTORY_OWNER`: a page the copy's own shaders write again in a
+    /// submission whose writes are withheld loses the earlier submission's
+    /// bytes with it: they were only in the copy, which holds the new ones
+    /// (`crate::watch::withheld`'s shortcut; a declared range of a program
+    /// using title memory goes back before such a submission runs, so this
+    /// takes writes into ranges nobody declared).
+    #[test]
+    fn withheld_writes_of_the_copy_over_its_lazy_page_stay_out() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::watch::tests::OwnerOn;
+        let _on = OwnerOn::set();
+        let (a, b, _) = owner_views(1);
+        let t = crate::watch::track_copy(a, PAGE, true).expect("views are tracked");
+        let u = crate::watch::track_copy(b, PAGE, true).expect("views are tracked");
+        fill(a, PAGE);
+        let mut ha = title_bytes(a, PAGE);
+        assert!(!t.take(a, a + PAGE).is_empty() && !u.take(b, b + PAGE).is_empty());
+        ha[..128].fill(0xaa);
+        assert_eq!(copy_back_run(&t, &[a], &ha, &Default::default()).lazy, 1);
+        // Its own shaders write the page again (in place: the copy's bytes are
+        // the buffer the page's are in), in a submission whose writes are
+        // withheld.
+        arm(&t, a, &ha);
+        ha[2048..2176].fill(0xbb);
+        crate::memory::forget_misses();
+        crate::memory::drop_withheld(a, PAGE);
+        assert_eq!(title_read(a + 5), pattern(5), "those bytes are gone");
+        assert_eq!(title_read(a + 2050), pattern(2050), "new bytes stay out");
+        crate::memory::log_frame();
+        drop((t, u));
+    }
+
+    /// `VICTORY_OWNER`, a copy's own page left lazy and written again in the
+    /// next submission through the same copy, whose writes are withheld: its
+    /// bytes are the submission's at the drop, so it goes back before the
+    /// shaders run (`crate::watch::writing_over`), and the title keeps the
+    /// earlier submission's bytes, not the withheld ones.
+    #[test]
+    fn a_withheld_submission_finds_its_lazy_page_gone() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::watch::tests::{OwnerOn, raw};
+        let _on = OwnerOn::set();
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (a, _, _) = owner_views(1);
+        register(a, a as u64, PAGE as u64);
+        let Some(copy) = find(a as u64, PAGE as u64) else {
+            unregister(a, a as u64);
+            return; // no host GPU here
+        };
+        let t = copy.tracked.as_ref().expect("views are tracked");
+        fill(a, PAGE);
+        let before = title_bytes(a, PAGE);
+        assert_eq!(copy.update(0, a, PAGE), Ok(PAGE), "the copy's bytes");
+        // An earlier submission's shaders wrote bytes 0-127; its copy-back
+        // leaves the page lazy, its bytes in the copy's own page.
+        copy.write_host(a as u64, &[0xaa; 128]);
+        // SAFETY: the copy's page, mapped for the process; the lazy page keeps
+        // the pointer (no borrow past this call).
+        let mine = unsafe { std::slice::from_raw_parts(copy.data, PAGE) };
+        let back = copy_back_run(t, &[a], mine, &Default::default());
+        assert_eq!(back.lazy, 1, "{back:?}");
+        assert_eq!(raw(a), None, "no access at the title's mapping");
+        // A submission whose shaders write bytes 2048-2175 of the page through
+        // the same copy misses memory: its writes stay in the copy, and the
+        // page is not theirs to write over.
+        let list = host.new_list().unwrap();
+        let writer = copy.clone();
+        {
+            let _writer = list.writer_uses_memory(true);
+            copy.refresh(&list, a as u64, PAGE as u64);
+            copy.gpu_writes(&list, a as u64, PAGE as u64, false);
+            list.defer_host(move || writer.write_host(a as u64 + 2048, &[0xbb]));
+        }
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        let title = title_bytes(a, PAGE);
+        assert_eq!(title[5], 0xaa, "the earlier submission's bytes went back");
+        assert_eq!(title[2050], before[2050], "the withheld write stayed out");
+        unregister(a, a as u64);
     }
 }

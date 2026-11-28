@@ -407,9 +407,11 @@ static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// garbage BVH nodes over meshlet buffers, run shards20), else from the
 /// frame's end ([`retake_dropped`]).
 pub(crate) fn drop_withheld(address: usize, len: usize) {
-    // Pages shaders wrote earlier that have not gone back hold these writes
-    // now too: they stay out with them, from now on.
-    crate::watch::forget_lazy(address, len);
+    // Pages an earlier submission left not gone back, that these writes do
+    // not stand on: they go back now, so withholding drops only what this
+    // submission wrote (`crate::watch::withheld`; its copy's bytes of a page
+    // it wrote over stay out with it).
+    crate::watch::withheld(address, len);
     if SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed) {
         crate::watch::retake(address, len);
     } else {
@@ -842,7 +844,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // nor while any list using title memory misses ([`withholding`]).
         let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
         if withheld > 0 {
-            for &(_, at) in &writes {
+            for &(k, at) in &writes {
+                // Its shaders wrote the page through a view the guards do not
+                // see: a lazy page of the copy there is not its bytes any
+                // more (`crate::watch::withheld`).
+                copies[k].wrote_over();
                 drop_withheld(at as usize, 1 << 16);
             }
         }
