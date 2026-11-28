@@ -177,6 +177,9 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(0);
     }
+    // Movie opens, logged or skipped (VICTORY_LOG_MOVIES / VICTORY_SKIP_MOVIES).
+    #[cfg(windows)]
+    victory_hle::modules::bink::wrap_imports(image.base(), image.info());
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
