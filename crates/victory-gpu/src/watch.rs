@@ -562,16 +562,29 @@ impl Tracked {
 
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
+    /// Untracked pages (such as foreign allocations inside a buffer or
+    /// window) are skipped so they are never left read-only.
     pub(crate) fn taken(&self, pages: &[usize]) {
         let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
-        let unguarded = guard_aliases(&mut g, &others);
         let pages: Vec<usize> = pages
             .iter()
             .copied()
+            .filter(|p| {
+                g.holders
+                    .get(p)
+                    .is_some_and(|h| h.iter().any(|c| Arc::ptr_eq(c, &self.changed)))
+            })
+            .collect();
+        if pages.is_empty() {
+            return;
+        }
+        let others = aliases(&g, &pages);
+        let unguarded = guard_aliases(&mut g, &others);
+        let pages: Vec<usize> = pages
+            .into_iter()
             .filter(|p| !unguarded.contains(p))
             .collect();
+        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         for page in protect(&mut g, &pages) {
             changed.remove(&page);
             self.changed.taken(page);
@@ -1614,5 +1627,129 @@ pub(crate) mod tests {
         drop(writing(a + 1, 1));
         assert_eq!(ta.take(a, a + PAGE), [(a, a + PAGE)]);
         assert_eq!(tb.take(b, b + PAGE), [(b, b + PAGE)]);
+    }
+    /// `Tracked::taken` (called after `Shadow::copy_back` / `copy_back_page`)
+    /// must guard only pages tracked by this tracker and leave adjacent
+    /// foreign or untracked pages writable (`PAGE_READWRITE`).
+    #[test]
+    fn taken_skips_untracked_and_foreign_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery,
+        };
+        const WINDOW: usize = 4 << 20;
+        let (base, foreign, pool) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then
+                // allocations in the window it left free, freed below.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * WINDOW, MEM_RESERVE, PAGE_READWRITE)
+                        as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let base = p.next_multiple_of(WINDOW);
+                    let at = |offset: usize, kind: u32| {
+                        VirtualAlloc(
+                            (base + offset) as *const _,
+                            PAGE,
+                            MEM_RESERVE | MEM_COMMIT | kind,
+                            PAGE_READWRITE,
+                        ) as usize
+                    };
+                    let (foreign, pool) = (at(1 << 20, 0), at(2 << 20, MEM_WRITE_WATCH));
+                    if p != 0 && foreign == base + (1 << 20) && pool == base + (2 << 20) {
+                        return Some((base, foreign, pool));
+                    }
+                    [foreign, pool]
+                        .into_iter()
+                        .filter(|&q| q != 0)
+                        .for_each(free);
+                    None
+                }
+            })
+            .expect("a free window");
+        let protection = |p: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        let t = track(base, WINDOW, true).expect("the pool is tracked");
+        assert!(t.changed(pool / PAGE));
+        t.taken(&[foreign / PAGE, pool / PAGE]);
+        assert!(!t.changed(pool / PAGE), "the tracked pool page is taken");
+        assert_eq!(
+            protection(pool),
+            PAGE_READONLY,
+            "the tracked pool page is guarded"
+        );
+        assert_eq!(
+            protection(foreign),
+            PAGE_READWRITE,
+            "the untracked foreign page stays writable"
+        );
+        assert!(
+            !guards().protected.contains(&(foreign / PAGE)),
+            "the untracked foreign page is not recorded as guarded"
+        );
+        drop(t);
+        free(foreign);
+        free(pool);
+
+        // End-to-end through Shadow::copy_back and Shadow::copy_back_page over
+        // a write-watched pool page followed by a plain committed page.
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then adjacent
+                // pool and plain allocations freed below.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE)
+                        as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(
+                            q as *const _,
+                            PAGE,
+                            MEM_RESERVE | MEM_COMMIT | kind,
+                            PAGE_READWRITE,
+                        ) as usize
+                    };
+                    let (pool, plain) = (at(p, MEM_WRITE_WATCH), at(p + PAGE, 0));
+                    if p != 0 && pool == p && plain == p + PAGE {
+                        return Some((pool, plain));
+                    }
+                    [pool, plain].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("two adjacent free pages");
+        let len = 2 * PAGE;
+        crate::shadow::register(pool, pool as u64, len as u64);
+        if let Some(copy) = crate::shadow::find(pool as u64, len as u64) {
+            copy.update(pool, len);
+            copy.writing(pool, len, false);
+            copy.write_host((plain + 16) as u64, &[0xAB]);
+            assert_eq!(copy.copy_back(pool, len), PAGE);
+            // SAFETY: `plain` is our own committed page.
+            assert_eq!(unsafe { ((plain + 16) as *const u8).read_volatile() }, 0xAB);
+            assert_eq!(
+                protection(plain),
+                PAGE_READWRITE,
+                "Shadow::copy_back must leave the untracked page writable"
+            );
+
+            copy.write_host((plain + 32) as u64, &[0xCD]);
+            assert_eq!(copy.copy_back_page(plain), PAGE);
+            // SAFETY: `plain` is our own committed page.
+            assert_eq!(unsafe { ((plain + 32) as *const u8).read_volatile() }, 0xCD);
+            assert_eq!(
+                protection(plain),
+                PAGE_READWRITE,
+                "Shadow::copy_back_page must leave the untracked page writable"
+            );
+            drop(copy);
+        }
+        crate::shadow::unregister(pool, pool as u64);
+        free(pool);
+        free(plain);
     }
 }
