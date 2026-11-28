@@ -3295,6 +3295,7 @@ uint ps() : SV_Target { return 1; }
         let shader = crate::pipeline::translated_for_test(
             "compute",
             crate::pipeline::Translated {
+                atomics64: false,
                 host: HostShader {
                     stage: HwStage::Cs,
                     dxil,
@@ -4205,6 +4206,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let shader = crate::pipeline::Shader::for_test(
             "compute",
             crate::pipeline::Translated {
+                atomics64: false,
                 host: host_shader,
                 used: used_entries,
             },

@@ -83,6 +83,8 @@ struct ShaderCache {
 }
 
 impl ShaderCache {
+    /// The shader cached under `full`, made from `stage` and `bytes`.
+    #[cfg(test)]
     fn get(
         &mut self,
         full: blake3::Hash,
@@ -90,8 +92,13 @@ impl ShaderCache {
         bytes: &[u8],
         trim: bool,
     ) -> Arc<Shader> {
-        if let Some(shader) = self.entries.get(full.as_bytes()) {
-            return shader.clone();
+        self.get_or_insert(full, Arc::new(Shader::new(stage, bytes)), trim)
+    }
+
+    /// As [`ShaderCache::get`], with the shader already hashed and made.
+    fn get_or_insert(&mut self, full: blake3::Hash, shader: Arc<Shader>, trim: bool) -> Arc<Shader> {
+        if let Some(existing) = self.entries.get(full.as_bytes()) {
+            return existing.clone();
         }
         if trim {
             self.misses_since_trim += 1;
@@ -100,7 +107,6 @@ impl ShaderCache {
                 self.trim_idle();
             }
         }
-        let shader = Arc::new(Shader::new(stage, bytes));
         self.entries.insert(*full.as_bytes(), shader.clone());
         shader
     }
@@ -131,15 +137,29 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         matches!(std::env::var("VICTORY_TRIM_IDLE_SHADERS").as_deref(), Ok("1"))
     });
     let full = blake3::hash(bytes);
+    let key = *full.as_bytes();
+    {
+        let shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = shaders.as_ref().and_then(|map| map.entries.get(&key)) {
+            return existing.clone();
+        }
+    }
+    let candidate = Arc::new(Shader::with_hash(stage, bytes, full));
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders.get_or_insert_with(ShaderCache::default).get(full, stage, bytes, trim)
+    shaders
+        .get_or_insert_with(ShaderCache::default)
+        .get_or_insert(full, candidate, trim)
 }
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        Self::with_hash(stage, bytes, blake3::hash(bytes))
+    }
+
+    fn with_hash(stage: &'static str, bytes: &[u8], full: blake3::Hash) -> Shader {
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash: full.to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
@@ -171,6 +191,8 @@ pub(crate) fn translated_for_test(
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Whether `host.dxil` declares 64-bit atomics on typed or heap resources (`SFI0`).
+    pub(crate) atomics64: bool,
 }
 
 #[cfg(all(windows, any(feature = "diagnostics", test)))]
@@ -413,6 +435,22 @@ fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
+/// Whether `dxil` declares 64-bit atomics on typed (`0x0040_0000`) or heap
+/// (`0x1000_0000`) resources in its `SFI0` feature flags.
+#[cfg(windows)]
+fn dxil_atomics64(dxil: &[u8]) -> bool {
+    victory_shader::Container::parse(dxil)
+        .ok()
+        .and_then(|c| {
+            c.part(victory_shader::FourCC::SFI0)?
+                .data
+                .get(..4)?
+                .try_into()
+                .ok()
+        })
+        .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
+}
+
 #[cfg(windows)]
 fn with_resources(
     container: &[u8],
@@ -434,7 +472,12 @@ fn with_resources(
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    let atomics64 = dxil_atomics64(&host.dxil);
+    Ok(Translated {
+        host,
+        used,
+        atomics64,
+    })
 }
 
 #[repr(C)]
@@ -522,6 +565,7 @@ pub(crate) fn mip_test_pipeline(
     used: victory_shader::UsedResource,
 ) -> This {
     let translated = Translated {
+        atomics64: false,
         host: victory_shader::emit::HostShader {
             stage: victory_shader::HwStage::Ps,
             dxil: Vec::new(),
@@ -1165,6 +1209,7 @@ mod tests {
         Shader::for_test(
             "compute",
             Translated {
+                atomics64: false,
                 host,
                 used: native.used,
             },
@@ -1423,6 +1468,37 @@ mod tests {
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+
+    #[test]
+    fn shader_reuses_single_hash_and_dxil_atomics64_reads_sfi0() {
+        let bytes = b"unique-shader-container-for-single-hash-test";
+        let a = shader("pixel", bytes);
+        let b = shader("pixel", bytes);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.hash, blake3::hash(bytes).to_hex()[..16]);
+
+        #[cfg(windows)]
+        {
+            let make_dxbc = |sfi0: u64| -> Vec<u8> {
+                let mut out = Vec::new();
+                out.extend_from_slice(b"DXBC");
+                out.extend_from_slice(&[0u8; 16]);
+                out.extend_from_slice(&1u32.to_le_bytes());
+                let total = 32u32 + 4 + 8 + 8;
+                out.extend_from_slice(&total.to_le_bytes());
+                out.extend_from_slice(&1u32.to_le_bytes());
+                out.extend_from_slice(&36u32.to_le_bytes());
+                out.extend_from_slice(b"SFI0");
+                out.extend_from_slice(&8u32.to_le_bytes());
+                out.extend_from_slice(&sfi0.to_le_bytes());
+                out
+            };
+            assert!(!dxil_atomics64(&make_dxbc(0)));
+            assert!(dxil_atomics64(&make_dxbc(0x0040_0000)));
+            assert!(dxil_atomics64(&make_dxbc(0x1000_0000)));
+            assert!(!dxil_atomics64(b"not-a-dxbc"));
+        }
     }
 }
 
