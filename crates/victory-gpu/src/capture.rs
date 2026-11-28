@@ -736,6 +736,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             [0, 9, 18].map(|shift| ((v >> shift) & 0x1ff) as f32 * scale)
         })),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
+        // R32G32_UINT: both color channels are unsigned integers.
+        17 => (8, Box::new(move |b| [u32_at(b, 0) as f32, u32_at(b, 1) as f32, 0.0])),
         35..=36 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         37..=38 => (4, Box::new(move |b| [f32::from(i16_at(b, 0)), f32::from(i16_at(b, 1)), 0.0])),
         48..=50 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
@@ -1153,6 +1155,19 @@ mod tests {
                 Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]),
             );
         }
+    }
+
+    #[test]
+    fn rg32_uint_channels_are_unsigned_and_skip_padding() {
+        let format = super::DXGI_FORMAT_R32G32_UINT.0 as u32;
+        let rows: Vec<_> = [0x8000_0000, 0x4000_0000, u32::MAX, 0, 0x8000_0000, u32::MAX]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        assert_eq!(
+            super::to_rgba(format, 1, 2, 12, &rows),
+            Some(vec![255, 127, 0, 255, 0, 255, 0, 255])
+        );
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
