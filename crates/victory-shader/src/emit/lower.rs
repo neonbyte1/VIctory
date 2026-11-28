@@ -3292,15 +3292,15 @@ impl<'a> Lower<'a> {
         self.as_float(x)
     }
 
-    /// Source `k` as bits, with any SDWA selection and bitwise `abs`/`neg`
-    /// modifiers (sign-bit moves that preserve denormals and NaN payloads).
-    fn src_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+    /// Source `k` as bits, with any SDWA selection (and the DPP/source-0
+    /// override), but without the `abs`/`neg` modifiers.
+    fn src_raw(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let mut x = match self.src0 {
-            Some(x) if k == 0 => x,
+        match self.src0 {
+            Some(x) if k == 0 => Ok(x),
             _ => {
                 let sel = Self::sdwa_src(inst, k);
                 // A byte or word select within the low half.
@@ -3310,11 +3310,20 @@ impl<'a> Lower<'a> {
                     None => self.operand(inst, &op)?,
                 };
                 match sel {
-                    Some((sel, sext)) => self.select_bits(x, sel, sext),
-                    None => x,
+                    Some((sel, sext)) => Ok(self.select_bits(x, sel, sext)),
+                    None => Ok(x),
                 }
             }
+        }
+    }
+
+    /// Source `k` as bits, with any SDWA selection and bitwise `abs`/`neg`
+    /// modifiers (sign-bit moves that preserve denormals and NaN payloads).
+    fn src_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
         };
+        let mut x = self.src_raw(inst, k)?;
         let c = self.cur;
         if v.abs >> k & 1 != 0 {
             let m = self.s.m.i32(0x7FFF_FFFF);
@@ -8728,7 +8737,6 @@ impl<'a> Lower<'a> {
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
                 let mut a = f(self, 0)?;
                 let floor = name != "v_cvt_i32_f32" && name != "v_cvt_u32_f32";
-                let x = a;
                 if floor {
                     // floor(x), or floor(x + 0.5) with the half added exactly
                     // (x - floor(x) is exact in f32), of x with denormals read
@@ -8754,13 +8762,34 @@ impl<'a> Lower<'a> {
                 };
                 let mut r = self.s.m.cast(c, op, a, self.s.t.i32);
                 if floor {
-                    // These saturate a NaN by its sign (measured on RDNA2).
-                    let xi = self.as_int(x);
-                    let zero = self.s.m.i32(0);
-                    let neg = self.s.m.cmp(c, pred::SLT, xi, zero);
+                    // These saturate a NaN by its sign (measured on RDNA2),
+                    // taken from the source's raw bits with the abs/neg
+                    // modifiers, all in integer ops: a host may fold the float
+                    // NaN test or a sign flip back into float arithmetic that
+                    // drops a NaN's sign.
+                    let raw = self.src_raw(inst, 0)?;
+                    let abs = v.abs & 1 != 0;
+                    let neg = v.neg & 1 != 0;
+                    // NaN test on the raw bits: (raw & 0x7fffffff) >u 0x7f800000.
+                    let mask = self.s.m.i32(0x7FFF_FFFF);
+                    let exp = self.s.m.bin(c, Bin::And, raw, mask);
+                    let qnan = self.s.m.i32(0x7F80_0000);
+                    let nan = self.s.m.cmp(c, pred::IUGT, exp, qnan);
+                    // The saturation value from the modified sign, without any
+                    // XOR: `abs` fixes the sign (negated by `neg`), otherwise
+                    // it is `raw`'s, with the arms swapped by `neg`.
                     let (lo, hi) = (self.s.m.i32(0x8000_0000), self.s.m.i32(0x7FFF_FFFF));
-                    let sat = self.s.m.select(c, neg, lo, hi);
-                    let nan = self.s.m.cmp(c, pred::UNO, x, x);
+                    let sat = if abs {
+                        if neg { lo } else { hi }
+                    } else {
+                        let zero = self.s.m.i32(0);
+                        let negative = self.s.m.cmp(c, pred::SLT, raw, zero);
+                        if neg {
+                            self.s.m.select(c, negative, hi, lo)
+                        } else {
+                            self.s.m.select(c, negative, lo, hi)
+                        }
+                    };
                     r = self.s.m.select(c, nan, sat, r);
                 }
                 int(self, r)
