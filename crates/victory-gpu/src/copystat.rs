@@ -322,6 +322,39 @@ pub(crate) enum C {
     /// (`crate::pipeline::builder`, `VICTORY_BVH_HALVES`).
     BvhRun,
     BvhHeld,
+    /// The frame's serial chain, per frame: time a submitting thread was
+    /// blocked on the host GPU, by what it waited for (`Host::complete_while`
+    /// and `Host::finish`, [`crate::host::Waited`]): a barrier's page tables,
+    /// another barrier (a submission waited for only because it must be alone
+    /// is one too), the upload list, a list run again, the eviction pass,
+    /// overlapping declared ranges, a settle, and other completions (the
+    /// completion thread's, `complete_all`/`complete_held`, `execute`). The
+    /// rest of the frame line's "on the GPU" is `ExecuteCommandLists`.
+    BlockBarrierMemoryUs,
+    BlockBarrierOtherUs,
+    BlockUploadsUs,
+    BlockListAgainUs,
+    BlockEvictionUs,
+    BlockDeclaredUs,
+    BlockSettleUs,
+    BlockOtherUs,
+    /// Copying back, by phase (`Host::finish`, under the submission lock):
+    /// the copies in video memory read back into the mirrors (`vram_completed`,
+    /// including the wait for unpredicted pages, `VramWaitedUs`), the lazy-page
+    /// check, the marked pages' copy-back (`MarkedUs`), the heap slots to read
+    /// (`take_reads` + `make_read`), the declared ranges' copy-back
+    /// (`CompareUs`), and the lists' work after them. The rest of the frame
+    /// line's "copying back" is the steps around those.
+    BackVramUs,
+    BackVerifyUs,
+    BackMarksUs,
+    BackReadUs,
+    BackRangesUs,
+    BackAfterUs,
+    /// Submissions prepared with nothing in flight: the pipe was empty, so
+    /// nothing of theirs overlapped this submission's GPU work
+    /// (`PreparedOverlapping` counts the others).
+    PreparedEmpty,
     /// Not a counter: how many there are. Keep it last.
     Count,
 }
@@ -357,6 +390,27 @@ pub(crate) fn add(c: C, n: u64) {
 #[cfg(test)]
 pub(crate) fn take() -> Vec<u64> {
     COUNT.0.iter().map(|a| a.swap(0, Relaxed)).collect()
+}
+
+/// `us` microseconds of a submitting thread blocked on the host GPU,
+/// waiting for `wait` (`crate::host::Waited`).
+pub(crate) fn waited(wait: crate::host::Waited, us: u64) {
+    use crate::host::Waited::{
+        BarrierMemory, BarrierOther, Completion, Declared, Eviction, ListAgain, Settle, Uploads,
+    };
+    add(
+        match wait {
+            BarrierMemory => C::BlockBarrierMemoryUs,
+            BarrierOther => C::BlockBarrierOtherUs,
+            Uploads => C::BlockUploadsUs,
+            ListAgain => C::BlockListAgainUs,
+            Eviction => C::BlockEvictionUs,
+            Declared => C::BlockDeclaredUs,
+            Settle => C::BlockSettleUs,
+            Completion => C::BlockOtherUs,
+        },
+        us,
+    );
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -485,14 +539,65 @@ pub(crate) fn page_faults() -> u64 {
 }
 
 /// Logs the counters per frame over `frames` frames, and the ranges that
-/// took most bytes.
-pub(crate) fn log(frames: f64) {
+/// took most bytes. `gpu_ms` and `back_ms`: the frame line's "on the GPU"
+/// (`SUBMISSION_US[1]`) and "copying back" (`COPY_BACK[0]`) per frame, which
+/// the first line splits.
+pub(crate) fn log(frames: f64, gpu_ms: f64, back_ms: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
     let c = COUNT.take(frames);
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
+    // The frame's serial chain in one line, in the five-second block: what the
+    // time blocked on the GPU was waiting for, what copy-back spent its time
+    // on (the phases of `Host::finish` under the submission lock), and how
+    // many submissions were prepared with an earlier one still in flight.
+    let blocks = [
+        C::BlockBarrierMemoryUs,
+        C::BlockBarrierOtherUs,
+        C::BlockUploadsUs,
+        C::BlockListAgainUs,
+        C::BlockEvictionUs,
+        C::BlockDeclaredUs,
+        C::BlockSettleUs,
+        C::BlockOtherUs,
+    ]
+    .map(|k| ms(c[k as usize]));
+    tracing::info!(
+        "chain per frame: {gpu_ms:.1} ms on the GPU or in ExecuteCommandLists: {:.1} waiting for a \
+         barrier's page tables, {:.1} another barrier, {:.1} the upload list, {:.1} a list run \
+         again, {:.1} the eviction pass, {:.1} overlapping declared ranges, {:.1} settles, {:.1} \
+         other completions; copying back {back_ms:.1} ms: \
+         {:.1} read-backs ({:.1} waited for), {:.1} marked pages ({:.1} reading and comparing, {:.1} \
+         waiting for the lease, {:.1} protecting, {:.1} writing, {:.1} verifying), {:.1} declared \
+         ranges ({:.1} comparing), {:.1} slots to read, {:.1} work after, {:.1} lazy-page check; \
+         {:.0} submissions: {:.0} prepared with work in flight, {:.0} with the pipe empty",
+        blocks[0],
+        blocks[1],
+        blocks[2],
+        blocks[3],
+        blocks[4],
+        blocks[5],
+        blocks[6],
+        blocks[7],
+        ms(c[C::BackVramUs as usize]),
+        ms(c[C::VramWaitedUs as usize]),
+        ms(c[C::BackMarksUs as usize]),
+        ms(c[C::MarkPreUs as usize]),
+        ms(c[C::MarkWaitUs as usize]),
+        ms(c[C::MarkProtectUs as usize]),
+        ms(c[C::MarkWriteUs as usize]),
+        ms(c[C::MarkVerifyUs as usize]),
+        ms(c[C::BackRangesUs as usize]),
+        ms(c[C::CompareUs as usize]),
+        ms(c[C::BackReadUs as usize]),
+        ms(c[C::BackAfterUs as usize]),
+        ms(c[C::BackVerifyUs as usize]),
+        c[C::Submissions as usize],
+        c[C::PreparedOverlapping as usize],
+        c[C::PreparedEmpty as usize],
+    );
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \

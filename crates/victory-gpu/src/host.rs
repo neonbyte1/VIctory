@@ -2180,6 +2180,10 @@ fn declared_overlap(next: &[Declared], flying: &[Declared]) -> bool {
     })
 }
 
+/// [`reasons_of`] bit of title memory written through page tables: their
+/// checks and page tables see every earlier result.
+const REASON_MEMORY: u8 = 1 << 5;
+
 /// [`HostList::heavy_reasons`] bits that keep a submission's completion
 /// before the next one is prepared whatever it touches: writes through the
 /// heap's views (declared nowhere), work after it that names nothing it
@@ -2187,7 +2191,7 @@ fn declared_overlap(next: &[Declared], flying: &[Declared]) -> bool {
 /// (anywhere). The others (bottom-of-pipe writes, declared GPU writes) are
 /// bounded and known at submission: later submissions wait for it only
 /// where they meet them (`Host::submit`, [`Settled`]).
-const BARRIER_REASONS: u8 = 1 | 1 << 1 | 1 << 3 | 1 << 5;
+const BARRIER_REASONS: u8 = 1 | 1 << 1 | 1 << 3 | REASON_MEMORY;
 
 /// [`HostList::heavy_reasons`] bit of work after it that names the title
 /// memory it writes ([`HostList::defer_after_writing`]): registered in
@@ -2219,6 +2223,55 @@ fn alone(reasons: u8, marks: bool, captured: bool, relaxed: bool) -> bool {
     } else {
         barrier(reasons, marks, captured, false)
     }
+}
+
+/// What a submission being prepared waits for in flight: bits of
+/// [`Host::submit`]'s closure, 0 for a submission it leaves in flight. The
+/// wait for the one it matches is attributed to the first of these it names
+/// ([`waited_for`], `crate::copystat`).
+const WAIT_BARRIER: u8 = 1;
+const WAIT_ALONE: u8 = 1 << 1;
+const WAIT_UPLOADS: u8 = 1 << 2;
+const WAIT_LIST_AGAIN: u8 = 1 << 3;
+const WAIT_EVICTION: u8 = 1 << 4;
+const WAIT_DECLARED: u8 = 1 << 5;
+/// A barrier prepared with those in flight left there (diagnostics: its count
+/// only, no wait of its own).
+const WAIT_WAIVED: u8 = 1 << 6;
+/// [`Host::complete_all`] and [`Host::complete_held`]: every submission in
+/// flight, whatever it is.
+const WAIT_OTHER: u8 = 1 << 7;
+
+/// What the wait in [`Host::complete_while`] for a submission in flight,
+/// `bits` from the caller's closure, is attributed to: the first reason its
+/// bits name, a barrier split into one for page tables and one for anything
+/// else (diagnostics). A submission that waits because it must be alone is a
+/// barrier wait too ([`alone`] implies [`barrier`]), so its time is there.
+#[cfg(feature = "diagnostics")]
+fn waited_for(bits: u8, flying: &InFlight) -> Waited {
+    if bits & WAIT_BARRIER != 0 {
+        if flying.reasons & REASON_MEMORY != 0 {
+            Waited::BarrierMemory
+        } else {
+            Waited::BarrierOther
+        }
+    } else if bits & WAIT_UPLOADS != 0 {
+        Waited::Uploads
+    } else if bits & WAIT_LIST_AGAIN != 0 {
+        Waited::ListAgain
+    } else if bits & WAIT_EVICTION != 0 {
+        Waited::Eviction
+    } else if bits & WAIT_DECLARED != 0 {
+        Waited::Declared
+    } else {
+        Waited::Completion
+    }
+}
+
+/// A constant when the time is not taken (no read of `flying`).
+#[cfg(not(feature = "diagnostics"))]
+fn waited_for(_bits: u8, _flying: &InFlight) -> Waited {
+    Waited::Completion
 }
 
 /// Why a submission being prepared completes one in flight first
@@ -2441,6 +2494,33 @@ pub(crate) struct Submitted {
     owners: u64,
 }
 
+/// What a submitting thread waits for on the host GPU ([`Host::complete_while`],
+/// [`Host::finish`]): `crate::copystat` splits the blocked time by it. Free in
+/// builds without diagnostics; the time is only taken then.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) enum Waited {
+    /// A barrier's completion, for its page tables (title memory, [`reasons_of`]
+    /// bit 5): its checks and page tables see every earlier result.
+    BarrierMemory,
+    /// A barrier's completion for another reason ([`BARRIER_REASONS`]).
+    BarrierOther,
+    /// The upload list's last use.
+    Uploads,
+    /// A host list run again (its prelude and steps are recorded again).
+    ListAgain,
+    /// The eviction pass's read marks.
+    Eviction,
+    /// A range both submissions declare.
+    Declared,
+    /// A settle: completing what the preparing is about to read
+    /// ([`Settled`]).
+    Settle,
+    /// Any other completion: the completion thread's, `complete_all`,
+    /// `complete_held`, `execute`.
+    Completion,
+}
+
 /// A submission on the host GPU, not completed yet: what completing it
 /// needs.
 struct InFlight {
@@ -2457,6 +2537,11 @@ struct InFlight {
     lists: Vec<std::sync::Arc<HostList>>,
     /// It completes before the next submission is prepared ([`barrier`]).
     barrier: bool,
+    /// Its lists' heavy reasons ([`HostList::heavy_reasons`]): diagnostics
+    /// splits the time a later submission waits for it by them (whether a
+    /// barrier was for page tables, [`Waited`]).
+    #[cfg(feature = "diagnostics")]
+    reasons: u8,
     /// The ranges its shaders declare as written ([`declared_overlap`]).
     declared: Vec<Declared>,
     /// It runs the upload list (`crate::bindless::uploads`), which the next
@@ -2789,11 +2874,11 @@ impl Host {
     /// [`Host::execute`] with the submission lock already held: the caller
     /// took it to snapshot what its lists read.
     fn execute_locked(&self, runs: &[&HostList], submitted: std::sync::MutexGuard<'_, Submitted>) {
-        let mut submitted = self.complete_while(submitted, |_| true);
+        let mut submitted = self.complete_while(submitted, |_| WAIT_OTHER);
         let record = self.run(&mut submitted, runs, false);
         #[cfg(feature = "diagnostics")]
         let (traced, sub) = (record.traced, record.value);
-        self.finish(record, runs, true);
+        self.finish(record, runs, true, Waited::Completion);
         drop(submitted);
         pump_after_completions();
         // A listed frame: what this submission's lists drew, as it is now
@@ -2888,18 +2973,30 @@ impl Host {
         let declared: Vec<Declared> = runs.iter().flat_map(|l| l.declared()).collect();
         let why = std::cell::Cell::new(0u8);
         let mut submitted = self.complete_while(self.lock_submitted(), |r| {
-            let bits = u8::from(r.barrier)
-                | u8::from(alone) << 1
-                | u8::from(uploading && r.uploads) << 2
-                | u8::from(
-                    r.lists
-                        .iter()
-                        .any(|held| lists.iter().any(|l| std::sync::Arc::ptr_eq(held, l))),
-                ) << 3
-                | u8::from(queue != 0 && r.marks && crate::resource::eviction_due()) << 4
-                | u8::from(declared_overlap(&declared, &r.declared)) << 5;
-            why.set(why.get() | bits | u8::from(waived) << 6);
-            bits != 0
+            let mut bits = 0;
+            if r.barrier {
+                bits |= WAIT_BARRIER;
+            }
+            if alone {
+                bits |= WAIT_ALONE;
+            }
+            if uploading && r.uploads {
+                bits |= WAIT_UPLOADS;
+            }
+            if r.lists
+                .iter()
+                .any(|held| lists.iter().any(|l| std::sync::Arc::ptr_eq(held, l)))
+            {
+                bits |= WAIT_LIST_AGAIN;
+            }
+            if queue != 0 && r.marks && crate::resource::eviction_due() {
+                bits |= WAIT_EVICTION;
+            }
+            if declared_overlap(&declared, &r.declared) {
+                bits |= WAIT_DECLARED;
+            }
+            why.set(why.get() | bits | if waived { WAIT_WAIVED } else { 0 });
+            bits
         });
         #[cfg(feature = "diagnostics")]
         {
@@ -2985,7 +3082,7 @@ impl Host {
 
     /// Completes every submission in flight ([`Host::finish`]).
     pub(crate) fn complete_all(&self) {
-        drop(self.complete_while(self.lock_submitted(), |_| true));
+        drop(self.complete_while(self.lock_submitted(), |_| WAIT_OTHER));
         pump_after_completions();
     }
 
@@ -2993,30 +3090,42 @@ impl Host {
     /// `list`: it may be reset then.
     fn complete_held(&self, list: &std::sync::Arc<HostList>) {
         drop(self.complete_while(self.lock_submitted(), |r| {
-            r.lists.iter().any(|l| std::sync::Arc::ptr_eq(l, list))
+            if r.lists.iter().any(|l| std::sync::Arc::ptr_eq(l, list)) {
+                WAIT_OTHER
+            } else {
+                0
+            }
         }));
         pump_after_completions();
     }
 
     /// Completes submissions in flight, oldest first, while one left
-    /// matches `matches`: waits for the host GPU without the lock (the
+    /// matches `causes`: waits for the host GPU without the lock (the
     /// completion thread and other submitting threads go on), and returns
-    /// it held, with none left matching.
+    /// it held, with none left matching. `causes` returns 0 for the ones it
+    /// leaves in flight, and else what the wait for it is about ([`WAIT_BARRIER`]
+    /// and the bits after it, [`Waited`]).
     fn complete_while<'a>(
         &'a self,
         mut submitted: std::sync::MutexGuard<'a, Submitted>,
-        matches: impl Fn(&InFlight) -> bool,
+        causes: impl Fn(&InFlight) -> u8,
     ) -> std::sync::MutexGuard<'a, Submitted> {
-        while let Some(last) = submitted
+        while let Some((last, waited)) = submitted
             .flight
             .iter()
             .rev()
-            .find(|r| matches(r))
-            .map(|r| r.value)
+            .find_map(|r| {
+                let bits = causes(r);
+                (bits != 0).then_some((r, bits))
+            })
+            .map(|(r, bits)| (r.value, waited_for(bits, r)))
         {
             drop(submitted);
             let waiting = std::time::Instant::now();
             wait_unlocked(&self.fence, last);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::waited(waited, waiting.elapsed().as_micros() as u64);
+            let _ = waited;
             SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             submitted = self.lock_submitted();
             // SAFETY: a plain query.
@@ -3024,18 +3133,19 @@ impl Host {
             while submitted.flight.front().is_some_and(|r| r.value <= reached) {
                 let record = submitted.flight.pop_front().expect("a first");
                 let quiet = !submitted.flight.iter().any(|r| r.marks);
-                self.complete(record, quiet);
+                self.complete(record, quiet, Waited::Completion);
             }
         }
         submitted
     }
 
     /// Waits for a submission in flight and completes it: its lists are
-    /// recycled once it has.
-    fn complete(&self, mut record: InFlight, quiet: bool) {
+    /// recycled once it has. `waited`: what the wait for it on the host GPU
+    /// is attributed to (diagnostics).
+    fn complete(&self, mut record: InFlight, quiet: bool, waited: Waited) {
         let lists = std::mem::take(&mut record.lists);
         let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
-        self.finish(record, &runs, quiet);
+        self.finish(record, &runs, quiet, waited);
         drop(runs);
         lists.into_iter().for_each(crate::list::recycle);
     }
@@ -3081,7 +3191,7 @@ impl Host {
             while submitted.flight.front().is_some_and(|r| r.value <= reached) {
                 let record = submitted.flight.pop_front().expect("a first");
                 let quiet = !submitted.flight.iter().any(|r| r.marks);
-                self.complete(record, quiet);
+                self.complete(record, quiet, Waited::Completion);
                 completed = true;
             }
             drop(submitted);
@@ -3133,7 +3243,7 @@ impl Host {
         while submitted.flight.front().is_some_and(|r| r.owner <= owner) {
             let record = submitted.flight.pop_front().expect("a first");
             let quiet = !submitted.flight.iter().any(|r| r.marks);
-            self.complete(record, quiet);
+            self.complete(record, quiet, Waited::Settle);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
@@ -3383,6 +3493,11 @@ impl Host {
             crate::copystat::C::PreparedOverlapping,
             u64::from(!submitted.flight.is_empty()),
         );
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::PreparedEmpty,
+            u64::from(submitted.flight.is_empty()),
+        );
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
@@ -3568,6 +3683,10 @@ impl Host {
             declared,
             uploads: uploads.is_some(),
             marks,
+            // Whether a barrier was for page tables: the split of whoever
+            // waits for this submission (`crate::copystat`).
+            #[cfg(feature = "diagnostics")]
+            reasons,
             sync: !overlap,
             prepared,
             batch,
@@ -3586,9 +3705,12 @@ impl Host {
     /// then the title fences signalled behind it. `runs`: its lists, but
     /// our upload list; `quiet`: no submission whose shaders mark reads is
     /// in flight after it (`crate::shadow::take_reads`).
-    fn finish(&self, mut record: InFlight, runs: &[&HostList], quiet: bool) {
+    fn finish(&self, mut record: InFlight, runs: &[&HostList], quiet: bool, waited: Waited) {
         let waiting = std::time::Instant::now();
         self.wait_for(record.value);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::waited(waited, waiting.elapsed().as_micros() as u64);
+        let _ = waited;
         SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::RAN, record.value, 0);
@@ -3641,8 +3763,12 @@ impl Host {
             add(C::HeavyCompletions, u64::from(record.barrier));
             add(C::MarksTaken, u64::from(marks_taken));
         }
-        let (unchanged, marks) =
-            self.vram_completed(std::mem::take(&mut record.vram), runs, marks_taken);
+        let (unchanged, marks) = {
+            #[cfg(feature = "diagnostics")]
+            let _timed =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackVramUs);
+            self.vram_completed(std::mem::take(&mut record.vram), runs, marks_taken)
+        };
         // One list's lock at a time: a submission may name a list twice.
         struct WriteBack {
             shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -3719,10 +3845,17 @@ impl Host {
         // Lazy view pages still hold the title bytes we left (diagnostics:
         // a writer that went past us loses its bytes at the first touch).
         #[cfg(feature = "diagnostics")]
-        crate::watch::verify_lazy(32);
+        {
+            let _timed =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackVerifyUs);
+            crate::watch::verify_lazy(32);
+        }
         if marks_taken {
             // Pages shaders marked first: the copy-backs below end what the
             // copies keep for them.
+            #[cfg(feature = "diagnostics")]
+            let _timed =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackMarksUs);
             crate::shadow::copy_back_marks(
                 record.owner,
                 &marks,
@@ -3735,11 +3868,17 @@ impl Host {
         // (a later submission's marks taken with them only make its views
         // early).
         if record.marks {
+            #[cfg(feature = "diagnostics")]
+            let _timed =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackReadUs);
             let read = crate::shadow::take_reads(quiet);
             if !read.is_empty() {
                 crate::descriptor::make_read(&read);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let _timed_ranges =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackRangesUs);
         for b in &back {
             if b.goes_back {
                 let written = b.shadow.copy_back(record.owner, b.address, b.len);
@@ -3755,11 +3894,18 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(_timed_ranges);
+        #[cfg(feature = "diagnostics")]
+        let _timed_after =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::BackAfterUs);
         for list in runs {
             for work in &list.deferred().after {
                 work();
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(_timed_after);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
@@ -7101,7 +7247,7 @@ impl Meter {
             self.logged = std::time::Instant::now();
             let report_frames = std::mem::take(&mut self.report_frames) as f64;
             // Of a frame, ms preparing submissions and ms waiting for the GPU.
-            let [cpu, gpu] = [0, 1].map(|i| {
+            let [cpu, gpu_ms] = [0, 1].map(|i| {
                 SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / report_frames
             });
             let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
@@ -7118,7 +7264,7 @@ impl Meter {
             let waited = crate::pipeline::take_waited_ms() / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/title frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
+                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu_ms:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; \
@@ -7183,7 +7329,7 @@ impl Meter {
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
-                crate::copystat::log(report_frames);
+                crate::copystat::log(report_frames, gpu_ms, back_ms);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
                 crate::shadow::log_stale(report_frames);
