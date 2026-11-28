@@ -65,6 +65,9 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        if victory_shader::emit::uav_order_raw() {
+            tracing::info!("VICTORY_UAV_ORDER=raw: halves meet only before UAV reads after writes");
+        }
         crate::descriptor::host::probe_view_limit();
         key(victory_shader::SOURCE_HASH, ENCODING, limit, victory_shader::emit::view_heap_limit())
     })
@@ -121,20 +124,34 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
     };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &host_key(build(), target, pair_meetings), container, translate),
+        Some(cache) => cached(
+            cache,
+            &host_key(
+                build(),
+                target,
+                pair_meetings,
+                victory_shader::emit::uav_order_raw(),
+            ),
+            container,
+            translate,
+        ),
         None => (translate(container), false),
     }
 }
 
 /// The part of an entry's key before the container: the build, and the
 /// host's wave sizes (a translation for one host's waves is not another's),
-/// and pair meetings when asked for (keys without them stay as they were).
-fn host_key(build: &[u8; 32], target: Target, pair_meetings: bool) -> [u8; 32] {
+/// and pair meetings and `VICTORY_UAV_ORDER=raw` when asked for (keys
+/// without them stay as they were).
+fn host_key(build: &[u8; 32], target: Target, pair_meetings: bool, uav_raw: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
     if pair_meetings {
         h.update(b"pair meetings");
+    }
+    if uav_raw {
+        h.update(b"uav order raw");
     }
     *h.finalize().as_bytes()
 }
@@ -566,11 +583,13 @@ mod tests {
             lanes_min: 32,
             lanes_max: 64,
         };
-        assert_eq!(host_key(&build, nvidia, false), host_key(&build, nvidia, false));
-        assert_ne!(host_key(&build, nvidia, false), host_key(&build, rdna, false));
-        assert_ne!(host_key(&build, nvidia, false), host_key(&[8; 32], nvidia, false));
+        assert_eq!(host_key(&build, nvidia, false, false), host_key(&build, nvidia, false, false));
+        assert_ne!(host_key(&build, nvidia, false, false), host_key(&build, rdna, false, false));
+        assert_ne!(host_key(&build, nvidia, false, false), host_key(&[8; 32], nvidia, false, false));
         // Pair meetings change the translation of the builder's programs.
-        assert_ne!(host_key(&build, nvidia, false), host_key(&build, nvidia, true));
+        assert_ne!(host_key(&build, nvidia, false, false), host_key(&build, nvidia, true, false));
+        // So does meeting only before UAV reads after writes.
+        assert_ne!(host_key(&build, nvidia, true, false), host_key(&build, nvidia, true, true));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
