@@ -1091,6 +1091,42 @@ fn drain_marks(bits: &mut [u32], end: u32) -> Vec<u32> {
     marked
 }
 
+/// Threads that put marked pages back, at most (the title's own threads
+/// run meanwhile).
+const PAGE_THREADS: usize = 6;
+/// Marked pages worth a thread more: fewer go back on the submitting one.
+const PAGES_PER_THREAD: usize = 8;
+
+/// Runs `f` on every `(copy, page)`, on several threads when there are many:
+/// a 64 KiB page costs 55 to 80 microseconds (two reads, a compare, writes
+/// and a protection change), and a world frame marks 2,000. The copies of
+/// one page keep their order, on one thread.
+fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow>, usize) + Sync) {
+    pages.sort_by_key(|&(_, page)| page);
+    let threads = (pages.len() / PAGES_PER_THREAD).min(PAGE_THREADS);
+    if threads < 2 {
+        for (copy, page) in &pages {
+            f(copy, *page);
+        }
+        return;
+    }
+    let groups: Vec<&[(Arc<Shadow>, usize)]> = pages.chunk_by(|a, b| a.1 == b.1).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        while let Some(group) = groups.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+            for (copy, page) in *group {
+                f(copy, *page);
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads {
+            scope.spawn(work);
+        }
+        work();
+    });
+}
+
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`Shadow::copy_back_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
@@ -1140,12 +1176,12 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
-    for (copy, page) in pages {
+    for_each_by_page(pages, |copy, page| {
         if withheld
             .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
+            .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
         {
-            continue;
+            return;
         }
         let written = copy.copy_back_marked(page);
         #[cfg(feature = "diagnostics")]
@@ -1155,7 +1191,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
-    }
+    });
 }
 
 struct Entry {
@@ -2364,6 +2400,57 @@ pub(crate) mod tests {
         );
         assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
         copy.copy_back(p, PAGE + 16);
+        unregister(p, p as u64);
+    }
+
+    /// Many marked pages, in two copies of the same memory (a buffer and
+    /// one placed inside it): every shader write reaches title memory.
+    #[test]
+    fn many_marked_pages_all_go_back() {
+        const PAGES: usize = 96;
+        let p = crate::watch::tests::pool(PAGES);
+        let len = PAGES * PAGE;
+        register(p, p as u64, len as u64);
+        register(p + 1, (p + len / 2) as u64, (len / 2) as u64);
+        let (Some(outer), Some(inner), Some(b)) = (
+            find(p as u64, len as u64),
+            find((p + len / 2) as u64, (len / 2) as u64),
+            bitmap(false),
+        ) else {
+            unregister(p + 1, (p + len / 2) as u64);
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        outer.update(p, len);
+        inner.update(p + len / 2, len / 2);
+        let words = b.data as *mut u32;
+        let mark = |n: usize| {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *words.add(n / 32) |= 1 << (n % 32) };
+        };
+        // Even pages through the outer copy, odd pages of the upper half
+        // through the inner one.
+        let mut written = Vec::new();
+        for page in 0..PAGES {
+            let at = p + page * PAGE + 10;
+            let (copy, first) = if page >= PAGES / 2 && page % 2 == 1 {
+                (&inner, PAGES / 2)
+            } else {
+                (&outer, 0)
+            };
+            copy.writing(p + page * PAGE, PAGE, true);
+            copy.write_host(at as u64, &[page as u8 + 1]);
+            mark(copy.marks.expect("tracked memory gets mark bits") as usize + page - first);
+            written.push((at, page as u8 + 1));
+        }
+        copy_back_marks(&[], false);
+        for (at, value) in written {
+            // SAFETY: a byte of our pool.
+            assert_eq!(unsafe { (at as *const u8).read_volatile() }, value, "{at:#x}");
+        }
+        outer.copy_back(p, len);
+        inner.copy_back(p + len / 2, len / 2);
+        unregister(p + 1, (p + len / 2) as u64);
         unregister(p, p as u64);
     }
 
