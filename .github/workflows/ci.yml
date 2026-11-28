@@ -166,8 +166,23 @@ jobs:
               xtask-*) args+=(--skip policy::tests::repository_passes_policy) ;;
             esac
             echo "::group::$name"
-            timeout --signal=KILL --kill-after=30 900 xvfb-run -a "$WINE" "$exe" "${args[@]}" \
-              || { echo "::error::$name failed"; status=1; }
+            case "$name" in
+              # Wine deadlocks mapping several images in one process (the
+              # windows::tests group hangs when run together, each test passes
+              # alone): run that binary's tests one process each.
+              victory_loader-*)
+                "$WINE" "$exe" --list 2>/dev/null | sed 's/: test$//' \
+                  | while read -r one; do
+                      timeout --signal=KILL --kill-after=30 120 \
+                        xvfb-run -a "$WINE" "$exe" --test-threads=1 --exact "$one" \
+                        || { echo "::error::$one failed"; exit 1; }
+                    done || { echo "::error::$name failed"; status=1; }
+                ;;
+              *)
+                timeout --signal=KILL --kill-after=30 600 xvfb-run -a "$WINE" "$exe" "${args[@]}" \
+                  || { echo "::error::$name failed"; status=1; }
+                ;;
+            esac
             # This prefix is the job's own: nothing of a binary outlives it
             # (a lingering wineserver holds the step's output open).
             "$WINESERVER" -k 2>/dev/null || true
