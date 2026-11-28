@@ -4249,6 +4249,17 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            #[cfg(windows)]
+            {
+                let reuses = crate::shadow::REUSES.load(Ordering::Relaxed);
+                let (windows, window_bytes) = crate::shadow::loose_stats();
+                tracing::info!(
+                    "loose windows: {windows} ({:.0} MB, never freed), {} covered by a wider \
+                     one since start",
+                    window_bytes as f64 / 1e6,
+                    reuses
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
