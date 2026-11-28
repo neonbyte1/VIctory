@@ -19,6 +19,7 @@ New to this? [docs/testing.md](testing.md) is a step-by-step guide for testing o
 6. **Formatting is required.** The fork's `main` is rustfmt-clean, and `.github/workflows/fmt.yml` fails any push or PR that isn't: run `cargo fmt --all` before committing on the fork. Upstream's tree isn't rustfmt-clean and its CI doesn't run rustfmt, so a PR to `Marvisak/VIctory` formats only the code it adds or changes, never unrelated lines. CI also runs `cargo xtask policy` and strict clippy (`-D warnings`, default and `--all-features`, `--all-targets`); run them before pushing.
    Merging an upstream PR into the fork: upstream's code isn't formatted, so format the incoming side first (`git switch -c tmp/<pr> <pr-head> && cargo fmt --all && git commit -am fmt`), merge `tmp/<pr>`, then run `cargo fmt --all` on the result. The merge commit still names `#N`; only real conflicts remain.
 7. **Never claim a speed-up without an adjacent control** (see section 5).
+8. **Results live on the fork too.** Every result posted upstream is also posted in full (not just a link) on the matching fork issue, so nothing is lost if upstream goes private or down. Upstream threads we took part in are archived as Markdown on the branch [`archive/upstream`](https://github.com/neonbyte1/VIctory/tree/archive/upstream), regenerated regularly with each post's author and link.
 
 ## 2. Branches on the fork
 
