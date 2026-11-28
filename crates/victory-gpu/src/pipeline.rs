@@ -744,7 +744,6 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 /// slower frame never reaches the TDR). So this and `skipped_shader` are
 /// here in every build; only the reporting around them (`note_drop`,
 /// `dropped`, `shaders_of`) is diagnostics.
-#[cfg(windows)]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
@@ -753,7 +752,6 @@ fn skip_hashes() -> &'static [String] {
     })
 }
 
-#[cfg(windows)]
 fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;

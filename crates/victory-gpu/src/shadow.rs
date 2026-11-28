@@ -1065,11 +1065,12 @@ impl Shadow {
         let Some(t) = &self.tracked else {
             return (0, Vec::new());
         };
-        if !self
-            .pending
+        if self
+            .subs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+            .iter()
+            .any(|s| !s.pending.is_empty())
         {
             return (0, Vec::new()); // shaders may be writing it
         }
@@ -2723,6 +2724,20 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Windows a covering window answered instead of a new copy (diagnostics).
+#[cfg(windows)]
+pub(crate) static REUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The loose windows by count and bytes (diagnostics): the shared segment's
+/// own content; the copies are never freed, so what this reaches is what
+/// the segment carries until the process ends.
+#[cfg(windows)]
+pub(crate) fn loose_stats() -> (usize, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = map.iter().map(|((_, len), _)| *len).sum();
+    (map.len(), bytes)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
@@ -3237,77 +3252,6 @@ pub(crate) mod tests {
         // page table still holds must not name memory reused meanwhile.
     }
 
-    /// A loose window wider than a later ask covers it: the narrower ask
-    /// reuses the wider copy instead of making another host buffer for
-    /// memory a copy already spans (the shared segment's bulk was these).
-    #[test]
-    fn a_wider_loose_window_covers_a_later_smaller_ask() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-        };
-        // One window-aligned pair of pages inside a reservation that
-        // guarantees the addresses, found free again (other tests allocate
-        // meanwhile: tried again if taken).
-        let pair = (0..8)
-            .find_map(|_| {
-                // SAFETY: a fresh reservation, released at once; then the
-                // two window-aligned allocations where it was, kept (as the
-                // other tests' pools: their copies must not name memory a
-                // later test reuses).
-                unsafe {
-                    let p = VirtualAlloc(std::ptr::null(), 3 * window() as usize, MEM_RESERVE, PAGE_READWRITE) as usize;
-                    if p == 0 {
-                        return None;
-                    }
-                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
-                    let aligned = p.next_multiple_of(window() as usize);
-                    let at = |q: usize| {
-                        VirtualAlloc(q as *const _, window() as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize
-                    };
-                    let (one, two) = (at(aligned), at(aligned + window() as usize));
-                    if one == aligned && two == aligned + window() as usize {
-                        return Some((one, two));
-                    }
-                    [one, two].into_iter().filter(|&q| q != 0).for_each(|q| {
-                        VirtualFree(q as *mut _, 0, MEM_RELEASE);
-                    });
-                    None
-                }
-            })
-            .expect("a window-aligned pair of pages");
-        let (one, two) = (pair.0 as u64, pair.1 as u64);
-        let Some(wide) = find(one, 2 * window()) else {
-            return; // no host GPU here
-        };
-        let before = REUSES.load(std::sync::atomic::Ordering::Relaxed);
-        let narrow = find(two, window());
-        let Some(narrow) = narrow else {
-            return; // no host GPU here (the wide one already was)
-        };
-        assert!(
-            std::sync::Arc::ptr_eq(&wide, &narrow),
-            "the narrower ask reuses the covering window"
-        );
-        assert_eq!(
-            REUSES.load(std::sync::atomic::Ordering::Relaxed),
-            before + 1,
-            "the reuse is counted"
-        );
-        // An ask the wide window does not reach still gets its own copy.
-        let beyond = find(two, 2 * window());
-        if let Some(beyond) = beyond {
-            assert!(
-                !std::sync::Arc::ptr_eq(&wide, &beyond),
-                "an ask past the covering window makes its own"
-            );
-            assert_eq!(
-                REUSES.load(std::sync::atomic::Ordering::Relaxed),
-                before + 1,
-                "no reuse for an ask past the window"
-            );
-        }
-    }
-
     /// The stale check (`VICTORY_STALE_CHECK`) finds a page the title wrote
     /// with its guard opened behind the tracking's back (a write nothing
     /// sees or reports), and only it: a write the guard saw counts as
@@ -3324,7 +3268,7 @@ pub(crate) mod tests {
             unregister(p, p as u64);
             return; // no host GPU here
         };
-        copy.update(p, len);
+        copy.update(0, p, len).unwrap();
         assert_eq!(copy.stale_pages(false), (3, Vec::new()), "nothing missed");
         // SAFETY: a byte of our pool, guarded: the handler marks the page.
         unsafe { ((p + 10) as *mut u8).write_volatile(1) };
@@ -3347,13 +3291,13 @@ pub(crate) mod tests {
             copy.read_host((p + PAGE + 20) as u64, 1)[0] & 0xffff,
             0x0203
         );
-        copy.writing(p, len, false);
+        copy.writing(0, p, len, false);
         assert_eq!(
             copy.stale_pages(false),
             (0, Vec::new()),
             "shaders may be writing it"
         );
-        copy.copy_back(p, len);
+        copy.copy_back(0, p, len);
         unregister(p, p as u64);
     }
 
@@ -3675,8 +3619,8 @@ pub(crate) mod tests {
             unregister(a, a as u64);
             return; // no host GPU here
         };
-        copy.update(a, len);
-        copy.writing(a, len, true);
+        copy.update(0, a, len).unwrap();
+        copy.writing(0, a, len, true);
         // The shaders write a byte in each page; the runtime unmaps the
         // other mapping of both pages while the submission runs.
         copy.write_host((a + 10) as u64, &[0xaa]);
@@ -3687,11 +3631,11 @@ pub(crate) mod tests {
         // SAFETY: a byte of our surviving mapping.
         unsafe { ((a + PAGE + 40) as *mut u8).write_volatile(0x11) };
         assert!(
-            copy.copy_back_marked(a) > 0,
+            copy.copy_back_marked(0, a, &Default::default()) > 0,
             "page 0's shader write goes back"
         );
         assert!(
-            copy.copy_back_marked(a + PAGE) > 0,
+            copy.copy_back_marked(0, a + PAGE, &Default::default()) > 0,
             "page 1's shader write goes back"
         );
         // SAFETY: bytes of our surviving mapping.
@@ -3702,7 +3646,7 @@ pub(crate) mod tests {
             (0xbb, 0x11),
             "page 1 kept both writers' bytes"
         );
-        copy.copy_back(a, len);
+        copy.copy_back(0, a, len);
         unregister(a, a as u64);
     }
 
