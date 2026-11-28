@@ -27,17 +27,7 @@ if [ $# -eq 0 ]; then
   exit 2
 fi
 
-detect_vk_device() {
-  command -v lspci >/dev/null 2>&1 || return 0
-  ids=$(lspci -nn 2>/dev/null |
-    grep -E 'VGA compatible controller|3D controller|Display controller' |
-    sed -nE 's/.*\[([0-9a-fA-F]{4}:[0-9a-fA-F]{4})\].*/\1/p')
-  [ -n "$ids" ] || return 0
-  nv=$(printf '%s\n' "$ids" | grep -i -m1 '^10de:')
-  printf '%s' "${nv:-$(printf '%s\n' "$ids" | head -n1)}"
-}
-
-DEV=${VICTORY_VK_DEVICE:-$(detect_vk_device)}
+DEV=${VICTORY_VK_DEVICE-$("$(dirname "$(readlink -f "$0")")/vk-device.sh")}
 RES=${VICTORY_HEADLESS_RES:-1280x720}
 W=${RES%x*}
 H=${RES#*x}
