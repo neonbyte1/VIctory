@@ -20,7 +20,7 @@ if not paths:
     sys.exit("usage: summarize-run.sh [--brief] <log.txt> [...]")
 ansi = re.compile(r"\x1b\[[0-9;]*m")
 frame = re.compile(
-    r"([\d.]+) fps, ([\d.]+) ms/title frame \(([\d.]+) preparing.*?; ([\d.]+) on the GPU; "
+    r"([\d.]+) fps, ([\d.]+) ms/(?:title )?frame \(([\d.]+) preparing.*?; ([\d.]+) on the GPU; "
     r"([\d.]+) copying back.*?dropped (\d+) without"
 )
 vram = re.compile(r"video memory: (\d+) MB of a (\d+) MB budget")
