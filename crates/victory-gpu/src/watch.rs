@@ -1912,6 +1912,10 @@ fn lazy_mode() -> u8 {
 
 /// Whether marked view pages go back lazily ([`Lease::lazify`]).
 pub(crate) fn lazy_views() -> bool {
+    #[cfg(test)]
+    if lazy_suspended() {
+        return false;
+    }
     lazy_mode() != 0
 }
 
@@ -1927,6 +1931,40 @@ pub(crate) fn owner() -> bool {
 #[cfg(test)]
 pub(crate) fn set_lazy_views(on: bool) {
     LAZY_VIEWS.store(u8::from(on), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: this thread's copies never make view pages lazy. The suite's
+    /// lazy tests flip the process-wide mode, so a test of writing back
+    /// through the runtime's own mapping pins its own copies eager.
+    static LAZY_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: whether this thread's copies keep view pages eager
+/// ([`LazySuspended`]).
+#[cfg(test)]
+pub(crate) fn lazy_suspended() -> bool {
+    LAZY_SUSPENDED.with(std::cell::Cell::get)
+}
+
+/// Tests: view pages eager for this thread until dropped
+/// ([`crate::watch::lazy_suspended`]).
+#[cfg(test)]
+pub(crate) struct LazySuspended(bool);
+
+#[cfg(test)]
+impl LazySuspended {
+    pub(crate) fn set() -> LazySuspended {
+        LazySuspended(LAZY_SUSPENDED.replace(true))
+    }
+}
+
+#[cfg(test)]
+impl Drop for LazySuspended {
+    fn drop(&mut self) {
+        LAZY_SUSPENDED.set(self.0);
+    }
 }
 
 /// Tests: [`owner`] on (lazy view pages too) or off.
@@ -3223,6 +3261,11 @@ pub(crate) mod tests {
     /// Lazy view pages on while it lives, as before after (and no earlier
     /// test's misses: copy-back makes no page lazy while writes are
     /// withheld).
+    /// One test at a time: the lazy/owner modes, the guard tables and the
+    /// views' aliases are process-wide, so tests that flip or lean on them
+    /// must not overlap (as `emit::valu_tests::ONE_AT_A_TIME`).
+    pub(crate) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     pub(crate) struct LazyOn(bool);
 
     impl LazyOn {
@@ -3284,13 +3327,20 @@ pub(crate) mod tests {
     /// `writable_alias` answers `own` for title memory `[title, title + len)`
     /// (the runtime's own view of the pages a title view shows).
     pub(crate) fn own_alias(title: usize, len: usize, own: usize) {
-        static AT: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
-        AT[0].store(title, Ordering::Relaxed);
-        AT[1].store(len, Ordering::Relaxed);
-        AT[2].store(own, Ordering::Relaxed);
+        // Per thread: tests run in parallel, and each answers for its own views.
+        thread_local! {
+            static AT: [std::cell::Cell<usize>; 3] = const { [const { std::cell::Cell::new(0) }; 3] };
+        }
+        AT.with(|s| {
+            s[0].set(title);
+            s[1].set(len);
+            s[2].set(own);
+        });
         set_writable_alias(|at| {
-            let (title, len, own) = (AT[0].load(Ordering::Relaxed), AT[1].load(Ordering::Relaxed), AT[2].load(Ordering::Relaxed));
-            (title..title + len).contains(&at).then(|| at - title + own)
+            AT.with(|s| {
+                let (title, len, own) = (s[0].get(), s[1].get(), s[2].get());
+                (title..title + len).contains(&at).then(|| at - title + own)
+            })
         });
     }
 
@@ -3324,6 +3374,7 @@ pub(crate) mod tests {
     /// made lazy (its next refresh would read it at once) and stays guarded.
     #[test]
     fn a_lazy_view_page_gets_the_copys_bytes_at_the_titles_first_read() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY};
         let _on = LazyOn::set();
         let missed = lazy_checks().1;
@@ -3359,6 +3410,7 @@ pub(crate) mod tests {
     /// the page lost this race (run lazy1-u1's crash, `perf/lazy-copyback`).
     #[test]
     fn racing_first_reads_of_a_lazy_view_page_all_find_the_copys_bytes() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let _on = LazyOn::set();
         for round in 0..20u8 {
             let (v, own) = section_views(1, 1);
@@ -3380,6 +3432,7 @@ pub(crate) mod tests {
     /// and an armed tracker keeps them as the page's bytes from before.
     #[test]
     fn a_write_to_a_lazy_view_page_lands_on_the_copys_bytes() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let _on = LazyOn::set();
         let (v, own) = section_views(1, 1);
         let a = v[0];
@@ -3401,6 +3454,7 @@ pub(crate) mod tests {
     /// runtime unmapping it, the copy going.
     #[test]
     fn our_own_touches_give_lazy_view_pages_their_bytes_first() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY};
         let _on = LazyOn::set();
         let (v, own) = section_views(6, 1);
@@ -3437,6 +3491,7 @@ pub(crate) mod tests {
     /// gives the copy's bytes to both, guarded again together.
     #[test]
     fn a_lazy_view_page_shown_elsewhere_is_lazy_at_every_address() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY};
         let _on = LazyOn::set();
         let (v, own) = section_views(1, 2);
@@ -3460,6 +3515,7 @@ pub(crate) mod tests {
     /// write of the runtime's is under way.
     #[test]
     fn view_pages_that_cannot_be_lazy_are_left_out() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let _on = LazyOn::set();
         let (v, own) = section_views(5, 1);
         let a = v[0];
@@ -3493,6 +3549,7 @@ pub(crate) mod tests {
     /// bytes, reported as written after, win where they land.
     #[test]
     fn a_runtime_write_to_a_lazy_view_page_lands_on_the_copys_bytes() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let _on = LazyOn::set();
         let (v, own) = section_views(1, 1);
         let a = v[0];
@@ -3518,6 +3575,7 @@ pub(crate) mod tests {
     /// not those we left.
     #[test]
     fn a_write_behind_a_lazy_view_pages_back_is_caught() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let _on = LazyOn::set();
         let (v, own) = section_views(1, 1);
         let a = v[0];
@@ -3538,6 +3596,7 @@ pub(crate) mod tests {
     /// and the copy takes them again.
     #[test]
     fn a_withheld_lazy_view_page_keeps_the_titles_bytes() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::PAGE_READONLY;
         let _on = LazyOn::set();
         let (v, own) = section_views(1, 1);

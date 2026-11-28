@@ -3339,6 +3339,7 @@ pub(crate) mod tests {
     /// page the title wrote meanwhile goes back at once by its saved bytes.
     #[test]
     fn lazy_view_marked_pages_go_back_at_the_first_touch() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{LazyOn, own_alias, raw, section_views};
         if !runs_on() {
             return; // page by page (`VICTORY_MARK_RUNS=0`): nothing goes lazy
@@ -3386,6 +3387,7 @@ pub(crate) mod tests {
     /// and a second submission's write before that read is what it finds.
     #[test]
     fn vram_lazy_view_writes_go_back_at_the_first_read() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{LazyOn, own_alias, raw, section_views};
         let Some(host) = host() else {
             return; // no host GPU here
@@ -3957,9 +3959,12 @@ mod run_tests {
     /// and the runtime's own (`c`), which copy-back is told to write
     /// through for `a`'s pages.
     fn three_views(pages: usize) -> (usize, usize, usize) {
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
-        static AT: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+        // Per thread: the tests run in parallel, and one test's views would
+        // otherwise answer another's alias question (its pages' `through`).
+        thread_local! {
+            static AT: [std::cell::Cell<usize>; 3] = const { [const { std::cell::Cell::new(0) }; 3] };
+        }
         let len = pages * PAGE;
         // SAFETY: a pagefile section mapped three times; the test keeps them.
         let [a, b, c] = unsafe {
@@ -3971,12 +3976,16 @@ mod run_tests {
         for k in (0..len).step_by(PAGE) {
             crate::watch::title_memory_aliased(b + k, &[a + k]);
         }
-        AT[0].store(a, Relaxed);
-        AT[1].store(len, Relaxed);
-        AT[2].store(c, Relaxed);
+        AT.with(|s| {
+            s[0].set(a);
+            s[1].set(len);
+            s[2].set(c);
+        });
         crate::watch::set_writable_alias(|at| {
-            let (a, len, c) = (AT[0].load(Relaxed), AT[1].load(Relaxed), AT[2].load(Relaxed));
-            (a..a + len).contains(&at).then(|| at - a + c)
+            AT.with(|s| {
+                let (a, len, c) = (s[0].get(), s[1].get(), s[2].get());
+                (a..a + len).contains(&at).then(|| at - a + c)
+            })
         });
         (a, b, c)
     }
@@ -3986,6 +3995,8 @@ mod run_tests {
     /// write there counts), and nothing is checked after.
     #[test]
     fn a_run_writes_view_pages_through_our_own_mapping() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _eager = crate::watch::LazySuspended::set();
         let (a, b, _) = three_views(3);
         let t = crate::watch::track_copy(a, 3 * PAGE, true).expect("views are tracked");
         fill(a, 3 * PAGE);
@@ -4012,6 +4023,8 @@ mod run_tests {
     /// mapping too.
     #[test]
     fn a_title_write_during_a_write_through_our_mapping_lands_after_it() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _eager = crate::watch::LazySuspended::set();
         let (a, b, _) = three_views(2);
         let t = crate::watch::track_copy(a, 2 * PAGE, true).expect("views are tracked");
         fill(a, 2 * PAGE);
@@ -4051,6 +4064,7 @@ mod run_tests {
     /// other page them.
     #[test]
     fn lazy_views_a_page_shaders_wrote_is_not_copied_until_touched() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{LazyOn, raw};
         let _on = LazyOn::set();
         let (a, b, c) = three_views(3);
@@ -4077,6 +4091,7 @@ mod run_tests {
     /// read, compared or written: the first touch finds both writes.
     #[test]
     fn lazy_views_a_page_marked_again_before_any_touch_is_never_copied() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{LazyOn, raw};
         let _on = LazyOn::set();
         let (a, b, c) = three_views(1);
@@ -4106,6 +4121,7 @@ mod run_tests {
     /// at its next refresh.
     #[test]
     fn lazy_views_a_directstorage_write_lands_over_the_shaders_bytes() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::LazyOn;
         let _on = LazyOn::set();
         let (a, b, c) = three_views(1);
@@ -4137,6 +4153,7 @@ mod run_tests {
     /// copy's whole page over it).
     #[test]
     fn lazy_views_a_page_another_copy_holds_goes_back_at_once() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use crate::watch::{lazy_checks, tests::LazyOn};
         let _on = LazyOn::set();
         let (a, _, _) = three_views(1);
@@ -4164,15 +4181,21 @@ mod run_tests {
     /// the same pages) and the runtime's own view `c`, through which pages
     /// at both go back (`VICTORY_OWNER` tests: two copies of one page).
     fn owner_views(pages: usize) -> (usize, usize, usize) {
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-        static AT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
-        let (a, b, c) = three_views(pages);
-        for (slot, v) in AT.iter().zip([a, b, pages * PAGE, c]) {
-            slot.store(v, Relaxed);
+        // Per thread, as [`three_views`]'s.
+        thread_local! {
+            static AT: [std::cell::Cell<usize>; 4] = const { [const { std::cell::Cell::new(0) }; 4] };
         }
+        let (a, b, c) = three_views(pages);
+        AT.with(|s| {
+            for (slot, v) in s.iter().zip([a, b, pages * PAGE, c]) {
+                slot.set(v);
+            }
+        });
         crate::watch::set_writable_alias(|at| {
-            let [a, b, len, c] = [0, 1, 2, 3].map(|k| AT[k].load(Relaxed));
-            [a, b].into_iter().find(|v| (*v..v + len).contains(&at)).map(|v| at - v + c)
+            AT.with(|s| {
+                let [a, b, len, c] = [0, 1, 2, 3].map(|k| s[k].get());
+                [a, b].into_iter().find(|v| (*v..v + len).contains(&at)).map(|v| at - v + c)
+            })
         });
         (a, b, c)
     }
@@ -4210,6 +4233,7 @@ mod run_tests {
     /// title's first read finds both writes.
     #[test]
     fn owner_two_copies_writing_disjoint_bytes_in_turn_both_land() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::{OwnerOn, raw};
         let _on = OwnerOn::set();
         let (a, b, c) = owner_views(1);
@@ -4257,6 +4281,7 @@ mod run_tests {
     /// (copies in video memory, `crate::watch::Tracked::own_bytes`) alike.
     #[test]
     fn owner_two_copies_in_flight_together_keep_both_writes() {
+        let _one = crate::watch::tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use crate::watch::tests::OwnerOn;
         let _on = OwnerOn::set();
         for (case, own) in (0..3).flat_map(|case| [(case, false), (case, true)]) {
