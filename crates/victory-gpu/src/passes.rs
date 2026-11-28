@@ -291,6 +291,7 @@ static WORK: LazyLock<Mutex<std::sync::mpsc::Sender<Arc<Shader>>>> = LazyLock::n
         view_marks: true,
         target: crate::shader_cache::host_target(),
         pair_meetings: crate::shader_cache::pair_meetings(),
+        dispatch_record: crate::shader_cache::dispatch_record(),
     };
     let spawned = std::thread::Builder::new()
         .name("victory gpu pass forms".into())
