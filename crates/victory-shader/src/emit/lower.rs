@@ -1543,7 +1543,24 @@ impl<'a> Lower<'a> {
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::GroupInfo => {
+                // `{first_wavefront, 14'b0, ordered_append_term[10:0], wave_count[5:0]}`
+                // (LLVM AMDGPUUsage, "Initial Kernel Execution State"): without GDS
+                // ordered append, bits 16:6 hold the wave's index in the group.
+                let e = self.s.entry;
+                let wave = self.wave();
+                let threads: u32 = self.s.threads.expect("compute").iter().product();
+                let count = self.s.m.i32(threads.div_ceil(wave) & 0x3F);
+                let w = self.wave_id();
+                let k6 = self.s.m.i32(6);
+                let placed = self.s.m.bin(e, Bin::Shl, w, k6);
+                let low = self.s.m.bin(e, Bin::Or, placed, count);
+                let zero = self.s.m.i32(0);
+                let is_first = self.s.m.cmp(e, pred::EQ, w, zero);
+                let first_bit = self.s.m.i32(1 << 31);
+                let high = self.s.m.select(e, is_first, first_bit, zero);
+                return Val::I32(self.s.m.bin(e, Bin::Or, high, low));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -1554,9 +1571,7 @@ impl<'a> Lower<'a> {
             Input::MergedWaveInfo => {
                 // shortcut: only the wave index (bits 24-27) is set; the
                 // console's other bits (lane counts) are read by no program.
-                let f = self.mesh_thread();
-                let shift = self.s.m.i32(self.wave().trailing_zeros());
-                let w = self.s.m.bin(self.s.entry, Bin::LShr, f, shift);
+                let w = self.wave_id();
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
             }
@@ -3134,6 +3149,13 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// Compute or mesh: the wave's index in the thread group.
+    fn wave_id(&mut self) -> V {
+        let f = self.mesh_thread();
+        let shift = self.s.m.i32(self.wave().trailing_zeros());
+        self.s.m.bin(self.s.entry, Bin::LShr, f, shift)
+    }
+
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -4503,6 +4525,19 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if name == "s_get_waveid_in_workgroup" {
+            if self.s.threads.is_none() {
+                return Err("s_get_waveid_in_workgroup outside compute");
+            }
+            let Some(Operand::Scalar { code, .. }) = *data else {
+                return Err(name);
+            };
+            if inst.write(Reg::S(code)).is_some() {
+                let w = self.wave_id();
+                self.write(inst, Reg::S(code), w, None);
+            }
+            return Ok(());
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }

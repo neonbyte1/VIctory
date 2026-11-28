@@ -3150,4 +3150,222 @@ mod tests {
             );
         }
     }
+
+    #[cfg(windows)]
+    fn validate_dxil_and_hash(dxil: &[u8]) {
+        let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        let mut copy = dxil.to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], dxil[4..20], "container hash");
+    }
+
+    #[cfg(not(windows))]
+    fn validate_dxil_and_hash(_: &[u8]) {}
+
+    #[test]
+    fn group_info_and_waveid_in_workgroup_lower_and_validate() {
+        use crate::native::MeshIo;
+        const S_ENDPGM: u32 = 0xBF81_0000;
+
+        // Compute (wave32 and wave64, 96 threads -> partial last wave under
+        // wave64): s1 is the thread-group info SGPR (after TGID_X in s0),
+        // joined across a uniform branch; s_get_waveid_in_workgroup writes s2
+        // (and null, a no-op write).
+        let cs_words = [
+            0xF4A8_1F40,
+            0xFA00_0000, // s_get_waveid_in_workgroup null
+            0xF4A8_0080,
+            0xFA00_0000, // s_get_waveid_in_workgroup s2
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> join
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xBF07_0201, // join: s_cmp_lg_u32 s1, s2
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let cs_code: Vec<u8> = cs_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        for wave64 in [false, true] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 7 | 1 << 10, // TGID_X_EN (s0) + TG_SIZE_EN (s1)
+                    threads: [96, 1, 1],
+                }),
+                code: cs_code.clone(),
+            };
+            let p = ir::build(&native.code, wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let l = lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+            })
+            .unwrap();
+            assert!(!l.wave_ops, "wave64={wave64}");
+            validate_dxil_and_hash(&l.dxil);
+        }
+
+        // Mesh stage: `s_get_waveid_in_workgroup` writes the wave index too.
+        let ms_words = [
+            0xF4A8_0040,
+            0xFA00_0000, // s_get_waveid_in_workgroup s1
+            0x7E00_0C01, // v_cvt_f32_u32 v0, s1
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            0xBF83_0009, // s_sendmsg sendmsg(GS_ALLOC_REQ)
+            0xF800_0941,
+            0x0000_0000, // exp prim v0, off, off, off done
+            0xF800_08CF,
+            0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+            S_ENDPGM,
+        ];
+        let ms_native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 64,
+                max_vertices: 64,
+                max_primitives: 64,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: ms_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&ms_native.code, false, ms_native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &ms_native.layout, ms_native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &ms_native).unwrap();
+        let pos = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let l = lower::lower(&lower::Parts {
+            native: &ms_native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![pos.clone()],
+            prims: vec![],
+            mesh_stride: 64,
+            view_marks: false,
+        })
+        .unwrap();
+        validate_dxil_and_hash(&l.dxil);
+
+        // Outside compute and mesh (`Ps` and `Vs`), `s_get_waveid_in_workgroup`
+        // is refused cleanly.
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        for (stage, io, outputs, end_words) in [
+            (
+                HwStage::Ps,
+                StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                vec![target],
+                [0xF800_180F, 0x0000_0000], // exp mrt0 v0.. done vm
+            ),
+            (
+                HwStage::Vs,
+                StageIo::Vs {
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+                vec![pos],
+                [0xF800_08CF, 0x0000_0000], // exp pos0 v0.. done
+            ),
+        ] {
+            let words = [
+                0xF4A8_0000,
+                0xFA00_0000, // s_get_waveid_in_workgroup s0
+                0x7E00_0200, // v_mov_b32 v0, s0
+                end_words[0],
+                end_words[1],
+                S_ENDPGM,
+            ];
+            let native = NativeProgram {
+                stage,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io,
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let err = lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs,
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+            })
+            .err()
+            .unwrap();
+            assert!(
+                matches!(
+                    err,
+                    crate::ShaderError::Unsupported {
+                        what: "s_get_waveid_in_workgroup outside compute",
+                        ..
+                    }
+                ),
+                "{stage:?}: {err:?}"
+            );
+        }
+    }
 }

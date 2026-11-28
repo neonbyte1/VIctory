@@ -4978,3 +4978,149 @@ fn v_dot2c_f32_f16_rounds_the_exact_sum_once() {
         );
     });
 }
+        );
+    });
+}
+
+#[test]
+fn compute_group_info_and_waveid_in_workgroup_match_the_group() {
+    // 1 user SGPR (table base in s0), TGID_X in s1 (bit 7), TG_SIZE in s2 (bit
+    // 10), and all three thread-id VGPRs in v0..v2 (`TIDIG_COMP_CNT = 2` at
+    // bits 12:11). For `[8, 4, 3]` = 96 threads: wave32 gives 3 full waves,
+    // wave64 gives 2 waves (the second partial, 32 threads). Each thread `f`
+    // writes `[s_tg_size, s_wave_id]` to `uav[2 * f .. 2 * f + 2]`.
+    let build = |wave64: bool| -> HostShader {
+        let mut words = vec![
+            s_mov_b32(4, 0),
+            s_mov_b32(5, 0x80),
+            s_load_dwordx4(8, 4)[0],
+            s_load_dwordx4(8, 4)[1],
+            // s_get_waveid_in_workgroup s3
+            0xF4A8_00C0,
+            0xFA00_0000,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        // flat = (v2 * 4 + v1) * 8 + v0; byte_off = flat * 8 in v3.
+        words.extend_from_slice(&vop3(0x11A, 3, 128 + 2, vgpr(2), 0));
+        words.extend_from_slice(&vop3(0x125, 3, vgpr(3), vgpr(1), 0));
+        words.extend_from_slice(&vop3(0x11A, 3, 128 + 3, vgpr(3), 0));
+        words.extend_from_slice(&vop3(0x125, 3, vgpr(3), vgpr(0), 0));
+        words.extend_from_slice(&vop3(0x11A, 3, 128 + 3, vgpr(3), 0));
+        words.push(vop1(0x001, 4, sgpr(2))); // v4 = TG_SIZE
+        words.push(vop1(0x001, 5, sgpr(3))); // v5 = s_get_waveid_in_workgroup
+        // buffer_store_dword v4 / v5, v3, s[8:11], 0 offen offset:0 / 4
+        words.extend_from_slice(&[0xE070_1000, 0x8002_0403, 0xE070_1004, 0x8002_0503]);
+        words.push(S_ENDPGM);
+
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1 | 1 << 7 | 1 << 10 | 2 << 11,
+                threads: [8, 4, 3],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let (p, st) = range::build(&native.code, wave64, native.vgprs).expect("range");
+        let st = st.expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+        let io = io::raise(&p, &native).expect("io");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            target: crate::emit::Target::ANY,
+            view_marks: false,
+        })
+        .expect("lower");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = lowered.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            memory: lowered.memory,
+            memory_writes: lowered.memory_writes,
+            view_addresses: lowered.view_addresses,
+            heap: lowered.heap,
+            heap_writes: lowered.heap_writes,
+            view_marks: lowered.view_marks,
+        }
+    };
+
+    let shaders = [(false, 32u32, build(false)), (true, 64u32, build(true))];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for &(wave64, wave, ref shader) in &shaders {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label} (wave64={wave64}): {e}"));
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(96 * 2)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} (wave64={wave64}): {e}"));
+            let count = 96u32.div_ceil(wave);
+            for flat in 0..96u32 {
+                let w = flat / wave;
+                let first = if w == 0 { 1u32 << 31 } else { 0 };
+                let want_info = first | (w << 6) | count;
+                let got_info = out[0][(flat * 2) as usize];
+                let got_wave = out[0][(flat * 2 + 1) as usize];
+                assert_eq!(
+                    (got_info, got_wave),
+                    (want_info, w),
+                    "{label} (wave64={wave64}, flat={flat})"
+                );
+            }
+        }
+    }
+}
