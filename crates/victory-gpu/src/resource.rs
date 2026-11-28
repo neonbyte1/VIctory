@@ -657,6 +657,12 @@ pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 pub type FreeRoutine = extern "system" fn(*mut c_void, u64);
 static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    // This allocator only refuses allocations, so there is nothing to free.
+    static TEST_ALLOCATOR: std::cell::Cell<Option<AllocRoutine>> = const { std::cell::Cell::new(None) };
+}
+
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
 /// memory themselves (Grand Theft Auto VI places its back buffers in a
@@ -700,11 +706,13 @@ impl Memory {
     /// A committed resource's memory: from the title's allocator if the
     /// runtime named one, else our own; zeroed either way.
     fn for_resource(info: AllocationInfo, heap_kind: u32) -> Result<Memory, HRESULT> {
-        let Some(&(alloc, _)) = ALLOCATOR.get() else {
+        let alloc = ALLOCATOR.get().map(|&(alloc, _)| alloc);
+        #[cfg(test)]
+        let alloc = TEST_ALLOCATOR.get().or(alloc);
+        let Some(alloc) = alloc else {
             return Memory::new(info);
         };
-        let layout = Layout::from_size_align(info.size as usize, info.alignment as usize)
-            .map_err(|_| E_INVALIDARG)?;
+        let layout = Self::layout(info)?;
         let attributes = resource_attributes(info, heap_kind);
         let ptr =
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
@@ -726,13 +734,17 @@ impl Memory {
         self.ptr.as_ptr() as u64
     }
 
-    fn new(info: AllocationInfo) -> Result<Memory, HRESULT> {
-        let layout = usize::try_from(info.size)
+    fn layout(info: AllocationInfo) -> Result<Layout, HRESULT> {
+        usize::try_from(info.size)
             .ok()
             .zip(usize::try_from(info.alignment).ok())
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
-            .ok_or(E_INVALIDARG)?;
+            .ok_or(E_INVALIDARG)
+    }
+
+    fn new(info: AllocationInfo) -> Result<Memory, HRESULT> {
+        let layout = Self::layout(info)?;
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
         Ok(Memory {
@@ -2065,6 +2077,13 @@ pub(crate) extern "system" fn create_committed(
         tracing::warn!(?desc, "no size for this resource");
         return E_INVALIDARG;
     };
+    if out.is_null() && object::is(iid, &RESOURCE_IIDS) {
+        // A capability check validates the storage shape without allocating.
+        return match Memory::layout(info) {
+            Ok(_) => object::S_FALSE,
+            Err(hr) => hr,
+        };
+    }
     tracing::debug!(
         dimension = desc.dimension,
         size = info.size,
@@ -2866,6 +2885,89 @@ pub(crate) mod tests {
         expected.sort_unstable();
         println!("clear-only capture produced {} PNGs", actual.len());
         assert_eq!(actual, expected, "color and depth PNGs at submission and at present");
+    }
+    #[test]
+    fn committed_resource_probe_does_not_call_the_allocator() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[cfg(windows)]
+        if let Some(device) = crate::host::test_warp_device() {
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+            use windows::core::Interface;
+
+            let native_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            // SAFETY: live device, valid descriptions and a null result pointer for validation.
+            let hr = unsafe {
+                (device.vtable().CreateCommittedResource)(
+                    device.as_raw(),
+                    &native_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    std::ptr::null(),
+                    &ID3D12Resource::IID,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(hr.0, object::S_FALSE);
+            println!("Native WARP returned S_FALSE for the buffer probe");
+        } else {
+            println!("Native WARP unavailable for the buffer probe");
+        }
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn deny(_: usize, _: u64) -> *mut c_void {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            std::ptr::null_mut()
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_ALLOCATOR.set(None);
+            }
+        }
+        assert!(TEST_ALLOCATOR.get().is_none());
+        TEST_ALLOCATOR.set(Some(deny));
+        let _reset = Reset;
+        let create = |width, out| {
+            create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &buffer(width),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                out,
+            )
+        };
+
+        let mut resource = std::ptr::null();
+        assert_eq!(create(64, &mut resource), E_OUTOFMEMORY);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(create(0, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        let probe = create(64, std::ptr::null_mut());
+        assert_eq!((probe, CALLS.load(Ordering::Relaxed)), (object::S_FALSE, 1));
     }
 
     fn heap(size: u64) -> This {

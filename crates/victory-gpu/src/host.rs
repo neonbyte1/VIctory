@@ -331,6 +331,18 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// A native software device for API comparisons that only need feature level 11.
+#[cfg(test)]
+pub(crate) fn test_warp_device() -> Option<ID3D12Device> {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    let adapter = warp_adapter().ok()?;
+    let mut device = None;
+    // SAFETY: a live software adapter and a writable device pointer.
+    unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device) }.ok()?;
+    device
+}
+
 /// Diagnostics, `VICTORY_GPU_TIMING`: GPU time per kind of command and
 /// pipeline (ms, commands) and lists' wall time against the sum of their
 /// commands' (ms), since the last frame-rate line.
