@@ -135,7 +135,7 @@ static SHADERS: Mutex<Option<ShaderCache>> = Mutex::new(None);
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
-    static TRIM: OnceLock<bool> = OnceLock::new();
+    static TRIM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let trim = *TRIM.get_or_init(|| {
         matches!(std::env::var("VICTORY_TRIM_IDLE_SHADERS").as_deref(), Ok("1"))
     });
@@ -714,7 +714,6 @@ pub(crate) fn take_waited_ms() -> f64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(any(windows, test))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')

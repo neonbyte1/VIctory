@@ -2645,6 +2645,15 @@ fn changed() {
 /// hold it. Changed under `BUFFERS`' lock.
 static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
 
+/// Counts title buffers made and released: which buffer is the innermost
+/// one holding some bytes ([`find`]) may differ when it changed.
+static OWNERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The count of [`OWNERS`].
+pub(crate) fn owners() -> u64 {
+    OWNERS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     buffers().insert(resource, start, len);
