@@ -592,6 +592,19 @@ mod tests {
         }
     }
 
+    /// Whether the host is Wine: it does not deliver a stack overflow to
+    /// the crash report, and the child that overflows never returns.
+    fn wine_host() -> bool {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        let ntdll: Vec<u16> = "ntdll.dll".encode_utf16().chain([0]).collect();
+        // SAFETY: NUL-terminated names; ntdll is loaded in every process.
+        unsafe {
+            let module = GetModuleHandleW(ntdll.as_ptr());
+            !module.is_null()
+                && GetProcAddress(module, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    }
+
     /// An address in the reserved, never committed part of this thread's
     /// stack.
     fn reserved_stack_address() -> usize {
@@ -1010,6 +1023,13 @@ mod tests {
 
     #[test]
     fn a_stack_overflow_is_still_reported() {
+        if wine_host() {
+            eprintln!(
+                "skipped a_stack_overflow_is_still_reported: Wine does not deliver the stack \
+                 overflow to the crash report, and the child that overflows never returns"
+            );
+            return;
+        }
         let (code, text) = Child {
             test: "unwind::tests::stack_overflow_child",
             variable: "VICTORY_STACK_OVERFLOW_CHILD",
