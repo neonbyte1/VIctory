@@ -871,6 +871,87 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn fill_scratch_reuses_same_range_and_invalidates_on_title_writes_and_reset() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let mut title = [0x11u8; 256];
+        let updated = [0x22u8; 64];
+        let src = title.as_ptr() as usize;
+        let fill_count = |l: &HostList| {
+            l.deferred()
+                .copies
+                .iter()
+                .filter(|s| matches!(s, Step::Fill(..)))
+                .count()
+        };
+
+        let g1 = list.fill_scratch(src, 64).unwrap();
+        assert_eq!(g1 % 256, 0, "CBV scratch must be 256-byte aligned");
+        assert_eq!(list.scratch.lock().unwrap().used, 256);
+        assert_eq!(fill_count(&list), 1);
+
+        // Repeating the same (src, len) reuses the cached GPU address without
+        // growing scratch or appending another Step::Fill.
+        for _ in 0..4 {
+            assert_eq!(list.fill_scratch(src, 64), Some(g1));
+        }
+        assert_eq!(list.scratch.lock().unwrap().used, 256);
+        assert_eq!(fill_count(&list), 1);
+
+        // A different length at the same source address allocates separately.
+        let g2 = list.fill_scratch(src, 128).unwrap();
+        assert_ne!(g2, g1);
+        assert_eq!(g2 % 256, 0);
+        assert_eq!(list.scratch.lock().unwrap().used, 512);
+        assert_eq!(fill_count(&list), 2);
+        assert_eq!(list.fill_scratch(src, 128), Some(g2));
+        assert_eq!(fill_count(&list), 2);
+
+        // A different source offset (unaligned) allocates separately and hits on repeat.
+        let g3 = list.fill_scratch(src + 16, 64).unwrap();
+        assert_ne!(g3, g1);
+        assert_ne!(g3, g2);
+        assert_eq!(g3 % 256, 0);
+        assert_eq!(fill_count(&list), 3);
+        assert_eq!(list.fill_scratch(src + 16, 64), Some(g3));
+        assert_eq!(fill_count(&list), 3);
+
+        // Host-only work does not write title memory and keeps the cache warm.
+        list.defer_host(|| {});
+        assert_eq!(list.fill_scratch(src, 64), Some(g1));
+        assert_eq!(fill_count(&list), 3);
+
+        // `defer_copy` writes title memory and must invalidate cached fills.
+        list.defer_copy(title.as_mut_ptr(), updated.as_ptr(), updated.len());
+        let g4 = list.fill_scratch(src, 64).unwrap();
+        assert_ne!(g4, g1);
+        assert_eq!(g4 % 256, 0);
+        assert_eq!(fill_count(&list), 4);
+        assert_eq!(list.fill_scratch(src, 64), Some(g4));
+        assert_eq!(fill_count(&list), 4);
+
+        // `defer` (`Step::Run`) may write title memory and must also invalidate.
+        list.defer(|| {});
+        let g5 = list.fill_scratch(src, 64).unwrap();
+        assert_ne!(g5, g4);
+        assert_eq!(g5 % 256, 0);
+        assert_eq!(fill_count(&list), 5);
+        assert_eq!(list.fill_scratch(src, 64), Some(g5));
+        assert_eq!(fill_count(&list), 5);
+
+        // Execute and reset: `Deferred` and `Scratch` both clear, so the next
+        // fill starts fresh from chunk 0 with a new Step::Fill.
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.deferred().filled.is_empty());
+        let g6 = list.fill_scratch(src, 64).unwrap();
+        assert_eq!(g6, g1, "reuses chunk 0 after reset");
+        assert_eq!(fill_count(&list), 1);
+        list.close();
+    }
+
+    #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
             eprintln!("skipping compositor initialization: no D3D12 device");
@@ -1616,6 +1697,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: crate::fx::Set<(usize, usize, usize)>,
+    /// Scratch upload copies filled since the last title-memory write
+    /// `(source title address, bytes) -> host scratch GPU address`.
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: crate::fx::Set<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1634,6 +1718,15 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+}
+
+impl Deferred {
+    /// A step that may write title memory invalidates cached refreshes and
+    /// scratch fills recorded earlier in the same list.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.filled.clear();
+    }
 }
 
 impl Host {
@@ -3047,7 +3140,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -3056,6 +3149,27 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// Copies `len` bytes of title memory at `src` into 256-byte aligned
+    /// scratch upload memory when the list is submitted, returning its host
+    /// GPU address. Reuses the same scratch copy while no title-memory write
+    /// intervenes in this list.
+    pub(crate) fn fill_scratch(&self, src: usize, len: usize) -> Option<u64> {
+        let key = (src, len);
+        if let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
+        }
+        // Allocate outside the `deferred` lock: `scratch` takes `deferred` if
+        // an oversized request spills into `deferred.uploads`.
+        let (gpu, dst) = self.scratch(len as u64)?;
+        let mut deferred = self.deferred();
+        if let Some(&existing) = deferred.filled.get(&key) {
+            return Some(existing);
+        }
+        deferred.copies.push(Step::Fill(dst as usize, src, len));
+        deferred.filled.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -3331,10 +3445,12 @@ impl HostList {
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
+    /// `work` may write title memory (refreshes and scratch fills after it
+    /// copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

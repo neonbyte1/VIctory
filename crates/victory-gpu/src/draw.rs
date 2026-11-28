@@ -253,9 +253,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         }
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as usize, len as usize)
 }
 
 macro_rules! once {
@@ -5848,6 +5846,137 @@ void main(uint3 id : SV_DispatchThreadID) {
             readback.Unmap(0, None);
         }
         assert_eq!(pixels, [[0, 255, 0, 255]; (SIDE * SIDE) as usize]);
+    }
+
+    /// Unaligned root CBVs reuse the same 256-byte-aligned scratch upload in
+    /// one list until a title-memory copy intervenes, after which a fresh
+    /// scratch fill delivers the updated constants without clobbering earlier
+    /// draws in the same submission.
+    #[test]
+    fn unaligned_root_cbv_caches_scratch_and_refreshes_after_title_copy() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SOURCE: &str = r#"
+#define RS "CBV(b0), RootConstants(num32BitConstants=1, b1), UAV(u0)"
+cbuffer Data : register(b0) { uint4 v; }
+cbuffer Slot : register(b1) { uint slot; }
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void cs() {
+    dst.Store4(slot * 16, v);
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: static shader source and entry names outlive the call.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("cbv_scratch"),
+                None,
+                None,
+                s!("cs"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: live compiled shader blob with embedded root signature.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.GetBufferPointer(),
+                    BytecodeLength: code.GetBufferSize(),
+                },
+                ..Default::default()
+            };
+            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+
+        let cb_buf = buffer(1024);
+        let (cb_base, _) = crate::resource::buffer_bytes(cb_buf).unwrap();
+        let unaligned = cb_base as u64 + 16;
+        let initial: [u32; 4] = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        let updated: [u32; 4] = [0xaaaa_aaaa, 0xbbbb_bbbb, 0xcccc_cccc, 0xdddd_dddd];
+        // SAFETY: inside our 1024-byte title buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                initial.as_ptr().cast::<u8>(),
+                unaligned as *mut u8,
+                size_of_val(&initial),
+            );
+        }
+
+        let (out, out_data) = host.shared_buffer(256).unwrap();
+        // SAFETY: inside the mapped output buffer.
+        unsafe { std::ptr::write_bytes(out_data, 0, 256) };
+        // SAFETY: live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+
+        let list = host.new_list().unwrap();
+        let cbv1 = root_view(&list, unaligned, false, false).expect("first unaligned CBV");
+        let cbv2 = root_view(&list, unaligned, false, false).expect("cached unaligned CBV");
+        assert_eq!(cbv1 % 256, 0);
+        assert_eq!(cbv2, cbv1, "same unaligned root CBV reuses scratch copy");
+
+        let dispatch = |cbv: u64, slot: u32| {
+            // SAFETY: open list and live host objects.
+            unsafe {
+                let l = &list.list;
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetComputeRootConstantBufferView(0, cbv);
+                l.SetComputeRoot32BitConstant(1, slot, 0);
+                l.SetComputeRootUnorderedAccessView(2, out_gpu);
+                l.Dispatch(1, 1, 1);
+            }
+        };
+        dispatch(cbv1, 0);
+        dispatch(cbv2, 1);
+
+        // A title-memory copy updates the constant buffer mid-list: the cache
+        // must invalidate so the third draw reads `updated` while draws 0 and 1
+        // still read `initial` from the earlier scratch copy.
+        list.defer_copy(
+            unaligned as *mut u8,
+            updated.as_ptr().cast::<u8>(),
+            size_of_val(&updated),
+        );
+        let cbv3 = root_view(&list, unaligned, false, false).expect("refreshed unaligned CBV");
+        assert_eq!(cbv3 % 256, 0);
+        assert_ne!(cbv3, cbv1, "title copy invalidates cached scratch copy");
+        dispatch(cbv3, 2);
+
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: inside the mapped output buffer after GPU completion.
+        let read = |slot: usize| unsafe { *(out_data.add(slot * 16) as *const [u32; 4]) };
+        assert_eq!(read(0), initial, "draw 0 reads initial constants");
+        assert_eq!(read(1), initial, "draw 1 reads cached initial constants");
+        assert_eq!(
+            read(2),
+            updated,
+            "draw 2 reads updated constants after title copy"
+        );
+        assert_eq!(host.log_messages(), None, "no D3D12 debug errors");
     }
 }
 
