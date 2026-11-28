@@ -850,7 +850,20 @@ fn lowered(
         u128::from_be_bytes(c.digest),
         0xba30_5538_e28d_414c_af39_a51a_4bc2_f308 | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
     ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
-    let thread_limit = box_rehydration;
+    // FIND-38: `DispatchX` with flag 0x20 gives thread counts, not group
+    // counts. Any compute program of one-dimensional groups without a group
+    // barrier takes the thread-count guard: the host sets the limit only for
+    // such a dispatch (and leaves 0, no limit, for every other), so lanes
+    // past the count stop at entry as the console never starts them. A
+    // program with `s_barrier` is left out (a lane that left would not reach
+    // the barrier).
+    let one_dimensional = matches!(native.io, crate::native::StageIo::Cs(cs)
+        if cs.threads[0] > 1 && cs.threads[1] == 1 && cs.threads[2] == 1);
+    let barrier = p
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| i.name() == "s_barrier"));
+    let thread_limit = box_rehydration || one_dimensional && !barrier;
     let lower = |parts| lower::lower_with_thread_limit(&parts, thread_limit);
     Ok(match lower(parts(st, res, false, false)) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
@@ -4053,5 +4066,63 @@ mod tests {
                 "{stage:?}: {err:?}"
             );
         }
+    }
+}
+
+/// FIND-38: which compute programs take the thread-count guard of a
+/// `DispatchX` whose flag 0x20 gives thread counts.
+#[cfg(test)]
+mod thread_limit_tests {
+    use crate::native::{ComputeIo, HwStage, NativeProgram, RootType, StageIo};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+    const S_BARRIER: u32 = 0xBF8A_0000;
+
+    /// Whether the program emitted for `code` in groups of `threads` reads
+    /// the dispatch's thread count.
+    fn takes_the_limit(threads: [u32; 3], code: &[u32]) -> bool {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads,
+            }),
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let empty = crate::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = super::emit(&empty, &native, &p, &st, &io, &res, super::Target::ANY).unwrap();
+        shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
+    }
+
+    #[test]
+    fn one_dimensional_groups_without_a_barrier_take_the_thread_limit() {
+        assert!(takes_the_limit([32, 1, 1], &[S_ENDPGM]));
+        assert!(takes_the_limit([64, 1, 1], &[S_ENDPGM]));
+    }
+
+    #[test]
+    fn programs_the_guard_would_break_or_not_cover_keep_their_groups() {
+        // A lane that left at entry would not reach the barrier.
+        assert!(!takes_the_limit([32, 1, 1], &[S_BARRIER, S_ENDPGM]));
+        // The guard tests X only.
+        assert!(!takes_the_limit([8, 8, 1], &[S_ENDPGM]));
+        assert!(!takes_the_limit([32, 1, 2], &[S_ENDPGM]));
+        // One thread a group: a thread count is a group count.
+        assert!(!takes_the_limit([1, 1, 1], &[S_ENDPGM]));
     }
 }
