@@ -1172,8 +1172,14 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     {
         d.format = typeless;
     }
-    // The host has no sRGB unordered access: such textures are typeless,
-    // their unordered access views plain UNORM.
+    typeless_if_unordered_srgb(&mut d);
+    Some(d)
+}
+
+// The host has no sRGB unordered access: such textures are typeless,
+// their unordered access views plain UNORM.
+#[cfg(windows)]
+fn typeless_if_unordered_srgb(d: &mut ResourceDesc) {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
@@ -1211,7 +1217,6 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
             d.flags &= !UNORDERED;
         }
     }
-    Some(d)
 }
 
 const DEPTH: u32 = 2;
@@ -1338,6 +1343,7 @@ fn shared_texture(
             }
         }
     }
+    typeless_if_unordered_srgb(&mut d);
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
@@ -2803,6 +2809,127 @@ pub(crate) mod tests {
         assert!(std::sync::Arc::ptr_eq(&first, &host_copy(written).unwrap()), "shared");
         for r in [read, written] {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_srgb_render_targets_with_unordered_access_are_typeless() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let Some(view_heap) = crate::descriptor::host::HostHeap::new(false, 16) else {
+            return;
+        };
+        let supports_uav = |format: u32| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: plain format-support query into a struct of its size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            }
+            .is_ok()
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+        };
+        let null = std::ptr::null();
+        let render_target = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32;
+        let h = heap(1 << 20);
+        let place = |offset, desc: &ResourceDesc, clear| {
+            let mut out = null;
+            assert_eq!(
+                create_placed(null, h, offset, desc, 0, clear, &RESOURCE_IIDS[0], &mut out),
+                S_OK
+            );
+            out
+        };
+        // RGBA8, BGRA8, and BGRX8: each with an sRGB render target and a linear UAV.
+        for (i, &(offset, srgb, linear, typeless)) in
+            [(0, 29, 28, 27), (KIB_64, 91, 87, 90), (2 * KIB_64, 93, 88, 92)]
+                .iter()
+                .enumerate()
+        {
+            // An explicit layout gives both title textures the same swizzle.
+            let target = ResourceDesc { layout: 1, flags: render_target, ..texture(64, 64, srgb, 1) };
+            let unordered = ResourceDesc { format: linear, flags: UNORDERED, ..target };
+            // The optimized clear value keeps the render target's typed format.
+            let clear = [srgb, 0, 0, 0, 1.0f32.to_bits()];
+            let r1 = place(offset, &target, clear.as_ptr().cast());
+            let r2 = place(offset, &unordered, null.cast());
+            let address = resource(r1).data() as u64;
+            assert_eq!(address, resource(r2).data() as u64);
+            assert_eq!(memory_key(address, &target), memory_key(address, &unordered));
+
+            let h1 = host_resource(r1)
+                .unwrap_or_else(|| panic!("no shared host texture for sRGB format {srgb}"));
+            // SAFETY: a live resource.
+            let desc = unsafe { h1.GetDesc() };
+            assert!(desc.Flags.contains(
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            ));
+            assert_eq!(desc.Format.0, typeless, "sRGB format {srgb}");
+            let h2 = host_resource(r2).expect("a shared host texture for the linear UAV");
+            assert_eq!(h1.as_raw(), h2.as_raw());
+            assert_eq!(view_format(r1), Some(srgb));
+            assert_eq!(view_format(r2), Some(linear));
+
+            // Make UAV descriptors in both the linear and sRGB formats: hosts
+            // that support typed UAVs for `linear` create the views; hosts that
+            // do not (e.g. B8G8R8X8_UNORM) must leave the slots null instead of
+            // removing the device.
+            let supported = supports_uav(linear);
+            let slot_linear = (i * 3) as u32;
+            let slot_srgb = slot_linear + 1;
+            let slot_r32 = slot_linear + 2;
+            view_heap.make_at(
+                slot_linear,
+                &crate::descriptor::View::Unordered(r2 as usize, 0, Some([linear, 4, 0, 0, 0, 0, 0, 0, 0, 0])),
+            );
+            view_heap.make_at(
+                slot_srgb,
+                &crate::descriptor::View::Unordered(r2 as usize, 0, Some([srgb, 4, 0, 0, 0, 0, 0, 0, 0, 0])),
+            );
+            assert_eq!(
+                view_heap.kept(slot_linear),
+                supported,
+                "linear UAV format {linear} kept state must match typed UAV support"
+            );
+            assert_eq!(
+                view_heap.kept(slot_srgb),
+                supported,
+                "sRGB UAV format {srgb} (rewritten to {linear}) kept state must match typed UAV support"
+            );
+            // A castable R32_UINT (42) UAV on the promoted typeless texture still works.
+            if host_copy(r2).is_some_and(|c| c.castable.contains(&42)) && supports_uav(42) {
+                view_heap.make_at(
+                    slot_r32,
+                    &crate::descriptor::View::Unordered(r2 as usize, 0, Some([42, 4, 0, 0, 0, 0, 0, 0, 0, 0])),
+                );
+                assert!(view_heap.kept(slot_r32), "castable R32_UINT UAV on typeless format {typeless}");
+            }
+            // SAFETY: plain device query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+            for slot in [slot_linear, slot_srgb, slot_r32] {
+                view_heap.make_null(slot);
+            }
+            for r in [r1, r2] {
+                assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+            }
         }
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }

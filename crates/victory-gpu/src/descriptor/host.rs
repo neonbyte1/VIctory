@@ -2929,6 +2929,65 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// Same-family and default unordered views in a format the host cannot
+    /// store to (such as `B8G8R8X8_UNORM` on `B8G8R8X8_TYPELESS`) are refused
+    /// by `fits` instead of reaching `CreateUnorderedAccessView`.
+    #[test]
+    fn unsupported_same_family_and_default_uavs_are_refused() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let make_tex = |format: DXGI_FORMAT| -> Option<ID3D12Resource> {
+            let mut tex: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            // SAFETY: plain committed texture creation.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut tex,
+                )
+            }
+            .ok()?;
+            tex
+        };
+        // B8G8R8X8_TYPELESS (92): linear B8G8R8X8_UNORM (88) and sRGB
+        // B8G8R8X8_UNORM_SRGB (93, rewritten to 88) must follow `typed_store(88)`,
+        // while a castable R32_UINT (42) view still fits.
+        let bgrx_typeless = make_tex(DXGI_FORMAT_B8G8R8X8_TYPELESS).expect("B8G8R8X8_TYPELESS texture");
+        let bgrx_supported = typed_store(88);
+        assert!(!bgrx_supported, "expected B8G8R8X8_UNORM typed UAV to be unsupported");
+        let mut linear = DXGI_FORMAT_B8G8R8X8_UNORM;
+        assert!(!fits(&bgrx_typeless, &[42], Some(&mut linear), true));
+        let mut srgb = DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+        assert!(!fits(&bgrx_typeless, &[42], Some(&mut srgb), true));
+        let mut r32 = DXGI_FORMAT_R32_UINT;
+        assert!(fits(&bgrx_typeless, &[42], Some(&mut r32), true));
+        // Default view (`view == 0`) on a typed texture whose format cannot
+        // store to typed UAVs must also be refused when the host allows
+        // creating such a resource.
+        if let Some(bgrx_typed) = make_tex(DXGI_FORMAT_B8G8R8X8_UNORM) {
+            assert!(!fits(&bgrx_typed, &[], None, true));
+            let mut same = DXGI_FORMAT_B8G8R8X8_UNORM;
+            assert!(!fits(&bgrx_typed, &[], Some(&mut same), true));
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
