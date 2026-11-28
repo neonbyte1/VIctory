@@ -43,6 +43,8 @@ mod fx;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod library_timing;
 pub mod list;
 #[cfg(windows)]
 mod memory;

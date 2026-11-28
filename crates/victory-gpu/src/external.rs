@@ -41,7 +41,13 @@ pub fn record<R>(
 ) -> Option<R> {
     let mut out = None;
     crate::list::with_state(list, |host, state| {
+        #[cfg(feature = "diagnostics")]
+        let (timed, started) = (crate::library_timing::begin(host), std::time::Instant::now());
         out = Some(f(&host.list));
+        #[cfg(feature = "diagnostics")]
+        if let Some(pair) = timed {
+            crate::library_timing::end(host, pair, started.elapsed());
+        }
         state.host_state_lost();
     });
     out

@@ -1286,6 +1286,13 @@ struct Deferred {
 }
 
 impl Host {
+    /// GPU timestamp ticks per second on the queue every list runs on.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1)
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -2227,6 +2234,8 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        #[cfg(feature = "diagnostics")]
+        crate::library_timing::list_reset(self);
         let mut deferred = self.deferred();
         let pooled = std::mem::take(&mut deferred.pooled_uploads);
         *deferred = Deferred::default();
