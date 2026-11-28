@@ -1350,7 +1350,7 @@ impl<'a> Lower<'a> {
                         && writes_uavs
                         && cs.threads.iter().product::<u32>() > 32 =>
                 {
-                    uav_order::meetings(p)
+                    uav_order::meetings(p, super::uav_order_raw())
                 }
                 _ => HashSet::new(),
             },
