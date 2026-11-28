@@ -717,6 +717,12 @@ pub(crate) fn ensure_copy_state(
             index,
             D3D12_RESOURCE_STATES(before as i32),
             D3D12_RESOURCE_STATES(after as i32),
+        );
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    });
+}
+
 /// Moves the selected mips, or the whole texture when `None`, of a title
 /// texture's host copy to `state` (`#559`'s view-based mip ranges).
 #[cfg(windows)]
@@ -736,11 +742,6 @@ pub(crate) fn ensure_mips(
     for mip in mips {
         ensure_copy_state(list, &copy, mip, state);
     }
-}
-        );
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
-    });
 }
 
 #[cfg(windows)]
@@ -1108,15 +1109,15 @@ extern "system" fn resolve(
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {            let format = DXGI_FORMAT(format as i32);
-            if let Some(rect) = resolve_region(to.GetDesc(), dst_sub, from.GetDesc(), src_sub) {
+            if let Some(rect) = resolve_region(to.texture.GetDesc(), dst_sub, from.texture.GetDesc(), src_sub) {
                 if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                     // The console clips a larger source to the destination.
                     list1.ResolveSubresourceRegion(
-                        &to,
+                        &to.texture,
                         dst_sub,
                         0,
                         0,
-                        &from,
+                        &from.texture,
                         src_sub,
                         Some(&rect),
                         format,
@@ -2197,8 +2198,10 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const Barrier
                     let mut emitted_transition = false;
                     if whole
                         && let Some(wanted) = wanted
+                        && let Some(copy) = crate::resource::host_copy(b.resource)
                     {
-                        list.transition(b.resource, wanted, None, |texture, mip, before, after| {
+                        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES as ALL;
+                        list.transition(&copy, ALL, wanted, |texture, mip, before, after| {
                             if before != after {
                                 let tex_key = texture.as_raw() as usize;
                                 if seen_transitions.contains(&tex_key) {
@@ -2487,7 +2490,9 @@ mod tests {
         for kind in [1, 2] {
             let before = list.kept_count();
             let barrier = Barrier { kind, flags: 0, first: texture, second: 0, last: 0 };
-            assert!(host_barrier(&list, &barrier).is_some());
+            let mut out = Vec::new();
+            host_barrier(&list, &barrier, &mut out);
+            assert_eq!(out.len(), 1);
             assert_eq!(list.kept_count(), before + 1, "kind {kind}");
         }
         list.close();
@@ -3438,7 +3443,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn enhanced_texture_barrier_transitions_and_propagates_across_lists() {
-        use std::sync::atomic::Ordering;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -3757,10 +3761,7 @@ mod tests {
             assert_eq!(close(list1), S_OK);
             execute(queue, 1, &list1);
             assert_eq!(
-                crate::resource::host_copy(tex)
-                    .unwrap()
-                    .state
-                    .load(Ordering::Relaxed),
+                crate::resource::host_copy(tex).unwrap().state(0),
                 0x40 | 0x80
             );
 
@@ -3783,10 +3784,7 @@ mod tests {
             execute(queue, 1, &list2);
             assert!(host.log_messages().is_none());
             assert_eq!(
-                crate::resource::host_copy(tex)
-                    .unwrap()
-                    .state
-                    .load(Ordering::Relaxed),
+                crate::resource::host_copy(tex).unwrap().state(0),
                 0x800
             );
             assert!(errors.0.lock().unwrap().is_empty());
@@ -3927,9 +3925,13 @@ mod tests {
 
             // Must still be in RENDER_TARGET (0x4) so a subsequent mip-0 clear does not fail.
             let mut recorded = false;
-            host_list(list)
-                .unwrap()
-                .transition(tex, 0x4, None, |_, _, _, _| recorded = true);
+            let copy = crate::resource::host_copy(tex).unwrap();
+            host_list(list).unwrap().transition(
+                &copy,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                0x4,
+                |_, _, _, _| recorded = true,
+            );
             assert!(
                 !recorded,
                 "partial mip-1 barrier clobbered whole-resource RENDER_TARGET state"
@@ -3956,7 +3958,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn enhanced_texture_barrier_transitions_render_target_for_heap_srv_read() {
-        use std::sync::atomic::Ordering;
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::Win32::Graphics::Direct3D12::*;
@@ -4151,7 +4152,13 @@ void main() {
                 hlist.list.Dispatch(1, 1, 1);
             }
             let mut recorded = false;
-            hlist.transition(tex, 0x40 | 0x80, None, |_, _, _, _| recorded = true);
+            let copy = crate::resource::host_copy(tex).unwrap();
+            hlist.transition(
+                &copy,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                0x40 | 0x80,
+                |_, _, _, _| recorded = true,
+            );
             assert!(
                 !recorded,
                 "texture stayed in RENDER_TARGET instead of transitioning to SHADER_RESOURCE"
@@ -4163,10 +4170,7 @@ void main() {
             assert!(host.log_messages().is_none());
             assert!(errors.0.lock().unwrap().is_empty());
             assert_eq!(
-                crate::resource::host_copy(tex)
-                    .unwrap()
-                    .state
-                    .load(Ordering::Relaxed),
+                crate::resource::host_copy(tex).unwrap().state(0),
                 0x40 | 0x80
             );
             // SAFETY: GPU execution finished and `out_ptr` is mapped for 256 bytes.

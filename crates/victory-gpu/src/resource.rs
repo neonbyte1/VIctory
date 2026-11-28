@@ -3244,43 +3244,28 @@ pub(crate) mod tests {
             S_OK
         );
         let list = host.new_list().unwrap();
-        let changes = |state, mips| {
+        let host_copy = crate::resource::host_copy(image).unwrap();
+        let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        let changes = |subresource, state| {
             let mut barriers = Vec::new();
-            list.transition(image, state, mips, |_, mip, before, after| {
-                barriers.push((mip, before, after));
+            list.transition(&host_copy, subresource, state, |_, index, before, after| {
+                barriers.push((index, before, after));
             });
             barriers
         };
-        assert!(changes(target, None).is_empty());
-        assert_eq!(changes(sampled, Some(0..1)), [(0, target, sampled)]);
-        assert!(changes(target, Some(1..2)).is_empty());
-        assert!(changes(sampled, Some(0..1)).is_empty());
+        // The list's first use records nothing: the prelude brings it there.
+        assert!(changes(all, target).is_empty());
+        // Two mips of one color target move independently.
+        assert_eq!(changes(0, sampled), [(0, target, sampled)]);
+        assert!(changes(1, target).is_empty());
+        assert!(changes(0, sampled).is_empty());
+        // A whole-texture move names each subresource that differs.
         assert_eq!(
-            changes(copy, None),
-            [
-                (0, sampled, target),
-                (D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, target, copy),
-            ]
+            changes(all, copy),
+            [(0, sampled, copy), (1, target, copy)]
         );
-
-        let close_list = host.new_list().unwrap();
-        close_list.transition(image, target, None, |_, _, _, _| {});
-        close_list.transition(image, sampled, Some(0..1), |_, _, _, _| {});
-        let mut restored = Vec::new();
-        close_list.close_transitions(|_, mip, before, after| {
-            restored.push((mip, before, after));
-        });
-        assert_eq!(restored, [(0, sampled, target)]);
-
-        let closing_list = host.new_list().unwrap();
-        closing_list.transition(image, target, None, |_, _, _, _| {});
-        closing_list.transition(image, sampled, Some(0..1), |_, _, _, _| {});
-        closing_list.close();
-        let mut remaining = Vec::new();
-        closing_list.close_transitions(|_, mip, before, after| {
-            remaining.push((mip, before, after));
-        });
-        assert!(remaining.is_empty());
+        assert_eq!(list.recorded_state(&host_copy, 0), Some(copy));
+        assert_eq!(list.recorded_state(&host_copy, 1), Some(copy));
 
         assert_eq!(
             slot::<extern "system" fn(This) -> u32>(image, 0x10)(image),
@@ -4058,7 +4043,13 @@ pub(crate) mod tests {
         let sample = || {
             let mut readback: Option<ID3D12Resource> = None;
             let back = host.new_list().unwrap();
-            let (_, before) = host_transition(dst, 0x800).unwrap();
+            let copy = crate::resource::host_copy(dst).unwrap();
+            crate::list::ensure_copy_state(
+                &back,
+                &copy,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                0x800,
+            );
             // SAFETY: live resources, matching footprints, and an open list.
             unsafe {
                 host.device
@@ -4074,11 +4065,6 @@ pub(crate) mod tests {
                         &mut readback,
                     )
                     .unwrap();
-                back.list.ResourceBarrier(&[crate::host::transition(
-                    &image,
-                    D3D12_RESOURCE_STATES(before as i32),
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
                 for (index, footprint) in footprints.into_iter().enumerate() {
                     let from = D3D12_TEXTURE_COPY_LOCATION {
                         pResource: std::mem::transmute_copy(&image),

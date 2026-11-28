@@ -700,7 +700,9 @@ pub(crate) mod tests {
         let depth = std::sync::Arc::new(crate::resource::HostTexture::new(texture.unwrap(), 0, Vec::new()));
         let list = host.new_list().unwrap();
         // Draw 1 renders to it: the depth side is used, no twin yet.
-        assert!(list.move_texture(&depth, 0x10).is_none(), "the list's first use records nothing");
+        let mut barriers = Vec::new();
+        list.move_texture(&depth, 0x10, &mut barriers);
+        assert!(barriers.is_empty(), "the list's first use records nothing");
         // Draw 2 uses its (new) twin: Draw 1's depth is copied over now.
         assert_eq!(list.twin_use(&depth, crate::twin::TWIN, true), Some(false));
         list.close();
@@ -940,10 +942,12 @@ pub(crate) mod tests {
         );
         let list = host.new_list().unwrap();
         // Record RENDER_TARGET (0x4) -> COPY_SOURCE (0x800) inside `list`.
+        let copy = crate::resource::host_copy(tex).unwrap();
+        let all = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         let mut moved = None;
-        list.transition(tex, 0x4, None, |_, _, before, after| moved = Some((before, after)));
+        list.transition(&copy, all, 0x4, |_, _, before, after| moved = Some((before, after)));
         assert!(moved.is_none());
-        list.transition(tex, 0x800, None, |_, _, before, after| moved = Some((before, after)));
+        list.transition(&copy, all, 0x800, |_, _, before, after| moved = Some((before, after)));
         assert_eq!(moved, Some((0x4, 0x800)));
         let host_tex = crate::resource::host_resource(tex).unwrap();
         // SAFETY: open list and live texture.
@@ -961,10 +965,7 @@ pub(crate) mod tests {
         //   Chunk 2 prelude: COPY_SOURCE (0x800) -> RENDER_TARGET (0x4), list ends at COPY_SOURCE (0x800), fence wait.
         host.execute(&[&list, &list]);
         assert_eq!(
-            crate::resource::host_copy(tex)
-                .unwrap()
-                .state
-                .load(Ordering::Relaxed),
+            crate::resource::host_copy(tex).unwrap().state(0),
             0x800
         );
 
@@ -1036,7 +1037,8 @@ pub(crate) struct HostList {
     /// Initial and final states of the host subresources this list uses.
     /// Lists are recorded on many threads and run in submission order,
     /// so `prelude` reconciles the states at submission. These entries
-    /// also keep the textures alive until the list is reset.    states: Mutex<States>,
+    /// also keep the textures alive until the list is reset.
+    states: Mutex<States>,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
@@ -2198,28 +2200,7 @@ impl HostList {
             || node_is_list(None, ansi.as_deref(), &pointers, &name)
     }
 
-    pub(crate) fn close_transitions(&self, mut record: impl FnMut(&ID3D12Resource, u32, u32, u32)) {
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        for state in states.values_mut() {
-            state.unify(&mut record);
-        }
-    }
-
     pub(crate) fn close(&self) {
-        // The submission prelude and presentation use one state per texture.
-        let mut barriers = Vec::new();
-        self.close_transitions(|texture, mip, before, after| {
-            barriers.push(transition_subresource(
-                texture,
-                mip,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATES(after as i32),
-            ));
-        });
-        if !barriers.is_empty() {
-            // SAFETY: an open list and resources held by the tracker.
-            unsafe { self.list.ResourceBarrier(&barriers) };
-        }
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
         for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
@@ -2284,18 +2265,21 @@ impl HostList {
 
     /// Moves host subresources to `wanted` in this list, emitting inline
     /// barriers for states that are already known and need to change.
-    /// A depth texture with a writable twin is routed to the side the use needs.    pub(crate) fn transition(
+    /// A depth texture with a writable twin is routed to the side the use needs.
+    pub(crate) fn transition(
         &self,
         copy: &Arc<HostTexture>,
         subresource: u32,
         wanted: u32,
         emit: impl FnMut(&ID3D12Resource, u32, u32, u32),
-    ) {        if let Some(Some(twin)) = copy.twin.get()
+    ) {
+        if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, copy, twin, wanted)
         {
             return;
         }
-        self.track(copy, subresource, wanted, emit);    }
+        self.track(copy, subresource, wanted, emit);
+    }
 
     fn track(
         &self,
@@ -2315,7 +2299,8 @@ impl HostList {
                 }
                 RecordedTexture::new(copy.clone())
             })
-            .record(subresource, wanted, emit);    }
+            .record(subresource, wanted, emit);
+    }
 
     /// Appends barriers for a texture without routing to its twin.
     pub(crate) fn move_texture(

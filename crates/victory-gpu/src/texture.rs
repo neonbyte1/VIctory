@@ -240,6 +240,14 @@ pub(crate) fn host_writes(list: &HostList, copy: &Arc<crate::resource::HostTextu
     list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
 }
 
+/// Whether `resource`'s host copy is written by the host GPU, not filled
+/// from title memory.
+#[cfg(test)]
+fn is_host_written(resource: This) -> bool {
+    crate::resource::host_copy(resource)
+        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
