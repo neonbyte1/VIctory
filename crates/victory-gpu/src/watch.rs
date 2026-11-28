@@ -814,6 +814,9 @@ pub struct Writing {
 
 impl Drop for Writing {
     fn drop(&mut self) {
+        if self.first >= self.last {
+            return;
+        }
         let mut g = guards();
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
@@ -829,6 +832,9 @@ impl Drop for Writing {
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
 pub fn writing(at: usize, len: usize) -> Writing {
+    if len == 0 {
+        return Writing { first: 0, last: 0 };
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
@@ -858,6 +864,9 @@ pub fn title_memory_unmapped(_at: usize, _len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     REMAP_EPOCH.fetch_add(1, Ordering::Release);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
@@ -1581,5 +1590,29 @@ pub(crate) mod tests {
         );
         free(a);
         free(b);
+    }
+    #[test]
+    fn unaligned_zero_length_writes_and_remaps_do_not_dirty_or_unlink() {
+        let (a, b) = twin_views(1);
+        let ta = track(a, PAGE, true).expect("a is tracked");
+        let tb = track(b, PAGE, true).expect("b is tracked");
+        assert_eq!(ta.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(tb.take(b, b + PAGE), [(b, b + PAGE)]);
+
+        let guard = writing(a + 1, 0);
+        assert!(ta.take(a, a + PAGE).is_empty());
+        assert!(tb.take(b, b + PAGE).is_empty());
+        drop(guard);
+        assert!(ta.take(a, a + PAGE).is_empty());
+        assert!(tb.take(b, b + PAGE).is_empty());
+
+        title_memory_remapped(a + 1, 0);
+        assert!(ta.take(a, a + PAGE).is_empty());
+        assert!(tb.take(b, b + PAGE).is_empty());
+
+        // The alias link must still be intact for a real 1-byte write.
+        drop(writing(a + 1, 1));
+        assert_eq!(ta.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(tb.take(b, b + PAGE), [(b, b + PAGE)]);
     }
 }
