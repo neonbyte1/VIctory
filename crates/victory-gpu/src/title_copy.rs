@@ -309,6 +309,20 @@ mod tests {
         free(to);
     }
 
+    /// Whether the host is Wine: its guard pages do not fault the way
+    /// Windows' do (a copy that meets one faults outside the routine's
+    /// recovered range), which is fatal rather than an assertion.
+    fn wine_host() -> bool {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        let ntdll: Vec<u16> = "ntdll.dll".encode_utf16().chain([0]).collect();
+        // SAFETY: NUL-terminated names; ntdll is loaded in every process.
+        unsafe {
+            let module = GetModuleHandleW(ntdll.as_ptr());
+            !module.is_null()
+                && GetProcAddress(module, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    }
+
     /// The page's protection, `PAGE_GUARD` included.
     fn protection(at: *mut u8, page: usize) -> u32 {
         // SAFETY: plain data filled in by the query.
@@ -324,6 +338,16 @@ mod tests {
     /// (zeros for the page), however it lies over the page.
     #[test]
     fn guard_pages_stay_guarded() {
+        // Wine spends a guard page on the first access without letting the
+        // routine's handler put it back ([`guard_again`] finds another
+        // protection), so the page does not end as a guard page there.
+        if wine_host() {
+            eprintln!(
+                "skipped guard_pages_stay_guarded: Wine does not restore a guard page the \
+                 way Windows does"
+            );
+            return;
+        }
         for other in [PAGE_READWRITE, PAGE_READONLY, PAGE_EXECUTE_READ] {
             for (start, len) in [
                 (PAGE, 1),
@@ -404,6 +428,16 @@ mod tests {
                 REPORTED.fetch_add(1, Ordering::Relaxed);
             }
             if ours { -1 } else { 0 }
+        }
+        // Wine's guard pages do not fault the way the title's do: a copy that
+        // meets one faults outside the routine's recovered range, which ends
+        // the process rather than failing an assertion. Nothing to test there.
+        if wine_host() {
+            eprintln!(
+                "skipped a_guard_page_the_title_touches_meanwhile: Wine does not report a \
+                 guard page's touches to the title's handler the way Windows does"
+            );
+            return;
         }
         let at = pages(1) as usize;
         PAGE_AT.store(at, Ordering::Relaxed);
