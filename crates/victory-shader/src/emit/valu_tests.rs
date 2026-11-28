@@ -2005,6 +2005,51 @@ fn s_lshl_add_shifts_the_first_operand_then_adds() {
         });
     }
 }
+#[test]
+fn v_16_bit_integer_ops_match_rdna2() {
+    // v_<op>_{u,i}16 v0, v1, v2 (VOP3 0x303..0x30c, 0x314): only the low
+    // halves of the sources count, and the result is the low half of v0.
+    // The 16-bit shifts take a four-bit amount from the first operand.
+    type Pick = fn(u16, u16) -> u16;
+    let ops: [(&str, u16, Pick); 10] = [
+        ("v_add_nc_u16", 0x303, u16::wrapping_add),
+        ("v_sub_nc_u16", 0x304, u16::wrapping_sub),
+        ("v_mul_lo_u16", 0x305, u16::wrapping_mul),
+        ("v_lshrrev_b16", 0x307, |a, b| b >> (a & 15)),
+        ("v_ashrrev_i16", 0x308, |a, b| {
+            ((b as i16) >> (a & 15)) as u16
+        }),
+        ("v_max_u16", 0x309, u16::max),
+        ("v_max_i16", 0x30A, |a, b| (a as i16).max(b as i16) as u16),
+        ("v_min_u16", 0x30B, u16::min),
+        ("v_min_i16", 0x30C, |a, b| (a as i16).min(b as i16) as u16),
+        ("v_lshlrev_b16", 0x314, |a, b| b << (a & 15)),
+    ];
+    let values = [0u16, 1, 5, 16, 17, 0x7FFF, 0x8000, 0xFFFF];
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            // Garbage in the high halves, which must not matter.
+            cases.push([0xABCD_0000 | u32::from(a), 0x1234_0000 | u32::from(b), 0, 0]);
+        }
+    }
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&[
+            vop1(0x001, 0, 128),
+            vop3(op, 0, vgpr(1), vgpr(2), 0)[0],
+            vop3(op, 0, vgpr(1), vgpr(2), 0)[1],
+        ]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let (a, b) = (inp[0] as u16, inp[1] as u16);
+            let want = pick(a, b);
+            assert_eq!(
+                got & 0xFFFF,
+                u32::from(want),
+                "{backend}: {name}({a:#06x}, {b:#06x}) = {got:#010x}, want {want:#06x}",
+            );
+        });
+    }
+}
 
 #[test]
 fn s_cmpk_compares_against_the_extended_immediate() {
