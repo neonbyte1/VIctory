@@ -67,6 +67,20 @@ mod twin;
 #[cfg(windows)]
 mod watch;
 
+static OUTPUT_RESOLUTION: std::sync::OnceLock<victory_core::Resolution> =
+    std::sync::OnceLock::new();
+
+/// Configure the output profile before the title's GPU host is created.
+pub fn set_output_resolution(
+    resolution: victory_core::Resolution,
+) -> Result<(), victory_core::Resolution> {
+    OUTPUT_RESOLUTION.set(resolution)
+}
+
+pub(crate) fn output_resolution() -> Option<victory_core::Resolution> {
+    OUTPUT_RESOLUTION.get().copied()
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]

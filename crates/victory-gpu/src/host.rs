@@ -2795,12 +2795,13 @@ impl Compositor {
         const SOURCE: &str = r#"
             Texture2D tex : register(t0);
             SamplerState smp : register(s0);
+            cbuffer Crop : register(b0) { float2 uvScale; float2 uvMin; float2 uvMax; };
             void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
                 uv = float2((id << 1) & 2, id & 2);
                 pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
             }
             float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
-                return tex.Sample(smp, uv);
+                return tex.Sample(smp, clamp(uv * uvScale, uvMin, uvMax));
             }
         "#;
         let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
@@ -2852,16 +2853,29 @@ impl Compositor {
                 OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
                 ..Default::default()
             };
-            let parameter = D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                        NumDescriptorRanges: 1,
-                        pDescriptorRanges: &range,
+            let parameters = [
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: &range,
+                        },
                     },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
                 },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-            };
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 0,
+                            RegisterSpace: 0,
+                            Num32BitValues: 6,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                },
+            ];
             let sampler = D3D12_STATIC_SAMPLER_DESC {
                 Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
                 AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -2875,8 +2889,8 @@ impl Compositor {
                 ..Default::default()
             };
             let desc = D3D12_ROOT_SIGNATURE_DESC {
-                NumParameters: 1,
-                pParameters: &parameter,
+                NumParameters: parameters.len() as u32,
+                pParameters: parameters.as_ptr(),
                 NumStaticSamplers: 1,
                 pStaticSamplers: &sampler,
                 ..Default::default()
@@ -3010,6 +3024,153 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     compositor: Option<Compositor>,
+    crop: Option<(u32, u32)>,
+}
+
+type PictureSize = (u32, u32);
+type PresentationPlan = Option<(u32, u32, Option<PictureSize>)>;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CropUv {
+    scale: [f32; 2],
+    min: [f32; 2],
+    max: [f32; 2],
+}
+
+fn presentation_plan(
+    width: u32,
+    height: u32,
+    client: Option<(u32, u32)>,
+    resolution: Option<victory_core::Resolution>,
+) -> PresentationPlan {
+    let Some(resolution) = resolution else {
+        return Some((width, height, None));
+    };
+    let crop = resolution.picture_size(width, height)?;
+    if crop != (resolution.width, resolution.height) {
+        return None;
+    }
+    let (client_width, client_height) = client?;
+    (client_width > 0 && client_height > 0)
+        .then_some((client_width, client_height, Some(crop)))
+}
+
+fn presentation(width: u32, height: u32, hwnd: HWND) -> PresentationPlan {
+    let resolution = crate::output_resolution();
+    let client = if resolution.is_some() {
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut rect = RECT::default();
+        // SAFETY: plain query on the title's visible window.
+        unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
+        Some((
+            (rect.right - rect.left).max(0) as u32,
+            (rect.bottom - rect.top).max(0) as u32,
+        ))
+    } else {
+        None
+    };
+    presentation_plan(width, height, client, resolution)
+}
+
+fn crop_uv(source: (u32, u32), crop: Option<(u32, u32)>) -> Option<CropUv> {
+    let (crop_width, crop_height) = crop.unwrap_or(source);
+    if source.0 == 0
+        || source.1 == 0
+        || crop_width == 0
+        || crop_height == 0
+        || crop_width > source.0
+        || crop_height > source.1
+    {
+        return None;
+    }
+    let inv_width = 1.0 / source.0 as f32;
+    let inv_height = 1.0 / source.1 as f32;
+    Some(CropUv {
+        scale: [crop_width as f32 * inv_width, crop_height as f32 * inv_height],
+        min: [0.5 * inv_width, 0.5 * inv_height],
+        max: [
+            (crop_width as f32 - 0.5) * inv_width,
+            (crop_height as f32 - 0.5) * inv_height,
+        ],
+    })
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::{crop_uv, presentation_plan};
+
+    #[test]
+    fn reduced_presentation_requires_the_expected_frame_and_client_crop() {
+        let resolution = victory_core::Resolution::HD_1080;
+        assert_eq!(
+            presentation_plan(3840, 2160, Some((1920, 1080)), Some(resolution)),
+            Some((1920, 1080, Some((1920, 1080))))
+        );
+        assert_eq!(
+            presentation_plan(1920, 1080, Some((1920, 1080)), Some(resolution)),
+            Some((1920, 1080, Some((1920, 1080))))
+        );
+        assert_eq!(
+            presentation_plan(3840, 2160, Some((1440, 810)), Some(resolution)),
+            Some((1440, 810, Some((1920, 1080))))
+        );
+        assert_eq!(
+            presentation_plan(3840, 2160, Some((2560, 1440)), Some(resolution)),
+            Some((2560, 1440, Some((1920, 1080))))
+        );
+        assert_eq!(
+            presentation_plan(3840, 2160, Some((0, 0)), Some(resolution)),
+            None
+        );
+        assert_eq!(
+            presentation_plan(1920, 1080, None, None),
+            Some((1920, 1080, None))
+        );
+        let initial = presentation_plan(3840, 2160, Some((960, 540)), Some(resolution))
+            .unwrap()
+            .0;
+        let resized = presentation_plan(3840, 2160, Some((1440, 810)), Some(resolution))
+            .unwrap()
+            .0;
+        assert_ne!(initial, resized, "client resize must request new buffers");
+    }
+
+    #[test]
+    fn crop_sampling_matches_native_and_double_size_source_geometry() {
+        assert_eq!(
+            crop_uv((1920, 1080), Some((1920, 1080))).unwrap().scale,
+            [1.0, 1.0]
+        );
+        assert_eq!(
+            crop_uv((3840, 2160), Some((1920, 1080))).unwrap().scale,
+            [0.5, 0.5]
+        );
+        assert_eq!(crop_uv((1920, 1080), None).unwrap().scale, [1.0, 1.0]);
+        assert_eq!(crop_uv((1920, 1080), Some((1921, 1080))), None);
+    }
+
+    #[test]
+    fn resized_sampling_clamps_to_the_last_crop_texel() {
+        fn sample_linear(pixels: &[f32], uv: f32) -> f32 {
+            let position =
+                (uv * pixels.len() as f32 - 0.5).clamp(0.0, pixels.len() as f32 - 1.0);
+            let left = position.floor() as usize;
+            let right = (left + 1).min(pixels.len() - 1);
+            let fraction = position - left as f32;
+            pixels[left] * (1.0 - fraction) + pixels[right] * fraction
+        }
+
+        // The bright texel lies immediately outside the crop and would bleed
+        // in at the right edge when the crop is enlarged without clamping.
+        let source = [0.1, 0.2, 1.0];
+        let crop = crop_uv((3, 1), Some((2, 1))).unwrap();
+        let scaled_uv = crop.scale[0];
+        let clamped_uv = scaled_uv.clamp(crop.min[0], crop.max[0]);
+        assert_eq!(sample_linear(&source, clamped_uv), source[1]);
+        assert!(sample_linear(&source, scaled_uv) > source[1]);
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3203,6 +3364,13 @@ impl Host {
             &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         ),
     ) -> Option<bool> {
+        if crate::output_resolution().is_some() && planes.len() != 1 {
+            tracing::warn!(
+                planes = planes.len(),
+                "reduced-resolution presentation requires a single composed title plane"
+            );
+            return None;
+        }
         let &(primary, _) = planes.first()?;
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
@@ -3210,8 +3378,8 @@ impl Host {
             tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
             return None;
         };
-        let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        let Presentation { presenter, retry } = &mut *presentation;
+        let mut presentation_state = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let Presentation { presenter, retry } = &mut *presentation_state;
         if presenter.is_none() && !retry.ready(Instant::now()) {
             return None;
         }
@@ -3220,7 +3388,8 @@ impl Host {
             .and_then(|p| p.compositor.as_ref())
             .map(|c| c.format);
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        let require_compositor = planes.len() > 1 || crate::output_resolution().is_some();
+        let planes = if require_compositor && cached_format != Some(format) {
             match create_compositor(&self.device, format) {
                 Ok(c) => {
                     new_compositor = Some(c);
@@ -3228,6 +3397,9 @@ impl Host {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
+                    if crate::output_resolution().is_some() {
+                        return None;
+                    }
                     &planes[..1]
                 }
             }
@@ -3256,23 +3428,29 @@ impl Host {
         if let Some(c) = new_compositor {
             p.compositor = Some(c);
         }
-        if (p.width, p.height, p.format) != (width, height, format) {
+        let (chain_width, chain_height, crop) = presentation(width, height, p.hwnd)?;
+        if (p.width, p.height, p.format) != (chain_width, chain_height, format)
+            || p.crop != crop
+        {
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
                 unsafe {
                     p.swap_chain.ResizeBuffers(
                         BUFFERS,
-                        width,
-                        height,
+                        chain_width,
+                        chain_height,
                         format,
                         DXGI_SWAP_CHAIN_FLAG(0),
                     )
                 }
             })?;
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    (p.width, p.height, p.format) = (chain_width, chain_height, format);
+                    p.crop = crop;
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, format = format.0, "swap chain not resized");
+                    tracing::warn!(error = %e, width = chain_width, height = chain_height, format = format.0, "swap chain not resized");
                     return None;
                 }
             }
@@ -3285,7 +3463,7 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
+            let (capture, probe) = if planes.len() == 1 && crate::output_resolution().is_none() {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
@@ -3411,26 +3589,42 @@ impl Host {
                 list.RSSetViewports(&[D3D12_VIEWPORT {
                     TopLeftX: 0.0,
                     TopLeftY: 0.0,
-                    Width: width as f32,
-                    Height: height as f32,
+                    Width: chain_width as f32,
+                    Height: chain_height as f32,
                     MinDepth: 0.0,
                     MaxDepth: 1.0,
                 }]);
                 list.RSSetScissorRects(&[RECT {
                     left: 0,
                     top: 0,
-                    right: width as i32,
-                    bottom: height as i32,
+                    right: chain_width as i32,
+                    bottom: chain_height as i32,
                 }]);
                 list.OMSetRenderTargets(1, Some(&rtv), false, None);
                 list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                for i in 0..count {
+                for (i, (tex, _)) in planes[..count].iter().enumerate() {
                     list.SetPipelineState(if i == 0 { &comp.opaque } else { &comp.overlay });
                     list.SetGraphicsRootDescriptorTable(
                         0,
                         D3D12_GPU_DESCRIPTOR_HANDLE {
                             ptr: srv_gpu_base.ptr + (i as u64) * u64::from(comp.srv_stride),
                         },
+                    );
+                    let desc = tex.GetDesc();
+                    let crop = crop_uv((desc.Width as u32, desc.Height), p.crop)?;
+                    let crop_constants = [
+                        crop.scale[0].to_bits(),
+                        crop.scale[1].to_bits(),
+                        crop.min[0].to_bits(),
+                        crop.min[1].to_bits(),
+                        crop.max[0].to_bits(),
+                        crop.max[1].to_bits(),
+                    ];
+                    list.SetGraphicsRoot32BitConstants(
+                        1,
+                        crop_constants.len() as u32,
+                        crop_constants.as_ptr().cast(),
+                        0,
                     );
                     list.DrawInstanced(3, 1, 0, 0);
                 }
@@ -3497,15 +3691,20 @@ impl Host {
     ) -> Result<Presenter, (&'static str, windows::core::Error)> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
+            None if crate::output_resolution().is_some() => {
+                return Err(("resolution window", windows::core::Error::empty()));
+            }
             None => window(width, height).map_err(|e| ("window", e))?,
         };
+        let (chain_width, chain_height, crop) = presentation(width, height, hwnd)
+            .ok_or_else(|| ("resolution window size", windows::core::Error::empty()))?;
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
                 .map_err(|e| ("DXGI factory", e))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: width,
-                Height: height,
+                Width: chain_width,
+                Height: chain_height,
                 Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
@@ -3522,16 +3721,17 @@ impl Host {
                 .map_err(|e| ("swap chain", e))?;
             let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(width = chain_width, height = chain_height, frame = ?(width, height), crop = ?crop, format = format.0, "presenting to a window");
             Ok(Presenter {
                 swap_chain,
-                width,
-                height,
+                width: chain_width,
+                height: chain_height,
                 format,
                 copy,
                 hwnd,
                 meter: Meter::new(),
                 compositor: None,
+                crop,
             })
         }
     }

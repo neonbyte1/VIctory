@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+victory-core.workspace = true
 memchr.workspace = true
 miniz_oxide.workspace = true
 

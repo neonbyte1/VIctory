@@ -113,9 +113,14 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
-        console: Console,
+        /// The console model and resolution profile the title sees. Defaults
+        /// to VICTORY_CONSOLE, then series-x.
+        #[arg(long, value_enum)]
+        console: Option<Console>,
+        /// Cap the title's actual render targets to a supported profile.
+        /// Supported: 1920x1080 (Series X profile only).
+        #[arg(long, value_name = "WIDTHxHEIGHT")]
+        resolution: Option<String>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -135,6 +140,83 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+/// The explicit command-line choice wins; otherwise use `VICTORY_CONSOLE`,
+/// with Series X as the unchanged default.
+fn resolve_console(cli: Option<Console>, env: Option<&str>) -> Result<Console> {
+    if let Some(console) = cli {
+        return Ok(console);
+    }
+    let Some(value) = env else {
+        return Ok(Console::SeriesX);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "series-x" => Ok(Console::SeriesX),
+        "series-s" => Ok(Console::SeriesS),
+        _ => anyhow::bail!("invalid VICTORY_CONSOLE {value:?}; expected series-x or series-s"),
+    }
+}
+
+fn resolve_resolution(
+    cli: Option<&str>,
+    env: Option<&str>,
+) -> Result<Option<victory_core::Resolution>> {
+    let Some(value) = cli.or(env) else {
+        return Ok(None);
+    };
+    victory_core::Resolution::parse(value)
+        .map(Some)
+        .map_err(|message| {
+            anyhow::anyhow!(
+                "invalid {} resolution {value:?}: {message}",
+                if cli.is_some() {
+                    "--resolution"
+                } else {
+                    "VICTORY_RESOLUTION"
+                }
+            )
+        })
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::{Console, resolve_console, resolve_resolution};
+
+    #[test]
+    fn cli_console_overrides_the_environment() {
+        assert!(matches!(
+            resolve_console(Some(Console::SeriesX), Some("series-s")),
+            Ok(Console::SeriesX)
+        ));
+    }
+
+    #[test]
+    fn environment_selects_a_lower_resolution_console_profile() {
+        assert!(matches!(
+            resolve_console(None, Some("series-s")),
+            Ok(Console::SeriesS)
+        ));
+    }
+
+    #[test]
+    fn unset_console_defaults_to_series_x() {
+        assert!(matches!(resolve_console(None, None), Ok(Console::SeriesX)));
+    }
+
+    #[test]
+    fn invalid_environment_value_is_rejected() {
+        assert!(resolve_console(None, Some("1080p")).is_err());
+    }
+
+    #[test]
+    fn resolution_cli_overrides_environment_and_unknown_sizes_fail_closed() {
+        assert_eq!(
+            resolve_resolution(Some("1920x1080"), Some("3840x2160")).unwrap(),
+            Some(victory_core::Resolution::HD_1080)
+        );
+        assert!(resolve_resolution(None, Some("3840x2160")).is_err());
+    }
 }
 
 /// Diagnostics: the heap bytes Rust code holds, for the statistics.
@@ -195,9 +277,37 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            resolution,
             title_args: _,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            let env_console = if console.is_none() {
+                std::env::var_os("VICTORY_CONSOLE")
+                    .map(|value| {
+                        value.into_string().map_err(|_| {
+                            anyhow::anyhow!("VICTORY_CONSOLE must contain valid Unicode")
+                        })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let console = resolve_console(console, env_console.as_deref())?;
+            let env_resolution = if resolution.is_none() {
+                std::env::var_os("VICTORY_RESOLUTION")
+                    .map(|value| {
+                        value.into_string().map_err(|_| {
+                            anyhow::anyhow!("VICTORY_RESOLUTION must contain valid Unicode")
+                        })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let resolution = resolve_resolution(resolution.as_deref(), env_resolution.as_deref())?;
+            if resolution.is_some() && matches!(console, Console::SeriesS) {
+                anyhow::bail!("--resolution requires the Series X console profile");
+            }
+            let code = run::run(&exe, unimplemented, strict, execute, console, resolution)?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);

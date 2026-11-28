@@ -36,12 +36,207 @@ fn check_cpu_features() -> Result<()> {
 }
 
 #[cfg(windows)]
+struct WritablePages {
+    page_size: usize,
+    pages: Vec<(usize, u32)>,
+}
+
+#[cfg(windows)]
+impl WritablePages {
+    fn acquire(address: usize, len: usize) -> Result<Self> {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+        anyhow::ensure!(len > 0, "cannot protect an empty image range");
+        let mut info = SYSTEM_INFO::default();
+        // SAFETY: `info` is writable storage for the system information.
+        unsafe { GetSystemInfo(&mut info) };
+        let page_size = info.dwPageSize as usize;
+        anyhow::ensure!(page_size.is_power_of_two(), "invalid Windows page size");
+        let end = address
+            .checked_add(len - 1)
+            .context("image patch range overflow")?;
+        let first = address & !(page_size - 1);
+        let last = end & !(page_size - 1);
+        let mut guard = Self {
+            page_size,
+            pages: Vec::new(),
+        };
+        for page in (first..=last).step_by(page_size) {
+            let mut old = 0;
+            // SAFETY: one page inside the already mapped image.
+            if unsafe { VirtualProtect(page as *const _, page_size, PAGE_READWRITE, &mut old) } == 0
+            {
+                let error = std::io::Error::last_os_error();
+                if let Err(restore_error) = guard.restore() {
+                    anyhow::bail!(
+                        "making image page {page:#x} writable failed: {error}; \
+                         restoring earlier pages also failed: {restore_error}"
+                    );
+                }
+                anyhow::bail!("making image page {page:#x} writable failed: {error}");
+            }
+            guard.pages.push((page, old));
+        }
+        Ok(guard)
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        use windows_sys::Win32::System::Memory::VirtualProtect;
+
+        self.restore_with(|page, page_size, protection| {
+            let mut ignored = 0;
+            // SAFETY: this page was made writable by `acquire`.
+            unsafe { VirtualProtect(page as *const _, page_size, protection, &mut ignored) != 0 }
+        })
+    }
+
+    fn restore_with(
+        &mut self,
+        mut restore_page: impl FnMut(usize, usize, u32) -> bool,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+        let mut retained = Vec::new();
+        for (page, protection) in std::mem::take(&mut self.pages) {
+            if !restore_page(page, self.page_size, protection) {
+                failures.push(page);
+                retained.push((page, protection));
+            }
+        }
+        self.pages = retained;
+        anyhow::ensure!(
+            failures.is_empty(),
+            "could not restore image page protections: {failures:x?}"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WritablePages {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            tracing::error!(%error, "failed to restore title image page protections");
+        }
+    }
+}
+
+#[cfg(windows)]
+fn with_writable_pages<T>(
+    address: usize,
+    len: usize,
+    write: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let mut guard = WritablePages::acquire(address, len)?;
+    let result = write();
+    let restored = guard.restore();
+    match (result, restored) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(write_error), Err(restore_error)) => Err(write_error.context(format!(
+            "also failed to restore protections: {restore_error}"
+        ))),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod writable_pages_tests {
+    use super::{WritablePages, with_writable_pages};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree, VirtualProtect,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    #[test]
+    fn restores_the_original_page_protection_after_writing() {
+        // SAFETY: system info is written to initialized storage.
+        let mut info = unsafe { std::mem::zeroed::<SYSTEM_INFO>() };
+        // SAFETY: `info` is writable storage for the system information.
+        unsafe { GetSystemInfo(&mut info) };
+        let page_size = info.dwPageSize as usize;
+        // SAFETY: requests one private page for this isolated test.
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                page_size,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let address = memory as usize;
+        let mut old = 0;
+        assert_ne!(
+            // SAFETY: allocation is live and at least one page long.
+            unsafe { VirtualProtect(memory, page_size, PAGE_READONLY, &mut old) },
+            0
+        );
+        assert_eq!(old, PAGE_READWRITE);
+
+        let write = with_writable_pages(address, 1, || {
+            // SAFETY: the helper temporarily made this page writable.
+            unsafe { memory.cast::<u8>().write(0x5a) };
+            Ok(())
+        });
+        assert!(write.is_ok());
+
+        let mut restored = 0;
+        // Query the protection by changing it and immediately restoring it.
+        assert_ne!(
+            // SAFETY: allocation is still live.
+            unsafe { VirtualProtect(memory, page_size, PAGE_READWRITE, &mut restored) },
+            0
+        );
+        assert_eq!(restored, PAGE_READONLY);
+        let mut ignored = 0;
+        assert_ne!(
+            // SAFETY: restore the original state before releasing the page.
+            unsafe { VirtualProtect(memory, page_size, restored, &mut ignored) },
+            0
+        );
+        // SAFETY: this is the original base returned by VirtualAlloc.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn failed_restores_are_attempted_once_and_remain_retryable() {
+        let mut guard = WritablePages {
+            page_size: 4096,
+            pages: vec![(0x1000, PAGE_READONLY), (0x2000, PAGE_READWRITE)],
+        };
+        let mut attempts = Vec::new();
+        let error = guard.restore_with(|page, _, _| {
+            attempts.push(page);
+            false
+        });
+        assert!(error.is_err());
+        assert_eq!(attempts, [0x1000, 0x2000]);
+        assert_eq!(guard.pages.len(), 2);
+
+        let mut retries = Vec::new();
+        assert!(
+            guard
+                .restore_with(|page, _, _| {
+                    retries.push(page);
+                    true
+                })
+                .is_ok()
+        );
+        assert_eq!(retries, [0x1000, 0x2000]);
+        assert!(guard.pages.is_empty());
+    }
+}
+
+#[cfg(windows)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
     strict: bool,
     execute: bool,
     console: Console,
+    resolution: Option<victory_core::Resolution>,
 ) -> Result<u32> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -52,6 +247,24 @@ pub fn run(
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    if let Some(resolution) = resolution {
+        use windows_sys::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        // SAFETY: process-wide setting, before any title window exists.
+        if unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } == 0
+        {
+            tracing::warn!("could not set per-monitor DPI awareness for reduced resolution");
+        }
+        victory_gpu::set_output_resolution(resolution)
+            .map_err(|_| anyhow::anyhow!("GPU output resolution was already configured"))?;
+        victory_hle::modules::lifecycle::set_output_resolution(resolution)
+            .map_err(|_| anyhow::anyhow!("title window resolution was already configured"))?;
+        if execute {
+            victory_hle::modules::lifecycle::preflight_output_resolution(resolution)
+                .map_err(|error| anyhow::anyhow!("resolution preflight failed: {error}"))?;
+        }
+    }
     if execute {
         // Before the host's own memory (the image read below, the GPU
         // device, the caches) takes the space the title's 32-bit memory needs.
@@ -66,7 +279,8 @@ pub fn run(
     )?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
-    match victory_game::identify(&hash) {
+    let build = victory_game::identify(&hash);
+    match build {
         Some(build) => {
             println!("build          {} ({hash})", build.label);
             if execute {
@@ -74,6 +288,11 @@ pub fn run(
             }
         }
         None => println!("build          unknown ({hash})"),
+    }
+    if resolution.is_some() && build.is_none() {
+        anyhow::bail!(
+            "--resolution is supported only for a known, versioned title build; this executable is unknown ({hash})"
+        );
     }
 
     let images = cfg.cache_subdir("images")?;
@@ -83,6 +302,33 @@ pub fn run(
     drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    if let Some(resolution) = resolution {
+        let build = build.expect("resolution override checked the build above");
+        let base = image.base();
+        let size = image.info().size_of_image as usize;
+        // SAFETY: `load` mapped `size_of_image` readable bytes at `base`.
+        let mapped = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
+        let plan = victory_game::output::plan(mapped, build, resolution)
+            .map_err(|error| anyhow::anyhow!("cannot apply --resolution safely: {error}"))?;
+        anyhow::ensure!(
+            victory_loader::step_over_breakpoint_at(base + plan.self_check_offset()),
+            "resolution self-check handler was already configured"
+        );
+        let writes = victory_game::output::validate_writes(mapped, plan, resolution)
+            .map_err(|error| anyhow::anyhow!("resolution patch revalidation failed: {error}"))?;
+        let write_range = writes.range();
+        with_writable_pages(base + write_range.start, write_range.len(), || {
+            // SAFETY: the loader mapped this image and the guard made only the
+            // pages covering these validated fields writable. No full-image
+            // mutable slice aliases the read-only PE pages.
+            unsafe { writes.write_to(base as *mut u8) };
+            Ok(())
+        })?;
+        println!(
+            "resolution     {}x{} (two ladder entries capped)",
+            resolution.width, resolution.height
+        );
+    }
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -553,6 +799,13 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: Option<victory_core::Resolution>,
+) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
 }

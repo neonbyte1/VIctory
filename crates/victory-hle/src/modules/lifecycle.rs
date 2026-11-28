@@ -20,6 +20,65 @@ use windows_sys::core::{PCSTR, PCWSTR, w};
 
 use crate::{HleModule, hle_export};
 
+static OUTPUT_RESOLUTION: std::sync::OnceLock<victory_core::Resolution> =
+    std::sync::OnceLock::new();
+
+/// Set before creating any title window.
+pub fn set_output_resolution(
+    resolution: victory_core::Resolution,
+) -> Result<(), victory_core::Resolution> {
+    OUTPUT_RESOLUTION.set(resolution)
+}
+
+/// Checks the current display area and configured window limit before a
+/// title is launched with a reduced output profile.
+pub fn preflight_output_resolution(
+    resolution: victory_core::Resolution,
+) -> Result<(), &'static str> {
+    let area = work_area().ok_or("could not determine the display work area or screen size")?;
+    let target = (resolution.width as i32, resolution.height as i32);
+    let outer = outer_size(0, wm::WS_OVERLAPPEDWINDOW, target.0, target.1);
+    let chrome = (outer.0 - target.0, outer.1 - target.1);
+    resolution_window_preflight(&area, target, chrome, window_limit())
+        .then_some(())
+        .ok_or("the resolution window cannot fit the display work area and VICTORY_WINDOW_MAX")
+}
+
+fn work_area_with(
+    query: impl FnOnce(&mut RECT) -> bool,
+    screen_size: impl FnOnce() -> Option<(i32, i32)>,
+) -> Option<RECT> {
+    let mut area = RECT::default();
+    if query(&mut area) && area.right > area.left && area.bottom > area.top {
+        return Some(area);
+    }
+    let (width, height) = screen_size()?;
+    (width > 0 && height > 0).then_some(RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    })
+}
+
+fn work_area() -> Option<RECT> {
+    work_area_with(
+        |area| {
+            // SAFETY: `area` receives the primary monitor's work area.
+            unsafe {
+                wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut *area).cast(), 0) != 0
+            }
+        },
+        || {
+            // SAFETY: plain system metrics queries with no pointer arguments.
+            let width = unsafe { wm::GetSystemMetrics(wm::SM_CXSCREEN) };
+            // SAFETY: plain system metrics queries with no pointer arguments.
+            let height = unsafe { wm::GetSystemMetrics(wm::SM_CYSCREEN) };
+            Some((width, height))
+        },
+    )
+}
+
 /// A suspend routine (`quiesced`) or a constrained-change routine
 /// (`constrained`): both take a flag and the title's context.
 type Routine = extern "system" fn(flag: u8, context: *mut c_void);
@@ -197,21 +256,79 @@ pub extern "system" fn CreateWindowExA(
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
-    let mut area = RECT::default();
-    // SAFETY: `area` receives the primary monitor's work area.
-    let known =
-        unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
+fn fit(
+    parent: HWND,
+    ex_style: u32,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    let area = work_area();
+    let known = area.is_some();
+    let area = area.unwrap_or_default();
+    if parent.is_null()
+        && let Some(resolution) = OUTPUT_RESOLUTION.get().copied()
+        && width >= resolution.width as i32
+        && height >= resolution.height as i32
+    {
+        let target = (resolution.width as i32, resolution.height as i32);
+        let requested_outer = outer_size(ex_style, style, target.0, target.1);
+        let chrome = (requested_outer.0 - target.0, requested_outer.1 - target.1);
+        let limit = window_limit();
+        let Some((client, outer)) = fit_resolution_into(&area, target, chrome, limit) else {
+            tracing::error!(
+                target_client = ?target,
+                ?chrome,
+                ?limit,
+                work_area = ?(area.right - area.left, area.bottom - area.top),
+                "resolution window cannot fit its title bar and configured bounds"
+            );
+            return None;
+        };
+        let (left, top) = if known {
+            (
+                area.left + (area.right - area.left - outer.0) / 2,
+                area.top + (area.bottom - area.top - outer.1) / 2,
+            )
+        } else {
+            (x, y)
+        };
+        tracing::info!(
+            asked = ?(width, height),
+            client = ?client,
+            outer = ?outer,
+            ?chrome,
+            "resolution window fitted to the work area and configured limit"
+        );
+        return Some((left, top, outer.0, outer.1));
+    }
     let limit = window_limit();
     let fitted = fit_with_limit(&area, width, height, limit);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+    if !parent.is_null() || !known || fitted == (width, height) {
+        return Some((x, y, width, height));
     }
     tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
     let (w, h) = fitted;
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
-    (left, top, w, h)
+    Some((left, top, w, h))
+}
+
+fn outer_size(ex_style: u32, style: u32, width: i32, height: i32) -> (i32, i32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    // SAFETY: `rect` is valid writable storage; the style flags describe the
+    // title window that will be created.
+    if unsafe { wm::AdjustWindowRectEx(&mut rect, style, 0, ex_style) } == 0 {
+        return (width, height);
+    }
+    (rect.right - rect.left, rect.bottom - rect.top)
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
@@ -235,12 +352,7 @@ fn window_limit() -> Option<(i32, i32)> {
     })
 }
 
-fn fit_with_limit(
-    area: &RECT,
-    width: i32,
-    height: i32,
-    limit: Option<(i32, i32)>,
-) -> (i32, i32) {
+fn fit_with_limit(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> (i32, i32) {
     let Some((max_width, max_height)) = limit else {
         return fit_into(area, width, height);
     };
@@ -251,6 +363,50 @@ fn fit_with_limit(
         bottom: (area.bottom - area.top).min(max_height),
     };
     fit_into(&bounded, width, height)
+}
+
+fn fit_resolution_into(
+    area: &RECT,
+    client: (i32, i32),
+    chrome: (i32, i32),
+    limit: Option<(i32, i32)>,
+) -> Option<((i32, i32), (i32, i32))> {
+    let area_width = (area.right - area.left).max(0);
+    let area_height = (area.bottom - area.top).max(0);
+    let max_outer = limit.map_or((area_width, area_height), |(w, h)| {
+        (area_width.min(w), area_height.min(h))
+    });
+    if chrome.0 < 0
+        || chrome.1 < 0
+        || max_outer.0 <= chrome.0
+        || max_outer.1 <= chrome.1
+        || client.0 <= 0
+        || client.1 <= 0
+    {
+        return None;
+    }
+    let content_area = RECT {
+        left: 0,
+        top: 0,
+        right: (max_outer.0 - chrome.0).max(0),
+        bottom: (max_outer.1 - chrome.1).max(0),
+    };
+    let fitted_client = fit_into(&content_area, client.0, client.1);
+    if fitted_client.0 <= 0 || fitted_client.1 <= 0 {
+        return None;
+    }
+    let fitted_outer = (fitted_client.0 + chrome.0, fitted_client.1 + chrome.1);
+    (fitted_outer.0 <= max_outer.0 && fitted_outer.1 <= max_outer.1)
+        .then_some((fitted_client, fitted_outer))
+}
+
+fn resolution_window_preflight(
+    area: &RECT,
+    client: (i32, i32),
+    chrome: (i32, i32),
+    limit: Option<(i32, i32)>,
+) -> bool {
+    fit_resolution_into(area, client, chrome, limit).is_some()
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
@@ -276,7 +432,15 @@ fn stand_in(title: HWND, ex_style: u32, style: u32, x: i32, y: i32, width: i32, 
     if title.is_null() {
         return;
     }
-    let (x, y, width, height) = fit(std::ptr::null_mut(), x, y, width, height);
+    let Some((x, y, width, height)) =
+        fit(std::ptr::null_mut(), ex_style, style, x, y, width, height)
+    else {
+        tracing::error!("resolution window could not be created within its configured bounds");
+        // No visible stand-in would leave the title running without output.
+        // SAFETY: `GetCurrentProcess` returns a valid pseudo-handle.
+        unsafe { TerminateProcess(GetCurrentProcess(), 1) };
+        std::process::abort();
+    };
     let mut text = vec![0u16; 512];
     // SAFETY: a window this thread just created; the buffer holds 512
     // characters. Its icon, if its class has one.
@@ -689,8 +853,14 @@ mod tests {
             right: 2660,
             bottom: 1490,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((1920, 1080))), (1920, 1080));
-        assert_eq!(fit_with_limit(&area, 640, 480, Some((1920, 1080))), (640, 480));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((1920, 1080))),
+            (1920, 1080)
+        );
+        assert_eq!(
+            fit_with_limit(&area, 640, 480, Some((1920, 1080))),
+            (640, 480)
+        );
         assert_eq!(fit_with_limit(&area, 3840, 2160, None), (2560, 1440));
     }
 
@@ -702,7 +872,10 @@ mod tests {
             right: 1920,
             bottom: 1040,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((2560, 1440))), (1848, 1040));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((2560, 1440))),
+            (1848, 1040)
+        );
         assert_eq!(
             fit_with_limit(&area, wm::CW_USEDEFAULT, 0, Some((1920, 1080))),
             (wm::CW_USEDEFAULT, 0)
@@ -717,7 +890,81 @@ mod tests {
             right: 2560,
             bottom: 1440,
         };
-        assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
+        assert_eq!(
+            fit_with_limit(&area, 1600, 1200, Some((1920, 1080))),
+            (1440, 1080)
+        );
+    }
+
+    #[test]
+    fn resolution_window_fits_1366_by_768_with_title_bar_and_aspect_ratio() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1366,
+            bottom: 768,
+        };
+        let (client, outer) = fit_resolution_into(&area, (1920, 1080), (16, 39), None).unwrap();
+        assert_eq!(client, (1296, 729));
+        assert_eq!(outer, (1312, 768));
+        assert!(outer.0 <= area.right - area.left);
+        assert!(outer.1 <= area.bottom - area.top);
+        assert!((client.0 * 9 - client.1 * 16).abs() <= 16);
+    }
+
+    #[test]
+    fn failed_work_area_query_uses_the_same_screen_fallback_for_preflight_and_fit() {
+        let area = work_area_with(|_| false, || Some((1366, 768))).unwrap();
+        assert_eq!(
+            (area.left, area.top, area.right, area.bottom),
+            (0, 0, 1366, 768)
+        );
+
+        let target = (1920, 1080);
+        let chrome = (16, 39);
+        let fitted = fit_resolution_into(&area, target, chrome, None).unwrap();
+        assert!(resolution_window_preflight(&area, target, chrome, None));
+        assert_eq!(fitted, ((1296, 729), (1312, 768)));
+    }
+
+    #[test]
+    fn resolution_window_max_includes_title_bar_and_keeps_client_aspect_ratio() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let limit = (1280, 720);
+        let chrome = (16, 39);
+        let (client, outer) =
+            fit_resolution_into(&area, (1920, 1080), chrome, Some(limit)).unwrap();
+        assert_eq!(client, (1210, 681));
+        assert_eq!(outer, (1226, 720));
+        assert!(outer.0 <= limit.0);
+        assert!(outer.1 <= limit.1);
+        assert!((client.0 * 9 - client.1 * 16).abs() <= 16);
+        assert_eq!((outer.0 - client.0, outer.1 - client.1), chrome);
+    }
+
+    #[test]
+    fn resolution_window_rejects_a_limit_smaller_than_its_title_bar() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        assert_eq!(
+            fit_resolution_into(&area, (1920, 1080), (16, 39), Some((100, 20))),
+            None
+        );
+        assert!(!resolution_window_preflight(
+            &area,
+            (1920, 1080),
+            (16, 39),
+            Some((100, 20))
+        ));
     }
 
     #[test]

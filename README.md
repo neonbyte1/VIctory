@@ -120,6 +120,26 @@ and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
 upscaler for your GPU (the log says so), the title's own DLLs run.
 
+Resolution profile: the title chooses its real render sizes from the console
+model it sees. Use `--console series-s` or set `VICTORY_CONSOLE=series-s` to
+select its lower-resolution Series S profile; the command-line option takes
+precedence over the environment variable. This changes the console profile,
+including device type and memory budget, rather than only changing the DXGI
+display mode. Unset both to keep the Series X default. The profile is a
+console preset; it does not select an arbitrary pixel size.
+
+For the known Series 1.0.2.1 build, `victory run <exe> --execute
+--resolution 1920x1080` (or `VICTORY_RESOLUTION=1920x1080`) caps the title's
+actual render-target ladder while keeping the Series X device profile. The
+CLI option takes precedence over the environment variable. Unknown builds,
+unmatched or ambiguous executable signatures, and unsupported sizes are
+rejected before the title starts. At present 1920x1080 is the only supported
+custom size. Presentation accepts a 1920x1080 frame or a 3840x2160 backing
+frame whose top-left 1920x1080 region is displayed; other frame geometry is
+rejected. The stand-in window can be resized, and VIctory scales that region
+to its current client size. The game frame geometry and visible crop still
+need confirmation against a supported local executable.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.

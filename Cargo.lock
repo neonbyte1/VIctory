@@ -660,6 +660,7 @@ dependencies = [
  "victory-pe",
  "victory-shader",
  "walkdir",
+ "windows-sys",
 ]
 
 [[package]]
@@ -684,6 +685,7 @@ version = "0.1.0"
 dependencies = [
  "memchr",
  "miniz_oxide",
+ "victory-core",
 ]
 
 [[package]]
@@ -695,6 +697,7 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
@@ -710,6 +713,7 @@ dependencies = [
  "opus-pure",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",

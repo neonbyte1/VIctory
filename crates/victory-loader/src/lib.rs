@@ -37,12 +37,13 @@ mod tls;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use crash::save_on_crash;
 #[cfg(windows)]
 pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
+    step_over_breakpoint_at,
 };
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
