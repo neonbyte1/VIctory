@@ -7,8 +7,9 @@
 //!
 //! "Changed" means a page of the memory changed since the last detiling
 //! ([`crate::watch`], which follows writes through every mapping of the
-//! same physical pages) in the runtime's memory; elsewhere, a content hash
-//! of the whole memory at every submission that samples it.
+//! same physical pages) in the runtime's memory. At each submission that
+//! samples it, hash subresources touching untracked pages, or the whole
+//! texture if it has no tracked pages.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Textures read through descriptor tables are brought up to date, and for
@@ -1024,13 +1025,12 @@ impl Staging {
             if ranges.is_empty() && loose.is_empty() {
                 return (0, None);
             }
-            // Only the subresources in the pages that changed (streamed
-            // textures change page by page; a whole re-read and detile of
-            // each cost up to 430 MB a frame, run integ2).
+            // Untracked pages can change even when the tracker reports no
+            // writes. Re-read only subresources on those or on dirty pages.
             let n = self.footprints.len();
             let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
-            let touched: Vec<usize> = (0..n)
-                .filter(|&i| {
+            let touched: Vec<_> = (0..n)
+                .filter_map(|i| {
                     let (a, b) = span(i);
                     let mut changed = ranges.iter().chain(&loose);
                     changed.any(|&(f, e)| f - start < b && a < e - start)
@@ -1057,23 +1057,26 @@ impl Staging {
             }
             // A changed page that holds only the subresource's bytes says it
             // changed. Pages it shares with other data the title writes
-            // (small textures): its own bytes decide. (Hashing a movie frame
-            // cost 8 ms a frame.)
+            // (small textures), and untracked pages: its own bytes decide.
+            // Keep the hash for untracked pages even after a tracked write,
+            // so the next refresh can skip an unchanged subresource.
             let page = crate::watch::PAGE;
             last.hashes.resize(n, None);
             let fresh: Vec<u32> = touched
                 .into_iter()
-                .filter(|&i| {
+                .filter(|&(i, has_untracked)| {
                     let (a, b) = span(i);
                     let (a0, b0) = (start + a, start + b);
-                    if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
+                    if !has_untracked
+                        && ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0))
+                    {
                         last.hashes[i] = None;
                         return true;
                     }
                     let hash = content_hash(&read[a..b]);
                     last.hashes[i].replace(hash) != Some(hash)
                 })
-                .map(|i| i as u32)
+                .map(|(i, _)| i as u32)
                 .collect();
             if fresh.is_empty() {
                 return (bytes, None);

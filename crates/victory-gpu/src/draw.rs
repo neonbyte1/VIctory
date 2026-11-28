@@ -4068,6 +4068,57 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(submit(Some(0x80)).0, 0, "the same bytes in a shared page: not uploaded");
     }
 
+    #[test]
+    fn a_heap_texture_refreshes_after_a_write_to_its_untracked_page() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // Linear RGBA8, one subresource across two 64 KiB pages. Plain
+        // committed memory is untracked, while the reserved tail is tracked.
+        // SAFETY: a new reservation, released below.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        // SAFETY: committing the first page of the reservation above.
+        assert_eq!(unsafe { VirtualAlloc(memory, PAGE, MEM_COMMIT, PAGE_READWRITE) }, memory);
+        let object = texture_at_address(memory as u64, &texture_words(128, 256, 28, 0x100, 0));
+        let copy = crate::resource::host_copy(object).unwrap();
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        let slots = Slots::new(1);
+        slots.make(0, &view);
+        let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+        viewed.set(0, Some(&view), true);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 8 * 16).unwrap();
+        let submit = || {
+            let list = host.new_list().unwrap();
+            list.defer_heap(&viewed);
+            run(&list, &slots, &read, 0, Some(&out), (1, 1));
+            list.close();
+            copy.stamp();
+            let before = crate::texture::uploads(object);
+            host.execute(&[&list]);
+            // SAFETY: the submitted shader wrote a float at the start of the mapped output.
+            let red = unsafe { data.cast::<f32>().read() };
+            (crate::texture::uploads(object) - before, red)
+        };
+        assert_eq!(submit(), (1, 0.0), "initial zero upload");
+        assert_eq!(submit(), (0, 0.0), "unchanged memory stays on the GPU");
+        // SAFETY: the first texel is in the writable first page.
+        unsafe { memory.cast::<u8>().write(0xff) };
+        assert_eq!(submit(), (1, 1.0), "late write reaches the GPU");
+        assert_eq!(submit(), (0, 1.0), "the refreshed texel stays on the GPU");
+
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(object, 0x10);
+        assert_eq!(release(object), 0);
+        drop(copy);
+        crate::watch::tests::free(memory as usize);
+    }
+
     /// A list recorded before another whose host copy writes a texture it
     /// reads, but run after it, reads the host's texels: whether its upload
     /// from title memory is still due is decided when its submission is
