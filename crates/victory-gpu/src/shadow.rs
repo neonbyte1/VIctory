@@ -1840,6 +1840,34 @@ pub(crate) fn vram_marked_reads(taken: &WriteMarks) -> Vec<(ID3D12Resource, u64,
     reads
 }
 
+/// The title ranges `(start, end)` of every copy whose pages `taken` marks
+/// (both bitmaps), whole: what completing those marks may touch besides the
+/// pages (the copy's bytes, snapshots and tracker; `crate::host`'s pipeline
+/// footprint, [`BUSY`]).
+pub(crate) fn marked_ranges(taken: &WriteMarks) -> Vec<(usize, usize)> {
+    let mut marked = taken.bits(None);
+    if marked.is_empty() {
+        return Vec::new();
+    }
+    marked.sort_unstable();
+    marked.dedup();
+    let m = marks();
+    let mut seen = std::collections::HashSet::new();
+    let mut ranges = Vec::new();
+    for n in marked {
+        let Some((&base, copy)) = m.owners.range(..=n).next_back() else {
+            continue;
+        };
+        if !seen.insert(base) {
+            continue;
+        }
+        if let Some(copy) = copy.upgrade() {
+            ranges.push((copy.start as usize, (copy.start + copy.len) as usize));
+        }
+    }
+    ranges
+}
+
 /// The host GPU address of the buffer views' written-pages bitmap, for the
 /// root UAV of shaders that mark their writes (`memory`: shaders that use
 /// title memory, see [`bitmap`]).
@@ -2658,6 +2686,12 @@ pub(crate) const AFTER: usize = usize::MAX - 1;
 /// clean, it would keep what the miss withholds).
 pub(crate) const KEPT: usize = usize::MAX - 2;
 
+/// The copy of [`Flight`]'s ranges whose completion runs off the submission
+/// lock now (`crate::host`'s pipeline, `VICTORY_PIPELINE`): the whole ranges
+/// of the copies it copies back. None, as [`LABEL`], so that every reader
+/// and every copy (its own too) crosses them and settles it first.
+pub(crate) const BUSY: usize = usize::MAX - 3;
+
 /// Title memory that submissions in flight write and that reaches title
 /// memory only once each completes (`crate::host::Host::finish`), by
 /// submission: ranges `(start, end, copy)` their shaders declared as written
@@ -2771,6 +2805,46 @@ pub(crate) fn land(owner: u64) {
     let mut f = flight();
     f.land(owner);
     FLYING.store(!f.is_empty(), AtomicOrdering::Release);
+    if BUSY_OWNER.load(AtomicOrdering::Acquire) == owner {
+        BUSY_OWNER.store(0, AtomicOrdering::Release);
+        busy_ranges().clear();
+    }
+}
+
+/// The submission whose completion runs off the submission lock ([`BUSY`]),
+/// 0 for none, and its ranges.
+static BUSY_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BUSY_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+fn busy_ranges() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+    BUSY_RANGES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Submission `owner`'s completion runs off the submission lock until it
+/// lands, touching title memory and copies of `ranges` (`[start, end)`):
+/// flown as [`BUSY`]. Under the submission lock.
+pub(crate) fn fly_busy(owner: u64, ranges: Vec<(usize, usize)>) {
+    *busy_ranges() = ranges.clone();
+    BUSY_OWNER.store(owner, AtomicOrdering::Release);
+    fly(
+        owner,
+        ranges.into_iter().map(|(a, e)| (a, e, BUSY)).collect(),
+    );
+}
+
+/// The submission whose completion runs off the submission lock, if one
+/// does. Asked under the submission lock, which it lands under.
+pub(crate) fn busy_owner() -> Option<u64> {
+    std::num::NonZeroU64::new(BUSY_OWNER.load(AtomicOrdering::Acquire)).map(u64::from)
+}
+
+/// [`busy_owner`] if its completion touches `[start, end)`.
+pub(crate) fn busy(start: usize, end: usize) -> Option<u64> {
+    let owner = busy_owner()?;
+    busy_ranges()
+        .iter()
+        .any(|&(a, e)| a < end && start < e)
+        .then_some(owner)
 }
 
 /// [`Flight::crossing`] of the submissions in flight. Asked while
@@ -3138,6 +3212,14 @@ fn stale_check() -> Option<(u64, bool)> {
         }
         on
     })
+}
+
+/// Whether `VICTORY_STALE_CHECK` compares copies with title memory at the
+/// start of submissions: no copy-back may run off the submission lock then
+/// (`crate::host`'s pipeline ends it first).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn checks_stale() -> bool {
+    stale_check().is_some()
 }
 
 /// What [`check_stale`] found since the last [`log_stale`]: copies checked,

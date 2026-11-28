@@ -245,6 +245,10 @@ pub(crate) enum C {
     /// A settle before a page table's rewrite (`crate::memory::prepare`,
     /// `VICTORY_PT_BARRIER`), counted only when its last user was in flight.
     SettleTable,
+    /// A settle of a completion whose middle runs off the submission lock
+    /// (`VICTORY_PIPELINE`) by a step that touches its copies without a
+    /// crossing (`crate::host::Settled::Busy`).
+    SettleBusy,
     SettleUs,
     /// Early release (`crate::early`, `VICTORY_EARLY_RELEASE`): held
     /// segments released on values of writes in flight that title memory
@@ -375,6 +379,26 @@ pub(crate) enum C {
     TablesByWait,
     TablesByOther,
     TablesWaitedUs,
+    /// Copying back (the frame line's "copying back"), by who did it: the
+    /// completion thread, a settle of a preparing, the waits before a title
+    /// submission is prepared, anything else (`crate::host`'s
+    /// `pipeline::copied_back`).
+    BackThreadUs,
+    BackSettleUs,
+    BackWaitUs,
+    BackOtherUs,
+    /// `VICTORY_PIPELINE`: completions whose middle ran off the submission
+    /// lock, and completions the completion thread ran whole for want of a
+    /// footprint (a page table's probes named pages); the middles' time,
+    /// of it the time a preparing ran beside it (the preparing's own waits
+    /// for it left out), and the waits of a lock holder for a middle still
+    /// running, and their time.
+    PipeSplit,
+    PipeWhole,
+    PipeMiddleUs,
+    PipeOverlapUs,
+    PipeWaits,
+    PipeWaitUs,
     /// Not a counter: how many there are. Keep it last.
     Count,
 }
@@ -592,7 +616,11 @@ pub(crate) fn log(frames: f64, gpu_ms: f64, back_ms: f64) {
          {:.1} read-backs ({:.1} waited for), {:.1} marked pages ({:.1} reading and comparing, {:.1} \
          waiting for the lease, {:.1} protecting, {:.1} writing, {:.1} verifying), {:.1} declared \
          ranges ({:.1} comparing), {:.1} slots to read, {:.1} work after, {:.1} lazy-page check; \
-         {:.0} submissions: {:.0} prepared with work in flight, {:.0} with the pipe empty",
+         {:.0} submissions: {:.0} prepared with work in flight, {:.0} with the pipe empty; \
+         copied back by the completion thread {:.1} ms, in settles {:.1}, before preparing {:.1}, \
+         elsewhere {:.1}; pipeline (VICTORY_PIPELINE): {:.1} completions with the copy-back off \
+         the lock ({:.1} whole under it), {:.1} ms copied back off the lock, {:.1} of it beside a \
+         preparing, {:.1} waits for one in progress ({:.1} ms), {:.1} settles of one",
         blocks[0],
         blocks[1],
         blocks[2],
@@ -617,6 +645,17 @@ pub(crate) fn log(frames: f64, gpu_ms: f64, back_ms: f64) {
         c[C::Submissions as usize],
         c[C::PreparedOverlapping as usize],
         c[C::PreparedEmpty as usize],
+        ms(c[C::BackThreadUs as usize]),
+        ms(c[C::BackSettleUs as usize]),
+        ms(c[C::BackWaitUs as usize]),
+        ms(c[C::BackOtherUs as usize]),
+        c[C::PipeSplit as usize],
+        c[C::PipeWhole as usize],
+        ms(c[C::PipeMiddleUs as usize]),
+        ms(c[C::PipeOverlapUs as usize]),
+        c[C::PipeWaits as usize],
+        ms(c[C::PipeWaitUs as usize]),
+        c[C::SettleBusy as usize],
     );
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
