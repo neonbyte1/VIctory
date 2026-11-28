@@ -1889,8 +1889,24 @@ mod state {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
+    /// The groups a mesh dispatch of `x` × `y` × `z` groups runs: the
+    /// title's mesh programs read only the x group id, so `x` (y and z
+    /// other than 1 are logged once); none if any dimension is empty.
+    pub(super) fn mesh_groups(x: u32, y: u32, z: u32) -> Option<u32> {
+        if x == 0 || y == 0 || z == 0 {
+            return None;
+        }
+        if y != 1 || z != 1 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+        }
+        Some(x)
+    }
     /// `DispatchMesh(x, y, z)` (the PC method of List6).
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+        if mesh_groups(x, y, z).is_none() {
+            return;
+        }
         super::count_draw();
         with_state(this, |list, s| s.dispatch_mesh(list, x, y, z));
     }
@@ -3034,6 +3050,20 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(inner), 0);
         assert_eq!(release(outer), 0);
+    }
+
+    /// Mesh programs read only the x group id, so a mesh dispatch runs its
+    /// x groups; one with no groups in any dimension runs nothing.
+    #[cfg(windows)]
+    #[test]
+    fn mesh_dispatches_run_x_groups_unless_empty() {
+        use state::mesh_groups;
+        assert_eq!(mesh_groups(5, 1, 1), Some(5));
+        assert_eq!(mesh_groups(0, 1, 1), None);
+        assert_eq!(mesh_groups(5, 0, 1), None);
+        assert_eq!(mesh_groups(5, 1, 0), None);
+        assert_eq!(mesh_groups(5, 2, 3), Some(5));
+        assert_eq!(mesh_groups(5, u32::MAX, u32::MAX), Some(5));
     }
 
     #[test]
@@ -4315,7 +4345,8 @@ void main() {
             assert_eq!(release(queue), 0);
             assert_eq!(release(title_heap_ptr), 0);
             assert_eq!(release(tex), 0);
-        });    }
+        });
+    }
 
     #[cfg(windows)]
     #[test]
@@ -4524,4 +4555,6 @@ void main() {
             assert_eq!(release(o), 0);
         }
     }
+
+    
 }
