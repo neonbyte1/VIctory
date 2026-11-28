@@ -48,20 +48,33 @@ measurement binaries by hand.
 from your normal `~/.wine`:
 
 ```sh
+GE=$HOME/GE-Proton11-14                # an unpacked GE-Proton release
+export PATH=$GE/files/bin:$PATH        # its wine and wineserver, in this shell
 export WINEPREFIX=$HOME/victory-prefix
 wineboot -u
 SYS=$WINEPREFIX/drive_c/windows/system32
-VKD3D=$HOME/GE-Proton11-14/files/lib/wine/vkd3d-proton/x86_64-windows
+VKD3D=$GE/files/lib/wine/vkd3d-proton/x86_64-windows
 cp "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$SYS/"
 ```
 
-`run-game.sh` unsets an inherited `VKD3D_SHADER_CACHE_PATH`: vkd3d-proton's
-pipeline cache must stay on during game runs (with it off every pipeline is
-a driver compile, minutes of backlog per run instead of seconds).
+The scripts call plain `wine` and `wineserver` from `PATH`; they must be the
+pair from the Wine you built the prefix with (a system `wineserver` next to
+GE-Proton's `wine` fails with a version mismatch). Put that `PATH` line in the
+shell that starts the queue as well. `run-game.sh` sets
+`WINEDLLOVERRIDES=d3d12,d3d12core,dxgi=n` itself and refuses to start without
+`WINEPREFIX`, so a run never lands in `~/.wine`.
+
+`run-game.sh` points `VKD3D_SHADER_CACHE_PATH` at
+`$VICTORY_RUNS_DIR/vkd3d-cache` and gives NVIDIA's own shader cache 12 GB
+(`__GL_SHADER_DISK_CACHE_SIZE`): vkd3d-proton's pipeline cache must stay on
+and survive between runs (a run folder is wiped for every run; with the cache
+off or evicted every pipeline is a driver compile, minutes of backlog per run
+instead of seconds).
 
 **Paths.** Put the game outside the repository and point
-`VICTORY_GAME_DIR` at it; `victory.toml` uses the same folder for
-`victory run`. Never copy game files into the checkout.
+`VICTORY_GAME_DIR` at it (a Linux path is fine: `run-game.sh` turns it into
+`Z:\...` for Wine); `victory.toml` uses the same folder for `victory run`.
+Never copy game files into the checkout.
 
 ## 3. Building
 
@@ -72,7 +85,7 @@ worktrees never overwrite each other's binaries, and keep each measured
 ```sh
 export CARGO_TARGET_DIR=/w/vt-linux
 . tools/linux/env.sh
-tools/linux/build.sh cargo build --profile diag -p victory --features diagnostics
+tools/linux/build.sh cargo build --target x86_64-pc-windows-msvc --profile diag -p victory --features diagnostics
 cp "$CARGO_TARGET_DIR/x86_64-pc-windows-msvc/diag/victory.exe" /w/exe/victory-$(git rev-parse --short HEAD).exe
 ```
 
@@ -84,7 +97,7 @@ the same lock, so a build cannot start during a measured run.
 Tests:
 
 ```sh
-cargo xtask wine-test -- --vkd3d-proton "$VKD3D"
+cargo xtask wine-test --vkd3d-proton "$VKD3D"
 # or, with env.sh sourced:
 tools/linux/build.sh cargo test --target x86_64-pc-windows-msvc -p victory-gpu --features diagnostics
 ```
@@ -137,7 +150,8 @@ GPU tests need a display for DXGI/D3D12 and must not overlap a game run.
 A *gate* gives them a hidden one and serialises them:
 
 ```sh
-export VICTORY_VKD3D_DIR=$HOME/GE-Proton11-14/files/lib/wine/vkd3d-proton/x86_64-windows
+export VICTORY_VKD3D_DIR=$VKD3D        # from section 2
+export VICTORY_HIDDEN=$PWD/tools/linux/hidden.sh   # the copy below lives in /tmp
 cp tools/linux/gate-template.sh /tmp/qgpupasses.sh
 
 cargo test --target x86_64-pc-windows-msvc -p victory-gpu --features diagnostics --no-run
@@ -162,8 +176,9 @@ Rules that the template and the queue rely on:
   its own command line. A bare `pkill wine` or `pkill -f winedbg` would hit
   the game run or another gate.
 - **Never `wineserver -k` the game's prefix.** The gate has a prefix of its
-  own (`$VICTORY_RUNS_DIR/gate/q-prefix`); shutting down the game's prefix
-  during a run kills that run.
+  own (`$VICTORY_RUNS_DIR/gate/q-prefix`, `VICTORY_GATE_PREFIX`) and ignores
+  an exported `WINEPREFIX`; shutting down the game's prefix during a run
+  kills that run.
 - The gate runs the exe through `hidden.sh` (fresh headless gamescope, Wine
   crash dialogs off) and kills its gamescope group afterwards, so nothing
   outlives the test and holds the gate.
@@ -180,6 +195,9 @@ The log for a tag is `$VICTORY_RUNS_DIR/gate/logs/gpu-<tag>.log`.
   (`cargo`, `rustc`, `clang-cl`, `victory.exe translate`) with `SIGSTOP`,
   below 48 GB it resumes them. It never touches the game or other users'
   processes. Run it next to the queue on a shared machine.
+- The Xid watch reads the kernel log with `journalctl -k`; a normal user needs
+  to be in the `systemd-journal` group (or `adm`) for that. Without access the
+  watch ends silently and a reset runs until the time limit.
 - `run-game.sh` samples VRAM with `nvidia-smi` into `vram.csv` (peak in
   `result.txt`) and watches the kernel log for an **Xid**. On a reset it
   waits `XID_GRACE` (15 s) and stops only that run's gamescope, so the
