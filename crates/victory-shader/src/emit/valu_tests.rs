@@ -5729,3 +5729,419 @@ fn v_ldexp_f16_matches_rdna2() {
         );
     });
 }
+
+/// SMEM `s_load_dwordx4` (count 2) or `s_load_dwordx8` (count 3) with byte offset.
+const fn smem_load(count_code: u8, dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | (count_code as u32) << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | (byte_off & 0x1F_FFFF),
+    ]
+}
+
+/// MIMG instruction (`dim` 3 = CUBE).
+const fn mimg_cube(
+    op: u8,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    ssamp: u8,
+    dmask: u8,
+    a16: bool,
+) -> [u32; 2] {
+    [
+        0x3C << 26 | (op as u32) << 18 | (dmask as u32) << 8 | 3 << 3,
+        (vaddr as u32)
+            | (vdata as u32) << 8
+            | ((srsrc as u32 >> 2) & 0x1F) << 16
+            | ((ssamp as u32 >> 2) & 0x1F) << 21
+            | (a16 as u32) << 30,
+    ]
+}
+
+/// Builds a 1-thread compute shader with root constants `s0..s3` copied into
+/// `v1..v4`, SRV 0 (`s[8:15]`) at view heap index 0, raw UAV (`s[20:23]`) at
+/// view heap index 1, and point-clamp sampler (`s[16:19]`) at sampler index 0.
+/// `body` writes `uav_dwords` result dwords starting at `v0`.
+fn build_cube_cs(body: &[u32], uav_dwords: u8) -> HostShader {
+    let mut words = Vec::new();
+    // Copy user SGPR s5 (sampler table) into s6 before zeroing s5 for s[4:5].
+    words.push(s_mov_b32(6, 5));
+    words.push(s_mov_b32(7, 0x80));
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&smem_load(0x03, 8, 4, 0));
+    words.extend_from_slice(&smem_load(0x02, 16, 6, 0));
+    words.extend_from_slice(&smem_load(0x02, 20, 4, 32));
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, sgpr(i)));
+    }
+    words.extend_from_slice(body);
+    for k in 0..uav_dwords {
+        words.extend_from_slice(&buffer_store_dword(k, 20, 4 * u16::from(k)));
+    }
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 5,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Sampler,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 5,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 6 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        view_marks: false,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+/// Runs `shader` on every SM 6.6 adapter (`Host::adapters`, including hardware
+/// GPUs and WARP) with `srv` at heap index 0 and a raw UAV of `uav_dwords` at
+/// heap index 1.
+fn run_cube_cases(
+    shader: &HostShader,
+    srv: View,
+    uav_dwords: u32,
+    cases: &[[u32; 4]],
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let samplers = [D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    }];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let adapters = Host::adapters();
+    assert!(
+        !adapters.is_empty(),
+        "no SM 6.6 hardware or WARP device available"
+    );
+    let views = [srv, View::RawUav(uav_dwords)];
+    for (label, host) in &adapters {
+        eprintln!("cube test adapter: {label}");
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (i, &inputs) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1 | 2) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &samplers,
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            check(label, i, inputs, &out[0]);
+        }
+    }
+}
+
+#[test]
+fn cube_array_samples_layers_faces_and_clamped_ids() {
+    // 2-cube array (12 faces, 4x4 per face): each texel encodes layer, face
+    // and (x, y) in RGBA so both layer/face selection and s/t direction
+    // reconstruction are checked on every face of every layer.
+    let mut texels = Vec::with_capacity(12 * 16);
+    for layer in 0..2u32 {
+        for face in 0..6u32 {
+            for y in 0..4u32 {
+                for x in 0..4u32 {
+                    texels.push([
+                        (10 * layer + face) as f32,
+                        x as f32,
+                        y as f32,
+                        (100 + layer) as f32,
+                    ]);
+                }
+            }
+        }
+    }
+
+    // v1 = s, v2 = t, v3 = layer, v4 = face:
+    // v_fma_f32 v3, v3, 8.0, v4  (VOP3 0x14b, src1 = literal 0x4100_0000)
+    // image_sample_lz v[0:3], v[1:3], s[8:15], s[16:19] dmask:0xf dim:CUBE
+    let [fma_w0, fma_w1] = vop3(0x14b, 3, vgpr(3), 255, vgpr(4));
+    let [img_w0, img_w1] = mimg_cube(0x27, 0, 1, 8, 16, 0xF, false);
+    let shader = build_cube_cs(&[fma_w0, fma_w1, 0x4100_0000, img_w0, img_w1], 4);
+
+    // Centre of texel (x=2, y=1) in [1, 2] face space: 1.0 + (idx + 0.5) / 4.0.
+    let (s, t) = (1.625f32.to_bits(), 1.375f32.to_bits());
+    let mut cases = Vec::new();
+    let mut expected = Vec::new();
+    for layer in 0..2u32 {
+        // Faces 0..=5 plus out-of-range 6 and 7, which clamp to face 5 (-Z)
+        // of the same layer on RDNA2.
+        for face in 0..8u32 {
+            cases.push([s, t, (layer as f32).to_bits(), (face as f32).to_bits()]);
+            expected.push((layer, face.min(5)));
+        }
+    }
+    run_cube_cases(
+        &shader,
+        View::CubeArray(4, 2, &texels),
+        4,
+        &cases,
+        |backend, i, inp, got| {
+            let (layer, clamped_face) = expected[i];
+            let want_r = (10 * layer + clamped_face) as f32;
+            let got_rgba = [got[0], got[1], got[2], got[3]].map(f32::from_bits);
+            assert_eq!(
+                got_rgba,
+                [want_r, 2.0, 1.0, (100 + layer) as f32],
+                "{backend}: layer={} face={} got {got_rgba:?}",
+                f32::from_bits(inp[2]),
+                f32::from_bits(inp[3]),
+            );
+        },
+    );
+
+    // Issue #720's literal-operand reproducer: v3 = 10.0 (layer 1, face 2 = +Y)
+    // with no v_fma in the shader still infers TextureCubeArray and reads 12.0.
+    let const_face = build_cube_cs(
+        &[
+            0x7E02_02FF,
+            0x3FC0_0000, // v_mov_b32 v1, 1.5
+            0x7E04_02FF,
+            0x3FC0_0000, // v_mov_b32 v2, 1.5
+            0x7E06_02FF,
+            0x4120_0000, // v_mov_b32 v3, 10.0
+            mimg_cube(0x27, 0, 1, 8, 16, 0x1, false)[0],
+            mimg_cube(0x27, 0, 1, 8, 16, 0x1, false)[1],
+        ],
+        1,
+    );
+    run_cube_cases(
+        &const_face,
+        View::CubeArray(4, 2, &texels),
+        1,
+        &[[0; 4]],
+        |backend, _, _, got| {
+            assert_eq!(
+                f32::from_bits(got[0]),
+                12.0,
+                "{backend}: constant face 10.0"
+            );
+        },
+    );
+}
+
+#[test]
+fn cube_samples_bare_faces_on_plain_cube_view() {
+    // Plain 1-cube view (`D3D12_SRV_DIMENSION_TEXTURECUBE`): a bare face
+    // operand stays `TextureCube` (kind 5) without regressing single cubes.
+    let mut texels = Vec::with_capacity(6 * 16);
+    for face in 0..6u32 {
+        for _ in 0..16 {
+            texels.push([face as f32, 0.0, 0.0, 1.0]);
+        }
+    }
+    let [img_w0, img_w1] = mimg_cube(0x27, 0, 1, 8, 16, 0x1, false);
+    let shader = build_cube_cs(&[img_w0, img_w1], 1);
+    let mid = 1.5f32.to_bits();
+    let cases: Vec<[u32; 4]> = (0..8u32)
+        .map(|f| [mid, mid, (f as f32).to_bits(), 0])
+        .collect();
+    run_cube_cases(
+        &shader,
+        View::Cube(4, &texels),
+        1,
+        &cases,
+        |backend, f, _, got| {
+            let want = f.min(5) as f32;
+            assert_eq!(
+                f32::from_bits(got[0]),
+                want,
+                "{backend}: plain cube face {f}"
+            );
+        },
+    );
+}
+
+#[test]
+fn cube_array_gather_and_resinfo_match_rdna2() {
+    // 3-cube array (18 faces, 4x4 per face): texel = 100 * layer + 10 * face + y * 4 + x.
+    let mut texels = Vec::with_capacity(18 * 16);
+    for layer in 0..3u32 {
+        for face in 0..6u32 {
+            for y in 0..4u32 {
+                for x in 0..4u32 {
+                    texels.push([(100 * layer + 10 * face + y * 4 + x) as f32; 4]);
+                }
+            }
+        }
+    }
+
+    // `image_gather4_lz` (0x47, dmask 1) with `v_fma_f32 v3, v3, 8.0, v4`.
+    let [fma_w0, fma_w1] = vop3(0x14b, 3, vgpr(3), 255, vgpr(4));
+    let [gat_w0, gat_w1] = mimg_cube(0x47, 0, 1, 8, 16, 0x1, false);
+    let gather_cs = build_cube_cs(&[fma_w0, fma_w1, 0x4100_0000, gat_w0, gat_w1], 4);
+    // At s = t = 1.5 (centre of the 4x4 face, footprint across texels (1,1)..(2,2)),
+    // all four gathered texels come from the requested (layer, face) and sum to
+    // 4 * (100 * layer + 10 * face) + (5 + 6 + 9 + 10) = 400 * layer + 40 * face + 30.
+    let mid = 1.5f32.to_bits();
+    let gather_cases = [
+        ([mid, mid, 0.0f32.to_bits(), 0.0f32.to_bits()], 0, 0),
+        ([mid, mid, 1.0f32.to_bits(), 2.0f32.to_bits()], 1, 2),
+        ([mid, mid, 2.0f32.to_bits(), 5.0f32.to_bits()], 2, 5),
+    ];
+    let g_in: Vec<[u32; 4]> = gather_cases.iter().map(|c| c.0).collect();
+    run_cube_cases(
+        &gather_cs,
+        View::CubeArray(4, 3, &texels),
+        4,
+        &g_in,
+        |backend, i, _, got| {
+            let (_, layer, face) = gather_cases[i];
+            let vals = [got[0], got[1], got[2], got[3]].map(f32::from_bits);
+            let sum: f32 = vals.iter().sum();
+            let want_sum = (400 * layer + 40 * face + 30) as f32;
+            assert_eq!(
+                sum, want_sum,
+                "{backend}: gather4 layer={layer} face={face} got {vals:?}"
+            );
+        },
+    );
+
+    // Standalone `image_get_resinfo v[0:3], v1, s[8:15] dmask:0xf dim:CUBE`:
+    // RDNA2 returns [width, height, 6 * cubes, levels] = [4, 4, 18, 1] for 3 cubes,
+    // and [4, 4, 12, 1] for 2 cubes.
+    let [res_w0, res_w1] = mimg_cube(0x0e, 0, 1, 8, 0, 0xF, false);
+    let resinfo_cs = build_cube_cs(&[res_w0, res_w1], 4);
+    run_cube_cases(
+        &resinfo_cs,
+        View::CubeArray(4, 3, &texels),
+        4,
+        &[[0; 4]],
+        |backend, _, _, got| {
+            assert_eq!(&got[..4], &[4, 4, 18, 1], "{backend}: 3-cube resinfo");
+        },
+    );
+    run_cube_cases(
+        &resinfo_cs,
+        View::CubeArray(4, 2, &texels[..12 * 16]),
+        4,
+        &[[0; 4]],
+        |backend, _, _, got| {
+            assert_eq!(&got[..4], &[4, 4, 12, 1], "{backend}: 2-cube resinfo");
+        },
+    );
+}

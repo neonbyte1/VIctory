@@ -306,6 +306,8 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+    /// Cube image sites (`dim` 3) whose descriptor is a `TextureCubeArray`.
+    cube_arrays: HashSet<Site>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -565,6 +567,9 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
     if fixed_below { lowest } else { lowest.max(code_end & !3) }
 }
 
+mod cube_array;
+use cube_array::cube_arrays;
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -732,6 +737,7 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
+            cube_arrays: cube_arrays(p, x.res),
         }
     }
 
@@ -9470,12 +9476,20 @@ impl<'a> Lower<'a> {
             1 => (2, 2),
             2 => (4, 3),
             // Sampled (face coordinates and face, see `cube_direction`) or
-            // sized only.
+            // sized only; `TextureCubeArray` (kind 9) when the program uses
+            // the cube slice.
             3 if name.starts_with("image_sample")
                 || name.starts_with("image_gather")
                 || name == "image_get_resinfo" =>
             {
-                (5, 3)
+                (
+                    if self.cube_arrays.contains(&site) {
+                        9
+                    } else {
+                        5
+                    },
+                    3,
+                )
             }
             4 => (6, 2),
             5 => (7, 3),
@@ -9738,11 +9752,16 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                let mut x = if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
                     self.s.m.extract(c, d, ch)
                 };
+                if kind == 9 && ch == 2 {
+                    // D3D reports cubes; the console's `resinfo` counts faces.
+                    let six = self.s.m.i32(6);
+                    x = self.s.m.bin(c, Bin::Mul, x, six);
+                }
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -9796,7 +9815,7 @@ impl<'a> Lower<'a> {
             // direction: with `_g16` each direction starts a VGPR, an odd
             // last gradient alone in its low half (LLVM's GFX10 assembler
             // tests, `gfx10_asm_mimg.s`: 3D `image_sample_d_g16` takes 7).
-            let grad_dim = if kind == 5 { 2 } else { spatial };
+            let grad_dim = if matches!(kind, 5 | 9) { 2 } else { spatial };
             let grad_regs = if op == 63 {
                 if g16 { grad_dim.div_ceil(2) } else { grad_dim }
             } else {
@@ -9819,12 +9838,15 @@ impl<'a> Lower<'a> {
                 let x = addr_at(self, coord_base, *a16, k)?;
                 *slot = to_float(self, *a16, x);
             }
-            if kind == 5 {
+            if matches!(kind, 5 | 9) {
                 if *unorm || op == 81 {
                     return Err("a cube sample with texel coordinates or a level query");
                 }
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                let (dir, slice) = self.cube_direction(cs[0], cs[1], cs[2], kind == 9);
                 cs[..3].copy_from_slice(&dir);
+                if let Some(slice) = slice {
+                    cs[3] = slice;
+                }
             }
             if *unorm {
                 // Texel coordinates: divided by the size of level 0.
@@ -9861,7 +9883,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            let offsets = if kind == 5 {
+            let offsets = if matches!(kind, 5 | 9) {
                 0
             } else {
                 (coords - usize::from(kind == 6 || kind == 7)).min(3)
@@ -9913,7 +9935,7 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
-                63 if kind == 5 => {
+                63 if matches!(kind, 5 | 9) => {
                     // A cube's gradients are the face's: ds, dt per step in x,
                     // then in y, in face coordinates (a face spans 1). The level
                     // the hardware picks from them, isotropically: log2 of the
@@ -10130,13 +10152,12 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// The direction a cube sample's face coordinates stand for: the
-    /// console takes s and t in [1, 2] (`v_cubesc`/`v_cubetc` over
-    /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
-    /// host's cube sampling turns back into the same texel.
-    // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
-    fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
+    /// The direction (and, for `array`, the cube slice) a cube sample's face
+    /// coordinates stand for: the console takes s and t in [1, 2]
+    /// (`v_cubesc`/`v_cubetc` over `|v_cubema|`, plus 1.5) and `8 * slice +
+    /// face` (`v_cubeid`), clamping face ids 6 and 7 to face 5 (-z), which
+    /// the host's cube sampling turns back into the same texel.
+    fn cube_direction(&mut self, s: V, t: V, face: V, array: bool) -> ([V; 3], Option<V>) {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
         let (two, three) = (k(self, 2.0), k(self, 3.0));
@@ -10150,22 +10171,31 @@ impl<'a> Lower<'a> {
             self.s.m.bin(c, Bin::Sub, z, v),
         );
         let (one, mone) = (k(self, 1.0), k(self, -1.0));
-        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
-        // Per face +x, -x, +y, -y, +z, -z.
+        let idx = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        let seven = self.s.m.i32(7);
+        let f = self.s.m.bin(c, Bin::And, idx, seven);
+        let slice = array.then(|| {
+            let k3 = self.s.m.i32(3);
+            let s = self.s.m.bin(c, Bin::LShr, idx, k3);
+            self.s.m.cast(c, Cast::UiToFp, s, self.s.t.f32)
+        });
+        // Per face +x, -x, +y, -y, +z, -z (6 and 7 clamp to -z on RDNA2).
         let table = [
             [one, mone, u, u, u, nu],
             [nv, nv, one, mone, nv, nv],
             [nu, u, v, nv, one, mone],
         ];
-        table.map(|row| {
+        let dir = table.map(|row| {
             let mut r = row[0];
             for (n, &x) in row.iter().enumerate().skip(1) {
                 let kn = self.s.m.i32(n as u32);
-                let is = self.s.m.cmp(c, pred::EQ, f, kn);
+                let p = if n == 5 { pred::IUGE } else { pred::EQ };
+                let is = self.s.m.cmp(c, p, f, kn);
                 r = self.s.m.select(c, is, x, r);
             }
             r
-        })
+        });
+        (dir, slice)
     }
 
     /// `image_gather4_l(_o)`: DXIL gathers only from a view's first level,
@@ -11963,7 +11993,7 @@ mod tests {
 
     mod size_handles;
 
-    const S_ENDPGM: u32 = 0xBF81_0000;
+    pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
     /// A program's constant table starts after its instructions, unless a
     /// load at a fixed offset reads below that.
@@ -12027,7 +12057,7 @@ mod tests {
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
+    pub(super) fn lower_with(
         words: &[u32],
         layout: Vec<RootParam>,
         used: Vec<UsedResource>,
@@ -12421,7 +12451,7 @@ mod tests {
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
-    fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+    pub(super) fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let range = |kind, user_data, slot| UsedResource {
             kind,
             root: RootType::Table,
@@ -13345,4 +13375,5 @@ mod tests {
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
     }
+
 }
