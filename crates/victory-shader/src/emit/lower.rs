@@ -31,6 +31,7 @@ mod frexp;
 mod trunc;
 mod rndne;
 mod directed;
+mod fract;
 #[cfg(all(test, windows))]
 mod mark_tests;
 #[cfg(all(test, windows))]
@@ -7695,6 +7696,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, Cast::FPTrunc, a, self.s.t.f32);
                 float(self, r)
             }
+            "v_fract_f64" => self.fract_f64(inst, guard),
             "v_cvt_f32_u32" => {
                 // WARP can misround a full-width uitofp. Each 16-bit
                 // half and the scaled high half are exact in f32, so the

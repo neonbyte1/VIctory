@@ -2220,6 +2220,86 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
 }
 
 #[test]
+fn fract_f64_vop1_returns_both_words_below_one() {
+    let limit = f64::from_bits(1.0f64.to_bits() - 1);
+    let values = [
+        0.0,
+        -0.0,
+        f64::from_bits(1),
+        f64::from_bits(0x8000_0000_0000_0001),
+        -2.0f64.powi(-54),
+        -3.0 * 2.0f64.powi(-54),
+        -5.0 * 2.0f64.powi(-54),
+        -2.0f64.powi(-22),
+        -2.0f64.powi(-21),
+        -(2.0f64.powi(-21) - 2.0f64.powi(-54)),
+        0.25,
+        -0.25,
+        0.5,
+        -0.5,
+        -limit,
+        1.25,
+        -1.25,
+        -13.5,
+        524_288.0 + 2.0f64.powi(-33),
+        -(524_288.0 + 2.0f64.powi(-33)),
+        1_048_576.125,
+        -1_048_576.125,
+        2_097_152.75,
+        -2_097_152.75,
+        4_503_599_627_370_495.5,
+        4_503_599_627_370_496.0,
+        -4_503_599_627_370_497.0,
+        f64::MAX,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::from_bits(0xfff0_0000_0000_0020),
+    ];
+    let inputs: Vec<_> = values
+        .iter()
+        .map(|x| {
+            let bits = x.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+    for source in [vgpr(1), sgpr(0)] {
+        for (word, shift) in [(6, 0), (7, 32)] {
+            let shader = build_valu_cs(&[vop1(0x03e, 6, source), vop1(0x001, 0, vgpr(word))]);
+            run_cases(&shader, &inputs, |backend, idx, _, got| {
+                let value = values[idx];
+                if value.is_finite() {
+                    let expected = (value - value.floor()).min(limit);
+                    let want = (expected.to_bits() >> shift) as u32;
+                    assert_eq!(got, want, "{backend}: source {source}, {value:?}, v{word}");
+                } else if shift == 32 {
+                    assert_eq!(got & 0x7ff8_0000, 0x7ff8_0000, "{backend}: quiet NaN");
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn fract_f64_vop3_literals_obey_abs_and_neg() {
+    let [op, sources] = vop3(0x1be, 6, 255, 0, 0);
+    let cases = [
+        (op, sources | 1 << 29, 0x402a_8000, 0x3fe8_0000), // 0.75 from negating +13.25.
+        (op | 1 << 8, sources, 0xc02a_8000, 0x3fd0_0000),  // 0.25 from abs(-13.25).
+    ];
+    for (op, sources, literal, expected) in cases {
+        let shader = build_valu_cs(&[op, sources, literal, vop1(0x001, 0, vgpr(7))]);
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let bits = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(bits & 0x8001, 0, "SFI0 doubles and int64 feature bits");
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}: literal {literal:#x}");
+        });
+    }
+}
+
+#[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
     let shader = build_valu_cs(&[vop1(0x020, 0, vgpr(1))]);
