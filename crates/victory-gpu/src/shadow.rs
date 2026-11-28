@@ -311,6 +311,26 @@ impl Shadow {
         self.marks.is_some()
     }
 
+    /// Whether every page of this copy has a mark bit below the bitmap's last
+    /// dword (which holds the overflow sink bit and is cleared whole in
+    /// [`copy_back_marks`]).
+    pub(crate) fn marks_complete(&self) -> bool {
+        self.marks
+            .is_some_and(|base| marks_below_last_word(base, pages(self.start, self.len)))
+    }
+
+    /// Marks the 64 KiB title page at `page` in the written-pages bitmap
+    /// (`memory`: shaders using title memory), as a shader write does (tests).
+    #[cfg(test)]
+    pub(crate) fn mark_page_for_test(&self, page: usize, memory: bool) {
+        let (bit, _) = self
+            .mark_entry(page as u64)
+            .expect("tracked copy with mark bits");
+        let b = bitmap(memory).expect("written-pages bitmap");
+        // SAFETY: `bit` is a valid mark bit inside the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -869,6 +889,13 @@ fn pages(start: u64, len: u64) -> u32 {
     ((start + len.max(1) - 1) >> 16).saturating_sub(start >> 16) as u32 + 1
 }
 
+/// Whether `page_count` consecutive mark bits starting at `base` all lie below
+/// the written-pages bitmap's last dword (which is cleared whole because of the
+/// overflow sink bit).
+fn marks_below_last_word(base: u32, page_count: u32) -> bool {
+    u64::from(base) + u64::from(page_count) <= u64::from(victory_shader::emit::VIEW_WRITE_BITS - 32)
+}
+
 /// The bits of the buffer views' written-pages bitmap (`victory_shader::
 /// emit`, "Write marks"): a run per tracked copy, a bit per title page it
 /// touches, for as long as it lives.
@@ -1130,11 +1157,12 @@ fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow
 }
 
 /// After a submission: every page its shaders marked as written through
-/// views goes back ([`Shadow::copy_back_marked`]), but for pages in
+/// views goes back ([`Shadow::copy_back_marked`]), except pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared) and, with `memory_withheld`, pages that shaders using
-/// title memory marked; the bitmaps are cleared. Before the copy-backs of
-/// declared ranges, which disarm the copies.
+/// title memory marked; both kinds of withheld marked pages are dropped from
+/// the copies (`crate::memory::drop_withheld`), and the bitmaps are cleared.
+/// Before the copy-backs of declared ranges, which disarm the copies.
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
@@ -1178,11 +1206,13 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    let mut dropped = Vec::new();
     for_each_by_page(pages, |copy, page| {
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
         {
+            dropped.push(page);
             return;
         }
         let written = copy.copy_back_marked(page);
@@ -1194,6 +1224,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     });
+    // Dropped after the marked copy-backs above: an immediate retake on a
+    // shared page would otherwise mark another copy's page changed before its
+    // own copy-back runs.
+    dropped.sort_unstable();
+    dropped.dedup();
+    for page in dropped {
+        crate::memory::drop_withheld(page, PAGE);
+    }
 }
 
 struct Entry {
@@ -2874,5 +2912,27 @@ pub(crate) fn mark_read(memory: bool, slot: u32) {
             );
             unregister(p, p as u64);
         }
+    }
+
+    /// Copies whose mark bits reach the bitmap's last dword (cleared whole for
+    /// the overflow sink bit) are not treated as having complete marks.
+    #[test]
+    fn marks_below_last_word_excludes_the_sink_dword() {
+        let limit = victory_shader::emit::VIEW_WRITE_BITS - 32;
+        assert!(marks_below_last_word(0, 1));
+        assert!(
+            marks_below_last_word(limit - 1, 1),
+            "last bit before final dword"
+        );
+        assert!(
+            marks_below_last_word(limit - 4, 4),
+            "run ending just before final dword"
+        );
+        assert!(!marks_below_last_word(limit, 1), "first bit of final dword");
+        assert!(
+            !marks_below_last_word(limit - 1, 2),
+            "run crossing into final dword"
+        );
+        assert!(!marks_below_last_word(u32::MAX, 1), "overflow-safe");
     }
 }

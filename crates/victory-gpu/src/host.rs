@@ -2092,7 +2092,14 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+        struct WriteBack {
+            shadow: std::sync::Arc<crate::shadow::Shadow>,
+            address: usize,
+            len: usize,
+            goes_back: bool,
+            marked: bool,
+        }
+        let mut back: Vec<WriteBack> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
@@ -2113,15 +2120,25 @@ impl Host {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len, _, memory) = step {
+                if let Step::GpuWrite(shadow, address, len, marked, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
-                    // A range both kinds declare is withheld whole.
+                    // A range both kinds declare is withheld whole; its writes
+                    // count as marked only if every step naming it marks them.
                     let goes_back = !(missed && *memory);
                     match index.get(&key) {
-                        Some(&i) => back[i].3 &= goes_back,
+                        Some(&i) => {
+                            back[i].goes_back &= goes_back;
+                            back[i].marked &= *marked;
+                        }
                         None => {
                             index.insert(key, back.len());
-                            back.push((shadow.clone(), *address, *len, goes_back));
+                            back.push(WriteBack {
+                                shadow: shadow.clone(),
+                                address: *address,
+                                len: *len,
+                                goes_back,
+                                marked: *marked,
+                            });
                         }
                     }
                 }
@@ -2132,19 +2149,21 @@ impl Host {
         // program using title memory and another both wrote).
         let held: Vec<(usize, usize, usize)> = back
             .iter()
-            .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (std::sync::Arc::as_ptr(s) as usize, *a, *n))
+            .filter(|b| !b.goes_back)
+            .map(|b| (std::sync::Arc::as_ptr(&b.shadow) as usize, b.address, b.len))
             .collect();
-        for b in back.iter_mut().filter(|b| b.3) {
-            let copy = std::sync::Arc::as_ptr(&b.0) as usize;
-            b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
+        for b in back.iter_mut().filter(|b| b.goes_back) {
+            let copy = std::sync::Arc::as_ptr(&b.shadow) as usize;
+            b.goes_back = !held
+                .iter()
+                .any(|&(c, a, n)| c == copy && a < b.address + b.len && b.address < a + n);
         }
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
         let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
             .iter()
-            .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (s.clone(), *a, *n))
+            .filter(|b| !b.goes_back)
+            .map(|b| (b.shadow.clone(), b.address, b.len))
             .collect();
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
@@ -2152,15 +2171,19 @@ impl Host {
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
-        for (shadow, address, len, goes_back) in &back {
-            let (address, len) = (*address, *len);
-            if *goes_back {
-                let written = shadow.copy_back(address, len);
+        for b in &back {
+            if b.goes_back {
+                let written = b.shadow.copy_back(b.address, b.len);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             } else {
-                shadow.keep_writes(address, len);
-                crate::memory::note_withheld(len as u64);
-                crate::memory::drop_withheld(address, len);
+                b.shadow.keep_writes(b.address, b.len);
+                crate::memory::note_withheld(b.len as u64);
+                // Where every step naming the range marked its writes (and no
+                // mark bit of the copy falls in the cleared last dword),
+                // `copy_back_marks` already dropped the pages shaders wrote.
+                if !(b.marked && b.shadow.marks_complete()) {
+                    crate::memory::drop_withheld(b.address, b.len);
+                }
             }
         }
         for list in runs {
@@ -5597,6 +5620,265 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+
+    /// A withheld range whose steps are all marked drops only the pages that
+    /// shaders marked; unmarked pages stay clean in the host copy and do not
+    /// re-copy from title memory on the next refresh.
+    #[test]
+    fn withheld_marked_range_drops_only_marked_pages() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        for (page, byte) in [(0, 0x11u8), (1, 0x22), (2, 0x33)] {
+            // SAFETY: our pool, not guarded yet.
+            unsafe { ((p + page * PAGE + 16) as *mut u8).write_volatile(byte) };
+        }
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+        let list = host.new_list().unwrap();
+        {
+            let _writer = list.writer_uses_memory(true);
+            copy.refresh(&list, p as u64, len as u64);
+            copy.gpu_writes(&list, p as u64, len as u64, true);
+        }
+        let c = copy.clone();
+        // `defer` flushes the pending refresh first, then simulates the shader
+        // write and its page mark before copy-back runs.
+        list.defer(move || {
+            c.write_host((p + 16) as u64, &[0xaa]);
+            c.mark_page_for_test(p, true);
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pool.
+        let title = |page: usize| unsafe { ((p + page * PAGE + 16) as *const u8).read_volatile() };
+        assert_eq!(
+            (title(0), title(1), title(2)),
+            (0x11, 0x22, 0x33),
+            "title memory untouched"
+        );
+        assert_eq!(
+            copy.update(p + PAGE, PAGE),
+            0,
+            "unmarked page 1 stays clean"
+        );
+        assert_eq!(
+            copy.update(p + 2 * PAGE, PAGE),
+            0,
+            "unmarked page 2 stays clean"
+        );
+        assert_eq!(copy.update(p, PAGE), PAGE, "marked page 0 was dropped");
+        assert_eq!(
+            copy.read_host((p + 16) as u64, 1)[0] & 0xff,
+            0x11,
+            "page 0 takes title memory again"
+        );
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// An ordinary marked range withheld because it overlaps a title-memory
+    /// withheld range drops the pages marked in the ordinary bitmap via
+    /// `copy_back_marks`, while leaving unmarked pages in both ranges clean.
+    #[test]
+    fn withheld_overlapping_ordinary_marked_write_drops_only_marked_pages() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        for (page, byte) in [(0, 0x11u8), (1, 0x22), (2, 0x33)] {
+            // SAFETY: our pool, not guarded yet.
+            unsafe { ((p + page * PAGE + 16) as *mut u8).write_volatile(byte) };
+        }
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+        let list = host.new_list().unwrap();
+        {
+            let _writer = list.writer_uses_memory(true);
+            copy.refresh(&list, p as u64, (2 * PAGE) as u64);
+            copy.gpu_writes(&list, p as u64, (2 * PAGE) as u64, true);
+        }
+        {
+            let _writer = list.writer_uses_memory(false);
+            copy.refresh(&list, (p + PAGE) as u64, (2 * PAGE) as u64);
+            copy.gpu_writes(&list, (p + PAGE) as u64, (2 * PAGE) as u64, true);
+        }
+        let c = copy.clone();
+        list.defer(move || {
+            c.write_host((p + 16) as u64, &[0xaa]);
+            c.mark_page_for_test(p, true);
+            c.write_host((p + PAGE + 16) as u64, &[0xbb]);
+            c.mark_page_for_test(p + PAGE, false);
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pool.
+        let title = |page: usize| unsafe { ((p + page * PAGE + 16) as *const u8).read_volatile() };
+        assert_eq!(
+            (title(0), title(1), title(2)),
+            (0x11, 0x22, 0x33),
+            "both withheld writes stay out of title memory"
+        );
+        assert_eq!(
+            copy.update(p + 2 * PAGE, PAGE),
+            0,
+            "unmarked page 2 stays clean"
+        );
+        assert_eq!(
+            copy.update(p, PAGE),
+            PAGE,
+            "title-memory marked page 0 dropped"
+        );
+        assert_eq!(
+            copy.update(p + PAGE, PAGE),
+            PAGE,
+            "ordinary-bitmap withheld page 1 dropped"
+        );
+        assert_eq!(copy.read_host((p + 16) as u64, 1)[0] & 0xff, 0x11);
+        assert_eq!(copy.read_host((p + PAGE + 16) as u64, 1)[0] & 0xff, 0x22);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// A withheld range declared by both a marked step and an unmarked step
+    /// merges `marked` with AND and still drops the whole range, so unmarked
+    /// writes cannot remain stale in the host copy.
+    #[test]
+    fn withheld_range_mixing_marked_and_unmarked_steps_drops_whole_range() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        for (page, byte) in [(0, 0x11u8), (1, 0x22)] {
+            // SAFETY: our pool, not guarded yet.
+            unsafe { ((p + page * PAGE + 16) as *mut u8).write_volatile(byte) };
+        }
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+        let list = host.new_list().unwrap();
+        {
+            let _writer = list.writer_uses_memory(true);
+            copy.refresh(&list, p as u64, len as u64);
+            copy.gpu_writes(&list, p as u64, len as u64, true);
+        }
+        {
+            let _writer = list.writer_uses_memory(false);
+            copy.gpu_writes(&list, p as u64, len as u64, false);
+        }
+        let c = copy.clone();
+        list.defer(move || {
+            // Unmarked write to page 1 (no mark bit set).
+            c.write_host((p + PAGE + 16) as u64, &[0xcc]);
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pool.
+        let title = |page: usize| unsafe { ((p + page * PAGE + 16) as *const u8).read_volatile() };
+        assert_eq!(
+            (title(0), title(1)),
+            (0x11, 0x22),
+            "withheld range stays out of title memory"
+        );
+        assert_eq!(
+            copy.update(p, len),
+            len,
+            "mixed marked/unmarked range drops whole"
+        );
+        assert_eq!(
+            copy.read_host((p + PAGE + 16) as u64, 1)[0] & 0xff,
+            0x22,
+            "unmarked write on page 1 is cleared from the copy"
+        );
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Dropping withheld marked pages in `copy_back_marks` runs after all
+    /// non-withheld marked copy-backs, so an immediate retake on a shared page
+    /// does not mark another copy's page changed before its own copy-back.
+    #[test]
+    fn withheld_marked_drop_runs_after_other_copy_marked_copy_back() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(2);
+        // SAFETY: our pool, not guarded yet.
+        unsafe {
+            ((p + 16) as *mut u8).write_volatile(0x11);
+            ((p + 32) as *mut u8).write_volatile(0x22);
+        }
+        crate::shadow::register(p, p as u64, (2 * PAGE) as u64);
+        crate::shadow::register(p + 1, p as u64, PAGE as u64);
+        let outer = crate::shadow::find(p as u64, (2 * PAGE) as u64).unwrap();
+        let inner = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&outer, &inner));
+        let list = host.new_list().unwrap();
+        {
+            // Outer has a withheld marked range, plus an overlapping ordinary
+            // marked write whose mark lands in the ordinary bitmap.
+            let _writer = list.writer_uses_memory(true);
+            outer.refresh(&list, p as u64, (2 * PAGE) as u64);
+            outer.gpu_writes(&list, p as u64, (2 * PAGE) as u64, true);
+        }
+        {
+            let _writer = list.writer_uses_memory(false);
+            outer.gpu_writes(&list, p as u64, PAGE as u64, true);
+            inner.refresh(&list, p as u64, PAGE as u64);
+            inner.gpu_writes(&list, p as u64, PAGE as u64, true);
+        }
+        let (o, i) = (outer.clone(), inner.clone());
+        list.defer(move || {
+            o.write_host((p + 16) as u64, &[0xaa]);
+            o.mark_page_for_test(p, false);
+            i.write_host((p + 32) as u64, &[0xbb]);
+            i.mark_page_for_test(p, false);
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pool.
+        let title = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!(
+            title(16),
+            0x11,
+            "withheld outer write does not reach title memory"
+        );
+        assert_eq!(
+            title(32),
+            0xbb,
+            "non-withheld inner write copies back before outer's page is retaken"
+        );
+        assert_eq!(
+            outer.update(p + PAGE, PAGE),
+            0,
+            "unmarked outer page 1 stays clean"
+        );
+        assert_eq!(
+            outer.update(p, PAGE),
+            PAGE,
+            "withheld marked outer page 0 was dropped"
+        );
+        assert_eq!(outer.read_host((p + 16) as u64, 1)[0] & 0xff, 0x11);
+        assert_eq!(outer.read_host((p + 32) as u64, 1)[0] & 0xff, 0xbb);
+        crate::shadow::unregister(p + 1, p as u64);
+        crate::shadow::unregister(p, p as u64);
+        drop((outer, inner));
+        crate::watch::tests::free(p);
     }
 }
 
