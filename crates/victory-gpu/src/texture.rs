@@ -713,30 +713,227 @@ fn copies(
 /// and the subresources detiled into it.
 pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 
+struct Job {
+    call: fn(*const (), usize),
+    data: *const (),
+    n: usize,
+    next: std::sync::atomic::AtomicUsize,
+    panicked: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+// SAFETY: `Job` is shared across worker threads only while the caller's
+// `WaitGuard` keeps the caller's stack frame alive until `remaining == 0`,
+// and `data` points to an `F: Fn(usize) + Sync`.
+unsafe impl Sync for Job {}
+
+struct PoolState {
+    job: *const Job,
+    generation: u64,
+    wanted: usize,
+    claimed: usize,
+    remaining: usize,
+    shutdown: bool,
+}
+
+// SAFETY: `job` points to a `Sync` `Job` pinned on the caller's stack for the
+// duration of the batch (`remaining > 0`).
+unsafe impl Send for PoolState {}
+
+/// Persistent worker pool for [`in_parallel`]: worker threads stay alive
+/// across submissions so each thread keeps its `thread_local!` [`Scratch`]
+/// buffer warm instead of re-faulting and zero-filling it on every call.
+struct ParallelPool {
+    workers: usize,
+    run_lock: Mutex<()>,
+    state: Arc<(Mutex<PoolState>, std::sync::Condvar, std::sync::Condvar)>,
+    #[cfg(test)]
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ParallelPool {
+    fn new(workers: usize) -> Self {
+        let state = Arc::new((
+            Mutex::new(PoolState {
+                job: std::ptr::null(),
+                generation: 0,
+                wanted: 0,
+                claimed: 0,
+                remaining: 0,
+                shutdown: false,
+            }),
+            std::sync::Condvar::new(),
+            std::sync::Condvar::new(),
+        ));
+        let mut live_workers = 0usize;
+        #[cfg(test)]
+        let mut handles = Vec::with_capacity(workers);
+        for idx in 0..workers {
+            let shared = Arc::clone(&state);
+            let builder = std::thread::Builder::new().name(format!("victory-tex-{idx}"));
+            if let Ok(h) = builder.spawn(move || {
+                let (lock, work_cv, done_cv) = &*shared;
+                let mut my_gen = 0u64;
+                loop {
+                    let job_ptr = {
+                        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while !st.shutdown && st.generation == my_gen {
+                            st = work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                        }
+                        if st.shutdown {
+                            break;
+                        }
+                        my_gen = st.generation;
+                        if st.claimed >= st.wanted {
+                            continue;
+                        }
+                        st.claimed += 1;
+                        st.job
+                    };
+                    // SAFETY: `job_ptr` is non-null and valid until this worker
+                    // decrements `st.remaining` below.
+                    run_job(unsafe { &*job_ptr });
+                    let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    st.remaining -= 1;
+                    if st.remaining == 0 {
+                        st.job = std::ptr::null();
+                        done_cv.notify_one();
+                    }
+                }
+            }) {
+                live_workers += 1;
+                #[cfg(test)]
+                handles.push(h);
+                #[cfg(not(test))]
+                drop(h);
+            }
+        }
+        Self {
+            workers: live_workers,
+            run_lock: Mutex::new(()),
+            state,
+            #[cfg(test)]
+            handles,
+        }
+    }
+
+    fn run<F: Fn(usize) + Sync>(&self, threads: usize, n: usize, f: F) {
+        use std::sync::atomic::AtomicUsize;
+
+        let workers = threads.saturating_sub(1).min(self.workers);
+        if workers == 0 || n < 2 {
+            (0..n).for_each(f);
+            return;
+        }
+        // Contended or re-entrant call: run inline instead of blocking or
+        // deadlocking against an outer `in_parallel` holding `run_lock`.
+        let Ok(_run) = self.run_lock.try_lock() else {
+            (0..n).for_each(f);
+            return;
+        };
+
+        fn invoke<F: Fn(usize) + Sync>(data: *const (), i: usize) {
+            // SAFETY: `data` points to `f: F` on `run`'s stack for the batch.
+            unsafe { (&*data.cast::<F>())(i) };
+        }
+
+        let job = Job {
+            call: invoke::<F>,
+            data: (&raw const f).cast(),
+            n,
+            next: AtomicUsize::new(0),
+            panicked: Mutex::new(None),
+        };
+
+        struct WaitGuard<'a> {
+            state: &'a (Mutex<PoolState>, std::sync::Condvar, std::sync::Condvar),
+        }
+        impl Drop for WaitGuard<'_> {
+            fn drop(&mut self) {
+                let (lock, _, done_cv) = self.state;
+                let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while st.remaining > 0 {
+                    st = done_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                st.job = std::ptr::null();
+            }
+        }
+
+        {
+            let (lock, work_cv, _) = &*self.state;
+            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            st.job = &raw const job;
+            st.wanted = workers;
+            st.claimed = 0;
+            st.remaining = workers;
+            st.generation = st.generation.wrapping_add(1);
+            drop(st);
+            work_cv.notify_all();
+        }
+        let guard = WaitGuard { state: &self.state };
+        run_job(&job);
+        drop(guard);
+        drop(_run);
+
+        if let Some(payload) = job.panicked.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ParallelPool {
+    fn drop(&mut self) {
+        let (lock, work_cv, _) = &*self.state;
+        {
+            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            st.shutdown = true;
+        }
+        work_cv.notify_all();
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+fn run_job(job: &Job) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    loop {
+        let i = job.next.fetch_add(1, Relaxed);
+        if i >= job.n {
+            break;
+        }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| (job.call)(job.data, i))) {
+            let mut slot = job.panicked.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(payload);
+            }
+            job.next.store(job.n, Relaxed);
+            break;
+        }
+    }
+}
+
+fn max_parallel_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, |n| n.get() / 4)
+        .clamp(1, 4)
+}
+
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
 /// at most: the title's own threads need the rest), here when that is
 /// fewer than two.
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
+    static POOL: std::sync::OnceLock<ParallelPool> = std::sync::OnceLock::new();
+    let max = max_parallel_threads();
+    let threads = max.min(n);
     if threads < 2 {
         (0..n).for_each(f);
         return;
     }
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    f(i);
-                }
-            });
-        }
-    });
+    let pool = POOL.get_or_init(|| ParallelPool::new(max - 1));
+    pool.run(threads, n, f);
 }
 
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
@@ -842,15 +1039,18 @@ impl Staging {
             // are written, and only they are hashed and detiled.
             let mut scratch = Scratch::take(size);
             let read = &mut scratch.0[..size];
+            let mut spans: Vec<(usize, usize)> = touched.iter().map(|&i| span(i)).collect();
+            merge_spans(&mut spans);
             let mut bytes = 0;
-            let mut done: Vec<(usize, usize)> = Vec::new();
-            for &i in &touched {
-                let (a, b) = span(i);
-                if !done.contains(&(a, b)) {
-                    // SAFETY: inside the buffer of the texture's size.
-                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
-                    (bytes, _) = (bytes + b - a, done.push((a, b)));
-                }
+            for (a, b) in spans {
+                // SAFETY: inside the buffer of the texture's size.
+                crate::host::copy_mapped(
+                    unsafe { read.as_mut_ptr().add(a) },
+                    self.memory.wrapping_add(a),
+                    b - a,
+                    false,
+                );
+                bytes += b - a;
             }
             // A changed page that holds only the subresource's bytes says it
             // changed. Pages it shares with other data the title writes
@@ -982,6 +1182,27 @@ impl Staging {
         }
         Some((buffer, at))
     }
+}
+
+/// Sorts `[a, b)` byte spans and merges overlapping or adjacent intervals
+/// (dropping empty spans) so each covered byte is read once.
+fn merge_spans(spans: &mut Vec<(usize, usize)>) {
+    spans.retain(|&(a, b)| a < b);
+    if spans.len() <= 1 {
+        return;
+    }
+    spans.sort_unstable();
+    let mut write = 0;
+    for read in 1..spans.len() {
+        let (a, b) = spans[read];
+        if a <= spans[write].1 {
+            spans[write].1 = spans[write].1.max(b);
+        } else {
+            write += 1;
+            spans[write] = (a, b);
+        }
+    }
+    spans.truncate(write + 1);
 }
 
 /// A buffer for the title memory a refresh reads, kept by the thread for
@@ -1906,6 +2127,138 @@ mod tests {
         assert!(
             host.log_messages().is_none(),
             "D3D12 debug layer reported an error"
+        );
+    }
+
+    #[test]
+    fn merge_spans_coalesces_overlapping_and_adjacent_intervals() {
+        let mut s = vec![
+            (100, 200),
+            (50, 50),
+            (0, 64),
+            (64, 100),
+            (300, 400),
+            (350, 380),
+            (380, 450),
+            (0, 64),
+        ];
+        merge_spans(&mut s);
+        assert_eq!(s, vec![(0, 200), (300, 450)]);
+
+        let mut empty = vec![(10, 10), (20, 10)];
+        merge_spans(&mut empty);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn parallel_pool_reuses_worker_scratch_and_handles_reentrancy_and_panics() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = ParallelPool::new(3);
+        let sum = AtomicUsize::new(0);
+        let first_ptrs: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
+        pool.run(4, 64, |i| {
+            let s = Scratch::take(64 * 1024);
+            first_ptrs.lock().unwrap().insert(s.0.as_ptr() as usize);
+            sum.fetch_add(i + 1, Ordering::Relaxed);
+        });
+        assert_eq!(sum.load(Ordering::Relaxed), 64 * 65 / 2);
+
+        // Second batch reuses the already-allocated thread_local Scratch buffers.
+        let mut second_ptrs = HashSet::new();
+        let second_lock: Mutex<&mut HashSet<usize>> = Mutex::new(&mut second_ptrs);
+        pool.run(4, 64, |_| {
+            let s = Scratch::take(64 * 1024);
+            second_lock.lock().unwrap().insert(s.0.as_ptr() as usize);
+        });
+        let first_ptrs = first_ptrs.into_inner().unwrap();
+        assert!(
+            second_ptrs.iter().any(|p| first_ptrs.contains(p)),
+            "expected persistent worker Scratch pointer reuse across batches: first={first_ptrs:?} second={second_ptrs:?}"
+        );
+
+        // Nested call runs inline without deadlocking.
+        let nested = AtomicUsize::new(0);
+        pool.run(4, 8, |_| {
+            pool.run(4, 4, |_| {
+                nested.fetch_add(1, Ordering::Relaxed);
+            });
+        });
+        assert_eq!(nested.load(Ordering::Relaxed), 32);
+
+        // Panic propagates cleanly and leaves pool reusable afterward.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.run(4, 16, |i| {
+                assert_ne!(i, 5, "boom");
+            });
+        }));
+        assert!(caught.is_err());
+
+        let after = AtomicUsize::new(0);
+        pool.run(4, 16, |_| {
+            after.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(after.load(Ordering::Relaxed), 16);
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_in_parallel_scratch_reuse() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        const BATCHES: usize = 40;
+        const ITEMS: usize = 8;
+        const BYTES: usize = 2 << 20; // 2 MiB texture read buffer
+
+        let run_scoped = || {
+            let t0 = std::time::Instant::now();
+            for _ in 0..BATCHES {
+                let next = AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        scope.spawn(|| loop {
+                            let i = next.fetch_add(1, Relaxed);
+                            if i >= ITEMS {
+                                break;
+                            }
+                            let mut s = Scratch::take(BYTES);
+                            // Touch one byte per 4 KiB page (as copy_mapped writes into read).
+                            for p in (0..BYTES).step_by(4096) {
+                                s.0[p] = (i as u8).wrapping_add(1);
+                            }
+                            std::hint::black_box(s.0[0]);
+                        });
+                    }
+                });
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / BATCHES as f64
+        };
+
+        let pool = ParallelPool::new(3);
+        let run_pooled = || {
+            // Warm once (simulating steady-state submissions after frame 1).
+            pool.run(4, ITEMS, |_| {
+                let _ = Scratch::take(BYTES);
+            });
+            let t0 = std::time::Instant::now();
+            for _ in 0..BATCHES {
+                pool.run(4, ITEMS, |i| {
+                    let mut s = Scratch::take(BYTES);
+                    for p in (0..BYTES).step_by(4096) {
+                        s.0[p] = (i as u8).wrapping_add(1);
+                    }
+                    std::hint::black_box(s.0[0]);
+                });
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / BATCHES as f64
+        };
+
+        let scoped_ms = run_scoped();
+        let pooled_ms = run_pooled();
+        eprintln!(
+            "in_parallel (4 threads, {ITEMS}x 2 MiB Scratch): scoped={scoped_ms:.3} ms/batch, pooled={pooled_ms:.3} ms/batch ({:.2}x)",
+            scoped_ms / pooled_ms
         );
     }
 }
