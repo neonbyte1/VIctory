@@ -175,7 +175,7 @@ impl Changed {
 pub(crate) type Runs = Vec<(usize, usize)>;
 
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
-pub(crate) struct Tracked {
+pub struct Tracked {
     start: usize,
     end: usize,
     changed: Arc<Changed>,
@@ -318,7 +318,7 @@ fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
 ///
 /// Only the pages of the range that are such memory are tracked; the rest is
 /// never guarded and is copied whole at each use, as memory with no tracker.
-pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
+pub fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     track_as(start, len, views, false)
 }
 
@@ -478,7 +478,7 @@ impl Tracked {
     /// now on mark them again) and returns the byte ranges to copy, cut to
     /// `[from, to)`, in order. A page whose part in the tracked memory lies
     /// only partly in `[from, to)` is copied in part and stays changed.
-    pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+    pub fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let (copy, zero) = self.take_split(from, to);
         let mut runs: Vec<(usize, usize)> = copy.into_iter().chain(zero).collect();
         runs.sort_unstable();
@@ -552,7 +552,7 @@ impl Tracked {
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
-    pub(crate) fn changed(&self, page: usize) -> bool {
+    pub fn changed(&self, page: usize) -> bool {
         self.changed
             .0
             .lock()
@@ -605,7 +605,7 @@ impl Tracked {
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
     /// pages there written next after they were taken have their bytes kept
     /// first ([`Tracked::saved`]).
-    pub(crate) fn arm(&self, from: usize, to: usize) {
+    pub fn arm(&self, from: usize, to: usize) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from < to {
             self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).arm(from / PAGE, to.div_ceil(PAGE));
@@ -632,7 +632,7 @@ impl Tracked {
     /// The bytes page `page` (a page number) held when it was first written
     /// since it was taken, if it was armed then (and so changed), with what
     /// the copy took of it since: the copy's bytes before the submission.
-    pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
+    pub fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
 

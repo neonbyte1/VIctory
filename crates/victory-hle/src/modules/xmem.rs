@@ -551,6 +551,27 @@ fn report_written(shown: &[usize]) {
     }
 }
 
+/// The title views showing pages (page numbers) when a write into them
+/// through our own views begins, opened and marked changed until it is
+/// dropped: told before the write (`kernel_will_write`), armed pages keep
+/// their bytes from before it. Views mapped during the write are told by
+/// [`report_written`] when it ends.
+struct PhysicalWrite {
+    _open: Vec<victory_gpu::KernelWrite>,
+}
+
+impl PhysicalWrite {
+    fn begin(pages: &[usize]) -> Self {
+        let mut shown = shown_at(pages);
+        shown.sort_unstable();
+        shown.dedup();
+        let write = |page| victory_gpu::kernel_will_write(page, PAGE);
+        Self {
+            _open: shown.into_iter().map(write).collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// The title addresses this thread's writes into physical pages reported.
@@ -731,6 +752,10 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    let written = pages
+        .get(offset / PAGE..(offset + data.len()).div_ceil(PAGE))
+        .unwrap_or(&[]);
+    let _write = PhysicalWrite::begin(written);
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -741,7 +766,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         (within, done) = (0, done + k);
     }
     // Where the pages show once written (see `PageWindow`).
-    report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
+    report_written(&shown_at(written));
     true
 }
 
@@ -759,6 +784,9 @@ pub(crate) struct PageWindow {
     /// the page there before the bytes landed would never hear of them. An
     /// address that stops showing a page meanwhile was told by the unmap.
     pages: Vec<usize>,
+    /// The title views showing the pages when the window opened, open
+    /// until it is done.
+    _write: PhysicalWrite,
 }
 
 impl Drop for PageWindow {
@@ -784,11 +812,16 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let pages = pages
+        .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+        .unwrap_or(&[]);
     Some(PageWindow {
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
+        pages: pages.to_vec(),
+        // Once the view is mapped: a window that fails opens nothing.
+        _write: PhysicalWrite::begin(pages),
     })
 }
 
@@ -2137,7 +2170,46 @@ mod tests {
                 assert_ne!(unsafe { VirtualFree(probe, 0, MEM_RELEASE) }, 0);
             }
         }
-        panic!("no room for two reservations side by side");
+        panic!("no room for two reservations side by side")
+    }
+
+    #[test]
+    fn physical_writes_guard_views_before_writing_and_catch_late_mappings() {
+        let pages = allocate(2);
+        let flags = MEM_RESERVE | PAGES_64K;
+        let v1 = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, flags, 0, PAGE_READWRITE);
+        let v2 = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, flags, 0, PAGE_READWRITE);
+        let (a1, a2) = (v1 as usize, v2 as usize);
+        assert_eq!(XMemMapPhysicalPages(v1, 1, &pages[0]), v1);
+        // SAFETY: mapped read-write.
+        unsafe { v1.cast::<u8>().write(0x11) };
+
+        let t1 = victory_gpu::track(a1, PAGE, true).expect("tracked");
+        assert_eq!(t1.take(a1, a1 + PAGE), [(a1, a1 + PAGE)]);
+        t1.arm(a1, a1 + PAGE);
+
+        let mut window = page_window(&pages, 0, 2 * PAGE).expect("one run");
+        window.bytes()[0] = 0x99;
+        // Page 1 is mapped and taken while the window is open: drop must still report it.
+        assert_eq!(XMemMapPhysicalPages(v2, 1, &pages[1]), v2);
+        let t2 = victory_gpu::track(a2, PAGE, true).expect("tracked");
+        assert_eq!(t2.take(a2, a2 + PAGE), [(a2, a2 + PAGE)]);
+        window.bytes()[PAGE] = 0x77;
+        drop(window);
+        assert_eq!(t1.saved(a1 / PAGE).expect("saved")[0], 0x11);
+        assert!(t1.changed(a1 / PAGE) && t2.changed(a2 / PAGE));
+
+        // `write_physical` also opens and saves armed views before copying.
+        assert_eq!(t1.take(a1, a1 + PAGE), [(a1, a1 + PAGE)]);
+        t1.arm(a1, a1 + PAGE);
+        assert!(write_physical(&pages[..1], 0, &[0xaa]));
+        assert_eq!(t1.saved(a1 / PAGE).expect("saved")[0], 0x99);
+        assert!(t1.changed(a1 / PAGE));
+
+        drop((t1, t2));
+        assert_eq!(XMemMapPhysicalPages(v1, 1, std::ptr::null()), v1);
+        assert_eq!(XMemMapPhysicalPages(v2, 1, std::ptr::null()), v2);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
 
