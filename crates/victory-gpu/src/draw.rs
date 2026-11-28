@@ -3668,7 +3668,9 @@ void main() {
             assert_eq!(state.topology, 0);
             assert_eq!(state.host_pipeline, 0);
             assert_eq!(state.host_roots, [0; 2]);
-            assert_eq!(state.host_heaps, Some([usize::MAX; 2]));
+            // A lost host state is not a wanted pair: `[usize::MAX; 2]` is
+            // the marker a list that binds no heaps wants (#2881).
+            assert_eq!(state.host_heaps, None);
             assert!(!state.table_failed);
             assert_eq!(state.fresh_tables.get(&(1, 2)), Some(&3));
             assert_eq!(state.root_slots.get(&(1, 2, true)), Some(&3));
