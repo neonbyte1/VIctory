@@ -235,6 +235,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_PATCH=<module>:<rva>:<hex bytes>,...` | writes bytes once at module load after relocation and before title protection; can patch code, unlike `VICTORY_POKE`'s repeated writes; logs replaced bytes |
 | `VICTORY_TITLE_ASSERTS=<n>` | continues past up to `n` `int3` asserts in title code, where the first one ends the process; the check is taken as passed, so what follows it is undefined |
+| `VICTORY_STEP_OVER=<hex offset>,...` | title breakpoints (`int3`) at these image offsets are stepped over instead of ending the run, each logged with its count. On Series 1.0.2.1 the pool allocator traps on an empty pool right before returning NULL (`63966f`, `5149aec`, #698): stepped over, the allocation fails and the title goes on into the world |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
