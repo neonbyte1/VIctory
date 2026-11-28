@@ -194,6 +194,12 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+The differential shader tests also need a console `dxc.exe`: set
+`VICTORY_CONSOLE_DXC` to its path. The PC compiler is `VICTORY_PC_DXC`, else
+the newest Windows SDK's `dxc.exe`. If either compiler is missing, those tests
+are skipped, because `tools()` returns `None` unless both compiler paths exist.
+`VICTORY_WARP=1` draws on WARP instead of the hardware adapter.
+
 ## Experimental memory option
 
 Set `VICTORY_TRIM_IDLE_SHADERS=1` before launch to periodically remove
