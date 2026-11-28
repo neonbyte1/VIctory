@@ -703,6 +703,18 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
             return Some(out);
         }
+        85 | 86 | 115 => {
+            // Packed B5G6R5, B5G5R5A1, or B4G4R4A4. The PNG drops alpha.
+            let rgb = match format {
+                85 => [(11, 31), (5, 63), (0, 31)],
+                86 => [(10, 31), (5, 31), (0, 31)],
+                _ => [(8, 15), (4, 15), (0, 15)],
+            };
+            (2, Box::new(move |b| {
+                let v = u16_at(b, 0);
+                rgb.map(|(shift, mask)| f32::from((v >> shift) & mask) / f32::from(mask))
+            }))
+        }
         23..=25 | 89 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
             let rgb = [0, 10, 20].map(|shift| (v >> shift & 0x3ff) as f32);
@@ -1093,6 +1105,24 @@ mod tests {
                 "format {format}"
             );
         }
+    }
+
+    #[test]
+    fn packed_unorm_captures_decode_each_rgb_width() {
+        let cases: [(u32, [u16; 4], u8); 3] = [
+            (85, [0xffff, 0x03ff, 0xf800, 0], 125),
+            (86, [0x7fff, 0x81ff, 0x7c00, 0x8000], 123),
+            (115, [0x0fff, 0xa07f, 0x0f00, 0xf000], 119),
+        ];
+        let actual = cases.map(|(format, [white, blue_with_green, red, black], _)| {
+            // Two pixels per row, then a nonzero padding word.
+            let rows = [white, blue_with_green, 0xffff, red, black, 0xffff].map(u16::to_le_bytes);
+            super::to_rgba(format, 2, 2, 6, rows.as_flattened())
+        });
+        let expected = cases.map(|(_, _, green)| {
+            Some(vec![255, 255, 255, 255, 0, green, 255, 255, 255, 0, 0, 255, 0, 0, 0, 255])
+        });
+        assert_eq!(actual, expected);
     }
 
     #[test]
