@@ -8,7 +8,8 @@
 //! from a buffer view's descriptor and an image descriptor's size fields
 //! (the host's view addresses), reads
 //! pointers into memory no copy holds (zeros, marked missed) and stores and
-//! loads through a root UAV (title memory in such a program).
+//! loads through a root UAV (title memory in such a program). Also: buffer
+//! loads of a table in the program's code, zeros out of the records.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -197,6 +198,7 @@ fn program() -> HostShader {
     assert!(l.memory && l.memory_writes && l.view_addresses);
     assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
     let shader = HostShader {
+        wave_size: l.wave_size,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -260,7 +262,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
     view_addresses[9..12].copy_from_slice(&image);
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -723,6 +725,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         .collect();
     assert_eq!(marks, [(6, super::ROOT_SRV_VIEW), (7, super::ROOT_VIEW_OFFSET)]);
     let shader = HostShader {
+        wave_size: l.wave_size,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -746,7 +749,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         .unwrap_or_else(|e| e.into_inner());
     let copy: Vec<u32> = (0..256).map(|k| 0x1000 + k).collect();
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -863,6 +866,7 @@ fn writes_through_views_mark_their_pages() {
     .expect("lower");
     assert!(l.view_marks && !l.memory, "marks without the page table");
     let shader = HostShader {
+        wave_size: l.wave_size,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -887,7 +891,7 @@ fn writes_through_views_mark_their_pages() {
     let value = 0x1234_5678;
     let marks = vec![100, 0xFFF0, super::VIEW_MARK_NONE, 0, 200, 0];
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -1016,6 +1020,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: l.wave_size,
         dxil: l.dxil,
         user_data: l.user_data,
         samplers: l.samplers,
@@ -1039,7 +1044,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     let words = (super::VIEW_READS + 64) / 32;
     let texel = [[0.5f32; 4]];
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -1126,6 +1131,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     assert!(l.memory && l.memory_writes);
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: l.wave_size,
         dxil: l.dxil,
         user_data: l.user_data,
         samplers: l.samplers,
@@ -1173,7 +1179,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -1445,6 +1451,7 @@ fn wave_coalesced_marks_equal_per_lane_marks_on_the_gpu() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             let shader = HostShader {
                 stage: HwStage::Cs,
+                wave_size: l.wave_size,
                 dxil: l.dxil,
                 user_data: l.user_data,
                 samplers: l.samplers,
@@ -1518,4 +1525,431 @@ fn wave_coalesced_marks_equal_per_lane_marks_on_the_gpu() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+const OFFEN: u32 = 1 << 12;
+const IDXEN: u32 = 1 << 13;
+
+/// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], soffset`; `low` holds the
+/// immediate offset and [`OFFEN`] or [`IDXEN`].
+const fn mubuf(op: u32, vdata: u8, vaddr: u8, srsrc: u8, soffset: u8, low: u32) -> [u32; 2] {
+    [
+        0x38 << 26 | op << 18 | low,
+        (soffset as u32) << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// The table [`code_table_program`] appends to its code.
+fn code_table() -> Vec<u32> {
+    (1..=64u32).map(|k| k.wrapping_mul(0x9E37_79B9)).collect()
+}
+
+/// Record limits of [`code_table_program`]'s two descriptors: bytes of the
+/// raw one (lane 29's dword past it, its byte 1 not), elements of the
+/// indexed one.
+const RAW_RECORDS: u32 = 4 * 29 + 2;
+const INDEXED_RECORDS: u32 = 21;
+
+/// A wave32 program of 32 lanes reading a table after its code through two
+/// descriptors built around `s_getpc_b64`: a raw one (`OOB_SELECT` 3) read
+/// per lane at `lane * 4` as a dword, its byte 1, and two dwords 4 bytes
+/// further through `soffset`, and a signed halfword at byte 3 (its high
+/// byte in the next dword); a structured one (`OOB_SELECT` 1, stride 8)
+/// read by `idxen` at the lane's element plus 4. Lane `l` stores the six
+/// dwords at `32 * l` of the UAV at heap index 0.
+fn code_table_program() -> Vec<u32> {
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
+    // s[12:15] and s[16:19]: the table's descriptors (the literals patched
+    // below with the table's distance from each s_getpc_b64's next word).
+    let raw = w.len();
+    w.extend([0xBE8C_1F00, 0x800C_FF0C, 0, 0x820D_800D]); // s_getpc_b64 s[12:13]; s_add_u32; s_addc_u32
+    w.extend([0xBE8E_03FF, RAW_RECORDS, 0xBE8F_03FF, 0x3101_4FAC]); // s_mov_b32 s14, s15
+    let indexed = w.len();
+    w.extend([0xBE90_1F00, 0x8010_FF10, 0, 0x8211_8011]); // s_getpc_b64 s[16:17]; s_add_u32; s_addc_u32
+    w.extend([0x8811_FF11, 8 << 16]); // s_or_b32 s17, s17, stride 8
+    w.extend([0xBE92_03FF, INDEXED_RECORDS, 0xBE93_03FF, 0x1101_4FAC]); // s_mov_b32 s18, s19
+    w.push(0xBE94_0384); // s_mov_b32 s20, 4
+    w.push(0x3402_0082); // v_lshlrev_b32 v1, 2, v0
+    w.push(0x3402_0085 | 7 << 17); // v_lshlrev_b32 v7, 5, v0
+    w.extend(mubuf(0x0C, 2, 1, 12, 0x80, OFFEN));
+    w.extend(mubuf(0x08, 3, 1, 12, 0x80, OFFEN | 1));
+    w.extend(mubuf(0x0C, 4, 0, 16, 0x80, IDXEN | 4));
+    w.extend(mubuf(0x0D, 5, 1, 12, 20, OFFEN));
+    w.extend(mubuf(0x0B, 8, 1, 12, 0x80, OFFEN | 3));
+    w.push(S_WAITCNT_ALL);
+    for (k, v) in [2u8, 3, 4, 5, 6, 8].into_iter().enumerate() {
+        w.extend(mubuf(0x1C, v, 7, 8, 0x80, OFFEN | (4 * k as u32)));
+    }
+    w.push(S_ENDPGM);
+    let table = 4 * w.len() as u32;
+    for at in [raw, indexed] {
+        w[at + 2] = table - 4 * (at as u32 + 1);
+    }
+    w.extend(code_table());
+    w
+}
+
+/// What lane `l` of [`code_table_program`] stores: out of range, a load
+/// reads 0 (a raw load by dword, each checked as `offset + soffset +
+/// size > records`; an indexed one by `index >= records`).
+fn code_table_model(l: u32) -> [u32; 6] {
+    let t = code_table();
+    let raw = |byte: u32, size: u32, x: u32| if byte + size > RAW_RECORDS { 0 } else { x };
+    [
+        raw(4 * l, 4, t[l as usize]),
+        raw(4 * l + 1, 1, t[l as usize] >> 8 & 0xFF),
+        if l >= INDEXED_RECORDS {
+            0
+        } else {
+            t[2 * l as usize + 1]
+        },
+        raw(4 * l + 4, 4, t[l as usize + 1]),
+        raw(4 * l + 8, 4, t[l as usize + 2]),
+        raw(
+            4 * l + 3,
+            2,
+            (t[l as usize] >> 24 | (t[l as usize + 1] & 0xFF) << 8) as u16 as i16 as u32,
+        ),
+    ]
+}
+
+fn lower_code_table_program(words: &[u32]) -> Result<HostShader, String> {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 9,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 1,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let e = |e: crate::ShaderError| e.to_string();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).map_err(e)?;
+    let st = structure::structure(&p).map_err(e)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).map_err(e)?;
+    let io = io::raise(&p, &native).map_err(e)?;
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
+        view_marks: false,
+    })
+    .map_err(e)?;
+    Ok(HostShader {
+        stage: HwStage::Cs,
+        wave_size: None,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    })
+}
+
+/// [`code_table_program`] decodes as written and lowers.
+#[test]
+fn code_table_buffer_loads_lower() {
+    let words = code_table_program();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let text: Vec<String> = crate::gfx10::decode(&code)
+        .expect("the program decodes")
+        .iter()
+        .map(|i| i.text(false))
+        .collect();
+    let table = 4 * (words.len() - 64);
+    let want = [
+        "s_getpc_b64 s[12:13]".to_owned(),
+        format!("s_add_u32 s12, s12, lit({:#010x})", table - 16),
+        "s_addc_u32 s13, s13, 0".to_owned(),
+        format!("s_mov_b32 s14, lit({RAW_RECORDS:#010x})"),
+        "s_mov_b32 s15, lit(0x31014fac)".to_owned(),
+        "s_getpc_b64 s[16:17]".to_owned(),
+        format!("s_add_u32 s16, s16, lit({:#010x})", table - 48),
+        "s_addc_u32 s17, s17, 0".to_owned(),
+        "s_or_b32 s17, s17, lit(0x00080000)".to_owned(),
+        format!("s_mov_b32 s18, lit({INDEXED_RECORDS:#010x})"),
+        "s_mov_b32 s19, lit(0x11014fac)".to_owned(),
+        "s_mov_b32 s20, 4".to_owned(),
+        "v_lshlrev_b32 v1, 2, v0".to_owned(),
+        "v_lshlrev_b32 v7, 5, v0".to_owned(),
+        "buffer_load_dword v2, v1, s[12:15], 0 offen".to_owned(),
+        "buffer_load_ubyte v3, v1, s[12:15], 0 offen offset:1".to_owned(),
+        "buffer_load_dword v4, v0, s[16:19], 0 idxen offset:4".to_owned(),
+        "buffer_load_dwordx2 v[5:6], v1, s[12:15], s20 offen".to_owned(),
+        "buffer_load_sshort v8, v1, s[12:15], 0 offen offset:3".to_owned(),
+    ];
+    assert_eq!(text[2..2 + want.len()], want[..]);
+    let shader = lower_code_table_program(&words).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    // OOB_SELECT 0 (offsets checked against the stride) is refused.
+    let mut checked = words.clone();
+    let at = words
+        .iter()
+        .position(|&w| w == 0x3101_4FAC)
+        .expect("dword 3");
+    checked[at] = 0x0101_4FAC;
+    let Err(e) = lower_code_table_program(&checked) else {
+        panic!("OOB_SELECT 0 lowered");
+    };
+    assert!(e.contains("checking offsets against its stride"), "{e}");
+}
+
+/// [`code_table_program`] on the host GPU and WARP matches
+/// [`code_table_model`] in every lane.
+#[test]
+fn code_table_buffer_loads_read_zeros_out_of_range() {
+    let shader = lower_code_table_program(&code_table_program()).expect("lower");
+    let want: Vec<u32> = (0..32)
+        .flat_map(|l| {
+            let mut row = code_table_model(l).to_vec();
+            row.resize(8, 0);
+            row
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            assert_eq!((u.root, u.slot), (RootType::Table, 1), "user data {u:?}");
+            ud[u.index as usize] = 0;
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(32 * 8)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+enum BcConst { Int(i64), Agg(Vec<u32>) }
+enum BcInst { Bin(u64, u32, u32), Cast(u64, u32), Cmp(u64, u32, u32), Extract(u32, u64), Call(String, Vec<u32>), Other }
+
+/// Decoded instructions and conditional branches of `main` from a DXIL container.
+struct Bc {
+    consts: std::collections::HashMap<u32, BcConst>,
+    insts: std::collections::HashMap<u32, (usize, BcInst)>,
+    cond_brs: Vec<(usize, usize, u32)>,
+}
+
+impl Bc {
+    fn parse(dxil: &[u8]) -> Self {
+        use std::collections::HashMap;
+        let c = crate::dxbc::Container::parse(dxil).expect("dxbc");
+        let bc = &c.part(crate::dxbc::FourCC::DXIL).expect("DXIL").data[24..];
+        assert_eq!(&bc[..4], b"BC\xC0\xDE");
+        let mut pos = 32usize;
+        let read = |p: &mut usize, n: u32| -> u64 {
+            (0..n).fold(0u64, |v, i| { let b = (bc[*p / 8] >> (*p % 8)) & 1; *p += 1; v | u64::from(b) << i })
+        };
+        let vbr = |p: &mut usize, w: u32| -> u64 {
+            let (mut v, mut sh) = (0u64, 0u32);
+            loop {
+                let x = read(p, w);
+                v |= (x & ((1 << (w - 1)) - 1)) << sh;
+                if x >> (w - 1) == 0 { return v; }
+                sh += w - 1;
+            }
+        };
+        let (mut stack, mut void_ty, mut ty_void) = (Vec::<(u64, u32)>::new(), None, HashMap::<u32, bool>::new());
+        let (mut ty_n, mut globals, mut funcs, mut const_n, mut next_id, mut blk) = (0u32, 0u32, 0u32, 0u32, 0u32, 0usize);
+        let (mut consts, mut names, mut insts, mut cond_brs) = (HashMap::new(), HashMap::<u32, String>::new(), HashMap::new(), Vec::new());
+        while pos < bc.len() * 8 {
+            match read(&mut pos, stack.last().map_or(2, |s| s.1)) {
+                0 => { pos = pos.next_multiple_of(32); stack.pop(); if stack.is_empty() { break; } }
+                1 => {
+                    let (id, nw) = (vbr(&mut pos, 8), vbr(&mut pos, 4) as u32);
+                    pos = pos.next_multiple_of(32) + 32;
+                    if id == 12 { (next_id, blk) = (globals + funcs + const_n, 0); }
+                    stack.push((id, nw));
+                }
+                3 => {
+                    let (code, n) = (vbr(&mut pos, 6), vbr(&mut pos, 6) as usize);
+                    let ops: Vec<u64> = (0..n).map(|_| vbr(&mut pos, 6)).collect();
+                    match stack.last().map(|s| s.0) {
+                        Some(17) if code != 1 && code != 19 => {
+                            if code == 2 { void_ty = Some(ty_n); }
+                            else if code == 21 { ty_void.insert(ty_n, Some(ops[1] as u32) == void_ty); }
+                            ty_n += 1;
+                        }
+                        Some(8) if code == 7 || code == 8 => if code == 7 { globals += 1 } else { funcs += 1 },
+                        Some(11) if code != 1 => {
+                            let id = globals + funcs + const_n;
+                            if code == 4 { let m = (ops[0] >> 1) as i64; consts.insert(id, BcConst::Int(if ops[0] & 1 == 0 { m } else { m.wrapping_neg() })); }
+                            else if code == 7 { consts.insert(id, BcConst::Agg(ops.iter().map(|&o| o as u32).collect())); }
+                            const_n += 1;
+                        }
+                        Some(14) if code == 1 => { names.insert(ops[0] as u32, ops[1..].iter().map(|&c| c as u8 as char).collect()); }
+                        Some(12) if code != 1 => {
+                            let rel = |r: u64| next_id - r as u32;
+                            match code {
+                                10 | 11 => { if code == 11 && ops.len() == 3 { cond_brs.push((blk, ops[0] as usize, rel(ops[2]))); } blk += 1; }
+                                44 => {}
+                                34 if ty_void.get(&(ops[2] as u32)).copied().unwrap_or(false) => {}
+                                _ => {
+                                    let inst = match code {
+                                        2 => BcInst::Bin(ops[2], rel(ops[0]), rel(ops[1])),
+                                        3 => BcInst::Cast(ops[2], rel(ops[0])),
+                                        26 => BcInst::Extract(rel(ops[0]), ops[1]),
+                                        28 => BcInst::Cmp(ops[2], rel(ops[0]), rel(ops[1])),
+                                        34 => BcInst::Call(names.get(&rel(ops[3])).cloned().unwrap_or_default(), ops[4..].iter().map(|&r| rel(r)).collect()),
+                                        _ => BcInst::Other,
+                                    };
+                                    insts.insert(next_id, (blk, inst));
+                                    next_id += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                other => panic!("unexpected bitcode abbrev {other}"),
+            }
+        }
+        Self { consts, insts, cond_brs }
+    }
+
+    fn int(&self, id: u32) -> Option<i64> { match self.consts.get(&id) { Some(BcConst::Int(v)) => Some(*v), _ => None } }
+
+    fn binding(&self, h: u32) -> Option<(i64, i64, i64)> {
+        let (_, BcInst::Call(name, args)) = self.insts.get(&h)? else { return None };
+        let inner = if name == "dx.op.annotateHandle" { args[1] } else { h };
+        let (_, BcInst::Call(name, args)) = self.insts.get(&inner)? else { return None };
+        let BcConst::Agg(f) = (name == "dx.op.createHandleFromBinding").then(|| self.consts.get(&args[1]))?? else { return None };
+        Some((self.int(f[0])?, self.int(f[2])?, self.int(f[3])?))
+    }
+
+    fn calls_on(&self, op: &str, bind: (i64, i64, i64)) -> Vec<(usize, &[u32])> {
+        self.insts.values().filter_map(|(b, i)| match i {
+            BcInst::Call(n, a) if n == op && self.binding(a[1]) == Some(bind) => Some((*b, a.as_slice())),
+            _ => None,
+        }).collect()
+    }
+
+    fn assert_guarded_dirty_or(&self, blk: usize, args: &[u32], bitmap: (i64, i64, i64)) -> usize {
+        assert_eq!((self.binding(args[1]), self.int(args[2])), (Some(bitmap), Some(2)));
+        let (word, bit) = (args[3], args[6]);
+        let &(test_blk, _, cond) = self.cond_brs.iter().find(|&&(_, then, _)| then == blk).expect("dirty atomic must be branched");
+        let (_, BcInst::Cmp(32, a, b)) = self.insts[&cond] else { panic!("guard must be icmp eq 0") };
+        let set = if self.int(b) == Some(0) { a } else { assert_eq!(self.int(a), Some(0)); b };
+        let (_, BcInst::Bin(10, x, y)) = self.insts[&set] else { panic!("test must mask word with bit") };
+        let old = if y == bit { x } else { assert_eq!(x, bit); y };
+        let (_, BcInst::Cast(11, ext)) = self.insts[&old] else { panic!("expected bitcast") };
+        let (_, BcInst::Extract(load, 0)) = self.insts[&ext] else { panic!("expected extract 0") };
+        let (load_blk, BcInst::Call(ref name, ref la)) = self.insts[&load] else { panic!("expected rawBufferLoad") };
+        assert_eq!((load_blk, name.as_str(), self.binding(la[1]), la[2]), (test_blk, "dx.op.rawBufferLoad.f32", Some(bitmap), word));
+        assert_eq!((self.int(la[4]), self.int(la[5]), self.insts[&word].0, self.insts[&bit].0), (Some(1), Some(4), test_blk, test_blk));
+        test_blk
+    }
+
+    fn gated_by_ne(&self, blk: usize, word: u32) -> bool {
+        let Some((_, BcInst::Bin(7, sh, _))) = self.insts.get(&word) else { return false };
+        let Some((_, BcInst::Bin(8, n, _))) = self.insts.get(sh) else { return false };
+        self.cond_brs.iter().any(|&(_, t, c)| t == blk && matches!(self.insts.get(&c), Some((_, BcInst::Cmp(33, a, b))) if a == n || b == n))
+    }
+
+    fn verify_dirty_marks(&self, bitmap: (i64, i64, i64), want_atomics: usize, want_ne: Option<usize>) {
+        let atomics = self.calls_on("dx.op.atomicBinOp.i32", bitmap);
+        assert_eq!(atomics.len(), want_atomics);
+        let ne = atomics.iter().filter(|&&(b, a)| self.gated_by_ne(self.assert_guarded_dirty_or(b, a, bitmap), a[3])).count();
+        if let Some(expected_ne) = want_ne {
+            assert_eq!(ne, expected_ne, "2nd marks must check n != bits[0] before loading bitmap");
+        }
+    }
+}
+
+/// Across 13 title-memory accesses (`program`), `memory_null` is loaded once in
+/// block 0, `(view, start)` loads coalesce via `raw_dword2`, every dirty-mark
+/// atomic is guarded by load + bit-test, and `WAVE_OPS` is not set.
+#[test]
+fn memory_entry_caches_null_coalesces_loads_and_guards_dirty_atomics() {
+    let shader = program();
+    let sfi0 = crate::dxbc::Container::parse(&shader.dxil).expect("dxbc").part(crate::dxbc::FourCC::SFI0).expect("SFI0").data;
+    assert_eq!(u64::from_le_bytes(sfi0.try_into().unwrap()) & 0x4000, 0, "no WAVE_OPS");
+    let bc = Bc::parse(&shader.dxil);
+    let pt_loads = bc.calls_on("dx.op.rawBufferLoad.f32", (0, 2, 0));
+    assert_eq!(pt_loads.iter().filter(|(_, a)| bc.int(a[2]) == Some(4096 * 4)).map(|(b, _)| *b).collect::<Vec<_>>(), [0]);
+    assert_eq!(pt_loads.iter().filter(|(_, a)| (bc.int(a[4]), bc.int(a[5])) == (Some(3), Some(8))).count(), 13);
+    // 1 hoisted memory_null + 13 primary memory_page L1 loads + 4 straddling-write L1 loads.
+    assert_eq!(pt_loads.iter().filter(|(_, a)| bc.int(a[4]) == Some(1)).count(), 18);
+    bc.verify_dirty_marks((0, 2, 1), 17, None);
+}
+
+/// Single-byte writes omit the 2nd mark statically in both `Lower::memory` and
+/// `Lower::mark_view_write`; `mark_view_write` coalesces `(base, phase)` and
+/// checks `n != bits[0]` before loading the bitmap; and `memory_null` hoists
+/// to entry block 0 even from a non-entry branch.
+#[test]
+fn dirty_mark_width_and_branch_hoisting() {
+    let mut val = validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    for (view_mark, bytes, in_branch) in [(false, 1, false), (false, 4, true), (true, 1, false), (true, 4, false)] {
+        let dxil = lower::synthetic_mark_dxil(view_mark, bytes, in_branch);
+        if let Some(v) = val.as_mut() { v.validate(&mut dxil.clone()).expect("DXIL validation failed"); }
+        let bc = Bc::parse(&dxil);
+        let (table, bitmap) = if view_mark { ((2, 2, 0), (1, 2, 1)) } else { ((0, 2, 0), (0, 2, 1)) };
+        let t_loads = bc.calls_on("dx.op.rawBufferLoad.f32", table);
+        assert_eq!(t_loads.iter().filter(|(_, a)| (bc.int(a[4]), bc.int(a[5])) == (Some(3), Some(8))).count(), 1);
+        if view_mark { assert_eq!(t_loads.len(), 1); }
+        else { assert_eq!(t_loads.iter().filter(|(_, a)| bc.int(a[2]) == Some(4096 * 4)).map(|(b, _)| *b).collect::<Vec<_>>(), [0]); }
+        let want = if bytes <= 1 { 1 } else { 2 };
+        assert_eq!(bc.calls_on("dx.op.rawBufferLoad.f32", bitmap).len(), want);
+        bc.verify_dirty_marks(bitmap, want, view_mark.then_some(usize::from(bytes > 1)));
+    }
 }

@@ -241,6 +241,10 @@ mod tests {
     fn waits_end_on_ticks_and_count_frames() {
         let _serial = CLOCK_TEST.lock().unwrap();
         let null = std::ptr::null();
+        // 2 ms ticks with the clock below faked: #2861's 50 ms ticks guard a
+        // *real* clock against a runner woken a tick late, which these
+        // `set_elapsed` steps do not read (the merge kept their constant and
+        // our body, and the 6 ms step then fell before the first tick).
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         set_elapsed(0);
         let mut first = 0;

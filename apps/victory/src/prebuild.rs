@@ -332,6 +332,15 @@ fn shaders_of_graphics(
     format_stages(slots.into_iter().flatten(), container)
 }
 
+pub(crate) fn keys_output_path(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>> {
+    let Some(file) = value else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(file);
+    victory_core::ensure_outside_repo(&path)?;
+    Ok(Some(path))
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -464,6 +473,24 @@ mod tests {
         assert_eq!(
             shaders_of_graphics(&vs_gs_unresolved, &container),
             format!("[vertex {vs_hash}, geometry ?]")
+        );
+    }
+
+    #[test]
+    fn prebuild_keys_inside_repo_is_refused() {
+        assert_eq!(keys_output_path(None).unwrap(), None);
+
+        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("keys.txt");
+        let err = keys_output_path(Some(std::ffi::OsString::from(&inside))).unwrap_err();
+        assert!(
+            err.to_string().contains("inside the VIctory source tree"),
+            "unexpected error: {err}"
+        );
+
+        let outside = std::env::temp_dir().join("victory-prebuild-keys-test.txt");
+        assert_eq!(
+            keys_output_path(Some(std::ffi::OsString::from(&outside))).unwrap(),
+            Some(outside)
         );
     }
 }

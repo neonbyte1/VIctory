@@ -6,6 +6,7 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -53,22 +54,22 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         let b = s.as_bytes();
         b.len() >= 2 && b[..2].iter().all(|c| b"/\\".contains(c))
     };
-    let path = if let Some(rest) = text.strip_prefix(r"\\?\") {
+    let wide = if let Some(rest) = text.strip_prefix(r"\\?\") {
         if !drive(rest) {
             return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
         }
-        text.clone()
+        Cow::Borrowed(url)
     } else if let Some(rest) = text.strip_prefix(r"\??\") {
         // The same prefix as the object manager spells it; the host's file
         // calls take it too.
         if !drive(rest) {
             return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
         }
-        return Ok(with_nul(url));
+        Cow::Borrowed(url)
     } else if share(&text) {
         return Err(("unc".into(), host_of(&text[2..])));
     } else if drive(&text) {
-        text.clone()
+        Cow::Borrowed(url)
     } else if let Some((scheme, rest)) = text.split_once(':').filter(|(s, _)| {
         s.len() > 1
             && s.bytes()
@@ -115,12 +116,11 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
             // A local file without a drive: the host resolves it as is.
             return Ok(with_nul(url));
         }
-        path
+        Cow::Owned(path.encode_utf16().collect())
     } else {
         // A relative path.
         return Ok(with_nul(url));
     };
-    let wide: Vec<u16> = path.encode_utf16().collect();
     Ok(files::translate(&wide).unwrap_or_else(|| with_nul(&wide)))
 }
 
@@ -554,6 +554,13 @@ mod tests {
             Some(&b"1"[..]),
             "{host}"
         );
+        let obj = text(&local(&wide(&format!(r"\??\{letter}:\movies\intro.mp4"))).unwrap());
+        assert!(obj.starts_with(r"\??\"), "{obj}");
+        assert_eq!(
+            std::fs::read(&obj).ok().as_deref(),
+            Some(&b"1"[..]),
+            "{obj}"
+        );
         let from_url =
             text(&local(&wide(&format!("file:///{letter}:/movies/intro%20a.mp4"))).unwrap());
         assert_eq!(
@@ -566,6 +573,20 @@ mod tests {
             r"C:\Windows\a.wav"
         );
         assert_eq!(text(&local(&wide("clip.mp4")).unwrap()), "clip.mp4");
+
+        // Non-UTF-16-pair code units survive both virtual-drive translation
+        // and the unmapped host fallback.
+        let mut unpaired_obj = wide(r"\??\C:\");
+        unpaired_obj.extend([0xD800, b'a' as u16]);
+        assert_eq!(local(&unpaired_obj).unwrap(), with_nul(&unpaired_obj));
+
+        let mut unpaired_mounted = wide(&format!(r"\??\{letter}:\"));
+        unpaired_mounted.extend([0xD800, b'a' as u16]);
+        assert!(
+            local(&unpaired_mounted)
+                .unwrap()
+                .ends_with(&[0xD800, b'a' as u16, 0])
+        );
     }
 
     /// Other spellings of `\\server\share\a.mp4`, as paths and as `file:`

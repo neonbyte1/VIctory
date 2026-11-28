@@ -32,8 +32,9 @@ pub const ANALYTICS: Guid = Guid::new(
     [0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b],
 );
 
-/// 38 characters (39 bytes with the NUL).
-const CONSOLE_ID: &str = "00000000000000000000000000000000000001";
+/// 38 characters (39 bytes with the NUL): the documented retail console
+/// ID, `00000000.00000000.00000000.00000000.00`.
+const CONSOLE_ID: &str = "00000000.00000000.00000000.00000000.00";
 /// The retail sandbox.
 const SANDBOX: &str = "RETAIL";
 /// The smallest sandbox-id buffer the runtime accepts, whatever the sandbox's
@@ -559,6 +560,24 @@ mod tests {
         }
         assert_eq!(get(&OBJECT, 16, buffer.as_mut_ptr(), &mut used), S_OK);
         assert_eq!((used, &buffer[..7]), (7, &b"RETAIL\0"[..]));
+    }
+
+    #[test]
+    fn the_console_id_is_the_documented_retail_value() {
+        use crate::modules::xasync::E_NOT_SUFFICIENT_BUFFER;
+
+        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        let get = method::<Get>(&OBJECT, 0x18);
+        let mut buffer = [0u8; 39];
+        let mut used = 0;
+        assert_eq!(get(&OBJECT, 39, buffer.as_mut_ptr(), &mut used), S_OK);
+        assert_eq!(used, 39);
+        assert_eq!(&buffer[..used], b"00000000.00000000.00000000.00000000.00\0");
+        assert_eq!(
+            get(&OBJECT, 38, buffer.as_mut_ptr(), &mut used),
+            E_NOT_SUFFICIENT_BUFFER,
+            "the console ID is 39 bytes, NUL included"
+        );
     }
 
     #[test]

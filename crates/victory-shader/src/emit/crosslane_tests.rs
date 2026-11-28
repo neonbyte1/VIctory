@@ -427,6 +427,7 @@ fn build_wave32_cs_with_ballots(
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -1067,7 +1068,7 @@ fn pixel_quad_swizzle_and_dpp_validate_and_create_pipeline() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;

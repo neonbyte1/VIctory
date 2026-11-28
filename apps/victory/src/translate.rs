@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+use victory_shader::emit::{self, counts::Counts, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -69,14 +69,33 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    wave_sizes: BTreeMap<Option<u32>, usize>,
     /// Reason → programs stopped by it, and the smallest recorded label.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+    /// With `--count`: the instructions of the emitted shaders, by stage
+    /// (with the programs counted) and in all.
+    count: bool,
+    counted: BTreeMap<&'static str, (usize, Counts)>,
 }
 
 impl Tally {
+    fn record_wave_size(&mut self, size: Option<u32>) {
+        *self.wave_sizes.entry(size).or_default() += 1;
+    }
+
+    fn wave_summary(&self) -> String {
+        let mut counts = BTreeMap::from([(None, 0), (Some(32), 0), (Some(64), 0)]);
+        counts.extend(self.wave_sizes.iter().map(|(&size, &count)| (size, count)));
+        counts
+            .into_iter()
+            .map(|(size, count)| format!("{count} {}", wave_label(size)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
         let example = example();
         if self.list {
@@ -133,14 +152,26 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        for (size, count) in other.wave_sizes {
+            *self.wave_sizes.entry(size).or_default() += count;
+        }
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        for (stage, (n, counts)) in other.counted {
+            let total = self.counted.entry(stage).or_default();
+            total.0 += n;
+            total.1.add(&counts);
+        }
         for (reason, (n, example)) in other.failed {
             self.record_failure(reason, n, example);
         }
     }
+}
+
+fn wave_label(size: Option<u32>) -> String {
+    size.map_or_else(|| "unrestricted".into(), |n| format!("wave{n}"))
 }
 
 /// Emitted shaders by label, shared between threads.
@@ -157,13 +188,50 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// Whether that host runs mesh shaders at all: an adapter without them
+    /// refuses every mesh pipeline with `E_FAIL`, which in the census reads
+    /// as a translator defect unless the refusal says what it is.
+    mesh: bool,
 }
 
+fn parse_pairs(value: &str) -> Result<Vec<(&str, &str)>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .enumerate()
+        .map(|(index, entry)| {
+            entry
+                .split_once('+')
+                .map(|(v, p)| (v.trim(), p.trim()))
+                .filter(|(v, p)| !v.is_empty() && !p.is_empty())
+                .with_context(|| {
+                    format!(
+                        "invalid VICTORY_PAIRS entry {} ({entry:?}): expected two non-empty selectors in vs+ps format",
+                        index + 1
+                    )
+                })
+        })
+        .collect()
+}
+
+/// How many translate workers: `--jobs` when given, else
+/// `VICTORY_PIPELINE_THREADS` — these threads call the same driver
+/// compiler the run's pipeline workers do (translate cannot run with no
+/// worker, so 0 means one), else every logical processor.
+fn thread_count(jobs: Option<usize>) -> usize {
+    jobs.or_else(|| victory_gpu::pipeline::env_workers().map(|n| n.max(1)))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+}
+
+#[allow(clippy::too_many_arguments)] // the CLI's own options
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
     pipelines: bool,
     list: bool,
+    count: bool,
     jobs: Option<usize>,
     host_lanes: Option<(u32, u32)>,
     pair_meetings: bool,
@@ -172,6 +240,11 @@ pub fn run(
     if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
+    let pair_config = match std::env::var("VICTORY_PAIRS") {
+        Err(std::env::VarError::NotPresent) => String::new(),
+        value => value.context("VICTORY_PAIRS must contain valid Unicode")?,
+    };
+    let pairs = parse_pairs(&pair_config)?;
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -198,15 +271,8 @@ pub fn run(
             target.lanes_min, target.lanes_max
         );
     }
-    let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|p| p.split_once('+'))
-        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
-        .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = thread_count(jobs);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     let started = std::time::Instant::now();
@@ -223,8 +289,10 @@ pub fn run(
                         s.spawn(|| {
                             let mut t = Tally {
                                 list,
+                                count,
                                 ..Tally::default()
                             };
+                            let host = pipelines.then(|| Host::new(false).ok()).flatten();
                             let mut checks = Checks {
                                 target,
                                 pair_meetings,
@@ -232,9 +300,8 @@ pub fn run(
                                 validator: validate
                                     .then(|| Validator::load(dll.as_deref()).ok())
                                     .flatten(),
-                                host: pipelines
-                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                    .flatten(),
+                                mesh: host.as_ref().is_some_and(Host::mesh_shaders),
+                                host: host.map(|h| (h, host::stub_ps())),
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -292,36 +359,70 @@ pub fn run(
          {} vertex values; exports {:?}, {} still f16 pairs)",
         t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
     );
+    // A check nobody asked for has no result: not a zero, which a reader
+    // of a pasted report takes for "none passed".
+    let checks = |validated: usize, made: usize| {
+        let validated = if validate {
+            format!("{validated} validated")
+        } else {
+            "validation not checked".to_owned()
+        };
+        let made = if pipelines {
+            format!("{made} pipelines")
+        } else {
+            "pipelines not made".to_owned()
+        };
+        format!("{validated}, {made}")
+    };
     println!(
-        "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
-        t.emitted, t.emit_programs, t.validated, t.pipelines
+        "DXIL         {} emitted of {} vertex and pixel programs; {}",
+        t.emitted,
+        t.emit_programs,
+        checks(t.validated, t.pipelines)
     );
     println!(
-        "             {} emitted of {} compute programs; {} validated, {} pipelines",
-        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
+        "             {} emitted of {} compute programs; {}",
+        t.cs_emitted,
+        t.cs_programs,
+        checks(t.cs_validated, t.cs_pipelines)
     );
     println!(
-        "             {} emitted of {} mesh programs; {} validated, {} pipelines",
-        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
+        "             {} emitted of {} mesh programs; {}",
+        t.ms_emitted,
+        t.ms_programs,
+        checks(t.ms_validated, t.ms_pipelines)
     );
-    if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
-        let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
-                } else {
-                    host.pipeline(vs, ps)
-                }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
-                _ => "not emitted".to_owned(),
-            };
-            println!("pair {v} + {p}: {made}");
-        }
+    println!("wave sizes   {}", t.wave_summary());
+    if count {
+        print_counts(&t.counted);
     }
+    if !pairs.is_empty() {
+    let host = Host::new(false).map_err(anyhow::Error::msg)?;
+    let kept = lock(&kept);
+    let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
+    for (v, p) in pairs {
+        let made = match (find(v), find(p)) {
+            // A mesh pair is named the same way the census names it
+            // everywhere else: the host without mesh shaders says so
+            // instead of failing to make the pipeline with an error that
+            // reads like the shaders' fault.
+            (Some((_, vs)), Some((_, ps))) => {
+                let made = if vs.stage == HwStage::Ms {
+                    if host.mesh_shaders() {
+                        host.mesh_pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+                    } else {
+                        Err("the host has no mesh shaders".to_owned())
+                    }
+                } else {
+                    host.pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+                };
+                made.map(|()| "pipeline created".to_owned()).unwrap_or_else(|e| e)
+            }
+            _ => "not emitted".to_owned(),
+        };
+        println!("pair {v} + {p}: {made}");
+    }
+}
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
@@ -346,7 +447,8 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     // The pre-build's key listing reads the pack without warming the caches.
     if pipelines && let Some(file) = std::env::var_os("VICTORY_PREBUILD_KEYS") {
-        return crate::prebuild::run(&paths, threads, Some(file.into()));
+        let keys = crate::prebuild::keys_output_path(Some(file))?;
+        return crate::prebuild::run(&paths, threads, keys);
     }
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
@@ -612,15 +714,40 @@ fn translate(
     }
 }
 
-/// Validates an emitted shader if asked to.
+/// Records an emitted shader and runs the requested checks.
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
+    t.record_wave_size(shader.wave_size);
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
+    }
+    if t.count {
+        match emit::counts::of(&shader.dxil) {
+            Ok(counts) => {
+                if t.list {
+                    t.lines.push(format!(
+                        "{}  {} host instructions in {} blocks",
+                        label(),
+                        counts.instructions,
+                        counts.blocks
+                    ));
+                }
+                let stage = match shader.stage {
+                    HwStage::Cs => "compute",
+                    HwStage::Ms => "mesh",
+                    HwStage::Ps => "pixel",
+                    _ => "vertex",
+                };
+                let total = t.counted.entry(stage).or_default();
+                total.0 += 1;
+                total.1.add(&counts);
+            }
+            Err(e) => t.fail(format!("count: {e}"), &label),
+        }
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
@@ -639,6 +766,10 @@ fn check(
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+            // An adapter without mesh shaders refuses every one of these with
+            // `Unspecified error`; say that instead, once per program, so the
+            // tally names the host and not the translator.
+            HwStage::Ms if !checks.mesh => Err("the host has no mesh shaders".to_owned()),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
@@ -654,7 +785,11 @@ fn check(
     }
     let Some(v) = checks.validator.as_mut() else {
         if t.list && checks.host.is_none() {
-            t.lines.push(format!("{}  emitted", label()));
+            t.lines.push(format!(
+                "{}  emitted, {}",
+                label(),
+                wave_label(shader.wave_size)
+            ));
         }
         return;
     };
@@ -698,6 +833,49 @@ fn check(
             );
         }
     }
+}
+
+/// With `--count`: what the emitted shaders hold, by stage and then by kind
+/// of instruction (most first). Counts only, so it can be posted as it is.
+fn print_counts(counted: &BTreeMap<&'static str, (usize, Counts)>) {
+    let mut all = (0, Counts::default());
+    for (n, counts) in counted.values() {
+        all.0 += n;
+        all.1.add(counts);
+    }
+    println!(
+        "host code    {} instructions in {} blocks of {} emitted programs",
+        all.1.instructions, all.1.blocks, all.0
+    );
+    for (stage, (n, counts)) in counted {
+        println!(
+            "             {stage}: {} instructions in {} blocks of {n} programs",
+            counts.instructions, counts.blocks
+        );
+    }
+    let mut kinds: Vec<_> = all.1.kinds.iter().collect();
+    kinds.sort_by_key(|&(kind, n)| (std::cmp::Reverse(*n), kind));
+    for (kind, n) in kinds {
+        println!("  {n:>11}  {kind}");
+    }
+}
+
+#[test]
+fn counts_emitted_wave_sizes() {
+    let mut total = Tally::default();
+    assert_eq!(total.wave_summary(), "0 unrestricted, 0 wave32, 0 wave64");
+    for sizes in [[None, Some(32), Some(64)], [Some(64); 3]] {
+        let mut worker = Tally::default();
+        for size in sizes {
+            worker.record_wave_size(size);
+        }
+        total.merge(worker);
+    }
+    assert_eq!(total.wave_summary(), "1 unrestricted, 1 wave32, 4 wave64");
+    assert_eq!(
+        [None, Some(32), Some(64)].map(wave_label),
+        ["unrestricted", "wave32", "wave64"]
+    );
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
@@ -880,6 +1058,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::Tally;
+    use super::parse_pairs;
 
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
@@ -887,7 +1066,7 @@ mod tests {
         // SAFETY: no other test in this binary touches the environment.
         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, Some(1), None, false).unwrap_err();
+        let err = super::run(vec![missing], false, false, false, false, Some(1), None, false).unwrap_err();
         // SAFETY: as above; unset so a later test's `run` is not refused.
         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(
@@ -925,6 +1104,36 @@ mod tests {
                 assert_eq!(example, "a@0x0");
                 assert_eq!(total.lines.len(), if list { 3 } else { 0 });
             }
+        }
+    }
+
+    #[test]
+    fn parses_shader_pairs() {
+        assert!(parse_pairs("").unwrap().is_empty());
+        assert_eq!(
+            parse_pairs(" vertex+pixel , mesh + pixel+variant ").unwrap(),
+            [("vertex", "pixel"), ("mesh", "pixel+variant")]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_shader_pairs() {
+        for (value, index, entry) in [
+            ("vs", 1, "vs"),
+            ("   ", 1, "   "),
+            ("+", 1, "+"),
+            ("+ps", 1, "+ps"),
+            ("vs+", 1, "vs+"),
+            ("vs+   ", 1, "vs+   "),
+            ("vs+ps,  +other", 2, "  +other"),
+            ("vs+ps,", 2, ""),
+            ("vs+ps,,other+pixel", 2, ""),
+        ] {
+            let error = parse_pairs(value).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("VICTORY_PAIRS entry {index} ({entry:?})")),
+                "{value:?}: {error}"
+            );
         }
     }
 }

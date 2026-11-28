@@ -646,21 +646,26 @@ pub enum Unnamed {
     Metadata,
 }
 
+/// Byte storage with 8-byte alignment for D3D12 subobject streams and
+/// `D3D12_INPUT_ELEMENT_DESC` arrays.
+#[repr(C, align(8))]
+struct AlignedBytes<const N: usize>([u8; N]);
+
 /// A creation stream as the engine builds it (0x2b0 bytes): root signature,
 /// five shader slots (the first a vertex or mesh shader), blend, sample
 /// mask, rasteriser, depth-stencil (with depth bounds), sample description,
 /// input layout, topology, target formats, depth format. Its pointers go
 /// to the shaders passed in and to the input elements it holds.
 pub struct Stream<'a> {
-    bytes: Vec<u8>,
-    _elements: Vec<[u8; 32]>,
+    bytes: Box<AlignedBytes<0x2b0>>,
+    _elements: Vec<AlignedBytes<32>>,
     _names: Vec<Vec<u8>>,
     _shaders: std::marker::PhantomData<&'a [u8]>,
 }
 
 impl Stream<'_> {
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes.0
     }
 }
 
@@ -691,10 +696,10 @@ pub fn stream<'a>(
         return Err(Unnamed::Metadata);
     };
     let (sample_mask, count, quality) = samples;
-    let mut s = vec![0u8; 0x2b0];
-    let put = |s: &mut Vec<u8>, at: usize, v: u32| s[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let mut s = Box::new(AlignedBytes([0u8; 0x2b0]));
+    let put = |s: &mut [u8], at: usize, v: u32| s[at..at + 4].copy_from_slice(&v.to_le_bytes());
     let put64 =
-        |s: &mut Vec<u8>, at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        |s: &mut [u8], at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
     for (at, kind) in [
         (0x10, if mesh { 24 } else { 1 }),
         (0x28, 2),
@@ -711,18 +716,18 @@ pub fn stream<'a>(
         (0x280, 15),
         (0x2a8, 16),
     ] {
-        put(&mut s, at, kind);
+        put(&mut s.0, at, kind);
     }
-    put64(&mut s, 0x18, first.as_ptr() as u64);
-    put64(&mut s, 0x20, first.len() as u64);
+    put64(&mut s.0, 0x18, first.as_ptr() as u64);
+    put64(&mut s.0, 0x20, first.len() as u64);
     if let Some(ps) = pixel {
-        put64(&mut s, 0x30, ps.as_ptr() as u64);
-        put64(&mut s, 0x38, ps.len() as u64);
+        put64(&mut s.0, 0x30, ps.as_ptr() as u64);
+        put64(&mut s.0, 0x38, ps.len() as u64);
     }
-    s[0x8c..0x1d4].copy_from_slice(&blend_desc(blend));
-    put(&mut s, 0x1dc, sample_mask);
-    s[0x1e4..0x210].copy_from_slice(&rasterizer_desc(raster));
-    s[0x214..0x24c].copy_from_slice(&depth_stencil_desc(depth));
+    s.0[0x8c..0x1d4].copy_from_slice(&blend_desc(blend));
+    put(&mut s.0, 0x1dc, sample_mask);
+    s.0[0x1e4..0x210].copy_from_slice(&rasterizer_desc(raster));
+    s.0[0x214..0x24c].copy_from_slice(&depth_stencil_desc(depth));
     // The engine makes 1 to 16 samples, a power of two; 21 records store
     // other values there, and a run creates those pipelines with one.
     let (count, quality) = if [1, 2, 4, 8, 16].contains(&count) {
@@ -730,13 +735,13 @@ pub fn stream<'a>(
     } else {
         (1, 0)
     };
-    put(&mut s, 0x254, count);
-    put(&mut s, 0x258, quality);
+    put(&mut s.0, 0x254, count);
+    put(&mut s.0, 0x258, quality);
     let names: Vec<Vec<u8>> = inputs
         .iter()
         .map(|e| [e.semantic.as_bytes(), &[0]].concat())
         .collect();
-    let elements: Vec<[u8; 32]> = inputs
+    let elements: Vec<AlignedBytes<32>> = inputs
         .iter()
         .zip(&names)
         .map(|(e, name)| {
@@ -748,21 +753,21 @@ pub fn stream<'a>(
             {
                 b[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
             }
-            b
+            AlignedBytes(b)
         })
         .collect();
     if !elements.is_empty() {
-        put64(&mut s, 0x268, elements.as_ptr() as u64);
-        put(&mut s, 0x270, elements.len() as u32);
+        put64(&mut s.0, 0x268, elements.as_ptr() as u64);
+        put(&mut s.0, 0x270, elements.len() as u32);
     }
-    put(&mut s, 0x27c, u32::from(topology));
+    put(&mut s.0, 0x27c, u32::from(topology));
     for (i, &f) in formats.iter().enumerate() {
-        put(&mut s, 0x284 + 4 * i, u32::from(f));
+        put(&mut s.0, 0x284 + 4 * i, u32::from(f));
     }
     // The engine counts targets up to the last one with a format.
     let targets = formats.iter().rposition(|&f| f != 0).map_or(0, |i| i + 1);
-    put(&mut s, 0x2a4, targets as u32);
-    put(&mut s, 0x2ac, u32::from(depth_format));
+    put(&mut s.0, 0x2a4, targets as u32);
+    put(&mut s.0, 0x2ac, u32::from(depth_format));
     Ok(Stream {
         bytes: s,
         _elements: elements,
@@ -1000,6 +1005,10 @@ mod tests {
         let q = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
         assert_eq!(b.len(), 0x2b0);
         assert_eq!((w(0x10), q(0x18), q(0x20)), (1, vs.as_ptr() as u64, 12));
+        assert_eq!(b.as_ptr().align_offset(8), 0);
+        assert_eq!(q(0x268) % 8, 0);
+        assert_eq!(std::mem::align_of::<AlignedBytes<0x2b0>>(), 8);
+        assert_eq!(std::mem::align_of::<AlignedBytes<32>>(), 8);
         assert_eq!((w(0x28), q(0x30), q(0x38)), (2, ps.as_ptr() as u64, 20));
         assert_eq!(b[0x8c..0x1d4], blend_desc(&blend));
         assert_eq!(w(0x1dc), u32::MAX);

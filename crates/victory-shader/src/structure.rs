@@ -824,6 +824,11 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
+                        (_, Fields::Valu(_))
+                            if matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32") =>
+                        {
+                            None
+                        }
                         (&Some(e), _) => {
                             if let Some((prev, guard)) = last_guard
                                 && prev == e
@@ -1180,19 +1185,44 @@ impl<'a> Lanes<'a> {
         let name = inst.name();
         match &inst.fields {
             Fields::Sop { src, .. } => {
-                let mut takes_mask = false;
-                for s in src {
-                    if let Operand::Scalar { code, .. } = *s
-                        && code != NULL
-                        && let Some(k) = self.key(|r| inst.read(r), code)
-                    {
-                        let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k)
-                            || phi && !self.joins_loaded(k) && self.mask(k).1;
-                    }
-                }
                 let touches_exec =
                     inst.write(Reg::S(EXEC)).is_some() || inst.read(Reg::S(EXEC)).is_some();
+                let mut takes_mask = false;
+                let mut restored_only = true;
+                let mut has_non_mask_operand = false;
+                for s in src {
+                    match *s {
+                        Operand::Scalar { code, .. } if code != NULL => {
+                            if let Some(k) = self.key(|r| inst.read(r), code) {
+                                let phi =
+                                    self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
+                                let restored = self.restored.contains_key(&k.0)
+                                    && self.restored.contains_key(&k.1);
+                                let is_mask = self.masks.contains_key(&k)
+                                    || (phi && !self.joins_loaded(k) || restored) && self.mask(k).1;
+                                if is_mask {
+                                    takes_mask = true;
+                                    if !restored {
+                                        restored_only = false;
+                                    }
+                                } else {
+                                    has_non_mask_operand = true;
+                                }
+                            } else {
+                                has_non_mask_operand = true;
+                            }
+                        }
+                        Operand::Const(128 | 193) | Operand::Literal(0 | u32::MAX) => {}
+                        _ => has_non_mask_operand = true,
+                    }
+                }
+                // A restored wave32 mask combined with a non-mask scalar or
+                // bitmask constant (e.g. `s_and_b32 s7, s6, 1`) is a numeric
+                // bit-test whose wave-wide scalar SCC must stay scalar for
+                // `s_cselect_b32` and `s_cbranch_scc*`.
+                if !touches_exec && takes_mask && restored_only && has_non_mask_operand {
+                    takes_mask = false;
+                }
                 if (takes_mask || touches_exec)
                     && let Some(r) = self.sop(inst).filter(|r| r.derived)
                 {
@@ -1247,6 +1277,23 @@ impl<'a> Lanes<'a> {
                     && let Some(k) = self.key(|r| inst.read(r), code)
                 {
                     self.mask(k);
+                }
+                if matches!(name, "v_div_fmas_f32" | "v_div_fmas_f64")
+                    && let Some(k) = self.key(|r| inst.read(r), VCC)
+                {
+                    self.mask(k);
+                }
+                // A wave32 mask restored from a VGPR lane via `v_readlane_b32`
+                // keeps its mask identity without claiming EXEC at the restore.
+                if !self.p.wave64
+                    && name == "v_readlane_b32"
+                    && let Some(&(_, r)) = inst.writes.first()
+                    && self
+                        .restored
+                        .get(&r)
+                        .is_some_and(|&orig| self.masks.contains_key(&(orig, orig)))
+                {
+                    self.mask((r, r));
                 }
                 if name.starts_with("v_cmpx") {
                     if let Some(k) = self.key(|r| inst.write(r), EXEC) {
@@ -1737,6 +1784,71 @@ mod tests {
         assert!(structure(&p).is_ok());
     }
 
+    #[test]
+    fn restored_mask_feeds_sop_mask_op() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc_lo, 0, v0
+                0xD761_0005,
+                0x0001_006A, // v_writelane_b32 v5, vcc_lo, 0
+                0xD760_0006,
+                0x0001_0105, // v_readlane_b32 s6, v5, 0
+                0x8701_7E06, // s_and_b32 s1, s6, exec_lo
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let read = p.blocks[0].insts[2].write(Reg::S(6)).unwrap();
+        let and = p.blocks[0].insts[3].write(Reg::S(1)).unwrap();
+        assert!(s.masks.contains_key(&read), "restored wave32 mask tracked");
+        assert!(
+            s.masks.contains_key(&and),
+            "SOP reading restored mask tracked"
+        );
+    }
+
+    #[test]
+    fn restored_mask_numeric_bit_test_keeps_scalar_scc() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc_lo, 0, v0
+                0xD761_0005,
+                0x0001_006A, // v_writelane_b32 v5, vcc_lo, 0
+                0xD760_0006,
+                0x0001_0105, // v_readlane_b32 s6, v5, 0
+                0x8707_8106, // s_and_b32 s7, s6, 1
+                0x8508_948A, // s_cselect_b32 s8, 10, 20
+                0xBF84_0001, // s_cbranch_scc0 -> +1
+                0xBE89_0381, // s_mov_b32 s9, 1
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let and_inst = &p.blocks[0].insts[3];
+        let and_dst = and_inst.write(Reg::S(7)).unwrap();
+        let and_scc = and_inst.write(Reg::Scc).unwrap();
+        assert!(
+            !s.masks.contains_key(&and_dst),
+            "numeric bit-test on restored mask must stay scalar"
+        );
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("expected conditional branch exit, got {:?}", s.exits[0]);
+        };
+        let atoms: Vec<Atom> = s
+            .bools
+            .vars(when)
+            .into_iter()
+            .map(|v| s.bools.atoms[v as usize])
+            .collect();
+        assert_eq!(
+            atoms,
+            vec![Atom::Uniform(and_scc)],
+            "s_cbranch_scc0 after numeric bit-test must branch on wave-wide scalar SCC"
+        );
+    }
+
     /// [`Bools::vars`] as it was: lists of the nodes and variables seen.
     fn vars_by_scan(b: &Bools, root: Bool) -> Vec<u32> {
         let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![root]);
@@ -1898,6 +2010,35 @@ mod tests {
     }
 
     #[test]
+    fn meet_rejects_opposite_facts_about_the_same_function() {
+        // Fifteen pairs: splitting the diagram runs past `MAX_MEET`, where
+        // the search gives up and answers that some lane meets both.
+        let (mut b, xs) = atoms(30);
+        let f = pairs_equal(&mut b, &xs, 15);
+        assert!(!b.meet(&[(f, true), (f, false)]));
+        // Two functions that only become the same one after a split: where
+        // `x` holds, both are `g`, held both ways.
+        let (mut b, xs) = atoms(31);
+        let g = pairs_equal(&mut b, &xs[1..], 15);
+        let h = b.and(xs[0], g);
+        let nx = b.not(xs[0]);
+        let k = b.or(nx, g);
+        assert!(!b.meet(&[(h, true), (k, false)]));
+    }
+
+    /// One condition other than a constant is met either way, also when it
+    /// is too large to split within the budget.
+    #[test]
+    fn meet_takes_one_condition_as_met() {
+        let (mut b, xs) = atoms(30);
+        let f = pairs_equal(&mut b, &xs, 15);
+        assert!(b.meet(&[(f, true)]));
+        assert!(b.meet(&[(f, false)]));
+        assert!(b.meet(&[(f, true), (f, true)]));
+        assert!(!b.meet(&[(f, true), (Bool::FALSE, true)]));
+    }
+
+    #[test]
     #[ignore = "benchmark: cargo test --release -p victory-shader bench_bools -- --ignored --nocapture"]
     fn bench_bools() {
         // Microseconds per call, over at least 3 calls and 50 ms.
@@ -1941,6 +2082,63 @@ mod tests {
                 vars_old / vars_new,
                 given_old / given_new
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p victory-shader bench_meet -- --ignored --nocapture"]
+    fn bench_meet() {
+        // Meet is queried during structurisation and resource tracking. Keep
+        // each BDD fixed so this measures the constraint search, not building
+        // the test expressions.
+        let time = |b: &Bools, facts: &[(Bool, bool)]| {
+            let start = std::time::Instant::now();
+            let result = b.meet(facts);
+            let mut calls = 1;
+            while calls < 3 || start.elapsed().as_millis() < 50 {
+                std::hint::black_box(b.meet(std::hint::black_box(facts)));
+                calls += 1;
+            }
+            (
+                start.elapsed().as_secs_f64() * 1e6 / f64::from(calls),
+                result,
+            )
+        };
+
+        for n in [8usize, 10, 12] {
+            let (mut b, xs) = atoms(2 * n as u64);
+            let f = pairs_equal(&mut b, &xs, n);
+            let constraints: Vec<_> = (0..8)
+                .map(|i| mixed(&mut b, &xs, 0x51ed + i, 12 * n))
+                .collect();
+            let cases = [
+                ("one", vec![(f, true)]),
+                (
+                    "four",
+                    constraints
+                        .iter()
+                        .take(4)
+                        .enumerate()
+                        .map(|(i, &condition)| (condition, i % 2 == 0))
+                        .collect(),
+                ),
+                (
+                    "eight",
+                    constraints
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &condition)| (condition, i % 2 == 0))
+                        .collect(),
+                ),
+                ("contradiction", vec![(f, true), (f, false)]),
+            ];
+            for (name, facts) in cases {
+                let (us, result) = time(&b, &facts);
+                println!(
+                    "n={n} case={name} facts={} result={result} {us:.2} us/call",
+                    facts.len()
+                );
+            }
         }
     }
 
@@ -2055,5 +2253,29 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn readlane_and_writelane_are_unguarded_under_narrowed_exec() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec_lo, 0, v0
+                0xD761_0001, // v_writelane_b32 v1, s0, 0
+                0x0001_0000,
+                0xD761_0002, // v_writelane_b32 v2, exec_lo, 0
+                0x0001_007E,
+                0xD760_0003, // v_readlane_b32 s3, v1, 0
+                0x0001_0101,
+                0x7E08_0280, // v_mov_b32 v4, 0 (control VALU)
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        assert_eq!(s.guards[0][0], None);
+        assert_eq!(s.guards[0][1], None);
+        assert_eq!(s.guards[0][2], None);
+        assert_eq!(s.guards[0][3], None);
+        assert!(s.guards[0][4].is_some(), "ordinary VALU remains guarded");
     }
 }

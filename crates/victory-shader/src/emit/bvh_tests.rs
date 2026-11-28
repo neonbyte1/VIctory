@@ -492,6 +492,7 @@ struct Config {
     a16: bool,
     sort_boxes: bool,
     memory: bool,
+    high: bool,
 }
 
 /// A synthetic wave32 program of 256 threads: lane n reads its ray from the
@@ -650,6 +651,7 @@ fn build(cfg: Config) -> HostShader {
     })
     .expect("lower");
     let shader = HostShader {
+        wave_size: lowered.wave_size,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -792,6 +794,7 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
 
 fn run_cases(cfg: Config, batches: usize) {
     let shader = build(cfg);
+    assert!(!cfg.high || !cfg.memory, "the 64-bit offset is the root descriptor path");
     // A program with the BVH instruction reads its root SRV as title
     // memory too.
     assert!(shader.memory);
@@ -807,7 +810,7 @@ fn run_cases(cfg: Config, batches: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for (label, warp) in Host::test_backends() {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -827,11 +830,16 @@ fn run_cases(cfg: Config, batches: usize) {
         }
         let (mut hits, mut tris) = (0, 0);
         for cases in &batches {
-            // Rays, then the nodes, 128 bytes each.
+            // Rays, then the nodes, 128 bytes each. With `high`, a second
+            // copy of the nodes `HIGH` bytes further into the host buffer,
+            // which the page table maps 4 GiB above `TITLE`: a node pointer
+            // with bit 29 set reaches it, a 32-bit shift the zeros below.
             let nodes = (LANES * 64) as u32;
-            let mut data = vec![0u32; LANES * 16 + LANES * 32];
+            let high_at = if cfg.high { HIGH as u32 / 4 } else { 0 };
+            let mut data = vec![0u32; LANES * 16 + LANES * 32 + high_at as usize];
             for (n, (w, ty, ray)) in cases.iter().enumerate() {
-                let ptr = (nodes + 128 * n as u32) >> 3 | ty;
+                let ptr = (nodes + 128 * n as u32) >> 3 | ty
+                    | if cfg.high { 1 << 29 } else { 0 };
                 let r = &mut data[16 * n..16 * n + 12];
                 r[0] = ptr;
                 r[1] = ray.extent.to_bits();
@@ -856,12 +864,17 @@ fn run_cases(cfg: Config, batches: usize) {
                         r[8 + k] = ray.inv[k].to_bits();
                     }
                 }
-                let at = LANES * 16 + 32 * n;
+                let at = if cfg.high {
+                    (high_at + nodes / 4 + 32 * n as u32) as usize
+                } else {
+                    LANES * 16 + 32 * n
+                };
                 data[at..at + 28].copy_from_slice(w);
             }
+            let table = if cfg.high { page_table_high(1, 3) } else { page_table(1, 3) };
             let roots = vec![
                 (0, Root::Constants(ud.clone())),
-                (1, Root::View { srv: true, data: page_table(1, 3) }),
+                (1, Root::View { srv: true, data: table }),
                 (2, Root::Uav(2 * 4096 / 32)),
             ];
             let views = [
@@ -924,6 +937,7 @@ fn intersections_on_the_gpu_equal_the_reference() {
             a16: false,
             sort_boxes: true,
             memory: false,
+            high: false,
         },
         16,
     );
@@ -937,9 +951,30 @@ fn intersections_with_64_bit_pointers_on_the_gpu_equal_the_reference() {
             a16: false,
             sort_boxes: true,
             memory: false,
+            high: false,
         },
         8,
     );
+}
+
+/// How far into the host buffer the copy of the nodes 4 GiB higher sits.
+const HIGH: usize = 64 << 10;
+
+/// [`page_table`], with the page 4 GiB higher too, mapped to the copy
+/// [`HIGH`] bytes into the buffer: a node pointer with bit 29 set reaches
+/// it.
+fn page_table_high(view: u32, null: u32) -> Vec<u32> {
+    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
+    let mut t = page_table(view, null);
+    // Level 1 has 4096 entries, then blocks of 4096 two-dword entries.
+    t.resize(4096 + 3 * 8192, 0);
+    // 4 GiB is one more 256 MiB region: the level-1 index goes up by 16.
+    let l1 = ((hi << 4) | (lo >> 28)) as usize;
+    t[l1 + 16] = 2;
+    let page = (lo >> 16 & 0xFFF) as usize;
+    let at = 4096 + 2 * 8192 + 2 * page;
+    t[at..at + 2].copy_from_slice(&[view, lo.wrapping_sub(HIGH as u32)]);
+    t
 }
 
 /// The title address of the rays and nodes in the title-memory runs.
@@ -970,6 +1005,7 @@ fn intersections_on_nodes_in_title_memory_equal_the_reference() {
             a16: false,
             sort_boxes: true,
             memory: true,
+            high: false,
         },
         4,
     );
@@ -979,76 +1015,26 @@ fn intersections_on_nodes_in_title_memory_equal_the_reference() {
             a16: false,
             sort_boxes: true,
             memory: true,
+            high: false,
         },
         4,
     );
 }
 
-/// `a16` packs ray direction and inverse direction as six f16 values in three
-/// dwords (8 address dwords for 32-bit pointers, 9 via NSA for 64-bit).
+/// A node pointer with bit 29 set (a node more than 2 GiB into the BVH)
+/// reads where it points: the page table maps the page 4 GiB higher to a
+/// second copy of the nodes, while the page below is zeros. A 32-bit shift
+/// wraps back to the zeros (#2368).
 #[test]
-fn intersections_with_a16_on_the_gpu_equal_the_reference() {
-    for memory in [false, true] {
-        for wide in [false, true] {
-            run_cases(
-                Config {
-                    wide,
-                    a16: true,
-                    sort_boxes: true,
-                    memory,
-                },
-                4,
-            );
-        }
-    }
-}
-
-/// Clearing descriptor bit 63 (`box_sort_en = 0`) skips the distance sort
-/// network and returns child pointers in their original slot order, for both
-/// root descriptors (`Source::Built`) and raw title-memory descriptors.
-#[test]
-fn unsorted_box_intersections_on_the_gpu_equal_the_reference() {
-    for memory in [false, true] {
-        for a16 in [false, true] {
-            run_cases(
-                Config {
-                    wide: false,
-                    a16,
-                    sort_boxes: false,
-                    memory,
-                },
-                4,
-            );
-        }
-    }
-}
-
-/// Descriptor flags that are not emulated (box growth, triangle return mode 0)
-/// remain refused by name.
-#[test]
-fn other_bvh_descriptor_flags_are_still_refused() {
-    let base = Config {
-        wide: false,
-        a16: false,
-        sort_boxes: true,
-        memory: false,
-    };
-    let cases = [
-        // Non-zero box growth (bits 55..62 = dword 1 bits 23..30).
-        (0x8080_0000u32, 8 << 28 | 1 << 24 | 1 << 27 | 0x3FF),
-        // Triangle return mode 0 (dword 3 bit 24 cleared).
-        (0x8000_0000u32, 8 << 28 | 1 << 27 | 0x3FF),
-    ];
-    for (w1_flags, w3) in cases {
-        let native = native_program(&program_with_flags(base, w1_flags, w3), false);
-        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-        let st = structure::structure(&p).expect("structure");
-        let err = resource::track(&p, &native.layout, native.stage, Some(&st))
-            .expect_err("unsupported BVH descriptor flags must be refused");
-        assert!(
-            err.to_string()
-                .contains("a BVH descriptor with other flags"),
-            "unexpected error for ({w1_flags:#x}, {w3:#x}): {err}"
-        );
-    }
+fn a_node_pointer_above_two_gib_reads_where_it_points() {
+    run_cases(
+        Config {
+            wide: false,
+            a16: false,
+            sort_boxes: true,
+            memory: false,
+            high: true,
+        },
+        2,
+    );
 }

@@ -44,7 +44,13 @@ pub fn record<R>(
         host.end_hoisted_indirect();
         // What the library records may write buffers.
         crate::indirect::end_window(host);
+        #[cfg(feature = "diagnostics")]
+        let (timed, started) = (crate::library_timing::begin(host), std::time::Instant::now());
         out = Some(f(&host.list));
+        #[cfg(feature = "diagnostics")]
+        if let Some(pair) = timed {
+            crate::library_timing::end(host, pair, started.elapsed());
+        }
         state.host_state_lost();
     });
     out

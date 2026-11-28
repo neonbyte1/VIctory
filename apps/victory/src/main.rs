@@ -107,6 +107,11 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Count the instructions of every emitted shader (the DXIL the
+        /// host's compiler is given): the total, by stage and by kind; with
+        /// `--list`, a line per program too.
+        #[arg(long)]
+        count: bool,
         /// Positive worker thread count (default: every logical core).
         #[arg(long)]
         jobs: Option<NonZeroUsize>,
@@ -203,6 +208,7 @@ fn main() -> Result<()> {
             validate,
             pipelines,
             list,
+            count,
             jobs,
             cache: false,
             host_lanes,
@@ -212,6 +218,7 @@ fn main() -> Result<()> {
             validate,
             pipelines,
             list,
+            count,
             jobs.map(NonZeroUsize::get),
             host_lanes,
             !no_pair_meetings,

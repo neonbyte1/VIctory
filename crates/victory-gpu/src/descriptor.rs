@@ -106,12 +106,26 @@ impl Heap {
             .as_ref()
     }
 
+    /// The host heap if already created, without allocating it (diagnostics).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn existing_host(&self) -> Option<&host::HostHeap> {
+        self.host.get()?.as_ref()
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
         let at = handle.checked_sub(self.start)?;
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
+    }
+
+    /// Whether its host heap holds fewer slots than it has (the host's cap,
+    /// or a paged heap's): only then does a draw make tables afresh
+    /// (`crate::draw`), for the title's slots past the host's.
+    #[cfg(windows)]
+    pub(crate) fn capped(&self) -> bool {
+        self.host().is_some_and(|host| host.count() < self.desc.count)
     }
 }
 
@@ -487,9 +501,31 @@ impl RtvRecord {
     fn explicit_desc<T>(&self) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         let mut words = self.desc;
+        // "The resource's format" (unknown) names none to a typeless copy.
+        if words[0] == 0 {
+            words[0] = crate::resource::view_format(self.resource).unwrap_or(0);
+        }
         words[0] = crate::resource::pc_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+    }
+
+    /// [`RtvRecord::explicit_desc`]'s words; `own` is the format a view of the
+    /// resource must name if its host copy is typeless (none if typed).
+    #[cfg(all(windows, test))]
+    fn host_words(&self, dimension: u32, own: impl FnOnce() -> Option<u32>) -> Option<[u32; 6]> {
+        let mut words = if self.described == 0 {
+            [own()?, dimension, 0, 0, 0, 0]
+        } else {
+            let mut words = self.desc;
+            // "The resource's format" (unknown) names none to a typeless copy.
+            if words[0] == 0 {
+                words[0] = own().unwrap_or(0);
+            }
+            words
+        };
+        words[0] = crate::resource::pc_format(words[0]);
+        Some(words)
     }
 }
 
@@ -644,6 +680,28 @@ fn default_dsv_desc(
             },
         },
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn rtv_mips(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    desc: Option<&windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC>,
+) -> Option<std::ops::Range<u32>> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RTV_DIMENSION_TEXTURE2D;
+    let count = crate::host::color_mip_count(texture)?;
+    let mip = match desc {
+        None => 0,
+        Some(desc) if desc.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the view dimension selects this union member.
+            let view = unsafe { desc.Anonymous.Texture2D };
+            if view.PlaneSlice != 0 {
+                return None;
+            }
+            view.MipSlice
+        }
+        Some(_) => return None,
+    };
+    (mip < count).then(|| mip..mip + 1)
 }
 
 /// Device method: records the view at `handle` (descriptor memory).
@@ -837,7 +895,6 @@ pub(crate) fn forget(resource: usize) {
 }
 
 /// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
@@ -851,9 +908,10 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    if tag != VIEW_TAG {
+        return None;
+    }
+    view_at(i, generation)
 }
 
 /// A description of `N` words, if the title passes one.
@@ -1228,6 +1286,23 @@ pub(crate) mod tests {
         assert!(!h.is_null());
         // SAFETY: our allocation.
         unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+    }
+    /// A view description with the unknown format on a texture the host
+    /// made typeless (a depth texture shaders read) takes the title's.
+    #[cfg(windows)]
+    #[test]
+    fn an_unknown_format_in_a_view_description_is_the_resources() {
+        let record = |format| RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: std::ptr::null(),
+            desc: [format, 3, 1, 0, 0, 0],
+        };
+        let d32 = 40;
+        assert_eq!(record(0).host_words(3, || Some(d32)).unwrap()[..2], [d32, 3], "typeless host copy");
+        assert_eq!(record(0).host_words(3, || None).unwrap()[0], 0, "typed host copy");
+        assert_eq!(record(45).host_words(3, || Some(d32)).unwrap()[0], 45, "a format named is kept");
+        assert_eq!(record(0).host_words(3, || Some(118)).unwrap()[0], 20, "as the host has it");
     }
 
     #[test]

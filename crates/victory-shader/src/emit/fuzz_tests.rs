@@ -219,6 +219,7 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
     .map_err(|e| format!("lower: {e:?}"))?;
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,

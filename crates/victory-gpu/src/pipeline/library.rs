@@ -34,7 +34,7 @@
 //! world), and loads that waited on it stalled every worker for as long.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -44,8 +44,19 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
+///
+/// The library's pipelines are named after the shaders they were made from,
+/// so a change to the translator (`victory_shader::SOURCE_HASH`) makes every
+/// name in it useless. The first run after one used to write the few
+/// pipelines it made over the old library: measured on the title, a 926 MB
+/// library (27 160 pipelines, a 7.5 minute warm-up) became 612 KB, and
+/// bisecting between two builds paid that warm-up for each of them, in
+/// turn, every time. So each translation keeps its library beside the
+/// others, in `dir/<SOURCE_HASH>`, and a run only ever writes its own;
+/// [`KEPT`] of the newest are kept.
 pub fn use_pipeline_cache(dir: PathBuf) {
     DIR.get_or_init(|| {
+        let dir = keyed(&dir);
         sweep_staging(&dir, std::process::id(), STAGING_KEPT);
         dir
     });
@@ -93,6 +104,66 @@ fn staging_pid(name: &str) -> Option<u32> {
         return None;
     }
     pid.parse().ok()
+}
+
+/// Whether `dir` is a library directory this wrote: a name that is 16
+/// lowercase hex digits (a [`victory_shader::SOURCE_HASH`]) holding a
+/// library.
+fn is_translation(dir: &Path) -> bool {
+    let ours = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 16
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    ours && dir.is_dir() && library_in(dir)
+}
+
+/// Whether `dir` holds a library: [`LIBRARY_FILE`], or any of its shards
+/// where the library is split (`#1653` puts one file per shard,
+/// `host-pipelines.00.bin` to `host-pipelines.15.bin`, in the same
+/// directory, and writes only the shards that changed, so a small cache can
+/// hold shard 15 and no shard 00). Both are checked so that the two changes
+/// read the same directories whichever of them lands first - the names are
+/// written out because `shard_file` does not exist without the split.
+fn library_in(dir: &Path) -> bool {
+    dir.join(LIBRARY_FILE).is_file()
+        || (0..16).any(|shard| dir.join(format!("host-pipelines.{shard:02}.bin")).is_file())
+}
+
+/// How many translations keep a library: the one in use and the previous
+/// build's, which is what a bisection between two builds needs.
+const KEPT: usize = 2;
+
+/// `dir` under this build's translation, with older libraries pruned to
+/// [`KEPT`] (by modification time).
+fn keyed(dir: &Path) -> PathBuf {
+    let path = dir.join(victory_shader::SOURCE_HASH);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return path;
+    };
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        // Only a directory this wrote: named like a translation and holding
+        // a library. Anything else in the cache directory (`backup/`, a
+        // copy of one) is not ours to delete.
+        .filter(|other| *other != path && is_translation(other))
+        .filter_map(|other| {
+            let at = other.metadata().ok()?.modified().ok()?;
+            Some((at, other))
+        })
+        .collect();
+    others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, older) in others.into_iter().skip(KEPT - 1) {
+        // A library and a list or two: gone with the translation that made
+        // them. Nothing this run reads is ever one of them.
+        let _ = std::fs::remove_dir_all(&older);
+    }
+    path
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -325,6 +396,10 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
 /// host descriptions).
 fn tag(blob: &[u8]) -> String {
     let limit = victory_shader::emit::loop_limit().to_le_bytes();
+    // The view-heap size shaders clamp their indices below is part of the
+    // translation too (as the shader cache keys it).
+    crate::descriptor::host::probe_view_limit();
+    let views = victory_shader::emit::view_heap_limit().to_le_bytes();
     let translator = victory_shader::SOURCE_HASH.as_bytes();
     let mut h = blake3::Hasher::new();
     for part in [
@@ -332,6 +407,7 @@ fn tag(blob: &[u8]) -> String {
         translator,
         include_bytes!("../shader_cache.rs"),
         &limit,
+        &views,
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
     ] {
@@ -381,6 +457,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+#[derive(Debug)]
 pub(crate) struct PipelineState {
     pub(crate) pso: ID3D12PipelineState,
     /// The library contains this PSO under its name.
@@ -396,34 +473,48 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<PipelineState> {
-    let wide = HSTRING::from(name);
+    pipeline_in(library(), name, load, create)
+}
+
+fn pipeline_in(
+    library: Option<&Shared>,
+    name: &str,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<PipelineState> {
     #[cfg(feature = "diagnostics")]
-    LAST.set(Some((name.to_owned(), true)));
-    let Some(library) = library() else {
+    LAST.set(None);
+    let make = || {
+        let pso = create()?;
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create().map(|pso| PipelineState { pso, in_library: false });
+        #[cfg(feature = "diagnostics")]
+        LAST.set(Some((name.to_owned(), false)));
+        Ok(PipelineState { pso, in_library: false })
     };
+    let Some(library) = library else {
+        return make();
+    };
+    let wide = HSTRING::from(name);
     let _held = NAMES.hold(name);
     // Outside the lock: loads take up to seconds, and a save holds the lock
     // for as long as it serialises. The library's blob lives as long as it
     // does, which is never dropped.
     if let Ok(pso) = load(&library.loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        LAST.set(Some((name.to_owned(), true)));
         return Ok(PipelineState { pso, in_library: true });
     }
     // Compiled outside the lock: compiles take up to seconds.
-    #[cfg(feature = "diagnostics")]
-    LAST.set(Some((name.to_owned(), false)));
-    let pso = create()?;
-    MADE.fetch_add(1, Ordering::Relaxed);
+    let made = make()?;
     let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    let in_library = unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok();
+    let in_library = unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &made.pso) }.is_ok();
     if in_library {
         l.added += 1;
     }
-    Ok(PipelineState { pso, in_library })
+    Ok(PipelineState { pso: made.pso, in_library })
 }
 
 #[cfg(feature = "diagnostics")]
@@ -434,11 +525,27 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Held by a save from start to end.
+static SAVING: Mutex<()> = Mutex::new(());
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    // One save at a time, from serialising to the last file: an older blob
+    // never lands over a newer, nor beside another's prebuilt list. The
+    // periodic saves (after each pipeline a worker makes) are best effort:
+    // they leave it to the save running; shutdown's waits.
+    let _saving = if now {
+        SAVING.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match SAVING.try_lock() {
+            Ok(saving) => saving,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    };
     let Some(dir) = DIR.get() else { return };
     if LIBRARY.get().is_none() && !USED_CHANGED.load(Ordering::Relaxed) {
         return;
@@ -702,6 +809,25 @@ pub(crate) fn note_used(key: &str) {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_refused_pipeline_has_no_built_record() {
+        use windows::Win32::Foundation::E_INVALIDARG;
+
+        // A preceding success on this worker must not become the refused pipeline's record.
+        for library in [None, library()] {
+            LAST.set(Some(("earlier".into(), true)));
+            let refused = pipeline_in(
+                library,
+                "refused",
+                |_, _| Err(E_INVALIDARG.into()),
+                || Err(E_INVALIDARG.into()),
+            );
+            assert_eq!(refused.unwrap_err().code(), E_INVALIDARG);
+            assert_eq!(LAST.take(), None);
+        }
+    }
+
     /// A size the host cannot give is refused, not fatal; others are zeros.
     #[test]
     fn a_save_buffer_the_host_cannot_give_is_refused() {
@@ -905,6 +1031,50 @@ mod tests {
         assert!(Dirty::take(&mut added, &mut prebuilt, &used).is_some(), "the next save writes them");
     }
 
+    /// A save waits for the one running (the worker's and shutdown's do not
+    /// interleave their files).
+    #[test]
+    fn a_save_waits_for_the_save_running() {
+        let running = SAVING.lock().unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let second = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                save(true);
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!done.load(Ordering::SeqCst), "a second save ran under the first");
+        drop(running);
+        second.join().unwrap();
+    }
+
+    /// A periodic save finding one running returns at once: compile workers
+    /// call it after every pipeline and must not wait out a save's files.
+    #[test]
+    fn a_periodic_save_does_not_wait_for_the_save_running() {
+        let running = SAVING.lock().unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let periodic = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                save(false);
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let returned = done.load(Ordering::SeqCst);
+        drop(running);
+        periodic.join().unwrap();
+        assert!(returned, "a periodic save waited for the one running");
+    }
+
     /// The pre-build's list holds only for the library bytes it was
     /// saved with.
     #[test]
@@ -1059,10 +1229,7 @@ mod tests {
     fn a_pipeline_loads_while_a_save_holds_the_library() {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::core::s;
-        let (Some(device), Some(library)) = (
-            crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()),
-            library(),
-        ) else {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
         // No resources, and the root signature made apart: a compiler need
@@ -1113,7 +1280,7 @@ mod tests {
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Made {}
         impl Made {
-            fn get(&self, made: bool) -> windows::core::Result<PipelineState> {
+            fn get(&self, library: Option<&Shared>, made: bool) -> windows::core::Result<PipelineState> {
                 let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     // SAFETY: a borrowed pointer the description never releases.
                     pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
@@ -1123,7 +1290,8 @@ mod tests {
                     },
                     ..Default::default()
                 };
-                pipeline(
+                pipeline_in(
+                    library,
                     "test: a pipeline loads while a save holds the library",
                     // SAFETY: the description points at live data.
                     |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
@@ -1136,12 +1304,23 @@ mod tests {
             }
         }
         let made = Made(device, root, code);
-        made.get(true).expect("made and stored");
+        #[cfg(feature = "diagnostics")]
+        {
+            made.get(None, true).expect("created without a library");
+            assert_eq!(LAST.take().map(|(_, loaded)| loaded), Some(false));
+        }
+        let Some(library) = library() else { return };
+        made.get(Some(library), true).expect("made and stored");
         let saving = library.state.lock().unwrap_or_else(|e| e.into_inner());
         let (done, loaded) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
             let made = &made;
-            s.spawn(move || done.send(made.get(false).is_ok()));
+            s.spawn(move || {
+                let loaded = made.get(Some(library), false).is_ok();
+                #[cfg(feature = "diagnostics")]
+                assert_eq!(LAST.take().map(|(_, loaded)| loaded), Some(true));
+                done.send(loaded)
+            });
             let loaded = loaded.recv_timeout(std::time::Duration::from_secs(30));
             drop(saving);
             assert_eq!(loaded, Ok(true), "the load waited for the save");
@@ -1225,3 +1404,62 @@ mod tests {
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
     }
 }
+
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+
+    /// Pruning keeps only directories this wrote: a `backup/` (or any
+    /// directory without a hash name) in the cache directory survives,
+    /// with what is in it, even when it is the oldest thing there.
+    #[test]
+    fn pruning_leaves_foreign_directories_alone() {
+        let dir = std::env::temp_dir().join(format!("victory-keyed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // An old directory of ours, an old one of someone else's, and the
+        // one this build uses.
+        for (name, own) in [("00112233aabbccdd", true), ("backup", false)] {
+            let at = dir.join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join("sentinel"), b"keep me").unwrap();
+            if own {
+                std::fs::write(at.join("host-pipelines.bin"), b"library").unwrap();
+            }
+        }
+        let current = dir.join(victory_shader::SOURCE_HASH);
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("host-pipelines.bin"), b"library").unwrap();
+
+        assert_eq!(keyed(&dir), current);
+        assert!(dir.join("backup").join("sentinel").is_file(), "a foreign directory was deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A translation's directory is a library with the one-file library or
+    /// with any single shard of a split one, not only shard 00 (review on
+    /// #2706: the split writes only the shards that changed). A shard number
+    /// past the split's sixteen, or no library file at all, is not one.
+    #[test]
+    fn any_shard_makes_a_library_directory() {
+        let dir = std::env::temp_dir().join(format!("victory-shards-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, file, library) in [
+            ("legacy", Some("host-pipelines.bin"), true),
+            ("first", Some("host-pipelines.00.bin"), true),
+            ("last", Some("host-pipelines.15.bin"), true),
+            ("past", Some("host-pipelines.16.bin"), false),
+            ("other", Some("sentinel"), false),
+            ("empty", None, false),
+        ] {
+            let at = dir.join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            if let Some(file) = file {
+                std::fs::write(at.join(file), b"library").unwrap();
+            }
+            assert_eq!(library_in(&at), library, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

@@ -191,6 +191,7 @@ fn lower_native(native: &NativeProgram) -> Result<HostShader, ShaderError> {
     })?;
     let shader = HostShader {
         stage: native.stage,
+        wave_size: lowered.wave_size,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         static_samplers: lowered

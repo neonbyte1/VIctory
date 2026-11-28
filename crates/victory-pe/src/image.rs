@@ -983,4 +983,94 @@ mod tests {
         bad[tls_dd + 4..tls_dd + 8].copy_from_slice(&40u32.to_le_bytes());
         assert!(matches!(ImageInfo::parse(&bad), Err(PeError::Malformed(_))));
     }
+
+    /// `IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT`.
+    const DELAY_IMPORT: usize = 13;
+
+    /// A synthetic image whose delay-load directory lists `delay.dll` with two
+    /// imports, "Func" (hint 5) and ordinal 7, and whose IAT starts at
+    /// `iat_rva`. The section is RVA 0x1000..0x1200 and the image ends at
+    /// 0x2000.
+    fn delay_image(iat_rva: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 0x200];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        // The descriptor, then the all-zero one that ends the table.
+        put32(&mut body, 0x00, 1); // attributes: RVAs, not VAs
+        put32(&mut body, 0x04, 0x1040); // DLL name
+        put32(&mut body, 0x0C, iat_rva); // import address table
+        put32(&mut body, 0x10, 0x1060); // import name table
+        body[0x40..0x4A].copy_from_slice(b"delay.dll\0");
+        // The name table: "Func" by hint/name, ordinal 7, the terminator.
+        body[0x60..0x68].copy_from_slice(&0x1100u64.to_le_bytes());
+        body[0x68..0x70].copy_from_slice(&(1u64 << 63 | 7).to_le_bytes());
+        body[0x100..0x102].copy_from_slice(&5u16.to_le_bytes());
+        body[0x102..0x107].copy_from_slice(b"Func\0");
+
+        let mut data = synthetic_image(&body);
+        let opt = 0x58;
+        // No export directory: the body is not one.
+        data[opt + 112..opt + 120].fill(0);
+        let dd = opt + 112 + DELAY_IMPORT * 8;
+        data[dd..dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[dd + 4..dd + 8].copy_from_slice(&0x40u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn delay_imports_list_names_and_ordinals_with_their_iat_slots() {
+        let info = ImageInfo::parse(&delay_image(0x1080)).unwrap();
+        assert!(info.imports.is_empty(), "delay imports are not imports");
+        assert_eq!(info.delay_imports.len(), 1);
+        let module = &info.delay_imports[0];
+        assert_eq!(module.dll, "delay.dll");
+        let entries: Vec<_> = module
+            .entries
+            .iter()
+            .map(|e| (e.symbol.clone(), e.iat_slot_rva))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (
+                    ImportSymbol::Name {
+                        hint: 5,
+                        name: "Func".into()
+                    },
+                    0x1080
+                ),
+                (ImportSymbol::Ordinal(7), 0x1088),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_image_without_a_delay_load_directory_has_no_delay_imports() {
+        let mut data = delay_image(0x1080);
+        let dd = 0x58 + 112 + DELAY_IMPORT * 8;
+        data[dd..dd + 8].fill(0);
+        let info = ImageInfo::parse(&data).unwrap();
+        assert!(info.delay_imports.is_empty());
+    }
+
+    #[test]
+    fn a_delay_iat_ending_at_the_end_of_the_image_is_accepted() {
+        // Two 8-byte slots: the second ends exactly at SizeOfImage (0x2000).
+        let info = ImageInfo::parse(&delay_image(0x2000 - 16)).unwrap();
+        assert_eq!(info.delay_imports[0].entries[1].iat_slot_rva, 0x2000 - 8);
+    }
+
+    #[test]
+    fn a_delay_iat_running_past_the_image_is_rejected() {
+        // One byte too far: the second slot would end at 0x2001.
+        assert!(matches!(
+            ImageInfo::parse(&delay_image(0x2000 - 15)),
+            Err(PeError::Malformed(_))
+        ));
+        // At the 4 GiB limit, where the slot's end overflows a u32.
+        assert!(matches!(
+            ImageInfo::parse(&delay_image(0xFFFF_FFF8)),
+            Err(PeError::Malformed(_))
+        ));
+    }
 }

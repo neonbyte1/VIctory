@@ -17,7 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -367,6 +367,16 @@ impl Shadow {
             .collect()
     }
 
+    /// Marks the page of title address `address` as written through a view
+    /// of the copy, as shaders do (tests).
+    #[cfg(test)]
+    pub(crate) fn mark_written(&self, address: u64) {
+        if let (Some((bit, _)), Some(b)) = (self.mark_entry(address), bitmap(false)) {
+            // SAFETY: a dword of the mapped bitmap; no submission runs.
+            unsafe { *(b.data as *mut u32).add(bit as usize / 32) |= 1 << (bit % 32) };
+        }
+    }
+
     /// Up to 64 bytes of the copy at title address `address`, as floats, and
     /// which copy it is (diagnostics: what shaders see there).
     #[cfg(feature = "diagnostics")]
@@ -495,6 +505,26 @@ impl Shadow {
     /// Whether writes through views of this copy are marked.
     pub(crate) fn marked(&self) -> bool {
         self.marks.is_some()
+    }
+
+    /// Whether every page of this copy has a mark bit below the bitmap's last
+    /// dword (which holds the overflow sink bit and is cleared whole in
+    /// [`copy_back_marks`]).
+    pub(crate) fn marks_complete(&self) -> bool {
+        self.marks
+            .is_some_and(|base| marks_below_last_word(base, pages(self.start, self.len)))
+    }
+
+    /// Marks the 64 KiB title page at `page` in the written-pages bitmap
+    /// (`memory`: shaders using title memory), as a shader write does (tests).
+    #[cfg(test)]
+    pub(crate) fn mark_page_for_test(&self, page: usize, memory: bool) {
+        let (bit, _) = self
+            .mark_entry(page as u64)
+            .expect("tracked copy with mark bits");
+        let b = bitmap(memory).expect("written-pages bitmap");
+        // SAFETY: `bit` is a valid mark bit inside the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -1020,6 +1050,66 @@ impl Shadow {
         }
     }
 
+    /// The stale check of this copy ([`check_stale`]): every page its
+    /// tracker calls unchanged and that it holds in tracked memory is
+    /// compared with title memory. Passed by: pages the title writes
+    /// meanwhile (a guard fault marks them before the write lands, so a
+    /// difference is asked about again after the compare), pages with
+    /// nothing mapped, and pages whose withheld shader writes stay in the
+    /// copies until the frame's end
+    /// (`crate::memory::withheld_until_frame_end`). Returns the pages
+    /// compared and, per page that differed, its address and the bytes that
+    /// did; with `fix` such pages are copied again.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn stale_pages(&self, fix: bool) -> (u64, Vec<(usize, usize)>) {
+        let Some(t) = &self.tracked else {
+            return (0, Vec::new());
+        };
+        if self
+            .subs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|s| !s.pending.is_empty())
+        {
+            return (0, Vec::new()); // shaders may be writing it
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (mut compared, mut differ) = (0, Vec::new());
+        let mut title = vec![0u8; PAGE];
+        for page in start / PAGE..end.div_ceil(PAGE) {
+            let (from, to) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+            if t.changed(page)
+                || !t.untracked(from, to).is_empty()
+                || crate::memory::withheld_until_frame_end(from, to)
+            {
+                continue;
+            }
+            let title = &mut title[..to - from];
+            if !crate::host::read_into(from as *const u8, title) {
+                continue;
+            }
+            compared += 1;
+            // SAFETY: inside the mapping; only the submitting thread writes it.
+            let ours =
+                unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+            if ours == &title[..] || t.changed(page) {
+                continue;
+            }
+            differ.push((
+                from,
+                ours.iter()
+                    .zip(title.iter())
+                    .filter(|(a, b)| a != b)
+                    .count(),
+            ));
+            if fix {
+                self.copy(from, to);
+            }
+        }
+        (compared, differ)
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -1219,6 +1309,13 @@ impl Drop for Shadow {
 /// The 64 KiB title pages `[start, start + len)` touches.
 fn pages(start: u64, len: u64) -> u32 {
     ((start + len.max(1) - 1) >> 16).saturating_sub(start >> 16) as u32 + 1
+}
+
+/// Whether `page_count` consecutive mark bits starting at `base` all lie below
+/// the written-pages bitmap's last dword (which is cleared whole because of the
+/// overflow sink bit).
+fn marks_below_last_word(base: u32, page_count: u32) -> bool {
+    u64::from(base) + u64::from(page_count) <= u64::from(victory_shader::emit::VIEW_WRITE_BITS - 32)
 }
 
 /// The bits of the buffer views' written-pages bitmap (`victory_shader::
@@ -2470,10 +2567,63 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
 }
 
-/// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+struct Buffers {
+    map: BTreeMap<(u64, usize), Entry>,
+    /// Live registration count per buffer size, keeping `max_size()` exact
+    /// in O(log n) across inserts, in-place replacements, and removals.
+    sizes: BTreeMap<u64, usize>,
+}
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+impl Buffers {
+    const fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            sizes: BTreeMap::new(),
+        }
+    }
+
+    fn max_size(&self) -> u64 {
+        self.sizes.keys().next_back().copied().unwrap_or(0)
+    }
+
+    fn insert(&mut self, resource: usize, start: u64, len: u64) {
+        if let Some(prev) = self.map.insert(
+            (start, resource),
+            Entry {
+                end: start + len,
+                shadow: None,
+            },
+        ) {
+            let old_len = prev.end - start;
+            if old_len == len {
+                return;
+            }
+            self.decrement_size(old_len);
+        }
+        *self.sizes.entry(len).or_insert(0) += 1;
+    }
+
+    fn remove(&mut self, resource: usize, start: u64) -> Option<Entry> {
+        let removed = self.map.remove(&(start, resource))?;
+        self.decrement_size(removed.end - start);
+        Some(removed)
+    }
+
+    fn decrement_size(&mut self, len: u64) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.sizes.entry(len) {
+            if *entry.get() > 1 {
+                *entry.get_mut() -= 1;
+            } else {
+                entry.remove();
+            }
+        }
+    }
+}
+
+/// Title buffers by (start address, resource), with their copy once made.
+static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers::new());
+
+fn buffers() -> std::sync::MutexGuard<'static, Buffers> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -2490,38 +2640,38 @@ fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
-/// The longest title buffer registered so far (it stays after the buffer is
-/// released): a buffer starting further below an address than this cannot
-/// hold it. Changed under `BUFFERS`' lock.
-static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
+/// Counts title buffers made and released: which buffer is the innermost
+/// one holding some bytes ([`find`]) may differ when it changed.
+static OWNERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The count of [`OWNERS`].
+pub(crate) fn owners() -> u64 {
+    OWNERS.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    let mut map = buffers();
-    MAX_SPAN.fetch_max(len, Ordering::Relaxed);
-    map.insert(
-        (start, resource),
-        Entry {
-            end: start.saturating_add(len),
-            shadow: None,
-        },
-    );
+    buffers().insert(resource, start, len);
+    // After the buffers changed: a count read before is looked at again.
+    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    let removed = buffers().remove(resource, start);
+    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
+    if removed.is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
 }
 
-/// The innermost entry holding `[address, end)`: the one starting closest
-/// below `address` that reaches `end`, among those starting at most `span`
-/// (the longest entry's length) below `end`. Big buffers hold many smaller
-/// ones (a heap's placed buffers), so the one holding an address past
-/// those can be any number of entries back.
-fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: u64) -> Option<(u64, usize)> {
-    let lowest = end.saturating_sub(span);
+fn find_buffer(
+    map: &BTreeMap<(u64, usize), Entry>,
+    max_size: u64,
+    address: u64,
+    end: u64,
+) -> Option<(u64, usize)> {
+    let lowest = end.saturating_sub(max_size);
     if lowest > address {
         return None;
     }
@@ -2535,13 +2685,12 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
-    let Some(key) = key else {
-        drop(map);
+    let mut state = buffers();
+    let Some(key) = find_buffer(&state.map, state.max_size(), address, end) else {
+        drop(state);
         return loose(address, end);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = state.map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -2579,11 +2728,46 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Windows a covering window answered instead of a new copy (diagnostics).
+#[cfg(windows)]
+pub(crate) static REUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The loose windows by count and bytes (diagnostics): the shared segment's
+/// own content; the copies are never freed, so what this reaches is what
+/// the segment carries until the process ends.
+#[cfg(windows)]
+pub(crate) fn loose_stats() -> (usize, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = map.iter().map(|((_, len), _)| *len).sum();
+    (map.len(), bytes)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
+        return Some(shadow.clone());
+    }
+    // A window that already covers [start, start + len) serves it without
+    // another host copy: the title asks for runs of neighbouring windows
+    // (a mesh pass's constants, then its vertices), and one big window
+    // covers each of them; measured, most asks were covered this way and
+    // the copies they would have made were the shared segment's bulk.
+    // Candidates start at or before ours; the first whose end reaches
+    // past ours wins (nearest start first, from the map's end).
+    let covering = map
+        .range(..(start, u64::MAX))
+        .rev()
+        .find(|((at, l), _)| at + *l >= start + len);
+    if let Some((_, shadow)) = covering {
+        #[cfg(windows)]
+        REUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory covered by a wider window"
+        );
         return Some(shadow.clone());
     }
     let backing = alloc_backing(len, 128 << 20, false, || {
@@ -2653,6 +2837,124 @@ pub(crate) fn log_views(frames: f64) {
             held as f64 / 1e6
         );
     }
+}
+
+/// `VICTORY_STALE_CHECK` (diagnostics, after ka1qux's check of the same
+/// name): once per presented frame, before a submission refreshes anything,
+/// one host copy in N (round robin over the copies) has the pages its tracker
+/// calls unchanged compared with title memory. A page that differs holds a
+/// write the tracking missed: the title's through a path that neither faults
+/// nor reports, or the shaders' through a view nobody declared or marked.
+/// The counts and the first pages that differ are logged with the frame
+/// statistics ([`log_stale`]); the target is none.
+///
+/// Its value: N (`1` checks every copy every frame); `fix`, every copy, and
+/// the pages that differ are copied; anything else, one copy in 64; unset,
+/// empty or `0`, off.
+#[cfg(feature = "diagnostics")]
+fn stale_setting(value: Option<&str>) -> Option<(u64, bool)> {
+    match value {
+        None | Some("" | "0") => None,
+        Some("fix") => Some((1, true)),
+        Some(n) => Some((n.parse().ok().filter(|&n| n > 0).unwrap_or(64), false)),
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn stale_check() -> Option<(u64, bool)> {
+    static ON: std::sync::OnceLock<Option<(u64, bool)>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = stale_setting(std::env::var("VICTORY_STALE_CHECK").ok().as_deref());
+        if let Some((every, fix)) = on {
+            tracing::warn!(
+                every,
+                fix,
+                "VICTORY_STALE_CHECK: pages of host copies the write tracking calls unchanged are compared with title memory"
+            );
+        }
+        on
+    })
+}
+
+/// What [`check_stale`] found since the last [`log_stale`]: copies checked,
+/// pages compared, pages and bytes that differed, the first pages that did
+/// (addresses, at most 10); and pages that differed in all.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Stale {
+    copies: u64,
+    pages: u64,
+    differed: u64,
+    bytes: u64,
+    first: Vec<usize>,
+    in_all: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+static STALE: Mutex<Stale> = Mutex::new(Stale {
+    copies: 0,
+    pages: 0,
+    differed: 0,
+    bytes: 0,
+    first: Vec::new(),
+    in_all: 0,
+});
+
+/// At the start of a submission (under the submission lock: no copy-back or
+/// refresh runs, nothing is armed or pending): with `VICTORY_STALE_CHECK`,
+/// the first submission of each presented frame checks its share of the
+/// copies ([`Shadow::stale_pages`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn check_stale() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let Some((every, fix)) = stale_check() else {
+        return;
+    };
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    let frame = crate::queue::presented();
+    if FRAME.swap(frame, Relaxed) == frame {
+        return;
+    }
+    for (k, copy) in all().iter().enumerate() {
+        if !(k as u64).wrapping_add(frame).is_multiple_of(every) {
+            continue;
+        }
+        let (pages, differ) = copy.stale_pages(fix);
+        let mut s = STALE.lock().unwrap_or_else(|e| e.into_inner());
+        s.copies += 1;
+        s.pages += pages;
+        s.differed += differ.len() as u64;
+        s.in_all += differ.len() as u64;
+        s.bytes += differ.iter().map(|&(_, n)| n as u64).sum::<u64>();
+        let room = 10usize.saturating_sub(s.first.len());
+        s.first.extend(differ.iter().map(|&(at, _)| at).take(room));
+    }
+}
+
+/// Logs what [`check_stale`] found over the last `frames` frames, if on.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_stale(frames: f64) {
+    let Some((every, _)) = stale_check() else {
+        return;
+    };
+    let s = {
+        let mut s = STALE.lock().unwrap_or_else(|e| e.into_inner());
+        let in_all = s.in_all;
+        let taken = std::mem::take(&mut *s);
+        s.in_all = in_all;
+        taken
+    };
+    let first: Vec<String> = s.first.iter().map(|a| format!("{a:#x}")).collect();
+    tracing::info!(
+        "stale check over {frames:.0} frames (one copy in {every} a frame): {} copies, {} pages the write tracking \
+         called unchanged compared with title memory, {} of them differed ({} bytes), {} in all; first: {}",
+        s.copies,
+        s.pages,
+        s.differed,
+        s.bytes,
+        s.in_all,
+        first.join(", ")
+    );
 }
 
 /// Copies of single views' bytes ([`for_view`]), by (start, length), held
@@ -2806,7 +3108,7 @@ impl Arena {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut all: Vec<Arc<Shadow>> = buffers().map.values().filter_map(|e| e.shadow.clone()).collect();
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
@@ -2815,6 +3117,7 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers()
+        .map
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -2972,6 +3275,142 @@ pub(crate) mod tests {
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
+    }
+
+    /// A loose window wider than a later ask covers it: the narrower ask
+    /// reuses the wider copy instead of making another host buffer for
+    /// memory a copy already spans (the shared segment's bulk was these).
+    #[test]
+    fn a_wider_loose_window_covers_a_later_smaller_ask() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // One window-aligned pair of pages inside a reservation that
+        // guarantees the addresses, found free again (other tests allocate
+        // meanwhile: tried again if taken).
+        let pair = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then the
+                // two window-aligned allocations where it was, kept (as the
+                // other tests' pools: their copies must not name memory a
+                // later test reuses).
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 3 * WINDOW as usize, MEM_RESERVE, PAGE_READWRITE)
+                        as usize;
+                    if p == 0 {
+                        return None;
+                    }
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let aligned = p.next_multiple_of(WINDOW as usize);
+                    let at = |q: usize| {
+                        VirtualAlloc(q as *const _, WINDOW as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                            as usize
+                    };
+                    let (one, two) = (at(aligned), at(aligned + WINDOW as usize));
+                    if one == aligned && two == aligned + WINDOW as usize {
+                        return Some((one, two));
+                    }
+                    [one, two].into_iter().filter(|&q| q != 0).for_each(|q| {
+                        VirtualFree(q as *mut _, 0, MEM_RELEASE);
+                    });
+                    None
+                }
+            })
+            .expect("a window-aligned pair of pages");
+        let (one, two) = (pair.0 as u64, pair.1 as u64);
+        let Some(wide) = find(one, 2 * WINDOW) else {
+            return; // no host GPU here
+        };
+        let before = REUSES.load(std::sync::atomic::Ordering::Relaxed);
+        let narrow = find(two, WINDOW);
+        let Some(narrow) = narrow else {
+            return; // no host GPU here (the wide one already was)
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&wide, &narrow),
+            "the narrower ask reuses the covering window"
+        );
+        assert_eq!(
+            REUSES.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "the reuse is counted"
+        );
+        // An ask the wide window does not reach still gets its own copy.
+        let beyond = find(two, 2 * WINDOW);
+        if let Some(beyond) = beyond {
+            assert!(
+                !std::sync::Arc::ptr_eq(&wide, &beyond),
+                "an ask past the covering window makes its own"
+            );
+            assert_eq!(
+                REUSES.load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "no reuse for an ask past the window"
+            );
+        }
+    }
+
+    /// The stale check (`VICTORY_STALE_CHECK`) finds a page the title wrote
+    /// with its guard opened behind the tracking's back (a write nothing
+    /// sees or reports), and only it: a write the guard saw counts as
+    /// changed and is passed by, and so is a copy shaders may be writing.
+    /// With `fix` the page is copied, and the next check finds nothing.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn the_stale_check_finds_writes_the_tracking_missed() {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(0, p, len).unwrap();
+        assert_eq!(copy.stale_pages(false), (3, Vec::new()), "nothing missed");
+        // SAFETY: a byte of our pool, guarded: the handler marks the page.
+        unsafe { ((p + 10) as *mut u8).write_volatile(1) };
+        let mut old = 0;
+        // SAFETY: a page of our pool; only its protection changes.
+        let opened =
+            unsafe { VirtualProtect((p + PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+        assert_ne!(opened, 0);
+        // SAFETY: two bytes of our pool, now writable with no fault.
+        unsafe { ((p + PAGE + 20) as *mut u16).write_volatile(0x0203) };
+        let found = (2, vec![(p + PAGE, 2)]);
+        assert_eq!(
+            copy.stale_pages(false),
+            found,
+            "page 0 changed, page 1 missed"
+        );
+        assert_eq!(copy.stale_pages(true), found);
+        assert_eq!(copy.stale_pages(false), (2, Vec::new()), "copied");
+        assert_eq!(
+            copy.read_host((p + PAGE + 20) as u64, 1)[0] & 0xffff,
+            0x0203
+        );
+        copy.writing(0, p, len, false);
+        assert_eq!(
+            copy.stale_pages(false),
+            (0, Vec::new()),
+            "shaders may be writing it"
+        );
+        copy.copy_back(0, p, len);
+        unregister(p, p as u64);
+    }
+
+    /// `VICTORY_STALE_CHECK`'s values: off, one copy in N, every copy with
+    /// the pages that differ copied, one in 64 for anything else.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn stale_check_settings() {
+        for off in [None, Some(""), Some("0")] {
+            assert_eq!(stale_setting(off), None);
+        }
+        assert_eq!(stale_setting(Some("1")), Some((1, false)));
+        assert_eq!(stale_setting(Some("16")), Some((16, false)));
+        assert_eq!(stale_setting(Some("fix")), Some((1, true)));
+        assert_eq!(stale_setting(Some("on")), Some((64, false)));
     }
 
     /// Runs of the shared buffers start a whole number of elements (and of
@@ -3263,6 +3702,50 @@ pub(crate) mod tests {
         assert_eq!(read(), 0xaa, "not named unchanged: the difference goes back");
         copy.copy_back(0, p, PAGE);
         unregister(p, p as u64);
+    }
+
+    /// Unmapping another mapping of an armed page leaves the copy's mapping
+    /// guarded and clean: the shaders' marked writes still go back, and a
+    /// title write to the surviving mapping still saves the page's old bytes
+    /// so both writers survive.
+    #[test]
+    fn remapping_an_alias_does_not_drop_marked_writes_on_the_surviving_copy() {
+        let (a, b) = crate::watch::tests::twin_views(2);
+        let len = 2 * PAGE;
+        register(a, a as u64, len as u64);
+        let Some(copy) = find(a as u64, len as u64) else {
+            unregister(a, a as u64);
+            return; // no host GPU here
+        };
+        copy.update(0, a, len).unwrap();
+        copy.writing(0, a, len, true);
+        // The shaders write a byte in each page; the runtime unmaps the
+        // other mapping of both pages while the submission runs.
+        copy.write_host((a + 10) as u64, &[0xaa]);
+        copy.write_host((a + PAGE + 20) as u64, &[0xbb]);
+        crate::watch::title_memory_remapped(b, len);
+        // The title then writes page 1 through the surviving mapping: it
+        // must still be guarded so the page's old bytes are saved first.
+        // SAFETY: a byte of our surviving mapping.
+        unsafe { ((a + PAGE + 40) as *mut u8).write_volatile(0x11) };
+        assert!(
+            copy.copy_back_marked(0, a, &Default::default()) > 0,
+            "page 0's shader write goes back"
+        );
+        assert!(
+            copy.copy_back_marked(0, a + PAGE, &Default::default()) > 0,
+            "page 1's shader write goes back"
+        );
+        // SAFETY: bytes of our surviving mapping.
+        let read = |at: usize| unsafe { ((a + at) as *const u8).read_volatile() };
+        assert_eq!(read(10), 0xaa, "page 0 kept the shader's write");
+        assert_eq!(
+            (read(PAGE + 20), read(PAGE + 40)),
+            (0xbb, 0x11),
+            "page 1 kept both writers' bytes"
+        );
+        copy.copy_back(0, a, len);
+        unregister(a, a as u64);
     }
 
     /// Mark bits are handed out in runs and come back joined.
