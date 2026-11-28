@@ -883,12 +883,17 @@ impl Ask<'_> {
     /// it takes. A page only partly inside is copied in part and stays
     /// changed.
     fn whole(&self) -> impl Iterator<Item = usize> + '_ {
-        let (start, end) = (self.tracked.start, self.tracked.end);
-        let (from, to) = self.range();
         self.pages
             .iter()
             .copied()
-            .filter(move |&p| (p * PAGE).max(start) >= from && ((p + 1) * PAGE).min(end) <= to)
+            .filter(move |&p| self.whole_page(p))
+    }
+
+    /// Whether page `page` (a page number) is one of [`Ask::whole`]'s.
+    fn whole_page(&self, page: usize) -> bool {
+        let (start, end) = (self.tracked.start, self.tracked.end);
+        let (from, to) = self.range();
+        (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to
     }
 }
 
@@ -911,42 +916,79 @@ impl Ask<'_> {
 /// [`Tracked::written`] read the set, and not in `pages`, stays changed for
 /// a later take.
 pub(crate) fn take_written(asks: &[Ask<'_>]) -> Vec<(Runs, Runs)> {
+    take_written_in(asks, guard_chunk())
+}
+
+/// Pages of [`take_written`] guarded in one hold of the guard lock
+/// (`VICTORY_GUARD_CHUNK`, 0: all of them, as before).
+///
+/// A hold covering a whole refresh batch (thousands of pages, a few
+/// milliseconds) is a hold every title thread's write fault in that time
+/// waits for, and the wait a fault sees is the *residual* of the hold it
+/// meets: with holds `S`, E[wait] grows with E[S²], so the longest holds in
+/// the batch are what a frame's faults wait behind, not the batch's total.
+///
+/// A chunk bounds the longest hold. Every page still leaves its tracker's
+/// set under the lock and guarded, before the caller copies
+/// ([`take_written`]'s guarantee is per page, and `crate::shadow`'s
+/// `refresh_planned` copies after the whole call returns).
+fn guard_chunk() -> usize {
+    static CHUNK: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("VICTORY_GUARD_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    });
+    *CHUNK
+}
+
+/// [`take_written`], the pages of one hold of the guard lock given
+/// (`0`: all of them in one).
+fn take_written_in(asks: &[Ask<'_>], chunk: usize) -> Vec<(Runs, Runs)> {
     let mut whole: Vec<usize> = asks.iter().flat_map(Ask::whole).collect();
     whole.sort_unstable();
     whole.dedup();
     let mut unmapped = Vec::new();
     if !whole.is_empty() {
-        // Every address showing the same pages is guarded too. A write in
-        // between marks them changed again; the copy, made after, has it.
-        #[cfg(feature = "diagnostics")]
-        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-        let mut g = guards();
+        let chunk = if chunk == 0 { whole.len() } else { chunk };
         #[cfg(test)]
         TAKE_COUNTS.with(|c| c.set((c.get().0 + 1, c.get().1)));
         #[cfg(feature = "diagnostics")]
-        {
+        crate::copystat::add(crate::copystat::C::TakeRounds, 1);
+        for pages in whole.chunks(chunk) {
+            // Every address showing the same pages is guarded too. A write
+            // in between marks them changed again; the copy, made after,
+            // has it.
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let mut g = guards();
+            #[cfg(feature = "diagnostics")]
             drop(waited);
-            crate::copystat::add(crate::copystat::C::TakeRounds, 1);
-        }
-        #[cfg(feature = "diagnostics")]
-        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
-        let others = aliases(&g, &whole);
-        let unguarded = guard_aliases(&mut g, &others);
-        #[cfg(feature = "diagnostics")]
-        drop(asked);
-        whole.retain(|p| !unguarded.contains(p));
-        // Ascending, as `whole` is.
-        let taken = protect_noting(&mut g, &whole, &mut unmapped);
-        for ask in asks {
-            let c = &ask.tracked.changed;
-            let mut changed = c.0.lock().unwrap_or_else(|e| e.into_inner());
-            for page in ask.whole().filter(|p| taken.binary_search(p).is_ok()) {
-                changed.remove(&page);
-                c.taken(page);
+            #[cfg(feature = "diagnostics")]
+            let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+            let others = aliases(&g, pages);
+            let unguarded = guard_aliases(&mut g, &others);
+            #[cfg(feature = "diagnostics")]
+            drop(asked);
+            // Ascending, as `whole` is.
+            let pages: Vec<usize> = pages
+                .iter()
+                .copied()
+                .filter(|p| !unguarded.contains(p))
+                .collect();
+            let taken = protect_noting(&mut g, &pages, &mut unmapped);
+            for ask in asks {
+                let c = &ask.tracked.changed;
+                let mut changed = c.0.lock().unwrap_or_else(|e| e.into_inner());
+                for &page in &taken {
+                    if ask.whole_page(page) {
+                        changed.remove(&page);
+                        c.taken(page);
+                    }
+                }
+                set_dirty(c.2, !changed.is_empty());
             }
-            set_dirty(c.2, !changed.is_empty());
         }
-        drop(g);
     }
     asks.iter()
         .map(|ask| {
@@ -2949,7 +2991,15 @@ fn install() {
             1,
             crate::census::Writer::Title(r.ExceptionAddress as usize),
         );
+        // The wait for the lock is what a fault costs when the lock is busy
+        // (a refresh batch guards thousands of pages a frame): counted apart
+        // from the work it then does (`GuardWaitUs`, as the take's own wait
+        // is), since the fix for it is shorter holds, not less work.
+        #[cfg(feature = "diagnostics")]
+        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
         let mut g = guards();
+        #[cfg(feature = "diagnostics")]
+        drop(waited);
         // A tracker armed for the page keeps its bytes before the write: they
         // are read without the lock, the page guarded meanwhile, and kept
         // only if it stayed guarded throughout ([`OPENED`]); else they are
@@ -2964,7 +3014,11 @@ fn install() {
             let before = opened(page).load(Ordering::Relaxed);
             drop(g);
             let bytes = page_bytes(page);
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
             g = guards();
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
             if g.protected.contains(&page) && opened(page).load(Ordering::Relaxed) == before {
                 read = bytes.map(|b| (page, b));
             }
@@ -3094,6 +3148,67 @@ pub(crate) mod tests {
         assert!(a.changed(p / PAGE) && !a.changed(p / PAGE + 1));
         drop((a, b));
         free(p);
+    }
+
+    /// A take whose pages the guard lock covers in several holds
+    /// (`VICTORY_GUARD_CHUNK`) takes the same pages, and guards every one of
+    /// them: a write after it faults again.
+    #[test]
+    fn a_take_in_chunks_takes_and_guards_every_page() {
+        let (one, many) = (pool(8), pool(8));
+        let (a, b) = (
+            track(one, 8 * PAGE, true).expect("tracked"),
+            track(many, 8 * PAGE, true).expect("tracked"),
+        );
+        let written = [1usize, 2, 3, 5, 7];
+        for (base, t) in [(one, &a), (many, &b)] {
+            // Guarded first, so that the writes below fault and open.
+            t.take(base, base + 8 * PAGE);
+            for &k in &written {
+                // SAFETY: a byte of our pool, committed read-write.
+                unsafe { ((base + k * PAGE + 8) as *mut u8).write_volatile(k as u8) };
+            }
+        }
+        let runs = |t: &Tracked, base: usize, chunk: usize| {
+            let pages = t.written(base, base + 8 * PAGE);
+            assert_eq!(pages.len(), written.len(), "the writes are seen");
+            take_written_in(
+                &[Ask {
+                    tracked: t,
+                    from: base,
+                    to: base + 8 * PAGE,
+                    pages: &pages,
+                }],
+                chunk,
+            )
+        };
+        let together = runs(&a, one, 0);
+        let chunked = runs(&b, many, 2);
+        assert_eq!(
+            chunked,
+            together
+                .into_iter()
+                .map(|(copy, zero)| {
+                    let shift = |runs: Runs| -> Runs {
+                        runs.into_iter()
+                            .map(|(x, y)| (x - one + many, y - one + many))
+                            .collect()
+                    };
+                    (shift(copy), shift(zero))
+                })
+                .collect::<Vec<_>>()
+        );
+        for (base, t) in [(one, &a), (many, &b)] {
+            for &k in &written {
+                // SAFETY: a byte of our pool; the take made the page
+                // read-only, so this faults into the handler.
+                unsafe { ((base + k * PAGE + 16) as *mut u8).write_volatile(0x5a) };
+                assert!(t.changed(base / PAGE + k), "page {k} guarded again");
+            }
+        }
+        drop((a, b));
+        free(one);
+        free(many);
     }
 
     /// A range running from free memory over another allocation into a pool
