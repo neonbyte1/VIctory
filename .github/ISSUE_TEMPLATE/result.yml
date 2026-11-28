@@ -1,0 +1,43 @@
+name: Measurement result
+description: An in-game or test measurement, always with an adjacent control.
+title: "Result: "
+labels: ["kind: result", "status: measuring"]
+body:
+  - type: input
+    id: tree
+    attributes: {label: Tree (branch @ commit), placeholder: "stack/nvidia-wine @ 1c31b7a"}
+    validations: {required: true}
+  - type: input
+    id: exe
+    attributes: {label: Exe sha256 (first 16 hex)}
+    validations: {required: true}
+  - type: input
+    id: env
+    attributes: {label: Env and run length, placeholder: "VICTORY_GPU_OVERLAP=1 ... ; 420 s"}
+    validations: {required: true}
+  - type: input
+    id: control
+    attributes: {label: Adjacent control (run tag, tree, exe sha)}
+    validations: {required: true}
+  - type: input
+    id: hardware
+    attributes: {label: Hardware (link to its kind:hardware issue)}
+    validations: {required: true}
+  - type: textarea
+    id: table
+    attributes:
+      label: Results (medians of the last 30 frame lines)
+      value: |
+        | Run | Frame | Min | Preparing | GPU | Copy-back | Dropped | VRAM |
+        |---|---|---|---|---|---|---|---|
+    validations: {required: true}
+  - type: textarea
+    id: picture
+    attributes: {label: Picture check (frames, luma, % pixels > 32 vs control)}
+  - type: textarea
+    id: verdict
+    attributes: {label: Verdict and inferences (mark guesses as such)}
+  - type: textarea
+    id: ai
+    attributes: {label: AI use, value: "_AI-assisted (<tool>); measured on my machine, no game data shared._"}
+    validations: {required: true}

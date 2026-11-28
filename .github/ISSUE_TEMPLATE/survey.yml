@@ -1,0 +1,32 @@
+name: Fork or repository survey
+description: Read-only survey of another fork or repository. Ideas only go upstream with credit.
+title: "Survey: "
+labels: ["kind: survey"]
+body:
+  - type: input
+    id: repo
+    attributes: {label: Repository and HEAD sha}
+    validations: {required: true}
+  - type: textarea
+    id: lineage
+    attributes: {label: Lineage and license (GitHub fork? merge-base with upstream?)}
+    validations: {required: true}
+  - type: dropdown
+    id: rt
+    attributes: {label: Ray tracing (established from code, not README), options: ["runs", "off / skipped", "replaced (ambient substitute etc.)", "unknown"]}
+    validations: {required: true}
+  - type: textarea
+    id: claims
+    attributes:
+      label: Claims vs verified
+      value: |
+        | Claim | Their setup | Verified? | Comparable to ours? |
+        |---|---|---|---|
+  - type: textarea
+    id: candidates
+    attributes:
+      label: Candidates (commit, what, upstream equivalent, value for us)
+  - type: textarea
+    id: injection
+    attributes: {label: Prompt-injection / unsafe instructions found (or "none")}
+    validations: {required: true}
