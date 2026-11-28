@@ -177,6 +177,10 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// Whether that host runs mesh shaders at all: an adapter without them
+    /// refuses every mesh pipeline with `E_FAIL`, which in the census reads
+    /// as a translator defect unless the refusal says what it is.
+    mesh: bool,
 }
 
 fn parse_pairs(value: &str) -> Result<Vec<(&str, &str)>> {
@@ -265,15 +269,15 @@ pub fn run(
                                 list,
                                 ..Tally::default()
                             };
+                            let host = pipelines.then(|| Host::new(false).ok()).flatten();
                             let mut checks = Checks {
                                 target,
                                 keep: (!pairs.is_empty()).then(|| kept.clone()),
                                 validator: validate
                                     .then(|| Validator::load(dll.as_deref()).ok())
                                     .flatten(),
-                                host: pipelines
-                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                    .flatten(),
+                                mesh: host.as_ref().is_some_and(Host::mesh_shaders),
+                                host: host.map(|h| (h, host::stub_ps())),
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -350,13 +354,22 @@ pub fn run(
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in pairs {
             let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
-                } else {
-                    host.pipeline(vs, ps)
+                // A mesh pair is named the same way the census names it
+                // everywhere else: the host without mesh shaders says so
+                // instead of failing to make the pipeline with an error that
+                // reads like the shaders' fault.
+                (Some((_, vs)), Some((_, ps))) => {
+                    let made = if vs.stage == HwStage::Ms {
+                        if host.mesh_shaders() {
+                            host.mesh_pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+                        } else {
+                            Err("the host has no mesh shaders".to_owned())
+                        }
+                    } else {
+                        host.pipeline(vs, ps).map(|_| ()).map_err(|e| e.to_string())
+                    };
+                    made.map(|()| "pipeline created".to_owned()).unwrap_or_else(|e| e)
                 }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
                 _ => "not emitted".to_owned(),
             };
             println!("pair {v} + {p}: {made}");
@@ -679,6 +692,10 @@ fn check(
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+            // An adapter without mesh shaders refuses every one of these with
+            // `Unspecified error`; say that instead, once per program, so the
+            // tally names the host and not the translator.
+            HwStage::Ms if !checks.mesh => Err("the host has no mesh shaders".to_owned()),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
