@@ -335,6 +335,22 @@ impl Module {
         self.consts.iter().any(|(_, c)| *c == want)
     }
 
+    /// The value of a 32-bit integer that any optimiser can work out before
+    /// the program runs: a constant, or integer arithmetic, compares, casts
+    /// and selects over such values (the builder itself folds nothing, a
+    /// driver does). `None` when it depends on anything else.
+    pub fn known_i32(&self, v: V) -> Option<u32> {
+        Known::new(self).int(v, KNOWN_DEPTH)
+    }
+
+    /// `known_i32` and how many values it looked at.
+    #[cfg(test)]
+    fn known_i32_visits(&self, v: V) -> (Option<u32>, u32) {
+        let mut k = Known::new(self);
+        let x = k.int(v, KNOWN_DEPTH);
+        (x, k.visits)
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
@@ -1424,6 +1440,132 @@ pub(super) fn two_function_bitcode() -> Vec<u8> {
     w.finish()
 }
 
+/// How far `known_i32` follows operands, and how many values it looks at
+/// in all: the expressions an `op_sel` half selection or a scalar select
+/// make are a few values deep, and a shader can build a deep graph that
+/// reuses a value on both sides (`v_add_nc_u32 v2, v2, v2` over and over).
+const KNOWN_DEPTH: u32 = 32;
+const KNOWN_VISITS: u32 = 512;
+
+/// One `known_i32` query: each value is worked out once (a value that is
+/// known is known at any depth; one that is not, is not at any lesser
+/// depth either), and the whole query looks at `KNOWN_VISITS` values at
+/// most.
+struct Known<'a> {
+    m: &'a Module,
+    seen: HashMap<V, (Option<u32>, u32)>,
+    visits: u32,
+}
+
+impl<'a> Known<'a> {
+    fn new(m: &'a Module) -> Self {
+        Self {
+            m,
+            seen: HashMap::new(),
+            visits: 0,
+        }
+    }
+
+    /// An integer of up to 32 bits (or a float's bits), with `depth`
+    /// values left to follow.
+    fn int(&mut self, v: V, depth: u32) -> Option<u32> {
+        match self.seen.get(&v) {
+            Some(&(Some(x), _)) => return Some(x),
+            Some(&(None, d)) if d >= depth => return None,
+            _ => {}
+        }
+        if self.visits >= KNOWN_VISITS {
+            return None;
+        }
+        self.visits += 1;
+        let x = self.eval(v, depth);
+        self.seen.insert(v, (x, depth));
+        x
+    }
+
+    fn bits(&self, v: V) -> Option<(u32, bool)> {
+        match self.m.types[self.m.type_of(v).0 as usize] {
+            TypeDef::Int(bits) if bits <= 32 => Some((bits, true)),
+            TypeDef::Float => Some((32, false)),
+            _ => None,
+        }
+    }
+
+    fn eval(&mut self, v: V, depth: u32) -> Option<u32> {
+        let depth = depth.checked_sub(1)?;
+        let (bits, int) = self.bits(v)?;
+        let mask = u32::MAX >> (32 - bits);
+        let signed = |x: u32, bits: u32| ((x << (32 - bits)) as i32) >> (32 - bits);
+        let m = self.m;
+        let x = match v {
+            V::Const(i) => match m.consts[i as usize].1 {
+                Const::Int(x) => x as u32,
+                Const::Float(x) => x,
+                _ => return None,
+            },
+            V::Inst(i) => match m.insts[i as usize].op {
+                Op::Bin(op, a, b) if int => {
+                    let (a, b) = (self.int(a, depth)?, self.int(b, depth)?);
+                    match op {
+                        Bin::Add => a.wrapping_add(b),
+                        Bin::Sub => a.wrapping_sub(b),
+                        Bin::Mul => a.wrapping_mul(b),
+                        Bin::Shl if b < bits => a << b,
+                        Bin::LShr if b < bits => (a & mask) >> b,
+                        Bin::AShr if b < bits => (signed(a, bits) >> b) as u32,
+                        Bin::And => a & b,
+                        Bin::Or => a | b,
+                        Bin::Xor => a ^ b,
+                        _ => return None,
+                    }
+                }
+                Op::Cmp(p, a, b) if (pred::EQ..=pred::SLE).contains(&p) => {
+                    let (from, true) = self.bits(a)? else {
+                        return None;
+                    };
+                    let (a, b) = (self.int(a, depth)?, self.int(b, depth)?);
+                    let (sa, sb) = (signed(a, from), signed(b, from));
+                    u32::from(match p {
+                        pred::EQ => a == b,
+                        pred::NE => a != b,
+                        pred::IUGT => a > b,
+                        pred::IUGE => a >= b,
+                        pred::IULT => a < b,
+                        pred::IULE => a <= b,
+                        pred::SGT => sa > sb,
+                        pred::SGE => sa >= sb,
+                        pred::SLT => sa < sb,
+                        _ => sa <= sb,
+                    })
+                }
+                Op::Cast(op, x) => {
+                    let from = match self.bits(x)? {
+                        (bits, true) => bits,
+                        (32, false) if op == Cast::Bitcast => 32,
+                        _ => return None,
+                    };
+                    let y = self.int(x, depth)?;
+                    match op {
+                        Cast::Trunc | Cast::ZExt | Cast::Bitcast => y & u32::MAX >> (32 - from),
+                        Cast::SExt => signed(y, from) as u32,
+                        _ => return None,
+                    }
+                }
+                Op::Select(cond, t, f) => match self.int(cond, depth) {
+                    Some(c) => self.int(if c & 1 != 0 { t } else { f }, depth)?,
+                    None => {
+                        let t = self.int(t, depth)?;
+                        (Some(t) == self.int(f, depth)).then_some(t)?
+                    }
+                },
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(x & mask)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1444,6 +1586,123 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// `known_i32` sees through the integer arithmetic over constants that
+    /// an `op_sel` half selection is made of, and stops at run-time values
+    /// and float arithmetic.
+    #[test]
+    fn known_i32_folds_constant_integer_arithmetic() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t]);
+        let f = m.function("dx.op.input", fty, Some(Attr::ReadNone), false);
+        let b = m.new_block();
+        let two = m.i32(0x4000_0000);
+        let (k16, low) = (m.i32(16), m.i32(0xFFFF));
+        let top = m.bin(b, Bin::LShr, two, k16);
+        let bottom = m.bin(b, Bin::And, two, low);
+        let hi = m.bin(b, Bin::Shl, bottom, k16);
+        let swapped = m.bin(b, Bin::Or, top, hi);
+        assert_eq!(m.known_i32(swapped), Some(0x4000));
+        let minus16 = m.i32(0xFFFF_FFF0);
+        assert_eq!(m.known_i32(minus16), Some(0xFFFF_FFF0));
+        let float = m.f32(2.0f32.to_bits());
+        let bits = m.cast(b, Cast::Bitcast, float, i32t);
+        assert_eq!(m.known_i32(bits), Some(0x4000_0000));
+        let shifted = m.bin(b, Bin::AShr, minus16, k16);
+        assert_eq!(m.known_i32(shifted), Some(u32::MAX));
+
+        let input = m.call(b, f, vec![two]);
+        assert_eq!(m.known_i32(input), None);
+        let mixed = m.bin(b, Bin::And, input, low);
+        assert_eq!(m.known_i32(mixed), None);
+        let yes = m.cmp(b, pred::EQ, input, two);
+        let same = m.select(b, yes, swapped, top);
+        assert_eq!(m.known_i32(same), Some(0x4000));
+        let either = m.select(b, yes, swapped, two);
+        assert_eq!(m.known_i32(either), None);
+        let sum = m.bin(b, Bin::Add, float, float);
+        assert_eq!(m.known_i32(sum), None);
+    }
+
+    /// A value used on both sides of each step (`v_add_nc_u32 v2, v2, v2`
+    /// over and over) is worked out once per query, not once per path: 31
+    /// doublings took 2^32 visits before, and a 40-step chain stops at the
+    /// depth limit having looked at each value once.
+    #[test]
+    fn known_i32_works_out_a_shared_value_once() {
+        let mut m = Module::default();
+        let b = m.new_block();
+        let mut x = m.i32(1);
+        let mut chain = vec![x];
+        for _ in 0..40 {
+            x = m.bin(b, Bin::Add, x, x);
+            chain.push(x);
+        }
+        assert_eq!(m.known_i32_visits(chain[31]), (Some(0x8000_0000), 32));
+        assert_eq!(m.known_i32_visits(chain[24]), (Some(1 << 24), 25));
+        // Past the depth limit: unknown, as before, after one visit to each
+        // of the 33 values in reach (the steps from 40 down to 8).
+        assert_eq!(m.known_i32_visits(chain[40]), (None, 33));
+        assert_eq!(m.known_i32(chain[40]), None);
+
+        // Many distinct values: unknown once the query has looked at
+        // `KNOWN_VISITS` of them.
+        let mut level: Vec<V> = (0..1024).map(|i| m.i32(i)).collect();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|p| m.bin(b, Bin::Xor, p[0], p[1]))
+                .collect();
+        }
+        let (k, visits) = m.known_i32_visits(level[0]);
+        assert_eq!(k, None);
+        assert_eq!(visits, KNOWN_VISITS);
+    }
+
+    /// An integer compare of known values is known, so a scalar select
+    /// over it (`s_cmp_eq_u32 1, 1` then `s_cselect_b32`) is too.
+    #[test]
+    fn known_i32_folds_integer_compares() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t]);
+        let f = m.function("dx.op.input", fty, Some(Attr::ReadNone), false);
+        let b = m.new_block();
+        let (one, minus1, k) = (m.i32(1), m.i32(u32::MAX), m.i32(0x4000));
+        let zero = m.i32(0);
+        let cases = [
+            (pred::EQ, one, one, 1),
+            (pred::NE, one, one, 0),
+            (pred::IUGT, minus1, one, 1),
+            (pred::IUGE, one, minus1, 0),
+            (pred::IULT, one, minus1, 1),
+            (pred::IULE, minus1, minus1, 1),
+            (pred::SGT, minus1, one, 0),
+            (pred::SGE, minus1, minus1, 1),
+            (pred::SLT, minus1, one, 1),
+            (pred::SLE, one, minus1, 0),
+        ];
+        for (p, x, y, want) in cases {
+            let c = m.cmp(b, p, x, y);
+            assert_eq!(m.known_i32(c), Some(want), "predicate {p}");
+            let sel = m.select(b, c, k, zero);
+            assert_eq!(m.known_i32(sel), Some(if want == 1 { 0x4000 } else { 0 }));
+        }
+        // Signed compares read the operands at their own width.
+        let i8t = m.int(8);
+        let byte = m.constant(i8t, Const::Int(0x80));
+        let small = m.constant(i8t, Const::Int(1));
+        let c = m.cmp(b, pred::SLT, byte, small);
+        assert_eq!(m.known_i32(c), Some(1));
+
+        let input = m.call(b, f, vec![one]);
+        let c = m.cmp(b, pred::EQ, input, one);
+        assert_eq!(m.known_i32(c), None);
+        let float = m.f32(1.0f32.to_bits());
+        let c = m.cmp(b, pred::OEQ, float, float);
+        assert_eq!(m.known_i32(c), None);
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each

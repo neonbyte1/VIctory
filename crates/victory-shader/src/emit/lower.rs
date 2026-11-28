@@ -2287,6 +2287,55 @@ impl<'a> Lower<'a> {
         (sel < 6).then_some((sel, sext))
     }
 
+    /// `acc` plus the dot product of the four signed bytes of `a` and `b`,
+    /// wrapping (`v_dot4_i32_i8`, `v_dot4c_i32_i8`).
+    ///
+    /// A multiplicand the host compiler can work out goes by hand, over its
+    /// non-zero bytes. Drivers read a constant `dot4AddPacked` operand that
+    /// fits in 16 bits as its low half in both halves, as a half-word
+    /// immediate would be: Intel's Xe-LP does so for every such constant
+    /// (0x4000 as 0x40004000, 64 as 0x00400040, -16 as 0xFFF0FFF0; #1829),
+    /// and the RTX 5070 for 0x4000 (#1896).
+    fn dot4_i8(&mut self, acc: V, a: V, b: V) -> V {
+        let c = self.cur;
+        let (ka, kb) = (self.s.m.known_i32(a), self.s.m.known_i32(b));
+        let (x, kx, k) = match (ka, kb) {
+            (None, None) => {
+                let i32_ty = self.s.t.i32;
+                return self.s.op(
+                    c,
+                    "dot4AddPacked.i32",
+                    Attr::ReadNone,
+                    i32_ty,
+                    163,
+                    &[acc, a, b],
+                );
+            }
+            (Some(k), None) => (b, None, k),
+            (_, Some(k)) => (a, ka, k),
+        };
+        let mut dot = acc;
+        for t in 0..4u8 {
+            let byte = i32::from((k >> (8 * t)) as i8);
+            if byte == 0 {
+                continue;
+            }
+            let p = match kx {
+                Some(x) => {
+                    let p = i32::from((x >> (8 * t)) as i8) * byte;
+                    self.s.m.i32(p as u32)
+                }
+                None => {
+                    let xb = self.select_bits(x, t, true);
+                    let kb = self.s.m.i32(byte as u32);
+                    self.s.m.bin(c, Bin::Mul, xb, kb)
+                }
+            };
+            dot = self.s.m.bin(c, Bin::Add, dot, p);
+        }
+        dot
+    }
+
     /// Bits `sel` (0-3 a byte, 4-5 a word) of `x`, extended.
     fn select_bits(&mut self, x: V, sel: u8, sext: bool) -> V {
         let c = self.cur;
@@ -7142,15 +7191,7 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, a, bb],
-                );
+                let r = self.dot4_i8(acc, a, bb);
                 int(self, r)
             }
             "v_dot4_i32_i8" | "v_dot8_i32_i4" | "v_dot4_u32_u8" | "v_dot8_u32_u4" => {
@@ -7227,15 +7268,7 @@ impl<'a> Lower<'a> {
                     self.write(inst, Reg::V(reg), r, guard);
                     return Ok(());
                 }
-                let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, xs[0], xs[1]],
-                );
+                let r = self.dot4_i8(acc, xs[0], xs[1]);
                 int(self, r)
             }
             "v_mov_b32" => {

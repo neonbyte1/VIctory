@@ -1107,10 +1107,12 @@ fn add_scc_carry_in_table_and_code_addresses_runs_on_host() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
         view_marks: false,
     })
     .unwrap();
     let shader = HostShader {
+        wave_size: lowered.wave_size,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -4195,6 +4197,18 @@ const fn packed_dot(
             | (src[2] as u32 & 0x1FF) << 18
             | (src[1] as u32 & 0x1FF) << 9
             | (src[0] as u32 & 0x1FF),
+    ]
+}
+
+/// VOP3P `v_dot4_i32_i8 vdst, src0, src1, src2`, `opsel` and `opsel_hi`
+/// one bit per source.
+const fn dot4(vdst: u8, src0: u16, src1: u16, src2: u16, opsel: u32, opsel_hi: u32) -> [u32; 2] {
+    [
+        0xCC16_0000 | (opsel_hi >> 2 & 1) << 14 | (opsel & 7) << 11 | vdst as u32,
+        (opsel_hi & 3) << 27
+            | (src2 as u32 & 0x1FF) << 18
+            | (src1 as u32 & 0x1FF) << 9
+            | (src0 as u32 & 0x1FF),
     ]
 }
 
@@ -8846,4 +8860,169 @@ fn v_log_f32_near_unity_meets_rdna2_one_ulp() {
         panic!("{}", open_problems.join("\n"));
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// The halves `op_sel` (`lo`) and `op_sel_hi` (`hi`) pick from `x`.
+fn op_sel_halves(x: u32, lo: bool, hi: bool) -> u32 {
+    let half = |top: bool| if top { x >> 16 } else { x & 0xFFFF };
+    half(lo) | half(hi) << 16
+}
+
+/// One step of a chain of dot products: its words, and the running sum it
+/// leaves in v0 from the inputs and the sum before it.
+type DotStep = (Vec<u32>, Box<dyn Fn([u32; 4], u32) -> u32>);
+
+/// Runs `steps` one after another in one program, v0 starting as the
+/// accumulator in v3, and compares v0 with the steps' sum for each input
+/// (`a` in v1, `b` in v2, the accumulator in v3).
+fn run_dot_chain(what: &str, steps: Vec<DotStep>) {
+    let mut body = vec![vop1(0x001, 0, vgpr(3))]; // v_mov_b32 v0, v3
+    for (words, _) in &steps {
+        body.extend(words);
+    }
+    let inputs = [
+        [0x0705_FB82, 0x0000_4000, 0x7FFF_FFF0, 0],
+        [0x80FF_7F01, 0x0000_0040, 0x0000_0123, 0],
+        [0x0302_FB02, 0xFFFF_FFF0, 0x8000_0000, 0],
+        [0x0302_FB02, 0x80FF_7F01, 0x7FFF_FFF0, 0],
+    ];
+    run_cases(&build_valu_cs(&body), &inputs, |backend, _, inp, got| {
+        let want = steps.iter().fold(inp[2], |sum, (_, step)| step(inp, sum));
+        assert_eq!(
+            got, want,
+            "{backend}: {what}, inputs {inp:08x?}: got {got:#010x}, want {want:#010x}",
+        );
+    });
+}
+
+/// `v_dot4_i32_i8 v0, v1, <constant>, v0` (or the constant first) with
+/// each `op_sel` choice for it, a literal's dword after the instruction.
+fn constant_dot_steps(code: u16, value: u32) -> Vec<DotStep> {
+    let literal = (code == 255).then_some(value);
+    let mut steps: Vec<DotStep> = Vec::new();
+    // (constant's place, op_sel, op_sel_hi, its low and high half selections)
+    for (place, opsel, opsel_hi, lo, hi) in [
+        (1, 0b000, 0b111, false, true),
+        (1, 0b010, 0b101, true, false),
+        (1, 0b000, 0b101, false, false),
+        (1, 0b010, 0b111, true, true),
+        (0, 0b000, 0b111, false, true),
+    ] {
+        let mut words = if place == 1 {
+            dot4(0, vgpr(1), code, vgpr(0), opsel, opsel_hi).to_vec()
+        } else {
+            dot4(0, code, vgpr(1), vgpr(0), opsel, opsel_hi).to_vec()
+        };
+        words.extend(literal);
+        let b = op_sel_halves(value, lo, hi);
+        steps.push((words, Box::new(move |inp, sum| dot4_ref(inp[0], b, sum))));
+    }
+    steps
+}
+
+/// `v_dot4_i32_i8` and `v_dot4c_i32_i8` with constant and register
+/// multiplicands, in either place and with each `op_sel` choice, against
+/// `dot4_ref`: inline integers (0, small positive, -1, -2, -16), the inline
+/// floats as their 32-bit patterns, literals that fit in 16 bits (which a
+/// driver may read as their low half in both halves, #1829) and wider ones,
+/// constants moved into a VGPR or an SGPR first, constant accumulators, and
+/// run-time values. The other operand and the accumulator come from root
+/// constants, so only the constant is known to the host compiler. Each
+/// class is one program, its dot products chained through v0.
+#[test]
+fn dot4_takes_every_constant_class_whole() {
+    let inline = |code: u16| resource::inline(code as u8).expect("inline");
+    let integers = [128u16, 129, 130, 143, 144, 191, 192, 193, 194, 208];
+    run_dot_chain(
+        "inline integers",
+        integers
+            .iter()
+            .flat_map(|&code| constant_dot_steps(code, inline(code)))
+            .collect(),
+    );
+    run_dot_chain(
+        "inline floats",
+        (240..=248)
+            .flat_map(|code| constant_dot_steps(code, inline(code)))
+            .collect(),
+    );
+    let literals = [
+        0x4000u32,
+        0x7F00,
+        0xFF80,
+        0xFFFF_8000,
+        0x0080_0000,
+        0x1234_5678,
+    ];
+    run_dot_chain(
+        "literals",
+        literals
+            .iter()
+            .flat_map(|&value| constant_dot_steps(255, value))
+            .collect(),
+    );
+
+    let mut held: Vec<DotStep> = Vec::new();
+    let mut dot4c: Vec<DotStep> = Vec::new();
+    for value in [0x4000u32, 0x40, 0xFFFF_FFF0, 0x1234_5678] {
+        // v_mov_b32 v2, literal; v_dot4_i32_i8 v0, v1, v2, v0
+        let mut words = vec![vop1(0x001, 2, 0xFF), value];
+        words.extend(dot4(0, vgpr(1), vgpr(2), vgpr(0), 0, 7));
+        held.push((
+            words,
+            Box::new(move |inp, sum| dot4_ref(inp[0], value, sum)),
+        ));
+        // s_mov_b32 s12, literal; v_dot4_i32_i8 v0, v1, s12, v0
+        let mut words = vec![s_mov_b32(12, 0xFF), value];
+        words.extend(dot4(0, vgpr(1), sgpr(12), vgpr(0), 0, 7));
+        held.push((
+            words,
+            Box::new(move |inp, sum| dot4_ref(inp[0], value, sum)),
+        ));
+        // v_dot4c_i32_i8 v0, literal, v1
+        let words = vec![0x0d << 25 | 1 << 9 | 0xFF, value];
+        dot4c.push((
+            words,
+            Box::new(move |inp, sum| dot4_ref(value, inp[0], sum)),
+        ));
+    }
+    run_dot_chain("constants in registers", held);
+    let mut accumulators: Vec<DotStep> = Vec::new();
+    for code in [129u16, 192, 208, 244] {
+        let value = inline(code);
+        // v_dot4c_i32_i8 v0, inline, v1
+        let words = vec![0x0d << 25 | 1 << 9 | u32::from(code)];
+        dot4c.push((
+            words,
+            Box::new(move |inp, sum| dot4_ref(value, inp[0], sum)),
+        ));
+        // v_dot4_i32_i8 v5, v1, v2, inline; v_add_nc_u32 v0, v5, v0
+        let mut words = dot4(5, vgpr(1), vgpr(2), code, 0, 7).to_vec();
+        words.push(0x25 << 25 | vgpr(5) as u32);
+        accumulators.push((
+            words,
+            Box::new(move |inp, sum| sum.wrapping_add(dot4_ref(inp[0], inp[1], value))),
+        ));
+    }
+    run_dot_chain("v_dot4c_i32_i8 constants", dot4c);
+    run_dot_chain("constant accumulators", accumulators);
+
+    // Run-time multiplicands with each op_sel choice: v_dot4_i32_i8 v0, v1, v2, v0
+    let runtime: Vec<DotStep> = [
+        (0b000, 0b111),
+        (0b011, 0b100),
+        (0b000, 0b100),
+        (0b011, 0b111),
+    ]
+    .into_iter()
+    .map(|(opsel, opsel_hi)| -> DotStep {
+        let sel =
+            move |x: u32, k: u32| op_sel_halves(x, opsel >> k & 1 != 0, opsel_hi >> k & 1 != 0);
+        (
+            dot4(0, vgpr(1), vgpr(2), vgpr(0), opsel, opsel_hi).to_vec(),
+            Box::new(move |inp, sum| dot4_ref(sel(inp[0], 0), sel(inp[1], 1), sum)),
+        )
+    })
+    .collect();
+    run_dot_chain("run-time operands", runtime);
 }

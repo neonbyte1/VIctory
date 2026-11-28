@@ -1119,7 +1119,7 @@ impl<'a> Tracer<'a> {
             return true;
         }
         if let Some(x) = self.add_scc(v) {
-            return self.carried(x, high);
+            return self.carried(x, high, known, unguarded);
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
             return self.carried(a, high, known, unguarded)
