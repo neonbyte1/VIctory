@@ -2138,13 +2138,23 @@ fn describe(view: Option<&View>) -> String {
             format!("{}x{} f{} flags {:#x} mem {at:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
-    // Small buffers (exposure, counters): their title memory now, as floats.
+    // Small buffers (exposure, counters): their title memory now, as floats,
+    // read through the kernel without `VirtualQuery` (see `Constant` below).
     let small = |range: Option<(u64, u64)>| match range {
-        Some((at, len)) if len <= 64 && crate::texture::committed(at as *const u8, len as usize) => {
-            // SAFETY: `len` committed bytes of title memory.
-            let b = unsafe { std::slice::from_raw_parts(at as *const u8, len as usize) };
-            let f: Vec<f32> = b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect();
-            format!(" = {f:?}")
+        Some((at, len @ 4..=64)) => {
+            let mut bytes = [0u8; 64];
+            let b = &mut bytes[..len as usize];
+            if crate::host::read_into(at as *const u8, b) {
+                let f: Vec<f32> = b
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&c| f32::from_le_bytes(c))
+                    .collect();
+                format!(" = {f:?}")
+            } else {
+                String::new()
+            }
         }
         _ => String::new(),
     };
@@ -4748,6 +4758,209 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn describe_reads_small_buffers_without_faulting_on_unmapped_memory() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+
+        struct Mapping(*mut u8);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: releases the two-page reservation created below.
+                unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+            }
+        }
+
+        // Two 4 KiB pages reserved, only the first committed.
+        // SAFETY: fresh process-private virtual reservation and single-page commit.
+        let base = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!p.is_null());
+            assert!(!VirtualAlloc(p.cast(), 4096, MEM_COMMIT, PAGE_READWRITE).is_null());
+            p
+        };
+        let _mapping = Mapping(base);
+
+        let buffer_at = |address: u64, width: u64| -> This {
+            let desc: [u32; 14] = [
+                1,
+                0,
+                0,
+                0,
+                width as u32,
+                (width >> 32) as u32,
+                1,
+                1 | 1 << 16,
+                0,
+                1,
+                0,
+                1,
+                0,
+                0,
+            ];
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut out = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_at_address(
+                    std::ptr::null(),
+                    address,
+                    desc.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut out,
+                ),
+                S_OK
+            );
+            out
+        };
+        let release = |r: This| {
+            // SAFETY: COM Release at vtable slot 2 (`0x10`) on our resource.
+            let f: extern "system" fn(This) -> u32 =
+                unsafe { std::mem::transmute((*(r as *const *const usize)).add(2).read()) };
+            assert_eq!(f(r), 0);
+        };
+        let srv_words = |first: u64, count: u32, stride: u32| -> [u32; 10] {
+            let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first,
+                        NumElements: count,
+                        StructureByteStride: stride,
+                        ..Default::default()
+                    },
+                },
+                ..Default::default()
+            };
+            // SAFETY: `D3D12_SHADER_RESOURCE_VIEW_DESC` is 40 initialized bytes.
+            unsafe { std::mem::transmute(d) }
+        };
+        let uav_words = |first: u64, count: u32, stride: u32| -> [u32; 10] {
+            let d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: first,
+                        NumElements: count,
+                        StructureByteStride: stride,
+                        ..Default::default()
+                    },
+                },
+                ..Default::default()
+            };
+            // SAFETY: `D3D12_UNORDERED_ACCESS_VIEW_DESC` is 40 initialized bytes.
+            unsafe { std::mem::transmute(d) }
+        };
+
+        // Unaligned committed address inside page 0.
+        let unaligned = base as u64 + 3;
+        let floats = [-0.0f32, 1.5, -2.25, 0.125, 3.5, -8.0];
+        for (i, v) in floats.into_iter().enumerate() {
+            // SAFETY: `[base + 3, base + 27)` lies inside the committed 4 KiB page.
+            unsafe {
+                std::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), base.add(3 + i * 4), 4);
+            }
+        }
+
+        let backed = buffer_at(unaligned, 4096);
+        assert_eq!(
+            describe(Some(&View::Shader(
+                backed as usize,
+                Some(srv_words(0, 1, 4)),
+            ))),
+            format!("buffer {:?} = [-0.0]", Some((unaligned, 4u64))),
+        );
+        assert_eq!(
+            describe(Some(&View::Shader(
+                backed as usize,
+                Some(srv_words(0, 4, 4)),
+            ))),
+            format!(
+                "buffer {:?} = [-0.0, 1.5, -2.25, 0.125]",
+                Some((unaligned, 16u64))
+            ),
+        );
+        assert_eq!(
+            describe(Some(&View::Unordered(
+                backed as usize,
+                0,
+                Some(uav_words(2, 2, 8)),
+            ))),
+            format!(
+                "uav buffer {:?} = [3.5, -8.0, 0.0, 0.0]",
+                Some((unaligned + 16, 16u64))
+            ),
+        );
+        assert!(
+            describe(Some(&View::Shader(
+                backed as usize,
+                Some(srv_words(0, 16, 4)),
+            )))
+            .starts_with(&format!(
+                "buffer {:?} = [-0.0, 1.5, -2.25, 0.125, 3.5, -8.0,",
+                Some((unaligned, 64u64))
+            ))
+        );
+        // Non-multiple-of-4 length in `4..=64` formats complete 4-byte chunks;
+        // empty (`0`), sub-dword (`< 4`), and `> 64` lengths omit the float suffix.
+        assert_eq!(
+            describe(Some(&View::Shader(
+                backed as usize,
+                Some(srv_words(0, 3, 2)),
+            ))),
+            format!("buffer {:?} = [-0.0]", Some((unaligned, 6u64))),
+        );
+        for (count, stride, bytes) in [(0, 4, 0u64), (1, 2, 2), (17, 4, 68)] {
+            assert_eq!(
+                describe(Some(&View::Shader(
+                    backed as usize,
+                    Some(srv_words(0, count, stride)),
+                ))),
+                format!("buffer {:?}", Some((unaligned, bytes))),
+            );
+        }
+        release(backed);
+
+        // Straddling committed page 0 into reserved page 1, pure reserved page 1,
+        // and low unmapped address: all omit the suffix without faulting.
+        for bad_addr in [base as u64 + 4088, base as u64 + 4096, 0x100] {
+            let unmapped = buffer_at(bad_addr, 64);
+            assert_eq!(
+                describe(Some(&View::Shader(
+                    unmapped as usize,
+                    Some(srv_words(0, 4, 4)),
+                ))),
+                format!("buffer {:?}", Some((bad_addr, 16u64))),
+            );
+            assert_eq!(
+                describe(Some(&View::Unordered(
+                    unmapped as usize,
+                    0,
+                    Some(uav_words(0, 4, 4)),
+                ))),
+                format!("uav buffer {:?}", Some((bad_addr, 16u64))),
+            );
+            assert_eq!(
+                describe(Some(&View::Shader(
+                    unmapped as usize,
+                    Some(srv_words(0, 0, 4)),
+                ))),
+                format!("buffer {:?}", Some((bad_addr, 0u64))),
+            );
+            release(unmapped);
         }
     }
 
