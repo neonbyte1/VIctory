@@ -692,6 +692,8 @@ fn translate(
                         view_marks: true,
                         target: checks.target,
                         pair_meetings: checks.pair_meetings,
+                        // As a run translates (`VICTORY_INDIRECT_PLAIN=1`).
+                        dispatch_record: victory_gpu::shader_cache::dispatch_record(),
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {

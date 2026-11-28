@@ -783,12 +783,15 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TitleBarrierCalls, 1);
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            format!(
-                "barrier kinds {:?}",
-                barriers.iter().map(|b| b.kind).collect::<Vec<_>>()
-            )
-        });
+        list.note_pass(
+            || crate::passes::Key::class(crate::passes::Class::Barrier),
+            || {
+                format!(
+                    "barrier kinds {:?}",
+                    barriers.iter().map(|b| b.kind).collect::<Vec<_>>()
+                )
+            },
+        );
         let mut host = Vec::with_capacity(barriers.len());
         for b in barriers {
             push_host_barriers(list, b, &mut host);
@@ -946,7 +949,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_copy_state(list, &from, ALL, COPY_SOURCE);
             crate::texture::host_writes(list, &to);
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            list.note_pass(
+                || crate::passes::Key::class(crate::passes::Class::Copy),
+                || format!("copy resource {src:?} to {dst:?}"),
+            );
             // SAFETY: an open list and live textures.
             list.crumbed(crate::host::Crumb::Copy, Some("copy resource"), || unsafe {
                 list.list.CopyResource(&to.texture, &from.texture)
@@ -1149,7 +1155,10 @@ extern "system" fn copy_texture_region(
             };
             match read {
                 Some(range) => list.note_read(text, range),
-                None => list.note_op(text),
+                None => list.note_pass(
+                    || crate::passes::Key::class(crate::passes::Class::Copy),
+                    text,
+                ),
             }
         }
         const _: () =
@@ -1291,7 +1300,10 @@ fn read_back(
             seen.push(pair);
             tracing::info!("a texture read back (first of this pair): {}", text());
         }
-        list.note_op(text);
+        list.note_pass(
+            || crate::passes::Key::class(crate::passes::Class::Copy),
+            text,
+        );
     }
     // SAFETY: an open list; both locations in the host's layout, naming live
     // resources; the region lies in the footprint (checked).
@@ -1361,7 +1373,10 @@ extern "system" fn resolve(
         ensure_copy_state(list, &from, src_sub, RESOLVE_SOURCE);
         crate::texture::host_writes(list, &to);
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        list.note_pass(
+            || crate::passes::Key::class(crate::passes::Class::Resolve),
+            || format!("resolve {src:?} to {dst:?} format {format}"),
+        );
         // SAFETY: an open list and live textures; the region is inside both.
         list.crumbed(crate::host::Crumb::Resolve, Some("resolve"), || unsafe {
             let format = DXGI_FORMAT(format as i32);
@@ -1466,6 +1481,8 @@ extern "system" fn clear_rtv(
             .map_or(ALL, |mips| mips.start);
         ensure_copy_state(list, &copy, subresource, RENDER_TARGET);
         let rtv = host.rtv(Some(&copy.texture), desc.as_ref());
+        #[cfg(feature = "diagnostics")]
+        list.note_class(crate::passes::Class::Clear);
         // SAFETY: an open list, a fresh view of a live texture.
         list.crumbed(
             crate::host::Crumb::Clear,
@@ -1510,6 +1527,8 @@ extern "system" fn clear_dsv(
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(&texture, record.depth_desc().as_ref());
+        #[cfg(feature = "diagnostics")]
+        list.note_class(crate::passes::Class::Clear);
         // SAFETY: an open list, a fresh view of a live texture.
         list.crumbed(crate::host::Crumb::Clear, Some("depth clear"), || unsafe {
             list.list.ClearDepthStencilView(
@@ -1720,7 +1739,10 @@ fn host_resolve(
     let (back, base, results) = list.query_readback(u64::from(count) * bytes)?;
     list.keep(&host.heap);
     #[cfg(feature = "diagnostics")]
-    list.note_op(|| format!("resolve {count} queries of type {kind} from {first}"));
+    list.note_pass(
+        || crate::passes::Key::class(crate::passes::Class::Queries),
+        || format!("resolve {count} queries of type {kind} from {first}"),
+    );
     for &(from, n) in &runs {
         let offset = base + u64::from(from) * bytes;
         // SAFETY: an open list, a live heap kept until the list is reset,
@@ -2559,12 +2581,15 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const Barrier
         let groups = unsafe { std::slice::from_raw_parts(groups, count as usize) };
         // Which kinds of barriers (0 global, 1 texture, 2 buffer) and how many.
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            format!(
-                "barrier groups {:?}",
-                groups.iter().map(|g| (g.kind, g.count)).collect::<Vec<_>>()
-            )
-        });
+        list.note_pass(
+            || crate::passes::Key::class(crate::passes::Class::Barrier),
+            || {
+                format!(
+                    "barrier groups {:?}",
+                    groups.iter().map(|g| (g.kind, g.count)).collect::<Vec<_>>()
+                )
+            },
+        );
         let mut out: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
         let mut seen_transitions: Vec<usize> = Vec::new();
         let mut need_global_uav = false;

@@ -642,7 +642,7 @@ pub(crate) fn read_indirect(
     let l = &list.list;
     use crate::host::transition;
     let (arg_state, copy) = (
-        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        crate::indirect::read_state(),
         D3D12_RESOURCE_STATE_COPY_SOURCE,
     );
     // SAFETY: plain creation; an open list and live buffers in the states

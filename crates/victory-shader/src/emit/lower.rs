@@ -251,6 +251,28 @@ impl Drop for PairMeetings {
     }
 }
 
+thread_local! {
+    /// Whether this thread's lowering reads the spread words from the
+    /// dispatch record when told to ([`super::Options::dispatch_record`]).
+    static DISPATCH_RECORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`super::Options::dispatch_record`] for this thread's lowering, until
+/// the guard drops.
+pub(super) struct DispatchRecord(bool);
+
+impl DispatchRecord {
+    pub(super) fn set(on: bool) -> DispatchRecord {
+        DispatchRecord(DISPATCH_RECORD.replace(on))
+    }
+}
+
+impl Drop for DispatchRecord {
+    fn drop(&mut self) {
+        DISPATCH_RECORD.set(self.0);
+    }
+}
+
 /// Polls of a meeting's counter before a host wave goes on without the
 /// other half: never reached while both run the program (the other half
 /// is at most a memory access behind); a half cut out of a loop at
@@ -2578,6 +2600,10 @@ impl<'a> Lower<'a> {
 
     /// Remaps compute group IDs `(x + z * row, y, 0)` and returns early on
     /// surplus groups (`eff_x >= asked`) when the host spreads >65,535 groups.
+    /// With [`super::Options::dispatch_record`], `row` and `asked` are the
+    /// first two words of root SRV [`super::DISPATCH_RECORD`] when the user
+    /// data's row is [`super::FROM_DISPATCH_RECORD`] (an indirect dispatch
+    /// whose command signature sets no constants), else the user data's.
     fn cs_spread_prologue(&mut self) {
         let base = self
             .x
@@ -2599,6 +2625,11 @@ impl<'a> Lower<'a> {
             root: RootType::Constants,
             dword: 1,
         });
+        let (row, asked) = if DISPATCH_RECORD.get() {
+            self.dispatch_record_words(row, asked)
+        } else {
+            (row, asked)
+        };
         let Val::I32(gx) = self.compute_id("groupId.i32", 94, 0) else {
             unreachable!()
         };
@@ -2631,6 +2662,41 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(ret, Term::Ret);
         self.s.m.terminate(e, Term::CondBr(keep, body, ret));
         self.cur = body;
+    }
+
+    /// The spread words (`row`, `asked`) of a program translated with
+    /// [`super::Options::dispatch_record`]: the first two words of root SRV
+    /// [`super::DISPATCH_RECORD`] when the user data's `row` is
+    /// [`super::FROM_DISPATCH_RECORD`], else the user data's own. The load
+    /// is unconditional (the host binds a readable buffer either way), in
+    /// the entry block, uniform.
+    fn dispatch_record_words(&mut self, row: V, asked: V) -> (V, V) {
+        let e = self.s.entry;
+        let h = self.s.root_srv_handle(super::DISPATCH_RECORD);
+        let (zero, u, mask, align) = (
+            self.s.m.i32(0),
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8(3),
+            self.s.m.i32(4),
+        );
+        let r = self.s.op(
+            e,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, zero, u, mask, align],
+        );
+        let words = [0, 1].map(|k| {
+            let f = self.s.m.extract(e, r, k);
+            self.s.m.cast(e, Cast::Bitcast, f, self.s.t.i32)
+        });
+        let marker = self.s.m.i32(super::FROM_DISPATCH_RECORD);
+        let from_record = self.s.m.cmp(e, pred::EQ, row, marker);
+        (
+            self.s.m.select(e, from_record, words[0], row),
+            self.s.m.select(e, from_record, words[1], asked),
+        )
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {

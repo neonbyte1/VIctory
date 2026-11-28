@@ -543,6 +543,7 @@ fn random_programs_translate_or_are_refused_the_same_way_every_time() {
             target: crate::emit::Target::ANY,
             view_marks: seed % 2 == 1,
             pair_meetings: true,
+            dispatch_record: false,
         };
         let once = || std::panic::catch_unwind(|| translate(&native, &c, options));
         let why = match (once(), once()) {

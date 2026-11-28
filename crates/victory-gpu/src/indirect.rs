@@ -101,7 +101,28 @@ uint clamped(uint at, uint record) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        if (spread != 0) {
+        if (spread == 2) {
+            // Lean (`bound_lean`), 12 words a record: the groups for the
+            // plain signature (none if spread), a 64-bit predicate (1 if
+            // spread), then the spread record (empty if not spread).
+            uint base = record * 12;
+            if (row != 0) {
+                store3(base, uint3(0, 0, 0));
+                dest[base + 4] = 1;
+                dest[base + 6] = row;
+                dest[base + 7] = asked;
+                store3(base + 8, g);
+            } else {
+                store3(base, g);
+                dest[base + 4] = 0;
+                dest[base + 6] = 0;
+                dest[base + 7] = 0;
+                store3(base + 8, uint3(0, 0, 0));
+            }
+            dest[base + 3] = 0;
+            dest[base + 5] = 0;
+            dest[base + 11] = 0;
+        } else if (spread != 0) {
             dest[record * 5] = row;
             dest[record * 5 + 1] = asked;
             store3(record * 5 + 2, g);
@@ -152,7 +173,10 @@ void main(uint lane : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
-            if (spread != 0 && record < records) {
+            if (spread == 2 && record < records) {
+                store3(record * 12, uint3(0, 0, 0));
+                store3(record * 12 + 8, uint3(0, 0, 0));
+            } else if (spread != 0 && record < records) {
                 store3(record * 5 + 2, uint3(0, 0, 0));
             } else {
                 dest[at] = 0;
@@ -620,8 +644,8 @@ impl HoistedClamps {
     }
 
     /// Ends the hoistable prefix on `list`: transitions every used scratch
-    /// chunk back from `INDIRECT_ARGUMENT` to `COMMON` once, and blocks
-    /// further hoisting on this list until `reset()`.
+    /// chunk back from `INDIRECT_ARGUMENT` ([`read_state`]) to `COMMON` once,
+    /// and blocks further hoisting on this list until `reset()`.
     pub(crate) fn end(&mut self, list: &ID3D12GraphicsCommandList) {
         self.hoistable = false;
         if self.restored || self.used == 0 {
@@ -630,13 +654,7 @@ impl HoistedClamps {
         self.restored = true;
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = self.chunks[..self.used]
             .iter()
-            .map(|b| {
-                transition(
-                    b,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                    D3D12_RESOURCE_STATE_COMMON,
-                )
-            })
+            .map(|b| transition(b, read_state(), D3D12_RESOURCE_STATE_COMMON))
             .collect();
         // SAFETY: an open list and live scratch chunks in `INDIRECT_ARGUMENT`.
         unsafe { list.ResourceBarrier(&barriers) };
@@ -703,7 +721,7 @@ impl HoistedClamps {
                 post.push(transition(
                     chunk,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    read_state(),
                 ));
             }
             prelude.ResourceBarrier(&post);
@@ -751,11 +769,48 @@ pub(crate) fn hoist(
 pub(crate) fn bound(
     list: &HostList,
     gpu: u64,
-    (kind, stride, records): (u32, u32, u32),
+    spec: (u32, u32, u32),
     spread: bool,
 ) -> Option<ID3D12Resource> {
+    bound_as(list, gpu, spec, u32::from(spread))
+}
+
+/// Bytes of a lean record ([`bound_lean`]): the groups for the plain
+/// signature (12 and 4 empty), the 64-bit predicate (at [`LEAN_PREDICATE`]),
+/// the spread record (at [`LEAN_SPREAD`], 20) and 4 empty.
+pub(crate) const LEAN_RECORD: u32 = 48;
+/// Where in a lean record its predicate lies.
+pub(crate) const LEAN_PREDICATE: u64 = 16;
+/// Where in a lean record its spread record lies.
+pub(crate) const LEAN_SPREAD: u64 = 24;
+
+/// [`bound`] for one spread dispatch record, lean
+/// (`VICTORY_INDIRECT_PLAIN=lean`; grosterr's form, fxceless/victory-fork
+/// cd10ed9): a record within 65,535 groups in x gets its groups for the
+/// plain `DISPATCH` signature and an empty spread record; a record past it
+/// none for the plain signature, its spread record, and a predicate of 1,
+/// under which the caller runs the spread signature. So exactly one of the
+/// two executions runs groups. [`LEAN_RECORD`] bytes a record; the caller
+/// takes it for executions of one record only, so the two executions keep
+/// the records' order.
+pub(crate) fn bound_lean(
+    list: &HostList,
+    gpu: u64,
+    spec: (u32, u32, u32),
+) -> Option<ID3D12Resource> {
+    bound_as(list, gpu, spec, 2)
+}
+
+/// [`bound`] into `layout`: 0 the records' own, 1 the spread layout, 2
+/// lean ([`bound_lean`]).
+fn bound_as(
+    list: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    layout: u32,
+) -> Option<ID3D12Resource> {
     #[cfg(feature = "diagnostics")]
-    note_clamp(list, "clamp");
+    note_clamp(list, "clamp", crate::passes::Class::Clamp);
     // An open window first: its draws come before this, in order.
     end_window(list);
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
@@ -764,12 +819,16 @@ pub(crate) fn bound(
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
-    let out_stride = if spread { 20 } else { stride };
+    let out_stride = match layout {
+        0 => stride,
+        1 => 20,
+        _ => LEAN_RECORD,
+    };
     let out = list.arguments(u64::from(out_stride) * u64::from(records.max(1)))?;
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::ClampSingle, 1);
     let l = &list.list;
-    let constants = [kind, stride, records, u32::from(spread)];
+    let constants = [kind, stride, records, layout];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
@@ -798,11 +857,7 @@ pub(crate) fn bound(
         );
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(
-                &out,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
+            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read_state()),
         ]);
     }
     Some(out)
@@ -816,7 +871,7 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
     unsafe {
         list.list.ResourceBarrier(&[transition(
             arguments,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            read_state(),
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
@@ -855,8 +910,21 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
 /// With [`gaps_on`] as well, executions whose shaders may store join too,
 /// indirect dispatches included: see [`Run`].
 pub(crate) fn windows_on() -> bool {
+    #[cfg(test)]
+    if let Some((windows, _)) = TEST_SWITCHES.get() {
+        return windows;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_CLAMP_WINDOW"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's [`windows_on`] and [`plain`] on this thread (else the
+    /// process's switches): tests that run an indirect execution end to end
+    /// through `crate::draw` compare the modes in one process.
+    pub(crate) static TEST_SWITCHES: std::cell::Cell<Option<(bool, Plain)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Whether indirect executions whose shaders may store (indirect
@@ -878,6 +946,80 @@ pub(crate) fn gaps_on() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| crate::switch::on_unless_zero("VICTORY_GPU_GAPS"));
     *ON
+}
+
+/// How indirect dispatches of programs that spread their groups (the
+/// spread prologue, `victory_shader`'s `DISPATCH_SLOT`) run
+/// (`VICTORY_INDIRECT_PLAIN`; off by default).
+///
+/// Off, each one's record is clamped into the 20-byte spread layout
+/// (`row`, `asked`, groups) by a clamp pass of its own, and its command
+/// signature sets the two words as root constants before `DISPATCH`
+/// (`crate::draw`'s spread signature, which vkd3d-proton runs as
+/// device-generated commands). The window pass did not write that layout,
+/// so no window took them ([`alone`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Plain {
+    /// As above.
+    Off,
+    /// `VICTORY_INDIRECT_PLAIN=window`: the window pass writes the spread
+    /// layout too, word for word the single clamp's, so with
+    /// `VICTORY_CLAMP_WINDOW=1` they join windows as other indirect
+    /// dispatches do ([`gaps_on`]); the spread signature stays.
+    Window,
+    /// `VICTORY_INDIRECT_PLAIN=1` (any other value but `0`): as `Window`,
+    /// and an execution of one record takes a signature of `DISPATCH`
+    /// alone (no root arguments) at the groups of its clamped record. The
+    /// program, translated to read its spread words from memory
+    /// (`victory_shader::emit::Options::dispatch_record`), reads the
+    /// record's first two words through a root view: exactly the words the
+    /// spread signature would have set. The list's clamped records are then
+    /// shader-readable as well as arguments ([`read_state`]).
+    Signature,
+    /// `VICTORY_INDIRECT_PLAIN=lean` (grosterr's form,
+    /// fxceless/victory-fork#1352 `cd10ed9`): no translation change and no
+    /// windows for spread dispatches; an execution of one record is clamped
+    /// alone into [`bound_lean`]'s layout and recorded twice: the plain
+    /// `DISPATCH` signature at its groups (empty past 65,535 in x; the
+    /// program's spread words are 0 from its bind, so it runs unspread),
+    /// then the spread signature under a predicate the clamp sets only for
+    /// a record past 65,535. More records keep the spread signature.
+    Lean,
+}
+
+/// This process's [`Plain`].
+pub(crate) fn plain() -> Plain {
+    #[cfg(test)]
+    if let Some((_, mode)) = TEST_SWITCHES.get() {
+        return mode;
+    }
+    static MODE: std::sync::LazyLock<Plain> = std::sync::LazyLock::new(|| {
+        let value = std::env::var_os("VICTORY_INDIRECT_PLAIN");
+        let mode = match value.as_deref().and_then(std::ffi::OsStr::to_str) {
+            None | Some("0") => Plain::Off,
+            Some("window") => Plain::Window,
+            Some("lean") => Plain::Lean,
+            Some(_) => Plain::Signature,
+        };
+        if mode != Plain::Off {
+            tracing::info!(?mode, "VICTORY_INDIRECT_PLAIN: spread indirect dispatches");
+        }
+        mode
+    });
+    *MODE
+}
+
+/// The state the list's clamped records are read in (single clamps,
+/// windows and hoisted chunks alike): indirect arguments, and with
+/// [`Plain::Signature`] also shader resources (a program reads its spread
+/// words from its record through a root view).
+pub(crate) fn read_state() -> D3D12_RESOURCE_STATES {
+    match plain() {
+        Plain::Signature => {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        }
+        Plain::Off | Plain::Window | Plain::Lean => D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    }
 }
 
 /// What may join a window that took an execution whose shaders may store
@@ -934,7 +1076,7 @@ pub(crate) enum Alone {
     NoWindows,
     /// An indirect dispatch (`VICTORY_GPU_GAPS` off).
     Dispatch,
-    /// Its groups are spread.
+    /// Its groups are spread ([`Plain::Off`]).
     Spread,
     /// It may store (`VICTORY_GPU_GAPS` off).
     Stores,
@@ -943,8 +1085,8 @@ pub(crate) enum Alone {
 /// Why an indirect execution not hoisted is clamped alone, or `None` if a
 /// window may take it (`windows`: `VICTORY_CLAMP_WINDOW`, `gaps`:
 /// [`gaps_on`]): `dispatch` an indirect dispatch, `stores` its shaders may
-/// store, `spread` its groups are spread (only the single clamp writes
-/// that layout).
+/// store, `spread` its groups are spread and the window pass does not
+/// write that layout ([`Plain::Off`]: only the single clamp does).
 pub(crate) fn alone(
     windows: bool,
     gaps: bool,
@@ -985,12 +1127,15 @@ pub(crate) fn count_alone(alone: Option<Alone>) {
 /// (`VICTORY_TIMED_CLAMP=1`, diagnostics): the GPU timing table charges
 /// it, its barriers and the bindings its execution then needs again to a
 /// row of its own (`clamp`, `clamp window`), not to the command before.
+/// GPU pass timing (`crate::passes`) always charges it to `class`.
 #[cfg(feature = "diagnostics")]
-fn note_clamp(list: &HostList, what: &'static str) {
+fn note_clamp(list: &HostList, what: &'static str, class: crate::passes::Class) {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| crate::switch::on("VICTORY_TIMED_CLAMP"));
     if *ON {
-        list.note_op(|| what.to_owned());
+        list.note_pass(|| crate::passes::Key::class(class), || what.to_owned());
+    } else {
+        list.note_class(class);
     }
 }
 
@@ -1019,7 +1164,9 @@ ByteAddressBuffer a2 : register(t2);
 ByteAddressBuffer a3 : register(t3);
 // Records, draws; then per draw (at 16 + 32 * draw) its first record in the
 // window, records, kind, stride, source, the records' offset in it, their
-// offset in `dest`. Draws in order; none without records.
+// offset in `dest`, and whether its groups spread (dispatches: 20-byte
+// records `row, asked, x, y, z` in `dest`, as the single clamp's spread
+// flag). Draws in order; none without records.
 ByteAddressBuffer table : register(t4);
 RWByteAddressBuffer dest : register(u0);
 RWStructuredBuffer<uint> budget : register(u1);
@@ -1038,8 +1185,8 @@ uint word(uint source, uint at) {
     return a3.Load(at);
 }
 // The single clamp's bounds, word for word: the record of `kind` at `from`
-// in `source` clamped into `dest` at `to`; its cost.
-uint clamped(uint kind, uint source, uint from, uint to) {
+// in `source` clamped into `dest` at `to`, spread or not; its cost.
+uint clamped(uint kind, uint source, uint from, uint to, uint spread) {
     uint cost;
     if (kind <= 1) {
         uint count = min(word(source, from), 1u << 24);
@@ -1051,12 +1198,30 @@ uint clamped(uint kind, uint source, uint from, uint to) {
             dest.Store(to + 16, word(source, from + 16));
         }
     } else if (kind == 2) {
-        uint3 g = min(uint3(word(source, from), word(source, from + 4), word(source, from + 8)), uint3(65535, 65535, 65535));
+        uint3 requested = uint3(word(source, from), word(source, from + 4), word(source, from + 8));
+        uint3 g = min(requested, uint3(65535, 65535, 65535));
+        uint row = 0;
+        uint asked = requested.x;
+        if (spread != 0 && asked > 65535 && requested.y != 0 && requested.z == 1) {
+            // Drop records over the per-dispatch budget before rounding up.
+            if (asked > GROUPS) {
+                g = uint3(0, 0, 0);
+            } else {
+                uint rows = (asked + 65534) / 65535;
+                row = (asked + rows - 1) / rows;
+                g = uint3(row, g.y, rows);
+            }
+        }
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        dest.Store3(to, g);
+        if (spread != 0) {
+            dest.Store2(to, uint2(row, asked));
+            dest.Store3(to + 8, g);
+        } else {
+            dest.Store3(to, g);
+        }
     } else {
         uint3 g = mesh_groups(uint3(word(source, from), word(source, from + 4), word(source, from + 8)));
         cost = g.x * g.y * g.z * 128;
@@ -1080,6 +1245,7 @@ void main(uint lane : SV_GroupIndex) {
         uint record = tile * 64 + lane;
         uint cost = 0;
         uint to = 0;
+        uint spread = 0;
         if (record < records) {
             uint draw = 0;
             for (uint k = 1; k < draws; k++) {
@@ -1088,10 +1254,11 @@ void main(uint lane : SV_GroupIndex) {
                 }
             }
             uint4 head = table.Load4(16 + 32 * draw);
-            uint3 place = table.Load3(32 + 32 * draw);
+            uint4 place = table.Load4(32 + 32 * draw);
             uint index = record - head.x;
-            to = place.z + index * head.w;
-            cost = clamped(head.z, place.x, place.y + index * head.w, to);
+            spread = place.w;
+            to = place.z + index * (spread != 0 ? 20u : head.w);
+            cost = clamped(head.z, place.x, place.y + index * head.w, to, spread);
         }
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
@@ -1107,7 +1274,13 @@ void main(uint lane : SV_GroupIndex) {
         }
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
-            dest.Store(to, 0);
+            // As the single clamp: a spread record keeps its words with no
+            // groups; any other its layout with none in its first.
+            if (spread != 0) {
+                dest.Store3(to + 8, uint3(0, 0, 0));
+            } else {
+                dest.Store(to, 0);
+            }
         }
     }
     if (lane == 0) {
@@ -1163,6 +1336,9 @@ struct Open {
     records: u32,
     bytes: u64,
     run: Run,
+    /// The window took an indirect dispatch (statistics).
+    #[cfg(feature = "diagnostics")]
+    dispatches: bool,
 }
 
 /// Ends `list`'s window, if one is open: its argument buffer back to
@@ -1202,21 +1378,25 @@ pub(crate) fn forget_windows(list: &HostList) {
 /// argument buffer, the records' offset in it, and whether a window was
 /// opened (its pass replaced the list's compute root signature and
 /// pipeline). `None` if it cannot be clamped in a window; the caller
-/// clamps it on its own ([`bound`]).
+/// clamps it on its own ([`bound`]). With `spread` (dispatches, not
+/// [`Plain::Off`]) the records are clamped into the single clamp's spread
+/// layout, 20 bytes each.
 pub(crate) fn windowed(
     list: &HostList,
     source: u64,
     offset: u64,
     (kind, stride, records): (u32, u32, u32),
     stores: bool,
+    spread: bool,
 ) -> Option<(ID3D12Resource, u64, bool)> {
-    let bytes = u64::from(stride) * u64::from(records.max(1));
+    let read = u64::from(stride) * u64::from(records.max(1));
+    let bytes = out_bytes((kind, stride, records), spread);
     if !source.is_multiple_of(4)
         || !offset.is_multiple_of(4)
         || !stride.is_multiple_of(4)
         || records > WINDOW_RECORDS
         || bytes > WINDOW_BYTES
-        || offset.checked_add(bytes)? > u64::from(u32::MAX)
+        || offset.checked_add(read)? > u64::from(u32::MAX)
     {
         return None;
     }
@@ -1233,7 +1413,7 @@ pub(crate) fn windowed(
     }
     if !takes {
         #[cfg(feature = "diagnostics")]
-        note_clamp(list, "clamp window");
+        note_clamp(list, "clamp window", crate::passes::Class::ClampWindow);
         if let Some(old) = window.open.take() {
             done(list, &old.out);
         }
@@ -1264,7 +1444,7 @@ pub(crate) fn windowed(
             index,
             offset as u32,
             at as u32,
-            0,
+            u32::from(spread),
         ];
         // SAFETY: the table's words lie in the list's upload memory, alive
         // until it is reset; the GPU reads them only once the list runs.
@@ -1282,12 +1462,31 @@ pub(crate) fn windowed(
     o.bytes += bytes;
     #[cfg(feature = "diagnostics")]
     {
-        crate::copystat::add(crate::copystat::C::ClampWindowDraws, 1);
+        use crate::copystat::{C, add};
+        add(C::ClampWindowDraws, 1);
         if opened {
-            crate::copystat::add(crate::copystat::C::ClampWindows, 1);
+            add(C::ClampWindows, 1);
+        }
+        if kind == 2 {
+            add(C::ClampWindowIndirectDispatches, 1);
+            if spread {
+                add(C::ClampWindowSpread, 1);
+            }
+            if !o.dispatches {
+                o.dispatches = true;
+                add(C::ClampDispatchWindows, 1);
+            }
         }
     }
     Some((o.out.clone(), at, opened))
+}
+
+/// Bytes of clamped records an execution takes in the list's argument
+/// buffer: `records` (at least one) of `stride`, or of the 20-byte spread
+/// layout with `spread`.
+fn out_bytes((_, stride, records): (u32, u32, u32), spread: bool) -> u64 {
+    let stride = if spread { 20 } else { stride };
+    u64::from(stride) * u64::from(records.max(1))
 }
 
 impl Open {
@@ -1304,12 +1503,12 @@ impl Open {
 /// Whether an indirect execution (as [`windowed`] takes it) joins `list`'s
 /// open window (tests: to read a window's records before the next one).
 #[cfg(test)]
-fn joins(list: &HostList, source: u64, (_, stride, records): (u32, u32, u32)) -> bool {
-    let bytes = u64::from(stride) * u64::from(records.max(1));
+fn joins(list: &HostList, source: u64, spec: (u32, u32, u32), spread: bool) -> bool {
+    let bytes = out_bytes(spec, spread);
     list.clamp_window()
         .open
         .as_ref()
-        .is_some_and(|o| o.fits(source, bytes, records) && o.run.takes())
+        .is_some_and(|o| o.fits(source, bytes, spec.2) && o.run.takes())
 }
 
 /// Records a window's pass in `list`, reading records from `sources`.
@@ -1347,11 +1546,7 @@ fn open(list: &HostList, sources: Vec<u64>) -> Option<Open> {
         l.Dispatch(1, 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(
-                &out,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
+            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read_state()),
         ]);
     }
     Some(Open {
@@ -1362,6 +1557,8 @@ fn open(list: &HostList, sources: Vec<u64>) -> Option<Open> {
         records: 0,
         bytes: 0,
         run: Run::default(),
+        #[cfg(feature = "diagnostics")]
+        dispatches: false,
     })
 }
 
@@ -1711,6 +1908,10 @@ mod tests {
         /// As `Write`, with the window left open: what a window that did not
         /// end there would clamp.
         WriteUnended(usize, u64, u32),
+        /// An indirect dispatch of a program that spreads its groups: title
+        /// buffer, byte offset, records, clamped into the 20-byte spread
+        /// layout (`VICTORY_INDIRECT_PLAIN` lets windows take it).
+        Spread(usize, u64, u32),
         /// The title's barrier (or pipeline sync): every earlier shader
         /// write first ([`super::stale_window`]).
         Barrier,
@@ -1791,22 +1992,27 @@ void main() { title.Store(at, value); }
         };
         for &step in steps {
             match step {
-                Step::Draw(buffer, offset, kind, records)
-                | Step::Stores(buffer, offset, kind, records) => {
+                Step::Draw(..) | Step::Stores(..) | Step::Spread(..) => {
+                    let (buffer, offset, kind, records, spread) = match step {
+                        Step::Draw(b, o, k, r) | Step::Stores(b, o, k, r) => (b, o, k, r, false),
+                        Step::Spread(b, o, r) => (b, o, 2, r, true),
+                        _ => unreachable!(),
+                    };
                     let spec = (kind, stride(kind), records);
-                    let len = u64::from(stride(kind)) * u64::from(records.max(1));
+                    let len = super::out_bytes(spec, spread);
                     let source = titles[buffer].1;
                     if window {
-                        if !super::joins(&list, source, spec) {
+                        if !super::joins(&list, source, spec, spread) {
                             flush(&mut pending);
                         }
                         let stores = matches!(step, Step::Stores(..));
                         let (out, at, _) =
-                            super::windowed(&list, source, offset, spec, stores).expect("a window");
+                            super::windowed(&list, source, offset, spec, stores, spread)
+                                .expect("a window");
                         pending.0.push((at, len, at_results));
                         pending.1 = Some(out);
                     } else {
-                        let out = super::bound(&list, source + offset, spec, false).unwrap();
+                        let out = super::bound(&list, source + offset, spec, spread).unwrap();
                         // SAFETY: an open list, live buffers.
                         unsafe {
                             list.list
@@ -1948,6 +2154,57 @@ void main() { title.Store(at, value); }
             return; // no host GPU here
         };
         assert_eq!(out[5], [1, 1, 1]);
+    }
+
+    /// Dispatches of programs that spread their groups
+    /// (`VICTORY_INDIRECT_PLAIN`): a window clamps them into the single
+    /// clamp's 20-byte spread layout word for word, among mesh draws and
+    /// dispatches that do not spread, one of several records included, and
+    /// with the budget running out in the middle (spread records past it
+    /// keep their words and run no groups).
+    #[test]
+    fn windows_clamp_spread_dispatches_as_single_clamps_do() {
+        let cases = [
+            [115_200, 1, 1],
+            [65_535, 1, 1],
+            [65_536, 1, 1],
+            [65_537, 1, 1],
+            [70_000, 2, 1],
+            [100, 2, 1],
+            [65_537, 0, 1],
+            [65_537, 1, 0],
+            [80_000, 1, 2],
+            [10, 70_000, 1],
+            [70_000, 131_072, 1],
+            [65_536, 131_072, 1],
+            [u32::MAX, 1, 1],
+        ];
+        let mut a: Vec<u32> = cases.concat();
+        // 2^26 threads each: the budget runs out at the second or third.
+        let heavy = a.len() as u64 * 4;
+        a.extend([65_535, 16, 1].repeat(3));
+        let tail = a.len() as u64 * 4;
+        a.extend([70_000, 1, 1, 5, 1, 1]);
+        let mut steps = Vec::new();
+        for i in 0..cases.len() as u64 {
+            steps.push(Step::Spread(0, 12 * i, 1));
+            if i % 4 == 1 {
+                steps.push(Step::Draw(0, 12 * i, 10, 1));
+                steps.push(Step::Stores(0, 12 * i, 2, 1));
+            }
+        }
+        steps.push(Step::Spread(0, 0, cases.len() as u32));
+        steps.extend((0..3).map(|i| Step::Spread(0, heavy + 12 * i, 1)));
+        steps.push(Step::Spread(0, tail, 2));
+        let Some(out) = same(&[a], &steps) else {
+            return; // no host GPU here
+        };
+        assert_eq!(out[0], [57_600, 115_200, 57_600, 1, 2]);
+        assert_eq!(
+            out.last().unwrap(),
+            &[35_000, 70_000, 0, 0, 0, 0, 5, 0, 0, 0],
+            "past the budget: the spread words, no groups"
+        );
     }
 
     /// A budget spent before the window opens stays spent: its draws all
@@ -2159,9 +2416,11 @@ void main() { title.Store(at, value); }
         let recorded: Vec<_> = lists
             .iter()
             .map(|l| {
-                let (out, _, opened) = super::windowed(l, gpu, 0, (10, 12, 1), false).unwrap();
+                let (out, _, opened) =
+                    super::windowed(l, gpu, 0, (10, 12, 1), false, false).unwrap();
                 assert!(opened);
-                let (again, at, opened) = super::windowed(l, gpu, 12, (10, 12, 1), false).unwrap();
+                let (again, at, opened) =
+                    super::windowed(l, gpu, 12, (10, 12, 1), false, false).unwrap();
                 assert!(
                     !opened && at == 12 && again.as_raw() == out.as_raw(),
                     "the second draw joins"
@@ -2201,6 +2460,55 @@ void main() { title.Store(at, value); }
             return; // no host GPU here
         };
         assert!(twice.iter().all(|r| r[0] == 0));
+    }
+    /// The lean clamp (grosterr's routing test on fxceless/victory-fork,
+    /// `warp_spread_lean_routes_small_and_large_records_and_counts_them`,
+    /// for this clamp's layout): a record within 65,535 groups in x goes to
+    /// the plain groups with a zero predicate and an empty spread record,
+    /// one past it to the spread record (the single clamp's words) with a
+    /// predicate of 1 and no plain groups; one over 2^20 groups runs
+    /// neither.
+    #[test]
+    fn lean_records_route_by_65535() {
+        let Some(host) = super::host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let cases: [([u32; 3], [u32; 12]); 5] = [
+            ([100, 2, 1], [100, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            ([65_535, 1, 1], [65_535, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (
+                [100_000, 1, 1],
+                [0, 0, 0, 0, 1, 0, 50_000, 100_000, 50_000, 1, 2, 0],
+            ),
+            (
+                [65_536, 1, 1],
+                [0, 0, 0, 0, 1, 0, 32_768, 65_536, 32_768, 1, 2, 0],
+            ),
+            ([(1 << 20) + 1, 1, 1], [0; 12]),
+        ];
+        for (input, expected) in cases {
+            let (title, data) = host.shared_buffer(12).unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: the mapping covers one record; a live buffer.
+            let address = unsafe {
+                data.cast::<[u32; 3]>().write(input);
+                title.GetGPUVirtualAddress()
+            };
+            let out = super::bound_lean(&list, address, (2, 12, 1)).unwrap();
+            super::done(&list, &out);
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the output mapping covers one lean record; the list ran.
+            let got = unsafe {
+                let mut mapped = std::ptr::null_mut();
+                out.Map(0, None, Some(&mut mapped)).unwrap();
+                let got = mapped.cast::<[u32; 12]>().read();
+                out.Unmap(0, None);
+                got
+            };
+            assert_eq!(got, expected, "lean record for {input:?}");
+        }
     }
 
     #[test]
