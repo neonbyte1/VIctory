@@ -795,26 +795,52 @@ const CPP_MAGIC: usize = 0x1993_0520;
 /// # Safety
 /// `p` are the parameters of a live MSVC throw (`p[0]` the magic).
 unsafe fn thrown(p: &[usize]) -> String {
+    if p.len() < 4 || p[2] == 0 || p[3] == 0 {
+        return "unknown".into();
+    }
     // SAFETY: the throw's ThrowInfo, its RVAs relative to `p[3]`: catchable
     // type array at +12 (count, then type RVAs), each type's descriptor at
     // +4, whose decorated name starts at +16; the object is at `p[1]`.
     unsafe {
         let rva = |at: usize| (at as *const u32).read_unaligned() as usize;
-        let types = p[3] + rva(p[2] + 12);
-        let name = |i: usize| {
-            let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
-            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
-                .to_string_lossy()
+        let types_rva = rva(p[2] + 12);
+        let Some(types) = (types_rva != 0)
+            .then(|| p[3].checked_add(types_rva))
+            .flatten()
+        else {
+            return "unknown".into();
         };
-        let first = name(0);
+        let count = rva(types).min(64);
+        if count == 0 {
+            return "unknown".into();
+        }
+        let name = |i: usize| -> Option<std::borrow::Cow<'_, str>> {
+            let entry_rva = rva(types + 4 + 4 * i);
+            let entry = (entry_rva != 0)
+                .then(|| p[3].checked_add(entry_rva))
+                .flatten()?;
+            let desc_rva = rva(entry + 4);
+            let descriptor = (desc_rva != 0)
+                .then(|| p[3].checked_add(desc_rva))
+                .flatten()?;
+            Some(
+                std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
+                    .to_string_lossy(),
+            )
+        };
+        let Some(first) = name(0) else {
+            return "unknown".into();
+        };
         let value = match &*first {
             // int, unsigned, long (HRESULT), unsigned long
             ".H" | ".I" | ".J" | ".K" if p[1] != 0 => {
                 format!(" = {:#010x}", (p[1] as *const u32).read_unaligned())
             }
             // std::exception keeps its message after the table pointer.
-            _ if (0..rva(types)).any(|i| name(i) == ".?AVexception@std@@") => {
-                let message = (p[1] as *const *const std::ffi::c_char).add(1).read();
+            _ if p[1] != 0 && (0..count).any(|i| name(i).as_deref() == Some(".?AVexception@std@@")) => {
+                let message = (p[1] as *const *const std::ffi::c_char)
+                    .add(1)
+                    .read_unaligned();
                 if message.is_null() {
                     String::new()
                 } else {
@@ -1827,5 +1853,33 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn thrown_and_unwind_handle_rethrow_and_corrupted_rsp() {
+        // MSVC C++ rethrow (`throw;`) passes null ThrowInfo / object pointers.
+        // SAFETY: null pointers are rejected before dereference.
+        assert_eq!(unsafe { thrown(&[CPP_MAGIC, 0, 0, 0]) }, "unknown");
+
+        // Overflowing `Rsp` must stop cleanly instead of panicking or wrapping.
+        // SAFETY: zeroed CONTEXT is valid for `unwind_into`.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = 0x1000;
+        context.Rsp = u64::MAX - 3;
+        let mut frames = Vec::new();
+        let walked = crate::unwind::unwind_into(context, 0, usize::MAX, &mut frames);
+        assert!(walked.is_ok());
+        assert_eq!(frames, [0x1000]);
+
+        // Misaligned `Rsp` inside stack bounds must read without UB.
+        let stack = [0u8; 32];
+        let low = stack.as_ptr() as usize;
+        let high = low + stack.len();
+        context.Rip = 0x2000;
+        context.Rsp = (low + 1) as u64;
+        frames.clear();
+        let walked = crate::unwind::unwind_into(context, low, high, &mut frames);
+        assert!(walked.is_ok());
+        assert_eq!(frames, [0x2000]);
     }
 }

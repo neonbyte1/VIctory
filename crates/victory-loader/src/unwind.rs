@@ -101,16 +101,17 @@ pub(crate) fn unwind_into(
     while frames.len() < MAX_FRAMES {
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
-        if rsp < low || rsp + 8 > high {
+        if rsp < low || rsp.checked_add(8).is_none_or(|end| end > high) {
             break;
         }
         let mut image = 0;
         // SAFETY: looks up the function table entry covering `Rip`, if any.
         let entry = unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) };
         if entry.is_null() {
-            // SAFETY: `rsp` is inside this thread's stack.
-            context.Rip = unsafe { (rsp as *const u64).read() };
-            context.Rsp += 8;
+            // SAFETY: `rsp..rsp + 8` is inside this thread's stack; use
+            // `read_unaligned` in case the crashing thread corrupted `Rsp`.
+            context.Rip = unsafe { (rsp as *const u64).read_unaligned() };
+            context.Rsp = context.Rsp.wrapping_add(8);
         } else {
             // SAFETY: `entry` came from `RtlLookupFunctionEntry` for `Rip`
             // with `image`; the context is our copy.
