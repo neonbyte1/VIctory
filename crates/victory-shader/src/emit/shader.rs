@@ -137,6 +137,9 @@ pub(crate) struct Mesh {
 
 pub(crate) struct Shader {
     pub m: Module,
+    /// Test builds: the property words of each handle annotation, in order.
+    #[cfg(test)]
+    pub annotations: Vec<(u32, u32)>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -243,6 +246,8 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
+            #[cfg(test)]
+            annotations: Vec::new(),
             t: Types {
                 void,
                 i1,
@@ -644,6 +649,8 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        #[cfg(test)]
+        self.annotations.push((props0, props1));
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
