@@ -2857,7 +2857,7 @@ impl HostList {
         let deferred = self.deferred();
         let mut steps = deferred.copies.iter().peekable();
         while let Some(step) = steps.next() {
-            let mut started;
+            let started;
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 std::time::Instant::now(),

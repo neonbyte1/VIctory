@@ -1721,6 +1721,33 @@ mod state {
             }
         });
     }
+    pub(super) const MAX_RENDER_TARGETS: usize =
+        windows::Win32::Graphics::Direct3D12::D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize;
+
+    /// Expands `(count, handles, one_range)` into at most 8 descriptor handles
+    /// without dereferencing `handles` when `count == 0` or `handles` is null.
+    pub(super) fn target_handles(
+        count: u32,
+        handles: *const u64,
+        one_range: i32,
+    ) -> ([u64; MAX_RENDER_TARGETS], usize) {
+        let n = (count as usize).min(MAX_RENDER_TARGETS);
+        let mut out = [0u64; MAX_RENDER_TARGETS];
+        if n == 0 || handles.is_null() {
+            return (out, 0);
+        }
+        if one_range != 0 {
+            // SAFETY: `n > 0` and `handles` is non-null: the title passes the first handle.
+            let first = unsafe { *handles };
+            for (i, slot) in out[..n].iter_mut().enumerate() {
+                *slot = first + 128 * i as u64;
+            }
+        } else {
+            out[..n].copy_from_slice(items(handles, n as u32));
+        }
+        (out, n)
+    }
+
     /// `(count, handles, one range, depth)`: with one range, the handles
     /// follow the first at the render target view size (128 bytes).
     pub(super) extern "system" fn targets(
@@ -1730,16 +1757,10 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
+        let (handles, len) = target_handles(count, handles, one_range);
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| s.set_targets(list, &handles[..len], depth));
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -4183,6 +4204,80 @@ void main() {
             assert_eq!(release(queue), 0);
             assert_eq!(release(title_heap_ptr), 0);
             assert_eq!(release(tex), 0);
-        });
+        });    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_handles_guards_empty_null_and_clamps_to_eight() {
+        let dangling = 0xDEAD_BEEF_DEAD_BEEF_usize as *const u64;
+        assert_eq!(state::target_handles(0, dangling, 1).1, 0);
+        assert_eq!(state::target_handles(0, dangling, 0).1, 0);
+        assert_eq!(state::target_handles(3, std::ptr::null(), 1).1, 0);
+        assert_eq!(state::target_handles(3, std::ptr::null(), 0).1, 0);
+
+        let base = 0x1000u64;
+        let (single, single_len) = state::target_handles(3, &base, 1);
+        assert_eq!(&single[..single_len], &[0x1000, 0x1080, 0x1100]);
+
+        let list = [10u64, 20, 30];
+        let (array, array_len) = state::target_handles(3, list.as_ptr(), 0);
+        assert_eq!(&array[..array_len], &[10, 20, 30]);
+
+        let (clamped_single, clamped_single_len) = state::target_handles(12, &base, 1);
+        assert_eq!(clamped_single_len, state::MAX_RENDER_TARGETS);
+        assert_eq!(
+            clamped_single,
+            [
+                0x1000, 0x1080, 0x1100, 0x1180, 0x1200, 0x1280, 0x1300, 0x1380
+            ]
+        );
+
+        let twelve = [10u64, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let (clamped_array, clamped_array_len) = state::target_handles(12, twelve.as_ptr(), 0);
+        assert_eq!(clamped_array_len, state::MAX_RENDER_TARGETS);
+        assert_eq!(clamped_array, [10, 20, 30, 40, 50, 60, 70, 80]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn om_set_render_targets_zero_count_does_not_read_handles() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+
+        // SAFETY: reserving and committing an isolated unreadable page for the test.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_NOACCESS,
+            )
+        };
+        assert!(!page.is_null());
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let om_set_render_targets =
+            slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190);
+        let dsv = 0u64;
+        om_set_render_targets(list, 0, page.cast::<u64>(), 1, &dsv);
+        om_set_render_targets(list, 0, page.cast::<u64>(), 0, std::ptr::null());
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        // SAFETY: `page` was allocated above with `VirtualAlloc`.
+        assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
     }
 }
