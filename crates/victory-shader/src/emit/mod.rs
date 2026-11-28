@@ -46,7 +46,8 @@
 //!   host copy (and kind) serves every draw of a list. In programs that
 //!   use title memory (below) root SRVs and UAVs are title memory instead;
 //!   elsewhere [`HostShader::root_srvs`] and [`HostShader::root_uavs`] now
-//!   hold only the host's own tables (`VIEW_STRIDES`).
+//!   hold only the host's own tables (`VIEW_STRIDES`, and `DISPATCH_RECORD`
+//!   with [`Options::dispatch_record`]).
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -414,6 +415,17 @@ pub const ROOT_VIEW_OFFSET: u32 = 4;
 /// [`UserData::slot`] for host-computed compute dispatch spreading
 /// (`dword = 0`: groups per row, or `0` when unspread; `dword = 1`: asked `x` groups).
 pub const DISPATCH_SLOT: u8 = u8::MAX;
+/// The [`DISPATCH_SLOT`] row value (`dword = 0`) that sends a program
+/// translated with [`Options::dispatch_record`] to its root SRV
+/// [`DISPATCH_RECORD`] for both words; a real row is at most 65,535.
+pub const FROM_DISPATCH_RECORD: u32 = u32::MAX;
+/// Root SRV `t`[`DISPATCH_RECORD`] in [`ROOT_CBV_SPACE`] of a compute
+/// program translated with [`Options::dispatch_record`]: the clamped
+/// record of its indirect dispatch, whose first two words are what
+/// [`DISPATCH_SLOT`] dwords 0 and 1 would hold (`row`, `asked`). Read in
+/// place of those two when dword 0 is [`FROM_DISPATCH_RECORD`]; the host
+/// binds some readable buffer of 8 bytes or more otherwise.
+pub const DISPATCH_RECORD: u8 = 254;
 
 /// Spreads wide, nonempty dispatches with one Z group when the shader can
 /// remap group IDs. Otherwise, bounds each dimension to the D3D12 limit.
@@ -527,6 +539,14 @@ pub struct Options {
     /// at a group barrier. On by default; off, such programs are refused,
     /// as before. Only programs that are refused without them change.
     pub pair_meetings: bool,
+    /// Compute programs with the spread prologue can take their spread words
+    /// from memory: root SRV [`DISPATCH_RECORD`] when the [`DISPATCH_SLOT`]
+    /// row is [`FROM_DISPATCH_RECORD`]. The host then runs their indirect
+    /// dispatches with a command signature of `DISPATCH` alone (no root
+    /// constants), the program reading the words the argument clamp wrote
+    /// beside the groups. Off by default (`VICTORY_INDIRECT_PLAIN=1` in
+    /// `victory-gpu`).
+    pub dispatch_record: bool,
 }
 
 impl Default for Options {
@@ -535,6 +555,7 @@ impl Default for Options {
             view_marks: false,
             target: Target::ANY,
             pair_meetings: true,
+            dispatch_record: false,
         }
     }
 }
@@ -613,6 +634,7 @@ pub fn emit_with(
     // (for every lowering of this program: the per-lane form, the console
     // flow, and the per-lane form again)
     let _pairs = lower::PairMeetings::set(options.pair_meetings);
+    let _record = lower::DispatchRecord::set(options.dispatch_record);
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),

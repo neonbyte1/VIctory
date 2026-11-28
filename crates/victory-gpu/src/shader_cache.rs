@@ -130,10 +130,12 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let pair_meetings = pair_meetings();
+    let dispatch_record = dispatch_record();
     let options = victory_shader::emit::Options {
         view_marks: true,
         target,
         pair_meetings,
+        dispatch_record,
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
@@ -145,6 +147,7 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
                 target,
                 pair_meetings,
                 victory_shader::emit::uav_order(),
+                dispatch_record,
             ),
             container,
             translate,
@@ -153,11 +156,25 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
     }
 }
 
+/// Whether compute programs translate to read their spread words from the
+/// dispatch record ([`victory_shader::emit::Options::dispatch_record`]):
+/// with `VICTORY_INDIRECT_PLAIN=1` only (`crate::indirect::plain`), whose
+/// indirect dispatches then take a command signature without constants.
+pub fn dispatch_record() -> bool {
+    crate::indirect::plain() == crate::indirect::Plain::Signature
+}
+
 /// The part of an entry's key before the container: the build, and the
 /// host's wave sizes (a translation for one host's waves is not another's),
-/// and pair meetings and `VICTORY_UAV_ORDER` other than `all` when asked
-/// for (keys without them stay as they were).
-fn host_key(build: &[u8; 32], target: Target, pair_meetings: bool, uav: UavOrder) -> [u8; 32] {
+/// and pair meetings, `VICTORY_UAV_ORDER` other than `all` and the dispatch
+/// record when asked for (keys without them stay as they were).
+fn host_key(
+    build: &[u8; 32],
+    target: Target,
+    pair_meetings: bool,
+    uav: UavOrder,
+    dispatch_record: bool,
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
@@ -172,6 +189,9 @@ fn host_key(build: &[u8; 32], target: Target, pair_meetings: bool, uav: UavOrder
             h.update(b"uav order off");
         }
         UavOrder::All => {}
+    }
+    if dispatch_record {
+        h.update(b"dispatch record");
     }
     *h.finalize().as_bytes()
 }
@@ -604,29 +624,35 @@ mod tests {
             lanes_max: 64,
         };
         let all = UavOrder::All;
+        let key = |build: &[u8; 32], target, pairs, uav| host_key(build, target, pairs, uav, false);
         assert_eq!(
-            host_key(&build, nvidia, false, all),
-            host_key(&build, nvidia, false, all)
+            key(&build, nvidia, false, all),
+            key(&build, nvidia, false, all)
         );
         assert_ne!(
-            host_key(&build, nvidia, false, all),
-            host_key(&build, rdna, false, all)
+            key(&build, nvidia, false, all),
+            key(&build, rdna, false, all)
         );
         assert_ne!(
-            host_key(&build, nvidia, false, all),
-            host_key(&[8; 32], nvidia, false, all)
+            key(&build, nvidia, false, all),
+            key(&[8; 32], nvidia, false, all)
         );
         // Pair meetings change the translation of the builder's programs.
         assert_ne!(
-            host_key(&build, nvidia, false, all),
-            host_key(&build, nvidia, true, all)
+            key(&build, nvidia, false, all),
+            key(&build, nvidia, true, all)
         );
         // So do meetings only before UAV reads after writes, or none.
-        let raw = host_key(&build, nvidia, true, UavOrder::Raw);
-        let off = host_key(&build, nvidia, true, UavOrder::Off);
-        assert_ne!(host_key(&build, nvidia, true, all), raw);
-        assert_ne!(host_key(&build, nvidia, true, all), off);
+        let raw = key(&build, nvidia, true, UavOrder::Raw);
+        let off = key(&build, nvidia, true, UavOrder::Off);
+        assert_ne!(key(&build, nvidia, true, all), raw);
+        assert_ne!(key(&build, nvidia, true, all), off);
         assert_ne!(raw, off);
+        // And the spread prologue reading the dispatch record.
+        assert_ne!(
+            key(&build, nvidia, true, all),
+            host_key(&build, nvidia, true, all, true)
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

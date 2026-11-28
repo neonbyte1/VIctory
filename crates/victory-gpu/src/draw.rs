@@ -134,6 +134,11 @@ pub(crate) struct State {
     fixed: Fixed,
     /// Host-computed compute dispatch spread constants `[row, asked_x]`.
     dispatch_spread: [u32; 2],
+    /// The host GPU address of the clamped record an indirect dispatch with
+    /// the plain signature reads its spread words from (root SRV
+    /// `DISPATCH_RECORD`; `crate::indirect::Plain::Signature`), 0 when
+    /// none: the user data's spread words are then the program's own.
+    dispatch_record: u64,
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -1011,6 +1016,23 @@ impl State {
                                 l.SetGraphicsRootShaderResourceView(param, gpu);
                             }
                         }
+                        continue;
+                    }
+                    if kind == 1 && compute && slot == victory_shader::emit::DISPATCH_RECORD {
+                        // The clamped record of an indirect dispatch with
+                        // the plain signature; otherwise words the program
+                        // reads and drops (its row is not the marker).
+                        let gpu = match self.dispatch_record {
+                            0 => no_dispatch_record(),
+                            record => Some(record),
+                        };
+                        let Some(gpu) = gpu else {
+                            not_run("no buffer for the dispatch record");
+                            return false;
+                        };
+                        // SAFETY: an open list; the list's argument buffer
+                        // or our buffer of the process, both live.
+                        unsafe { l.SetComputeRootShaderResourceView(param, gpu) };
                         continue;
                     }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
@@ -2182,7 +2204,24 @@ impl State {
             },
             None => None,
         };
-        let spread = if kind == DISPATCH && p.compute {
+        // One record of a program that reads its spread words from its
+        // clamped record (`VICTORY_INDIRECT_PLAIN=1`, root SRV
+        // `DISPATCH_RECORD`) runs through a signature of `DISPATCH` alone
+        // at the groups of the 20-byte spread record; the root view and the
+        // marker row are set at `bind` below. More records keep the spread
+        // signature: a root view names one record.
+        let plain = kind == DISPATCH
+            && p.compute
+            && max == 1
+            && crate::indirect::plain() == crate::indirect::Plain::Signature
+            && p.stages.first().is_some_and(|s| {
+                s.root_srvs
+                    .iter()
+                    .any(|&(slot, _)| slot == victory_shader::emit::DISPATCH_RECORD)
+            });
+        let spread = if plain {
+            host_signature(DISPATCH, 20)
+        } else if kind == DISPATCH && p.compute {
             p.stages.first().and_then(|s| {
                 let (param, _) = s.user_data?;
                 let row_index = s
@@ -2275,7 +2314,9 @@ impl State {
             // window with the indirect draws next to them (#3197,
             // `crate::indirect::windowed`); with `VICTORY_GPU_GAPS`, indirect
             // dispatches and draws that may store too, while nothing but
-            // the window's executions comes between (`crate::indirect::Run`).
+            // the window's executions comes between (`crate::indirect::Run`);
+            // dispatches with spread groups only where the window pass
+            // writes their layout (`VICTORY_INDIRECT_PLAIN`).
             let stores = may_write_arguments(p);
             #[cfg(feature = "diagnostics")]
             if stores && kind != DISPATCH && crate::indirect::windows_on() {
@@ -2286,7 +2327,7 @@ impl State {
                 crate::indirect::gaps_on(),
                 kind == DISPATCH,
                 stores,
-                is_spread,
+                is_spread && crate::indirect::plain() == crate::indirect::Plain::Off,
             );
             let joins = alone.is_none();
             let window = joins
@@ -2298,6 +2339,7 @@ impl State {
                         arguments - start,
                         spec,
                         stores,
+                        is_spread,
                     )
                 })
                 .flatten();
@@ -2320,7 +2362,15 @@ impl State {
                 }
                 None => {
                     #[cfg(feature = "diagnostics")]
-                    crate::indirect::count_alone(alone);
+                    {
+                        crate::indirect::count_alone(alone);
+                        if kind == DISPATCH {
+                            crate::copystat::add(
+                                crate::copystat::C::ClampIndirectDispatchesAlone,
+                                1,
+                            );
+                        }
+                    }
                     // Bounded first: the clamp binds a compute pipeline of its own.
                     let Some(clamped) = crate::indirect::bound(list, args_gpu, spec, is_spread)
                     else {
@@ -2340,6 +2390,18 @@ impl State {
                     }) && self.prepare(list, kind == INDEXED)
                 }
                 MESH => self.prepare_for(list, false, true),
+                DISPATCH if plain => {
+                    // The program reads its spread words from the clamped
+                    // record (`victory_shader::emit::DISPATCH_RECORD`):
+                    // the words the spread signature would have set.
+                    // SAFETY: the list's argument buffer, alive.
+                    self.dispatch_record = unsafe { clamped.GetGPUVirtualAddress() } + at;
+                    self.dispatch_spread = [victory_shader::emit::FROM_DISPATCH_RECORD; 2];
+                    let bound = p.compute && self.bind(list, p, true);
+                    self.dispatch_record = 0;
+                    self.dispatch_spread = [0, 0];
+                    bound
+                }
                 DISPATCH => p.compute && self.bind(list, p, true),
                 _ => false,
             };
@@ -2364,6 +2426,18 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        #[cfg(feature = "diagnostics")]
+        if plain {
+            crate::copystat::add(crate::copystat::C::IndirectPlain, 1);
+        } else if is_spread {
+            crate::copystat::add(crate::copystat::C::IndirectSpreadSignature, 1);
+        }
+        // The plain signature reads the groups after the spread words.
+        let groups_at = clamped_at + if plain { 8 } else { 0 };
+        #[cfg(test)]
+        if plain {
+            PLAIN_DISPATCHES.set(PLAIN_DISPATCHES.get() + 1);
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         list.crumbed(Crumb::Indirect, None, || unsafe {
@@ -2371,7 +2445,7 @@ impl State {
                 &signature,
                 max,
                 &clamped,
-                clamped_at,
+                groups_at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -2406,6 +2480,29 @@ impl State {
         }
         true
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Indirect dispatches this thread ran with the plain signature
+    /// (`crate::indirect::Plain::Signature`; tests).
+    pub(crate) static PLAIN_DISPATCHES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// What root SRV `DISPATCH_RECORD` names when no record is the program's:
+/// 16 bytes of upload memory, made once and kept for the process. A
+/// program translated with the dispatch record reads them and drops them
+/// (its row is not `FROM_DISPATCH_RECORD`). `None` without a host.
+fn no_dispatch_record() -> Option<u64> {
+    static RECORD: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+        let (buffer, _) = crate::host::host()?.upload_buffer(16)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        // Never released: the address stays valid for every list.
+        std::mem::forget(buffer);
+        Some(gpu)
+    });
+    *RECORD
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -6012,6 +6109,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 view_marks: true,
                 target: victory_shader::emit::Target::ANY,
                 pair_meetings: false,
+                dispatch_record: false,
             },
         )
         .unwrap();

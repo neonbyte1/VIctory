@@ -1581,6 +1581,115 @@ fn cs_spread_prologue_remaps_group_ids_and_bounds_groups() {
     }
 }
 
+/// With [`super::Options::dispatch_record`] the spread prologue takes `row`
+/// and `asked` from root SRV [`super::DISPATCH_RECORD`] when the user data's
+/// row is [`super::FROM_DISPATCH_RECORD`] (an indirect dispatch with the
+/// plain signature), and the user data's own otherwise (whatever the root
+/// view holds): both run exactly the groups of
+/// `cs_spread_prologue_remaps_group_ids_and_bounds_groups`. Without the
+/// option the program declares no such view.
+#[test]
+fn cs_spread_prologue_reads_the_dispatch_record_at_the_marker() {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0102,
+        0xFA00_0000, // s_load_dwordx4 s[4:7], s[4:5], 0
+        0x7E02_0201, // v_mov_b32 v1, s1
+        0x3400_0282, // v_lshlrev_b32 v0, 2, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000,
+        0x8001_0100, // buffer_store_dword v1, v0, s[4:7], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let without = build_spread_cs(&words).expect("lower");
+    assert!(
+        without.root_srvs.is_empty(),
+        "no dispatch record without the option"
+    );
+    let shader = {
+        let _record = super::lower::DispatchRecord::set(true);
+        build_spread_cs(&words).expect("lower")
+    };
+    assert_eq!(shader.root_srvs, [super::DISPATCH_RECORD]);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    const ASKED: u32 = 65_537;
+    let (row, asked_x, gx, gy, gz) = crate::emit::spread_groups(ASKED, 1, 1, true);
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        if force_warp && !warp {
+            continue;
+        }
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) if force_warp => {
+                panic!("could not create the requested SM 6.6 WARP device: {e}")
+            }
+            Err(e) => {
+                eprintln!("no SM 6.6 {label} device ({e}), skipped");
+                continue;
+            }
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute pipeline creation failed: {e}"));
+        // (user data row and asked, the record's two words)
+        for (what, words, record) in [
+            (
+                "from the record",
+                [super::FROM_DISPATCH_RECORD; 2],
+                vec![row, asked_x, gx, gy, gz],
+            ),
+            ("from the user data", [row, asked_x], vec![7, 3, 0, 0]),
+        ] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if u.slot == super::DISPATCH_SLOT {
+                    ud[u.index as usize] = words[usize::from(u.dword != 0)];
+                }
+            }
+            let views = [View::RawUav(ASKED)];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: record,
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [gx, gy, gz],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {what}: dispatch failed: {e}"));
+            assert_eq!(
+                out[0].len(),
+                ASKED as usize,
+                "{label} {what}: output length"
+            );
+            for (i, &val) in out[0].iter().enumerate() {
+                assert_eq!(val, i as u32, "{label} {what}: element {i} mismatch");
+            }
+        }
+        eprintln!("{label}: verified {ASKED} group IDs from the record and the user data");
+    }
+}
+
 /// Empty root-constant slices (`Vec::new()`, whose pointer is dangling `0x4`)
 /// bind a single zero dword so the `user_data_dwords().max(1)` slot declared
 /// by `root_signature_for` stays defined without dereferencing `0x4` on NVIDIA.

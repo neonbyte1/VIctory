@@ -105,6 +105,7 @@ fn emit(
         view_marks: false,
         target,
         pair_meetings,
+        dispatch_record: false,
     };
     super::emit_with(&c, native, &p, &st, &io, &res, options).map_err(|e| e.to_string())
 }
@@ -232,6 +233,7 @@ fn builder_program(host: &Host, hash: &str) -> Option<HostShader> {
         view_marks: false,
         target: host.target(),
         pair_meetings: true,
+        dispatch_record: false,
     };
     assert!(
         super::translate_with(

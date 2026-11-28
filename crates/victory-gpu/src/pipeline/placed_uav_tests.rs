@@ -68,6 +68,12 @@ fn store_shader() -> Arc<Shader> {
 }
 
 fn translated_shader(native: NativeProgram) -> Arc<Shader> {
+    translated_shader_with(native, false)
+}
+
+/// As [`translated_shader`], the spread prologue reading the dispatch
+/// record with `dispatch_record` ([`emit::Options::dispatch_record`]).
+fn translated_shader_with(native: NativeProgram, dispatch_record: bool) -> Arc<Shader> {
     // Compute has no input/output signatures. Supply just the DXBC header.
     let mut container = vec![0; 32];
     container[..4].copy_from_slice(b"DXBC");
@@ -78,10 +84,19 @@ fn translated_shader(native: NativeProgram) -> Arc<Shader> {
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    let host = emit::emit(&c, &native, &p, &st, &io, &res, emit::Target::ANY).unwrap();
+    let options = emit::Options {
+        dispatch_record,
+        ..emit::Options::default()
+    };
+    let host = emit::emit_with(&c, &native, &p, &st, &io, &res, options).unwrap();
+    let mut hash = blake3::Hasher::new();
+    hash.update(&native.code);
+    if dispatch_record {
+        hash.update(b"dispatch record");
+    }
     Arc::new(Shader {
         stage: "compute",
-        hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
+        hash: hash.finalize().to_hex()[..16].to_owned(),
         container,
         translated: OnceLock::from(Some(Translated {
             atomics64: false,
@@ -228,14 +243,11 @@ fn test_views() -> Guest {
     Guest(views)
 }
 
-#[test]
-fn direct_and_indirect_dispatch_write_each_group_once() {
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
-
-    let Some(host) = crate::host::host() else {
-        eprintln!("no host GPU; skipped");
-        return;
-    };
+/// A compute program of one-thread groups writing `x | z << 17` at slot
+/// `x | z << 17` (8 bytes a slot) of a raw UAV and adding 1 to the word
+/// after it, spread prologue included; reading its spread words from the
+/// dispatch record with `dispatch_record`.
+fn group_writer(dispatch_record: bool) -> Arc<Shader> {
     let words = [
         0xBE84_0300, // s_mov_b32 s4, s0 (table address)
         0xBE85_0380, // s_mov_b32 s5, 0
@@ -254,43 +266,60 @@ fn direct_and_indirect_dispatch_write_each_group_once() {
         0x8001_0200, // buffer_atomic_add v2, v0, s[4:7], 0 offen offset:4
         0xBF81_0000, // s_endpgm
     ];
-    let shader = translated_shader(NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 8,
-        layout: vec![RootParam {
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            sgprs: 1,
-            base_register: 0,
-            user_data: 0,
-            slot: 0,
-        }],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 0,
-            slot: 0,
-        }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: (1 << 1) | (1 << 7) | (1 << 9),
-            threads: [1, 1, 1],
-        }),
-        code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
-    });
+    let shader = translated_shader_with(
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (1 << 1) | (1 << 7) | (1 << 9),
+                threads: [1, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        },
+        dispatch_record,
+    );
+    let host = &shader.translated().unwrap().host;
     assert!(
-        shader
-            .translated()
-            .unwrap()
-            .host
-            .user_data
+        host.user_data
             .iter()
             .any(|entry| { entry.slot == emit::DISPATCH_SLOT && entry.dword == 0 })
     );
+    assert_eq!(
+        host.root_srvs.contains(&emit::DISPATCH_RECORD),
+        dispatch_record,
+        "the dispatch record's root view, with the option only"
+    );
+    shader
+}
+
+#[test]
+fn direct_and_indirect_dispatch_write_each_group_once() {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
+
+    let Some(host) = crate::host::host() else {
+        eprintln!("no host GPU; skipped");
+        return;
+    };
+    let shader = group_writer(false);
     let null = std::ptr::null();
     let mut pipeline = null;
     assert_eq!(
@@ -371,6 +400,185 @@ fn direct_and_indirect_dispatch_write_each_group_once() {
                     [u32::MAX, 0]
                 };
                 assert_eq!(record, expected, "{path} {requested:?}, group slot {index}");
+            }
+        }
+    }
+}
+
+/// The groups an indirect dispatch of a spreading program runs for the
+/// record `requested`, as the argument clamp and the spread prologue make
+/// them: slots `x` below the first, `z` below the second, each run as many
+/// times as the third (`y`).
+fn groups_run([x, y, z]: [u32; 3]) -> (usize, usize, u32) {
+    const LIMIT: u32 = 65_535;
+    const GROUPS: u64 = 1 << 20;
+    let too_many =
+        |g: [u32; 3]| g[2] != 0 && u64::from(g[0]) * u64::from(g[1]) > GROUPS / u64::from(g[2]);
+    if x > LIMIT && y != 0 && z == 1 {
+        // Spread over rows of z; every group past `x` returns at once.
+        let rows = x.div_ceil(LIMIT);
+        let g = [x.div_ceil(rows), y.min(LIMIT), rows];
+        return if u64::from(x) > GROUPS || too_many(g) {
+            (0, 0, 0)
+        } else {
+            (x as usize, 1, g[1])
+        };
+    }
+    let g = [x, y, z].map(|v| v.min(LIMIT));
+    if g.contains(&0) || too_many(g) {
+        (0, 0, 0)
+    } else {
+        (g[0] as usize, g[2] as usize, g[1])
+    }
+}
+
+/// An indirect dispatch of a program that spreads its groups sees the same
+/// spread words and runs the same groups with `VICTORY_INDIRECT_PLAIN` off,
+/// `window` and `1`, with and without clamp windows: the spread signature's
+/// root constants and the plain signature's dispatch record are the same
+/// two words of the same clamped record. Zero and oversized group counts
+/// included: past 65,535 in x (spread over z), past 65,535 in y or z
+/// (bounded), past 2^20 groups (none run).
+#[test]
+fn indirect_dispatch_runs_the_same_groups_in_every_plain_mode() {
+    use crate::indirect::{Plain, TEST_SWITCHES};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS;
+
+    let Some(host) = crate::host::host() else {
+        eprintln!("no host GPU; skipped");
+        return;
+    };
+    let null = std::ptr::null();
+    let pipelines = [false, true].map(|record| {
+        let mut pipeline = null;
+        assert_eq!(
+            hand_out(
+                vec![group_writer(record)],
+                None,
+                &[],
+                &PIPELINE_IIDS[0],
+                &mut pipeline
+            ),
+            S_OK
+        );
+        assert!(host_pipeline(pipeline).is_some(), "synthetic host pipeline");
+        Guest(pipeline)
+    });
+    let views = test_views();
+    let handle = crate::descriptor::heap(views.0).start;
+    const Z_STRIDE: usize = 1 << 17;
+    // Room for an erroneously dispatched tail and a second z slice.
+    const SLOTS: usize = Z_STRIDE + 65_539;
+    let output = Guest(crate::resource::test_buffer((SLOTS * 8) as u64));
+    let mapped = crate::resource::buffer_bytes(output.0).unwrap().0;
+    let view = [
+        DXGI_FORMAT_R32_TYPELESS.0 as u32,
+        D3D12_UAV_DIMENSION_BUFFER.0 as u32,
+        0,
+        0,
+        (SLOTS * 2) as u32,
+        0,
+        0,
+        0,
+        D3D12_BUFFER_UAV_FLAG_RAW.0 as u32,
+        0,
+    ];
+    crate::descriptor::create_uav(null, output.0, null, &view, handle);
+    let args = Guest(crate::resource::test_buffer(12));
+    let arg_data = crate::resource::buffer_bytes(args.0)
+        .unwrap()
+        .0
+        .cast::<[u32; 3]>();
+    // (name, the program reads the dispatch record, windows, mode, the
+    // plain signature runs).
+    let modes = [
+        ("off", false, false, Plain::Off, false),
+        ("off, windows", false, true, Plain::Off, false),
+        ("window, windows", false, true, Plain::Window, false),
+        ("1", true, false, Plain::Signature, true),
+        ("1, windows", true, true, Plain::Signature, true),
+        (
+            "record program, spread signature",
+            true,
+            true,
+            Plain::Window,
+            false,
+        ),
+        ("record program, off", true, false, Plain::Off, false),
+    ];
+    let cases = [
+        [3, 2, 1],
+        [2, 3, 2],
+        [0, 1, 1],
+        [5, 0, 1],
+        [5, 1, 0],
+        [65_535, 1, 1],
+        [65_536, 1, 1],
+        [65_537, 1, 1],
+        [70_000, 2, 1],
+        [65_537, 0, 1],
+        [65_537, 1, 2],
+        [7, 70_000, 1],
+        [65_535, 16, 1],
+        [65_535, 17, 1],
+        [70_000, 131_072, 1],
+        [(1 << 20) + 1, 1, 1],
+        [u32::MAX, 1, 1],
+    ];
+    for requested in cases {
+        let (xs, zs, count) = groups_run(requested);
+        for (name, record, windows, mode, plain) in modes {
+            // Direct too, for the program reading the record (its root
+            // view names our buffer then), where a direct dispatch runs
+            // the indirect one's groups (no 2^20 bound there).
+            let direct = record
+                && requested.iter().map(|&v| u64::from(v)).product::<u64>() <= 1 << 20
+                && requested[0] < 1 << 17;
+            for direct in [false, true].into_iter().filter(|&d| !d || direct) {
+                // SAFETY: the mapped test allocations cover these writes and
+                // the previous submission has finished.
+                unsafe {
+                    arg_data.write(requested);
+                    std::slice::from_raw_parts_mut(mapped.cast::<[u32; 2]>(), SLOTS)
+                        .fill([u32::MAX, 0]);
+                }
+                let list = host.new_list().unwrap();
+                let mut state = crate::draw::State::default();
+                state.set_pipeline(pipelines[usize::from(record)].0);
+                state.set_heaps(&[views.0]);
+                state.set_table(true, 0, handle);
+                TEST_SWITCHES.set(Some((windows, mode)));
+                let before = crate::draw::PLAIN_DISPATCHES.get();
+                if direct {
+                    state.dispatch(&list, requested[0], requested[1], requested[2]);
+                } else {
+                    assert!(state.execute_indirect(&list, (2, 12, 1), (arg_data as u64, 12), None));
+                }
+                let plains = crate::draw::PLAIN_DISPATCHES.get() - before;
+                list.close();
+                TEST_SWITCHES.set(None);
+                host.execute(&[&list]);
+                // SAFETY: the list's synchronous submission and UAV copyback are done.
+                unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
+                let path = if direct { "direct" } else { "indirect" };
+                assert_eq!(
+                    plains,
+                    u32::from(plain && !direct),
+                    "{name} {path}: the plain signature ran"
+                );
+                // SAFETY: the finished list copied back all SLOTS records.
+                let slots = unsafe { std::slice::from_raw_parts(mapped.cast::<[u32; 2]>(), SLOTS) };
+                for (index, &slot) in slots.iter().enumerate() {
+                    let expected = if index % Z_STRIDE < xs && index / Z_STRIDE < zs {
+                        [index as u32, count]
+                    } else {
+                        [u32::MAX, 0]
+                    };
+                    assert_eq!(
+                        slot, expected,
+                        "{name} {path} {requested:?}, group slot {index}"
+                    );
+                }
             }
         }
     }
