@@ -441,7 +441,7 @@ pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> windows::core::Result<PipelineState> {
     pipeline_in(library(), name, load, create)
 }
 
@@ -458,7 +458,7 @@ fn pipeline_in(
         MADE.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         LAST.set(Some((name.to_owned(), false)));
-        Ok(pso)
+        Ok(PipelineState { pso, in_library: false })
     };
     let Some(library) = library else {
         return make();
@@ -475,15 +475,15 @@ fn pipeline_in(
         return Ok(PipelineState { pso, in_library: true });
     }
     // Compiled outside the lock: compiles take up to seconds.
-    let pso = make()?;
+    let made = make()?;
     let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    let in_library = unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok();
+    let in_library = unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &made.pso) }.is_ok();
     if in_library {
         l.added += 1;
     }
-    Ok(PipelineState { pso, in_library })
+    Ok(PipelineState { pso: made.pso, in_library })
 }
 
 #[cfg(feature = "diagnostics")]
