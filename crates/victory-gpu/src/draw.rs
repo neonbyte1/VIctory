@@ -4495,6 +4495,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
         slots.make_null(0);
+        // Held until the submission that may still use it has run.
+        crate::host::release_retired();
+        // Released on a thread of its own.
+        let since = std::time::Instant::now();
+        while shown.upgrade().is_some() && since.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
         assert!(shown.upgrade().is_none(), "released with the slot");
     }
 

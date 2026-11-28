@@ -568,8 +568,9 @@ impl HostHeap {
             // one of its shaders may hold the old descriptor (or read the
             // slot at an index from wrong data): what it views is freed
             // only once that work has run.
-            if let Some((old, _)) = old {
-                crate::host::retire(old);
+            // Its copy of title memory too: its marks are read after the run.
+            if let Some((old, copy)) = old {
+                crate::host::retire(old, copy);
             }
         }
     }
@@ -2562,6 +2563,27 @@ mod tests {
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+    }
+
+    /// A slot rewritten while a submission runs keeps the copy its view
+    /// had of title memory until that work has run (its marked writes are
+    /// read after it).
+    #[test]
+    fn a_rewritten_slot_retires_its_copy_of_title_memory() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let mut memory = vec![0u8; 4096];
+        let at = memory.as_mut_ptr() as usize;
+        crate::shadow::register(at, at as u64, 4096);
+        let Some(copy) = crate::shadow::find(at as u64, 4096) else {
+            crate::shadow::unregister(at, at as u64);
+            return; // no host GPU here
+        };
+        let before = std::sync::Arc::strong_count(&copy);
+        heap.keep(0, Some((copy.buffer.clone(), Some(copy.clone()))));
+        heap.keep(0, None);
+        assert_eq!(std::sync::Arc::strong_count(&copy), before + 1, "held until the run is over");
+        crate::host::release_retired();
+        crate::shadow::unregister(at, at as u64);
     }
 
     #[test]
