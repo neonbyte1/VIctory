@@ -765,7 +765,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         63..=64 => (1, Box::new(|b| [f32::from(b[0] as i8); 3])),
         _ => return None,
     };
-    let values: Vec<[f32; 3]> = (0..h)
+    let mut values: Vec<[f32; 3]> = (0..h)
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
@@ -796,8 +796,18 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let (p50, p99) = (at(0.5), at(0.99));
     let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
     let high = if grey || p99 == 0.0 { max } else { p99 };
+    // Halve both endpoints and the samples if the finite span overflows f32.
+    let reported_low = low;
+    let (low, high) = if high - low == f32::INFINITY {
+        for channel in values.iter_mut().flatten() {
+            *channel *= 0.5;
+        }
+        (low * 0.5, high * 0.5)
+    } else {
+        (low, high)
+    };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
+    tracing::info!(format, low = reported_low, high = max, p50, p99, nonzero, not_finite, "target values");
     // A constant nonzero grey target has no contrast to stretch. Keep it
     // distinguishable from an all-zero target in the dump.
     let flat_nonzero = grey && low == high && low != 0.0;
@@ -852,6 +862,18 @@ fn r32_integer_to_rgba(format: u32, words: impl Iterator<Item = u32>) -> Vec<u8>
     let (p50, p99) = (at(0.5), at(0.99));
     tracing::info!(format, low, high, p50, p99, nonzero, not_finite = 0, "target values");
     out
+}
+
+#[cfg(test)]
+#[test]
+fn grayscale_capture_preserves_contrast_across_a_wide_float_range() {
+    let format = DXGI_FORMAT_R32_FLOAT.0 as u32;
+    let expected = [0, 127, 191, 255].map(|gray| [gray, gray, gray, 255]);
+    for max in [f32::MAX / 4.0, f32::MAX] {
+        let rows = [-max, 0.0, f32::MAX, max / 2.0, max, f32::MAX].map(f32::to_le_bytes);
+        let rgba = to_rgba(format, 2, 2, 12, rows.as_flattened());
+        assert_eq!(rgba.as_deref(), Some(expected.as_flattened()), "range -{max} to {max}");
+    }
 }
 
 #[test]
