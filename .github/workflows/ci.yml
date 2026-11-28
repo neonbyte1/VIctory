@@ -20,7 +20,7 @@ jobs:
   # adapter a machine without one falls back to, so the device tests run.
   check:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
       # The version and components pinned in rust-toolchain.toml.
@@ -50,6 +50,7 @@ jobs:
       WINEDLLOVERRIDES: "d3d12,d3d12core=n;winedbg.exe=d"
       # Ubuntu 24.04's wine64 package has no `wine` wrapper.
       WINE: /usr/lib/wine/wine64
+      WINESERVER: /usr/lib/wine/wineserver
       # Pinned so a run is the same harness every time (docs/linux.md §1-2).
       XWIN_VERSION: "0.10.0"
       VKD3D_PROTON_VERSION: "3.1"
@@ -147,6 +148,9 @@ jobs:
             echo "::group::$name"
             timeout --signal=KILL --kill-after=30 900 xvfb-run -a "$WINE" "$exe" "${args[@]}" \
               || { echo "::error::$name failed"; status=1; }
+            # This prefix is the job's own: nothing of a binary outlives it
+            # (a lingering wineserver holds the step's output open).
+            "$WINESERVER" -k 2>/dev/null || true
             echo "::endgroup::"
           done < target/test-exes.txt
           exit "$status"
