@@ -161,6 +161,7 @@ impl Kernel {
             ud[u.index as usize] = match u.root {
                 RootType::Constants => slot,
                 RootType::Table => 0,
+                RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X) => 0,
                 other => panic!("unexpected root {other:?}"),
             };
         }

@@ -2474,7 +2474,9 @@ mod tests {
         for shift in [2, 16, 21] {
             let mut constants = vec![0; shader.user_data_dwords() as usize];
             for u in &shader.user_data {
-                constants[u.index as usize] = [0, 0, shift][u.dword as usize];
+                if u.root != RootType::Other(super::USER_DISPATCH_THREADS_X) {
+                    constants[u.index as usize] = [0, 0, shift][u.dword as usize];
+                }
             }
             let out = host
                 .dispatch(

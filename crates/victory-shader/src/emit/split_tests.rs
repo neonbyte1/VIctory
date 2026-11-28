@@ -1308,21 +1308,24 @@ fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
     for (target, want) in [(super::Target::ANY, Some(64)), (wave32, None)] {
         let cs = emit_for(&p, target).unwrap();
         assert_eq!(wave_size(&cs.dxil), want, "{target:?}");
-        let per_lane = super::lower::lower(&super::lower::Parts {
-            native: &p,
-            p: &code,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
-            target,
-            console_cf: false,
-            per_lane_only: false,
-            view_marks: false,
-        })
+        let per_lane = super::lower::lower_with_thread_limit(
+            &super::lower::Parts {
+                native: &p,
+                p: &code,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+                target,
+                console_cf: false,
+                per_lane_only: false,
+                view_marks: false,
+            },
+            true,
+        )
         .unwrap_or_else(|e| panic!("{target:?}: {e}"));
         assert_eq!(per_lane.dxil, cs.dxil, "{target:?}");
     }
