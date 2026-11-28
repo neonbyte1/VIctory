@@ -3224,12 +3224,16 @@ mod tests {
         write_address(table.as_mut_ptr() as usize, 1, Some(&View::Shader(0, Some(words))));
         assert_eq!(table, [u32::MAX, u32::MAX, u32::MAX, u32::MAX, 0x5f1c_0000, 0xd, 0, 0]);
 
-        // A placed buffer view: dimension 1, 64 elements from element 0,
-        // its memory at 0x1_2345_6700 (description dwords 10 and 11).
+        // A placed buffer view: dimension 1, 64 elements of 4 bytes from
+        // element 0, its memory at 0x1_2345_6700 (description dwords 10 and
+        // 11). The stride is set as a real view has one: `buffer_range`
+        // refuses an element size of 0 (our `checked_view_span`, "the
+        // world's 16-byte view of 0 elements removed the device"), where
+        // the PR's arithmetic still gave an address.
         let mut resource = [0u32; 14];
         resource[0] = 1;
         let mut desc = [0u32; 16];
-        (desc[1], desc[2], desc[6], desc[10], desc[11]) = (1, 0x1688, 64, 0x2345_6700, 1);
+        (desc[1], desc[2], desc[6], desc[7], desc[10], desc[11]) = (1, 0x1688, 64, 4, 0x2345_6700, 1);
         write_address(table.as_mut_ptr() as usize, 0, Some(&View::Placed(false, resource, desc)));
         assert_eq!(table, [0x2345_6700, 1, 0, 0, 0x5f1c_0000, 0xd, 0, 0]);
 
