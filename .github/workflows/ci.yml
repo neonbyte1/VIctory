@@ -51,7 +51,7 @@ jobs:
       # Ubuntu 24.04's wine64 package has no `wine` wrapper.
       WINE: /usr/lib/wine/wine64
       # Pinned so a run is the same harness every time (docs/linux.md §1-2).
-      XWIN_VERSION: "0.6.7"
+      XWIN_VERSION: "0.10.0"
       VKD3D_PROTON_VERSION: "3.1"
     steps:
       - uses: actions/checkout@v5
@@ -79,7 +79,7 @@ jobs:
       - name: xwin splat
         run: |
           if [ ! -d ~/.xwin/crt ]; then
-            cargo install xwin --version "$XWIN_VERSION" --locked
+            cargo install xwin --version "$XWIN_VERSION"
             xwin --accept-license splat --output ~/.xwin
           fi
       - name: vkd3d-proton
