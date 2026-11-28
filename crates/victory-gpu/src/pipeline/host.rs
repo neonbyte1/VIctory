@@ -1242,6 +1242,7 @@ mod tests {
                     atomics64: false,
                     host: victory_shader::emit::HostShader {
                         stage: hw,
+                        wave_size: None,
                         dxil: bytes.to_vec(),
                         user_data: Vec::new(),
                         samplers: Vec::new(),

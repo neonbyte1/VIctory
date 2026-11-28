@@ -527,7 +527,7 @@ fn distant_refreshes_preparing() {
     const CPU: u32 = 0x1234_5678;
     const GPU: u32 = 0x8765_4321;
     let b = Buffer::new(pool(LEN), LEN, 0).expect("an 8 MiB host copy");
-    b.copy.update(b.start, LEN);
+    b.copy.update(0, b.start, LEN).unwrap();
     let pages = [0, 2, LEN / PAGE - 1];
     for page in [0, 1, 2, LEN / PAGE - 1] {
         b.write(page, u64::from(CPU), false);
@@ -593,14 +593,14 @@ fn unit_costs(all: &[Buffer]) {
     println!("\nunit costs:");
     // Everything taken and guarded first.
     for b in all {
-        b.copy.update(b.start, b.len);
+        b.copy.update(0, b.start, b.len).unwrap();
     }
     // 1. A check of a copy nothing wrote.
     const ROUNDS: usize = 20;
     let started = Instant::now();
     for _ in 0..ROUNDS {
         for b in all {
-            assert_eq!(b.copy.update(b.start, b.len), 0);
+            assert_eq!(b.copy.update(0, b.start, b.len).unwrap(), 0);
         }
     }
     let direct = ms(started) * 1e6 / (ROUNDS * all.len()) as f64;
@@ -610,7 +610,7 @@ fn unit_costs(all: &[Buffer]) {
         for b in all {
             batch.add(&b.copy, b.start, b.len);
         }
-        assert_eq!(batch.flush(), 0);
+        assert_eq!(batch.flush(0, &mut |_, _| {}), 0);
     }
     let batched = ms(started) * 1e6 / (ROUNDS * all.len()) as f64;
     println!(
@@ -625,15 +625,15 @@ fn unit_costs(all: &[Buffer]) {
             .map(|k| (heap.start + k * 2 * MIB + 4096, MIB))
             .collect();
         for &(at, len) in &ranges {
-            heap.copy.writing(at, len, true);
+            heap.copy.writing(0, at, len, true);
         }
         let started = Instant::now();
         for _ in 0..ROUNDS * 10 {
-            heap.copy.update(heap.start, heap.len);
+            heap.copy.update(0, heap.start, heap.len).unwrap();
         }
         let each = ms(started) * 1e3 / (ROUNDS * 10) as f64;
         for &(at, len) in &ranges {
-            heap.copy.copy_back(at, len);
+            heap.copy.copy_back(0, at, len);
         }
         println!("  a check of the unchanged heap with {declared} declared ranges on it: {each:.2} us");
     }
@@ -644,11 +644,11 @@ fn unit_costs(all: &[Buffer]) {
         let len = heap.start + heap.len - at;
         let started = Instant::now();
         for _ in 0..N {
-            heap.copy.writing(at, len, true);
+            heap.copy.writing(0, at, len, true);
         }
         let arm = ms(started) * 1e3 / N as f64;
         let started = Instant::now();
-        heap.copy.copy_back(at, len);
+        heap.copy.copy_back(0, at, len);
         println!(
             "  declaring {what} to its end as written (marked): {arm:.1} us each; ending it {:.1} us",
             ms(started) * 1e3
@@ -661,12 +661,12 @@ fn unit_costs(all: &[Buffer]) {
     let (mut kept, mut back) = (0.0, 0.0);
     for n in 0..MERGES {
         let started = Instant::now();
-        one.copy.writing(one.start, one.len, false);
+        one.copy.writing(0, one.start, one.len, false);
         kept += ms(started);
         let at = one.start + (n % (MIB / PAGE)) * PAGE + 128;
         one.copy.write_host(at as u64, &(n as u64 | 1 << 62).to_le_bytes());
         let started = Instant::now();
-        assert_eq!(one.copy.copy_back(one.start, one.len), PAGE, "one piece merged");
+        assert_eq!(one.copy.copy_back(0, one.start, one.len), PAGE, "one piece merged");
         back += ms(started);
     }
     println!(
@@ -697,7 +697,7 @@ fn unit_costs(all: &[Buffer]) {
                 let after = page_faults();
                 write_faults += after - faults;
                 let started = Instant::now();
-                assert_eq!(b.copy.update(b.start, b.len), n * PAGE);
+                assert_eq!(b.copy.update(0, b.start, b.len).unwrap(), n * PAGE);
                 refresh_ms += ms(started);
                 refresh_faults += page_faults() - after;
             }

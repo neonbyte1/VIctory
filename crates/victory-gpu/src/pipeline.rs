@@ -654,6 +654,7 @@ pub(crate) fn mip_test_pipeline(
         atomics64: false,
         host: victory_shader::emit::HostShader {
             stage: victory_shader::HwStage::Ps,
+            wave_size: None,
             dxil: Vec::new(),
             user_data: Vec::new(),
             samplers: Vec::new(),
@@ -675,6 +676,7 @@ pub(crate) fn mip_test_pipeline(
         hash: "mip-test".into(),
         container: Vec::new(),
         translated: OnceLock::from(Some(translated)),
+        used: OnceLock::new(),
     });
     native.stages.push(host::Stage {
         shader,

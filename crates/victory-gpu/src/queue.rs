@@ -1105,7 +1105,7 @@ pub(crate) mod tests {
             S_OK
         );
         let texture = crate::resource::host_copy(resource).unwrap();
-        let state = texture.state.load(Ordering::Relaxed);
+        let state = texture.state(0);
         let holding = || {
             held()
                 .blocked(&read_value)
@@ -1125,7 +1125,7 @@ pub(crate) mod tests {
         assert_eq!(present(q, 1, &plane, null.cast()), S_OK);
         assert_eq!(holding(), Some(2), "the present is queued behind the wait");
         assert_eq!(
-            texture.state.load(Ordering::Relaxed),
+            texture.state(0),
             state,
             "the frame's state is kept meanwhile"
         );

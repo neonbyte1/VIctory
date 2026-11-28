@@ -4506,10 +4506,10 @@ pub(crate) mod tests {
         let len = 2 * PAGE;
         crate::shadow::register(pool, pool as u64, len as u64);
         if let Some(copy) = crate::shadow::find(pool as u64, len as u64) {
-            copy.update(pool, len);
-            copy.writing(pool, len, false);
+            copy.update(0, pool, len).unwrap();
+            copy.writing(0, pool, len, false);
             copy.write_host((plain + 16) as u64, &[0xAB]);
-            assert_eq!(copy.copy_back(pool, len), PAGE);
+            assert_eq!(copy.copy_back(0, pool, len), PAGE);
             // SAFETY: `plain` is our own committed page.
             assert_eq!(unsafe { ((plain + 16) as *const u8).read_volatile() }, 0xAB);
             assert_eq!(

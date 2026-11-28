@@ -182,13 +182,13 @@ pub(crate) fn view(resource: usize, write: bool) {
 }
 
 /// The pass just bound runs, also writing `targets` and `depth` (0: none).
-pub(crate) fn ran(targets: &[usize], depth: usize) {
+pub(crate) fn ran(targets: impl IntoIterator<Item = usize>, depth: usize) {
     PASS.with_borrow_mut(|p| {
         if !p.on {
             return;
         }
         p.on = false;
-        p.writes.extend_from_slice(targets);
+        p.writes.extend(targets);
         p.writes.extend((depth != 0).then_some(depth));
         let mut g = GRAPH.lock().unwrap_or_else(|e| e.into_inner());
         g.ran(&p.reads, &p.writes);

@@ -678,7 +678,7 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             (self.host_pipeline, self.host_roots[1]) = (p.pso.as_raw() as usize, 0);
         }
-        crate::feeds::ran(&self.targets, self.depth.map_or(0, |d| d.resource));
+        crate::feeds::ran(self.targets.iter().map(|&(t, _)| t), self.depth.map_or(0, |d| d.resource));
         true
     }
 
@@ -712,7 +712,7 @@ impl State {
     ) -> Vec<usize> {
         let mut writes = Vec::new();
         if !compute {
-            writes.extend(self.targets.iter().copied().filter(|&t| t != 0));
+            writes.extend(self.targets.iter().map(|&(t, _)| t).filter(|&t| t != 0));
             writes.extend(self.depth.map(|depth| depth.resource));
         }
         let uavs = uavs.filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table);
@@ -1338,7 +1338,7 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
-        crate::feeds::ran(&[], 0);
+        crate::feeds::ran([], 0);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -2610,6 +2610,12 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
+/// A user-data entry that takes where a root view's address lies in the
+/// copy its view shows (not a dword of a root constants parameter).
+fn is_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
+}
+
 /// A user-data entry that takes the heap index of a root view's view.
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
@@ -2729,6 +2735,7 @@ mod tests {
     ) -> crate::pipeline::host::Stage {
         let mut host = victory_shader::emit::HostShader {
             stage: victory_shader::HwStage::Ps,
+            wave_size: None,
             dxil: Vec::new(),
             user_data: Vec::new(),
             samplers: Vec::new(),
@@ -2967,7 +2974,7 @@ mod tests {
         assert_eq!(gpu, unsafe { table.GetGPUVirtualAddress() });
         list.close();
     }
-    use crate::object::{HRESULT, IUNKNOWN, S_OK, slot};
+    use crate::object::{IUNKNOWN, slot};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
@@ -4590,7 +4597,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         slots.make(0, &view);
         let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
         viewed.set(0, Some(&view), true);
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let (out, data) = host.shared_buffer(64 * 8 * 16).unwrap();
         let submit = || {
             let list = host.new_list().unwrap();
@@ -4909,7 +4916,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         for (i, &t) in textures.iter().enumerate() {
             slots.make(i as u32, &View::Shader(t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])));
         }
-        let read = compile_cs(
+        let read = reader(
             r#"
 #define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
 Texture2D<uint> a : register(t0);
@@ -4922,6 +4929,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     o.Store2((id.y * 16 + id.x) * 8, uint2(a.Load(at), b.Load(at)));
 }
 "#,
+            2,
         );
         let (out, data) = host.shared_buffer(u64::from(N * N) * 8).unwrap();
         let free = heap_host.dynamic_free();
@@ -4988,7 +4996,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         for (i, &t) in textures.iter().enumerate() {
             slots.make(i as u32, &View::Shader(t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])));
         }
-        let read = compile_cs(
+        let read = reader(
             r#"
 #define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
 Texture2D<uint> a : register(t0);
@@ -5001,6 +5009,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     o.Store2((id.y * 16 + id.x) * 8, uint2(a.Load(at), b.Load(at)));
 }
 "#,
+            2,
         );
         let srv = |list: &HostList| {
             for t in &textures {
@@ -6481,8 +6490,8 @@ void cs() {
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };
 
         let list = host.new_list().unwrap();
-        let cbv1 = root_view(&list, unaligned, false, false).expect("first unaligned CBV");
-        let cbv2 = root_view(&list, unaligned, false, false).expect("cached unaligned CBV");
+        let cbv1 = super::root_view(&list, unaligned, false, false).expect("first unaligned CBV");
+        let cbv2 = super::root_view(&list, unaligned, false, false).expect("cached unaligned CBV");
         assert_eq!(cbv1 % 256, 0);
         assert_eq!(cbv2, cbv1, "same unaligned root CBV reuses scratch copy");
 
@@ -6509,7 +6518,7 @@ void cs() {
             updated.as_ptr().cast::<u8>(),
             size_of_val(&updated),
         );
-        let cbv3 = root_view(&list, unaligned, false, false).expect("refreshed unaligned CBV");
+        let cbv3 = super::root_view(&list, unaligned, false, false).expect("refreshed unaligned CBV");
         assert_eq!(cbv3 % 256, 0);
         assert_ne!(cbv3, cbv1, "title copy invalidates cached scratch copy");
         dispatch(cbv3, 2);

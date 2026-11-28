@@ -765,7 +765,7 @@ pub(crate) mod tests {
         let heap_host = title_heap.host().expect("a host view heap");
         assert!(!heap_host.kept(slot), "placed texture left null until read");
         let list = host.new_list().unwrap();
-        crate::shadow::tests::record_mark_read(&list, false, slot);
+        crate::shadow::tests::mark_read(false, slot);
         list.close();
         host.execute(&[&list]);
         assert!(heap_host.kept(slot), "made after its first read");
@@ -773,7 +773,7 @@ pub(crate) mod tests {
         assert!(crate::resource::give_up_now(texture));
         assert!(!heap_host.kept(slot), "given up");
         list.reset();
-        crate::shadow::tests::record_mark_read(&list, false, slot);
+        crate::shadow::tests::mark_read(false, slot);
         list.close();
         host.execute(&[&list]);
         assert!(heap_host.kept(slot), "made again after its first read");
@@ -1064,8 +1064,9 @@ pub(crate) mod tests {
         assert_eq!(list.fill_scratch(src, 64), Some(g4));
         assert_eq!(fill_count(&list), 4);
 
-        // `defer` (`Step::Run`) may write title memory and must also invalidate.
-        list.defer(|| {});
+        // `defer_copy_memory` (`Step::CopyMemory`) may write title memory and
+        // must also invalidate.
+        list.defer_copy_memory(title.as_mut_ptr(), updated.as_ptr(), updated.len());
         let g5 = list.fill_scratch(src, 64).unwrap();
         assert_ne!(g5, g4);
         assert_eq!(g5 % 256, 0);
@@ -4180,12 +4181,12 @@ impl HostList {
             }
         };
         let has_hoisted = !self.hoisted().is_empty();
-        if copies.is_empty()
-            && !has_hoisted
-            && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first)
-        {
-            left();
-            return None;
+        let mut barriers = Vec::new();
+        if copies.is_empty() {
+            reconcile(&mut barriers);
+            if barriers.is_empty() && !has_hoisted {
+                return None;
+            }
         }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
@@ -4746,7 +4747,7 @@ impl HostList {
     pub(crate) fn defer_copy_memory(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::CopyMemory(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -6657,7 +6658,7 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                p.copy.crumbed(Crumb::Copy, Some("present copy"), || list.CopyResource(&back, texture));
+                copy.crumbed(Crumb::Copy, Some("present copy"), || list.CopyResource(&back, texture));
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
@@ -6827,8 +6828,8 @@ impl Host {
             // title may release or give them up meanwhile. Not the back
             // buffer: the swap chain keeps it, and holding it past the frame
             // would make a resize fail (every list completes before one).
-            for &(texture, _) in planes {
-                copy.keep(texture);
+            for plane in planes {
+                copy.keep(&plane.texture);
             }
             copy.close();
             self.submit(0, vec![copy.clone()]);
@@ -7054,12 +7055,12 @@ impl Host {
 /// has completed (those before it complete first).
 static RETIRED: Mutex<Vec<Box<dyn std::any::Any + Send>>> = Mutex::new(Vec::new());
 
-/// Keeps `resource` alive until the GPU work running now (or the next
-/// submission's) has run: title threads rewrite view heap slots while the
-/// GPU runs, and a shader that took the old descriptor still reads what it
-/// views.
-pub(crate) fn retire(resource: ID3D12Resource) {
-    retire_any(Box::new(resource));
+/// Keeps `resource` (and `copy`, the title memory its view's marks are read
+/// from) alive until the GPU work running now (or the next submission's)
+/// has run: title threads rewrite view heap slots while the GPU runs, and a
+/// shader that took the old descriptor still reads what it views.
+pub(crate) fn retire(resource: ID3D12Resource, copy: Option<Arc<crate::shadow::Shadow>>) {
+    retire_any(Box::new((resource, copy)));
 }
 
 /// As [`retire`], for any holder of host objects (host textures given up).
@@ -8291,7 +8292,7 @@ mod withholding {
         let c = copy.clone();
         // `defer` flushes the pending refresh first, then simulates the shader
         // write and its page mark before copy-back runs.
-        list.defer(move || {
+        list.defer_host(move || {
             c.write_host((p + 16) as u64, &[0xaa]);
             c.mark_page_for_test(p, true);
         });
@@ -8306,16 +8307,16 @@ mod withholding {
             "title memory untouched"
         );
         assert_eq!(
-            copy.update(p + PAGE, PAGE),
+            copy.update(0, p + PAGE, PAGE).unwrap(),
             0,
             "unmarked page 1 stays clean"
         );
         assert_eq!(
-            copy.update(p + 2 * PAGE, PAGE),
+            copy.update(0, p + 2 * PAGE, PAGE).unwrap(),
             0,
             "unmarked page 2 stays clean"
         );
-        assert_eq!(copy.update(p, PAGE), PAGE, "marked page 0 was dropped");
+        assert_eq!(copy.update(0, p, PAGE).unwrap(), PAGE, "marked page 0 was dropped");
         assert_eq!(
             copy.read_host((p + 16) as u64, 1)[0] & 0xff,
             0x11,
@@ -8355,7 +8356,7 @@ mod withholding {
             copy.gpu_writes(&list, (p + PAGE) as u64, (2 * PAGE) as u64, true);
         }
         let c = copy.clone();
-        list.defer(move || {
+        list.defer_host(move || {
             c.write_host((p + 16) as u64, &[0xaa]);
             c.mark_page_for_test(p, true);
             c.write_host((p + PAGE + 16) as u64, &[0xbb]);
@@ -8372,17 +8373,17 @@ mod withholding {
             "both withheld writes stay out of title memory"
         );
         assert_eq!(
-            copy.update(p + 2 * PAGE, PAGE),
+            copy.update(0, p + 2 * PAGE, PAGE).unwrap(),
             0,
             "unmarked page 2 stays clean"
         );
         assert_eq!(
-            copy.update(p, PAGE),
+            copy.update(0, p, PAGE).unwrap(),
             PAGE,
             "title-memory marked page 0 dropped"
         );
         assert_eq!(
-            copy.update(p + PAGE, PAGE),
+            copy.update(0, p + PAGE, PAGE).unwrap(),
             PAGE,
             "ordinary-bitmap withheld page 1 dropped"
         );
@@ -8421,7 +8422,7 @@ mod withholding {
             copy.gpu_writes(&list, p as u64, len as u64, false);
         }
         let c = copy.clone();
-        list.defer(move || {
+        list.defer_host(move || {
             // Unmarked write to page 1 (no mark bit set).
             c.write_host((p + PAGE + 16) as u64, &[0xcc]);
         });
@@ -8436,7 +8437,7 @@ mod withholding {
             "withheld range stays out of title memory"
         );
         assert_eq!(
-            copy.update(p, len),
+            copy.update(0, p, len).unwrap(),
             len,
             "mixed marked/unmarked range drops whole"
         );
@@ -8485,7 +8486,7 @@ mod withholding {
             inner.gpu_writes(&list, p as u64, PAGE as u64, true);
         }
         let (o, i) = (outer.clone(), inner.clone());
-        list.defer(move || {
+        list.defer_host(move || {
             o.write_host((p + 16) as u64, &[0xaa]);
             o.mark_page_for_test(p, false);
             i.write_host((p + 32) as u64, &[0xbb]);
@@ -8507,12 +8508,12 @@ mod withholding {
             "non-withheld inner write copies back before outer's page is retaken"
         );
         assert_eq!(
-            outer.update(p + PAGE, PAGE),
+            outer.update(0, p + PAGE, PAGE).unwrap(),
             0,
             "unmarked outer page 1 stays clean"
         );
         assert_eq!(
-            outer.update(p, PAGE),
+            outer.update(0, p, PAGE).unwrap(),
             PAGE,
             "withheld marked outer page 0 was dropped"
         );
