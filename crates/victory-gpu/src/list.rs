@@ -1571,13 +1571,18 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
-    let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
-        return std::ptr::null_mut();
-    };
-    if this.is_null() || !align.is_power_of_two() {
+    if this.is_null() || (alignment != 0 && !alignment.is_power_of_two()) {
         return std::ptr::null_mut();
     }
+    let Ok(align) = usize::try_from(alignment.max(16)) else {
+        return std::ptr::null_mut();
+    };
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
+        return std::ptr::null_mut();
+    };
     let Some(block) = Upload::new(len) else {
         return std::ptr::null_mut();
     };
@@ -3290,6 +3295,77 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn allocate_upload_validates_alignment_and_size_overflow() {
+        let null: This = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        assert!(allocate_upload(null, 64, 16).is_null());
+
+        for bad_align in [
+            3u64,
+            5,
+            6,
+            7,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            24,
+            48,
+            96,
+            u64::MAX,
+        ] {
+            assert!(
+                allocate_upload(list, 64, bad_align).is_null(),
+                "alignment {bad_align} must fail"
+            );
+        }
+        for bad_size in [u64::MAX, u64::MAX - 8] {
+            assert!(
+                allocate_upload(list, bad_size, 16).is_null(),
+                "overflowing size {bad_size:#x} must fail"
+            );
+        }
+        // SAFETY: `list` is our `List`.
+        let uploads = unsafe { &(*list.cast::<List>()).uploads };
+        assert!(uploads.lock().unwrap().is_empty());
+
+        for align in [0u64, 1, 2, 4, 8, 16, 32, 64, 256] {
+            let expected = align.max(16) as usize;
+            let ptr = allocate_upload(list, 96, align);
+            assert!(!ptr.is_null(), "valid alignment {align} failed");
+            assert!((ptr as usize).is_multiple_of(expected));
+            #[cfg(windows)]
+            assert!((1usize << 32..1usize << 40).contains(&(ptr as usize)));
+            // SAFETY: 96 zeroed bytes were allocated at `ptr`.
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, 96) };
+            assert!(slice.iter().all(|&b| b == 0));
+            slice.fill(0x5c);
+        }
+        let zero_sized = allocate_upload(list, 0, 0);
+        assert!(!zero_sized.is_null() && (zero_sized as usize).is_multiple_of(16));
+
+        assert_eq!(close(list), S_OK);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(uploads.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 
     fn new_newer_list(allocator: This) -> This {
