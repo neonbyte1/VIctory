@@ -565,7 +565,18 @@ cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uin
 // Offsets and pitches are in bytes, all multiples of 4 (placed footprints).
 RWStructuredBuffer<uint> buf : register(u0);
 uint depth(uint u) { return asuint((float)u * asfloat(0x37800080)); }
-uint u16(uint d) { return (uint)(saturate(asfloat(d)) * 65535.0 + 0.5); }
+uint u16(uint d) {
+    float value = saturate(asfloat(d));
+    float scaled = value * 65536.0;
+    float fraction = frac(scaled);
+    // 65535 * value = scaled - value. Test the half-step on the
+    // fraction so the large integer part cannot round it away.
+    precise float fraction_minus_half = fraction - 0.5;
+    precise float value_minus_half = value - 0.5;
+    return (uint)scaled + (uint)(fraction_minus_half >= value)
+                        - (uint)(fraction < value_minus_half);
+}
+[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x * 2;
@@ -687,6 +698,77 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_depth_rounds_at_each_u16_threshold() {
+        let Some(host) = host() else {
+            return;
+        };
+        let converter = converter().expect("depth converter");
+        // Five adjacent f32 values at each midpoint, then every depth
+        // code widened by the reciprocal used by the forward converter.
+        let depths: Vec<f32> = (0..65535)
+            .flat_map(|code| {
+                let center = ((f64::from(code) + 0.5) / 65535.0) as f32;
+                (center.to_bits() - 2..=center.to_bits() + 2).map(f32::from_bits)
+            })
+            .chain((0..=65535).map(|code| code as f32 * f32::from_bits(0x37800080)))
+            .chain([0.0, 1.0, f32::NEG_INFINITY, f32::INFINITY, f32::NAN])
+            .collect();
+        const WIDTH: u32 = 512;
+        const HEIGHT: u32 = 768;
+        const PITCH16: u32 = WIDTH * 2;
+        const PITCH32: u32 = WIDTH * 4;
+        const AT32: u32 = PITCH16 * HEIGHT;
+        assert_eq!(depths.len(), (WIDTH * HEIGHT) as usize);
+        let input_bytes = u64::from(PITCH32 * HEIGHT);
+        let scratch = scratch_buffer(u64::from(AT32) + input_bytes).unwrap();
+        let list = host.new_list().unwrap();
+        let (input, data) = list.upload(host, input_bytes).unwrap();
+        let (output, mapped) = list.readback(host, u64::from(AT32)).unwrap();
+        let l = &list.list;
+        let state = |from, to| transition(&scratch, from, to);
+        let constants = [WIDTH, HEIGHT, PITCH16, 0, PITCH32, AT32, 0, 0];
+        // SAFETY: the mapped upload holds every input float. The two
+        // footprints in scratch are disjoint and every dispatched row fits.
+        unsafe {
+            std::ptr::copy_nonoverlapping(depths.as_ptr().cast(), data, input_bytes as usize);
+            l.CopyBufferRegion(&scratch, u64::from(AT32), &input, 0, input_bytes);
+            l.ResourceBarrier(&[state(
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            l.SetComputeRootSignature(&converter.root);
+            l.SetPipelineState(&converter.pso);
+            l.SetComputeRootUnorderedAccessView(1, scratch.GetGPUVirtualAddress());
+            l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+            l.Dispatch(WIDTH / 128, HEIGHT, 1);
+            l.ResourceBarrier(&[state(
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyBufferRegion(&output, 0, &scratch, 0, u64::from(AT32));
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the submission completed and readback remains mapped.
+        let actual = unsafe { std::slice::from_raw_parts(mapped.cast::<u16>(), depths.len()) };
+        let mut mismatches = 0;
+        let mut first = None;
+        for (&depth, &got) in depths.iter().zip(actual) {
+            let want = (f64::from(depth).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+            if got != want {
+                mismatches += 1;
+                first.get_or_insert((depth.to_bits(), want, got));
+            }
+        }
+        assert_eq!(
+            mismatches,
+            0,
+            "{mismatches} of {} depths misrounded, first (bits, expected, actual) {first:x?}",
+            depths.len()
+        );
+    }
 
     /// The material-depth frame of Grand Theft Auto VI: written through
     /// unordered views, read as a shader resource in the same list, written
