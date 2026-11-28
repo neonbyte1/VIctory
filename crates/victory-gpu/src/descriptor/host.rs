@@ -398,6 +398,13 @@ impl HostHeap {
         (self.pairs_end > self.count + self.dynamic).then_some(self.count + self.dynamic)
     }
 
+    /// The dynamic slots free now (tests).
+    #[cfg(test)]
+    pub(crate) fn dynamic_free(&self) -> usize {
+        let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        guard.1.iter().filter(|&&taken| !taken).count()
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -420,7 +427,19 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
-        self.keep(index, kept.flatten());
+        self.keep_view(index, view, kept.flatten(), mark);
+    }
+
+    /// Copies a view made in a CPU-only heap into a dynamic slot and holds
+    /// the same resource and, for an unaligned buffer view, its arena slice.
+    pub(crate) fn copy_view_at(&self, device: &ID3D12Device, index: u32, view: &View, made: &MadeView) {
+        // SAFETY: a reserved view slot and a live descriptor in a CPU-only view heap.
+        unsafe { device.CopyDescriptorsSimple(1, self.cpu(index), made.at, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        self.keep_view(index, view, Some((made.resource.clone(), made.shadow.clone())), made.mark);
+    }
+
+    fn keep_view(&self, index: u32, view: &View, kept: Kept, mark: Option<(u32, u32)>) {
+        self.keep(index, kept);
         self.set_stride(index, Some(view));
         self.set_mark(index, mark);
         // A table made afresh: shaders reading a view's address there (e.g.
@@ -1699,8 +1718,32 @@ pub(crate) fn typed_store(format: u32) -> bool {
     ok
 }
 
-/// Makes the host descriptor for `view` at `at` (in any host view heap):
-/// the host resource it views, if it can.
+/// A descriptor made in a CPU-only view heap and what it needs to stay live.
+pub(crate) struct MadeView {
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    pub(crate) resource: ID3D12Resource,
+    shadow: Option<std::sync::Arc<crate::shadow::Shadow>>,
+    mark: Option<(u32, u32)>,
+}
+
+impl MadeView {
+    pub(crate) fn identity(&self) -> (usize, usize) {
+        use windows::core::Interface;
+        let shadow = self.shadow.as_ref().map_or(0, |s| std::sync::Arc::as_ptr(s) as usize);
+        (self.resource.as_raw() as usize, shadow)
+    }
+}
+
+/// Makes a descriptor in a CPU-only view heap without dropping its copy of
+/// title memory before the descriptor can be used.
+pub(crate) fn make_cpu_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<MadeView> {
+    let (kept, mark) = make_marked(view, at);
+    let (resource, shadow) = kept.flatten()?;
+    Some(MadeView { at, resource, shadow, mark })
+}
+
+/// Makes a test descriptor and returns the host resource it views.
+#[cfg(test)]
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
     make(view, at).flatten().map(|k| k.0)
 }

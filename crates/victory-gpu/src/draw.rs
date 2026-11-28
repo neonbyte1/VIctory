@@ -116,6 +116,14 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// Slots made for unordered access clears in this list
+    /// ([`State::clear_view`]): keyed by view heap, view, and host view
+    /// identity, so that clears of one view (a stand-in's, at each dispatch of
+    /// its program) share one. The slots are among [`Self::dynamic`], held
+    /// until the list is reset (which drops this with them) or released.
+    /// The slot holds both the host resource and any arena slice in the key.
+    /// Made again in each segment of the list, as root views are.
+    clear_slots: std::collections::BTreeMap<(usize, View, (usize, usize)), u32>,
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
@@ -338,6 +346,7 @@ impl State {
         self.host_state_lost();
         self.fresh_tables.clear();
         self.root_slots.clear();
+        self.clear_slots.clear();
         self.memory = None;
         let fixed = std::mem::take(&mut self.fixed);
         if fixed.topology {
@@ -1113,23 +1122,48 @@ impl State {
             once!("an unordered access clear of a slot without a view");
             return;
         };
+        self.clear_view(list, &view, values, float, rects);
+    }
+
+    /// The clear of [`Self::clear_unordered`] of `view`. Whether it was
+    /// recorded. Its shader-visible slot is a dynamic one the list holds
+    /// until reset, one per view however often the list clears it
+    /// (`clear_slots`).
+    fn clear_view(
+        &mut self,
+        list: &HostList,
+        view: &View,
+        values: [u32; 4],
+        float: bool,
+        rects: &[RECT],
+    ) -> bool {
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
         let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
             once!("an unordered access clear without a bound view heap");
-            return;
+            return false;
         };
-        let Some(visible) = heap.host() else { return };
-        let Some(slot) = visible.dynamic(1) else {
-            return;
-        };
-        self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
-        visible.make_at(slot, &view);
+        let Some(visible) = heap.host() else { return false };
         let at = host.cpu_view();
-        let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
+        let Some(made) = crate::descriptor::host::make_cpu_view(view, at) else {
             once!("an unordered access clear of a view the host cannot make");
-            return;
+            return false;
         };
+        let key = (std::ptr::from_ref(heap) as usize, view.clone(), made.identity());
+        let slot = match self.clear_slots.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                #[cfg(test)]
+                tests::before_clear_slot();
+                let Some(slot) = visible.dynamic(1) else {
+                    return false;
+                };
+                self.dynamic.push((key.0, slot, 1));
+                visible.copy_view_at(&host.device, slot, view, &made);
+                self.clear_slots.insert(key, slot);
+                slot
+            }
+        };
+        let resource = &made.resource;
         let written = UsedResource {
             kind: ResourceType::Uav,
             root: RootType::Table,
@@ -1140,21 +1174,22 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        readable(list, &written, &view, false);
+        readable(list, &written, view, false);
         self.bind_heaps(list, false);
-        list.keep(&resource);
+        list.keep(resource);
         let gpu = visible.gpu(slot);
         // SAFETY: an open list; both slots view the live resource.
         list.crumbed(Crumb::Clear, Some("unordered access clear"), || unsafe {
             if float {
                 let values = values.map(f32::from_bits);
                 list.list
-                    .ClearUnorderedAccessViewFloat(gpu, at, &resource, &values, rects);
+                    .ClearUnorderedAccessViewFloat(gpu, at, resource, &values, rects);
             } else {
                 list.list
-                    .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
+                    .ClearUnorderedAccessViewUint(gpu, at, resource, &values, rects);
             }
         });
+        true
     }
 
     /// Runs a dispatch on the host.
@@ -2273,6 +2308,16 @@ mod tests {
         let (_, set, first) = written_texture_words(&[0x34, 0x12], pitch, 2);
         assert_eq!(set, 1);
         assert_eq!(first, [f32::from_bits(0x1234)]);
+    }
+
+    thread_local! {
+        static BEFORE_CLEAR_SLOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_clear_slot() {
+        if let Some(hook) = BEFORE_CLEAR_SLOT.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
     }
 
     /// A root signature that indexes the heaps directly needs one of each
@@ -3964,6 +4009,217 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (n, x) = submit();
         assert_eq!(n, 1, "mip 1 alone");
         assert!((x - 64.0 / 255.0).abs() < 1e-6, "mip 0 kept: {x}");
+    }
+
+    /// Another view can reserve an arena slice before a clear installs its
+    /// visible slot. The clear must still write the first view's own slice.
+    #[test]
+    fn an_unaligned_clear_keeps_its_arena_slice_until_the_slot_is_written() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let buffer = buffer(1 << 16);
+        let (bytes, _) = crate::resource::buffer_bytes(buffer).unwrap();
+        let placed = |address: u64| {
+            let resource = [1, 0, 0, 0, 16, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            // One R32G32B32A32_UINT element, off the buffer's 16-byte elements.
+            desc[..10].copy_from_slice(&[3, 1, 0, 0, 1, 0, 0, 0, 0, 0]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(true, resource, desc)
+        };
+        let (first, other) = (placed(bytes as u64 + 4), placed(bytes as u64 + 36));
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        let competitor = std::rc::Rc::new(std::cell::Cell::new(None));
+        let competing_slice = competitor.clone();
+        BEFORE_CLEAR_SLOT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let (copy, address, _) = crate::descriptor::host::view_copy(&other).unwrap();
+                copy.write_host(address, &0x1234u32.to_le_bytes());
+                competing_slice.set(Some((copy, address)));
+            }));
+        });
+        assert!(state.clear_view(&list, &first, [0x55; 4], false, &[]));
+        let (other, other_at) = competitor.take().expect("another slice was allocated before the slot");
+        let (first, first_at, _) = crate::descriptor::host::view_copy(&first).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(first.read_host(first_at, 1), [0x55], "the slice named by the visible slot");
+        assert_eq!(other.read_host(other_at, 1), [0x1234], "the other slice");
+        list.reset();
+        state.reset(null);
+        crate::object::release(heap);
+        drop((first, other));
+        crate::object::release(buffer);
+    }
+
+    /// Clears of one view in one list share one dynamic slot (a title
+    /// that clears one view in many passes): eight clears of a
+    /// view take one, a clear of another view one more, and the views hold
+    /// their last clears; the slots come back when the list is reset.
+    #[test]
+    fn clears_of_one_view_in_a_list_share_a_dynamic_slot() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let heap_host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        // R32_UINT.
+        let textures: Vec<This> = (0..2)
+            .map(|_| texture_at_address(title_memory(1 << 20), &texture_words(N, N, 42, 0x105, 4)))
+            .collect();
+        let uavs: Vec<View> = textures
+            .iter()
+            .map(|&t| View::Unordered(t as usize, 0, Some([42, 4, 0, 0, 0, 0, 0, 0, 0, 0])))
+            .collect();
+        let slots = Slots::new(2);
+        for (i, &t) in textures.iter().enumerate() {
+            slots.make(i as u32, &View::Shader(t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])));
+        }
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
+Texture2D<uint> a : register(t0);
+Texture2D<uint> b : register(t1);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    o.Store2((id.y * 16 + id.x) * 8, uint2(a.Load(at), b.Load(at)));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(u64::from(N * N) * 8).unwrap();
+        let free = heap_host.dynamic_free();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        for k in 1..=8 {
+            assert!(state.clear_view(&list, &uavs[0], [k, 0, 0, 0], false, &[]), "clear {k}");
+        }
+        assert_eq!(heap_host.dynamic_free(), free - 1, "eight clears of one view, one slot");
+        assert!(state.clear_view(&list, &uavs[1], [0x77, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "another view, another slot");
+        assert!(state.clear_view(&list, &uavs[0], [0x55, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "the first view's slot again");
+        for t in &textures {
+            let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
+            readable(&list, &used(ResourceType::Srv), &srv, false);
+        }
+        run(&list, &slots, &read, 0, Some(&out), (N / 8, N / 8));
+        list.close();
+        host.execute(&[&list]);
+        for i in [0usize, 5, 7 * 16 + 9, 255] {
+            // SAFETY: inside the mapped output, after the list ran.
+            let words = unsafe { (data.add(i * 8) as *const [u32; 2]).read() };
+            assert_eq!(words, [0x55, 0x77], "texel {i}: each view's last clear");
+        }
+        list.reset();
+        state.reset(null);
+        assert_eq!(heap_host.dynamic_free(), free, "the slots come back at reset");
+        // A new recording takes a slot afresh.
+        state.set_heaps(&[heap]);
+        assert!(state.clear_view(&list, &uavs[0], [1, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 1);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        state.reset(null);
+    }
+
+    /// A clear of one view on both sides of a cut of the list (a wait that
+    /// moves the recording on to a new host list): the new segment takes a
+    /// slot of its own, since its view heap is bound afresh, while the old
+    /// segment's slot stays held, as its commands still name it, until the
+    /// list is reset. Both segments run in order, and each read sees the
+    /// clear recorded before it in its own segment.
+    #[test]
+    fn a_clear_after_a_cut_takes_a_new_slot_and_the_old_one_stays_held() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: u32 = 16;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let heap_host = crate::descriptor::heap(heap).host().expect("a host view heap");
+        // R32_UINT.
+        let textures: Vec<This> = (0..2)
+            .map(|_| texture_at_address(title_memory(1 << 20), &texture_words(N, N, 42, 0x105, 4)))
+            .collect();
+        let uav = View::Unordered(textures[0] as usize, 0, Some([42, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        let slots = Slots::new(2);
+        for (i, &t) in textures.iter().enumerate() {
+            slots.make(i as u32, &View::Shader(t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0])));
+        }
+        let read = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
+Texture2D<uint> a : register(t0);
+Texture2D<uint> b : register(t1);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int3 at = int3(id.xy, 0);
+    o.Store2((id.y * 16 + id.x) * 8, uint2(a.Load(at), b.Load(at)));
+}
+"#,
+        );
+        let srv = |list: &HostList| {
+            for t in &textures {
+                let srv = View::Shader(*t as usize, Some([42, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0]));
+                readable(list, &used(ResourceType::Srv), &srv, false);
+            }
+        };
+        let outs: Vec<_> = (0..2).map(|_| host.shared_buffer(u64::from(N * N) * 8).unwrap()).collect();
+        let free = heap_host.dynamic_free();
+        let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        assert!(state.clear_view(&first, &uav, [0x11, 0, 0, 0], false, &[]));
+        assert!(state.clear_view(&first, &uav, [0x33, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 1, "one slot before the cut");
+        srv(&first);
+        run(&first, &slots, &read, 0, Some(&outs[0].0), (N / 8, N / 8));
+        first.close();
+        state.cut(&second);
+        assert_eq!(heap_host.dynamic_free(), free - 1, "the cut gives no slot back");
+        assert!(state.clear_view(&second, &uav, [0x22, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "the new segment's own slot; the old one held");
+        assert!(state.clear_view(&second, &uav, [0x44, 0, 0, 0], false, &[]));
+        assert_eq!(heap_host.dynamic_free(), free - 2, "shared again within the new segment");
+        srv(&second);
+        run(&second, &slots, &read, 0, Some(&outs[1].0), (N / 8, N / 8));
+        second.close();
+        host.execute(&[&first, &second]);
+        for (k, want) in [(0usize, 0x33), (1, 0x44)] {
+            for i in [0usize, 5, 7 * 16 + 9, 255] {
+                // SAFETY: inside the mapped output, after the lists ran.
+                let word = unsafe { (outs[k].1.add(i * 8) as *const u32).read() };
+                assert_eq!(word, want, "segment {k}, texel {i}: its last clear");
+            }
+        }
+        assert_eq!(heap_host.dynamic_free(), free - 2, "both slots held until reset");
+        first.reset();
+        second.reset();
+        state.reset(null);
+        assert_eq!(heap_host.dynamic_free(), free, "both slots come back at reset");
     }
 
     /// A mip in memory that is not the runtime's (plain committed memory
