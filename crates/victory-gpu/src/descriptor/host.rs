@@ -651,8 +651,9 @@ impl HostHeap {
     pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
         let Some(host) = host() else { return };
         // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
-        // a longer copy's rest reads 0 through it.
-        let elements = (bytes / 4).min(1 << 27) as u32;
+        // a longer copy's rest reads 0 through it. D3D12 rejects `NumElements = 0`
+        // even for null raw descriptors (matching `raw_view_at`).
+        let elements = raw_pair_elements(buffer.is_some(), bytes);
         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -2257,6 +2258,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Element count (`NumElements`) for a raw SRV/UAV pair: non-zero even for
+/// null descriptors, clamped to 2^27 elements (512 MiB).
+fn raw_pair_elements(has_buffer: bool, bytes: u64) -> u32 {
+    if has_buffer {
+        (bytes / 4).clamp(1, 1 << 27) as u32
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3389,5 +3400,30 @@ mod tests {
         assert_eq!(describe_resource(buf.as_ref()), "host buffer 0x1000B");
         // SAFETY: plain device health query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn raw_pair_elements_never_returns_zero() {
+        assert_eq!(raw_pair_elements(false, 0), 1);
+        assert_eq!(raw_pair_elements(false, 256), 1);
+        assert_eq!(raw_pair_elements(true, 0), 1);
+        assert_eq!(raw_pair_elements(true, 3), 1);
+        assert_eq!(raw_pair_elements(true, 256), 64);
+        assert_eq!(raw_pair_elements(true, u64::MAX), 1 << 27);
+    }
+
+    #[test]
+    fn raw_pair_null_descriptor_is_accepted_by_device() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let slot = heap.pair().unwrap();
+        heap.raw_pair_at(slot, None, 0);
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        heap.free_pair(slot);
     }
 }
