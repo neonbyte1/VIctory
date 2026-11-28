@@ -80,6 +80,7 @@ fn store_shader() -> Arc<Shader> {
         hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
         container,
         translated: OnceLock::from(Some(Translated {
+            atomics64: false,
             host,
             used: native.used,
         })),

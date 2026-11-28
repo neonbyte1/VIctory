@@ -138,7 +138,7 @@ pub(crate) fn add(c: C, n: u64) {
 /// The counters since they were last taken or logged, by [`C`] (tests).
 #[cfg(test)]
 pub(crate) fn take() -> Vec<u64> {
-    COUNT.iter().map(|a| a.swap(0, Relaxed)).collect()
+    COUNT.0.iter().map(|a| a.swap(0, Relaxed)).collect()
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
