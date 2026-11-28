@@ -650,7 +650,10 @@ fn copies(
     for &i in subresources {
         let i = i as usize;
         let mut footprint = staging.footprints[i];
-        footprint.Offset += at;
+        // `at` is where offset 0 of the staging layout would be; it wraps
+        // below the buffer's start when only later subresources were
+        // reserved ([`Staging::detile`]), the sum lies inside.
+        footprint.Offset = footprint.Offset.wrapping_add(at);
         let footprint = &footprint;
         #[cfg(feature = "diagnostics")]
         {
@@ -1104,6 +1107,29 @@ impl Staging {
                 }
             };
         if !readable {
+            // A streamed texture's smaller mips (at the start of its memory)
+            // can be there before the larger ones: those are detiled from
+            // the bytes they take and uploaded, the rest keep what they hold.
+            if let Some(first) = first_resident_mip(&self.layout, self.memory) {
+                let len = self.layout.bytes_from(first) as usize;
+                // SAFETY: committed memory, `len` bytes from the texture's start.
+                let tiled = unsafe { std::slice::from_raw_parts(self.memory, len) };
+                let hash = blake3::hash(tiled);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, len as u64);
+                if last.hash == Some(hash) {
+                    return (len, None);
+                }
+                let resident: Vec<u32> = all()
+                    .into_iter()
+                    .filter(|i| i % self.mips >= first)
+                    .collect();
+                let buffer = self.detile(tiled, &resident);
+                last.hash = buffer.is_some().then_some(hash);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, len as u64);
+                return (len, buffer.map(|(b, at)| (b, at, resident)));
+            }
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -1140,9 +1166,18 @@ impl Staging {
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
     /// staging buffer (`None` if none could be had or a subresource could
-    /// not be read).
+    /// not be read), and where offset 0 of the staging layout lies in it.
+    /// Only the layout from the first of them on is reserved (subresources
+    /// lie in their order, the smaller mips last): offset 0 may lie before
+    /// the buffer's start, wrapped.
     fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = staging_space(self.size)?;
+        // Footprint offsets are multiples of 512, as the reservation's start.
+        let from = subresources
+            .iter()
+            .map(|&i| self.footprints[i as usize].Offset)
+            .min()?
+            .min(self.size);
+        let (buffer, at, data) = staging_space(self.size - from)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -1170,8 +1205,11 @@ impl Staging {
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
             // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
             // keeping the slice strictly inside the mapped staging buffer even when
-            // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+            // GetCopyableFootprints does not pad the final row of the last subresource;
+            // the reservation starts at `from`, at most the offset.
+            let linear = unsafe {
+                std::slice::from_raw_parts_mut(data.add((footprint.Offset - from) as usize), len)
+            };
             if let Err(e) =
                 plane.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -1180,7 +1218,7 @@ impl Staging {
                 return None;
             }
         }
-        Some((buffer, at))
+        Some((buffer, at.wrapping_sub(from)))
     }
 }
 
@@ -1267,6 +1305,23 @@ fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64)
         .saturating_mul(depth as usize);
     let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
     padded.min(remaining)
+}
+
+/// The largest mip from which on a texture whose memory is not all committed
+/// has every byte its mips take committed (`None`: not even its smallest
+/// mip, or a layout whose slices each hold a whole chain).
+fn first_resident_mip(layout: &victory_formats::texture::Layout, memory: *const u8) -> Option<u32> {
+    let size = layout.size;
+    let mips = layout.desc.mips;
+    // Most textures not there at all fail at their smallest mip.
+    let smallest = layout.bytes_from(mips.checked_sub(1)?);
+    if smallest >= size || !committed(memory, smallest as usize) {
+        return None;
+    }
+    (1..mips).find(|&m| {
+        let len = layout.bytes_from(m);
+        len < size && committed(memory, len as usize)
+    })
 }
 
 /// Whether `[at, at + len)` is committed, readable memory (streamed textures
@@ -1645,6 +1700,178 @@ mod tests {
             ),
             row_bytes[1] as usize
         );
+    }
+
+    /// A streamed 1024x1024 BC1 texture in memory without write tracking,
+    /// refreshed as its mips arrive (smallest first): each refresh stages
+    /// the mips whose bytes are there, detiled as the layout says, in
+    /// staging space from the first of them on; then the larger ones; then,
+    /// all there, the whole texture.
+    #[test]
+    fn a_streamed_texture_stages_its_resident_mips_then_the_larger_ones() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC1_UNORM, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let Some(host) = host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 1024,
+            depth: 1,
+            mips: 9,
+            element_bytes: 8,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        })
+        .unwrap();
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 9,
+            Format: DXGI_FORMAT_BC1_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 9];
+        let (mut rows, mut total) = (vec![0u32; 9], 0);
+        // SAFETY: outputs for nine subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                0,
+                9,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                None,
+                Some(&mut total),
+            );
+        }
+        let size = layout.size as usize;
+        // SAFETY: a private reservation for the test, freed below.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!memory.is_null());
+        let staging = Staging {
+            size: total,
+            spans: spans(&layout, 9, 9),
+            footprints,
+            rows,
+            layout,
+            mips: 9,
+            memory: memory.cast(),
+            tracked: None,
+            last: Mutex::default(),
+            uploads: Default::default(),
+            copied: Default::default(),
+        };
+        let pattern = |i: usize| (i.wrapping_mul(2_654_435_761) >> 13) as u8;
+        for (first, len) in [
+            (4, staging.layout.bytes_from(4)),
+            (2, staging.layout.bytes_from(2)),
+        ]
+        .into_iter()
+        .chain([(0, staging.layout.size)])
+        {
+            let len = len as usize;
+            // SAFETY: commits the start of our reservation, then fills it.
+            unsafe {
+                assert_eq!(
+                    VirtualAlloc(memory, len, MEM_COMMIT, PAGE_READWRITE),
+                    memory
+                );
+                let bytes = std::slice::from_raw_parts_mut(memory.cast::<u8>(), len);
+                bytes
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, b)| *b = pattern(i));
+            }
+            let (read, upload) = staging.refresh_now();
+            let (buffer, at, list) = upload.expect("staged");
+            assert_eq!(list, (first..9).collect::<Vec<_>>(), "{len} bytes");
+            assert_eq!(read, len);
+            // SAFETY: committed memory of `len` bytes.
+            let tiled = unsafe { std::slice::from_raw_parts(memory.cast::<u8>(), len) };
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: an upload buffer, mapped to read what was staged.
+            unsafe { buffer.Map(0, None, Some(&mut mapped)) }.unwrap();
+            for mip in first..9 {
+                let f = staging.footprints[mip as usize];
+                let (pitch, rows) = (f.Footprint.RowPitch as usize, staging.rows[mip as usize]);
+                let len = pitch * rows as usize;
+                let mut want = vec![0; len];
+                staging
+                    .layout
+                    .detile(tiled, mip, 0, &mut want, pitch, len)
+                    .unwrap();
+                let at = f.Offset.wrapping_add(at) as usize;
+                let m = staging.layout.mips[mip as usize];
+                let bytes = m.width as usize * 8;
+                for row in 0..rows as usize {
+                    // SAFETY: the staged rows of the subresource.
+                    let got = unsafe {
+                        std::slice::from_raw_parts(mapped.cast::<u8>().add(at + row * pitch), bytes)
+                    };
+                    assert_eq!(got, &want[row * pitch..][..bytes], "mip {mip} row {row}");
+                }
+            }
+            // SAFETY: unmaps what was mapped above.
+            unsafe { buffer.Unmap(0, None) };
+        }
+        // SAFETY: freeing the reservation above.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// 1024x1024 BC1 in 4 KiB blocks with only its smallest mips' blocks
+    /// committed: they are the resident ones; with nothing committed, none.
+    #[test]
+    fn a_texture_with_only_its_small_mips_committed_reads_them() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 1024,
+            depth: 1,
+            mips: 9,
+            element_bytes: 8,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        })
+        .unwrap();
+        let size = layout.size as usize;
+        // SAFETY: a private reservation for the test, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        assert_eq!(first_resident_mip(&layout, base.cast()), None);
+        for first in [4, 3, 2, 1] {
+            let len = layout.bytes_from(first) as usize;
+            // SAFETY: commits the start of our reservation.
+            let at = unsafe { VirtualAlloc(base, len, MEM_COMMIT, PAGE_READWRITE) };
+            assert_eq!(at, base);
+            assert_eq!(
+                first_resident_mip(&layout, base.cast()),
+                Some(first),
+                "{len} bytes"
+            );
+        }
+        // SAFETY: freeing the reservation above.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 
     #[test]
