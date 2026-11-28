@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 mod bvh;
 mod marks;
 mod phi;
+mod uav_order;
 
 #[cfg(test)]
 pub(crate) use marks::per_lane_marks;
@@ -457,6 +458,9 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Console flow in halves: UAV accesses the halves meet before
+    /// (`uav_order`), as `(block, index)`.
+    uav_order: HashSet<(usize, usize)>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -1140,6 +1144,17 @@ impl<'a> Lower<'a> {
             root_memory,
             flat: None,
             no_barrier,
+            uav_order: match x.native.io {
+                StageIo::Cs(cs)
+                    if x.console_cf
+                        && split
+                        && writes_uavs
+                        && cs.threads.iter().product::<u32>() > 32 =>
+                {
+                    uav_order::meetings(p)
+                }
+                _ => HashSet::new(),
+            },
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -4441,6 +4456,9 @@ impl<'a> Lower<'a> {
         };
         if self.pairs.is_some() {
             self.exchange_first(inst);
+        }
+        if self.uav_order.contains(&(b, i)) {
+            self.order_uavs();
         }
         let effect = matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. })
@@ -11984,9 +12002,15 @@ impl<'a> Lower<'a> {
     /// wave reads the counter (one dword all lanes share) until it reaches
     /// the next even number, at most [`MEETING_POLLS`] times.
     fn meet(&mut self) {
+        self.meet_fenced(8);
+    }
+
+    /// [`Self::meet`] with the barrier flags `fence` (memory fences only)
+    /// around it.
+    fn meet_fenced(&mut self, fence: u32) {
         let (counter, ..) = self.pair_slots.expect("pair meetings");
         let (i1t, i32t, void) = (self.s.t.i1, self.s.t.i32, self.s.t.void);
-        let (fence, zero, one) = (self.s.m.i32(8), self.s.m.i32(0), self.s.m.i32(1));
+        let (fence, zero, one) = (self.s.m.i32(fence), self.s.m.i32(0), self.s.m.i32(1));
         let c = self.cur;
         self.s.op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         let first = self
