@@ -441,27 +441,41 @@ pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    pipeline_in(library(), name, load, create)
+}
+
+fn pipeline_in(
+    library: Option<&Shared>,
+    name: &str,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<PipelineState> {
-    let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
-    LAST.set(Some((name.to_owned(), true)));
-    let Some(library) = library() else {
+    LAST.set(None);
+    let make = || {
+        let pso = create()?;
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create().map(|pso| PipelineState { pso, in_library: false });
+        #[cfg(feature = "diagnostics")]
+        LAST.set(Some((name.to_owned(), false)));
+        Ok(pso)
     };
+    let Some(library) = library else {
+        return make();
+    };
+    let wide = HSTRING::from(name);
     let _held = NAMES.hold(name);
     // Outside the lock: loads take up to seconds, and a save holds the lock
     // for as long as it serialises. The library's blob lives as long as it
     // does, which is never dropped.
     if let Ok(pso) = load(&library.loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        LAST.set(Some((name.to_owned(), true)));
         return Ok(PipelineState { pso, in_library: true });
     }
     // Compiled outside the lock: compiles take up to seconds.
-    #[cfg(feature = "diagnostics")]
-    LAST.set(Some((name.to_owned(), false)));
-    let pso = create()?;
-    MADE.fetch_add(1, Ordering::Relaxed);
+    let pso = make()?;
     let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
@@ -719,6 +733,25 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_refused_pipeline_has_no_built_record() {
+        use windows::Win32::Foundation::E_INVALIDARG;
+
+        // A preceding success on this worker must not become the refused pipeline's record.
+        for library in [None, library()] {
+            LAST.set(Some(("earlier".into(), true)));
+            let refused = pipeline_in(
+                library,
+                "refused",
+                |_, _| Err(E_INVALIDARG.into()),
+                || Err(E_INVALIDARG.into()),
+            );
+            assert_eq!(refused.unwrap_err().code(), E_INVALIDARG);
+            assert_eq!(LAST.take(), None);
+        }
+    }
 
     /// A size the host cannot give is refused, not fatal; others are zeros.
     #[test]
@@ -1135,10 +1168,7 @@ mod tests {
     fn a_pipeline_loads_while_a_save_holds_the_library() {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::core::s;
-        let (Some(device), Some(library)) = (
-            crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()),
-            library(),
-        ) else {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
         // No resources, and the root signature made apart: a compiler need
@@ -1189,7 +1219,7 @@ mod tests {
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Made {}
         impl Made {
-            fn get(&self, made: bool) -> windows::core::Result<PipelineState> {
+            fn get(&self, library: Option<&Shared>, made: bool) -> windows::core::Result<PipelineState> {
                 let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     // SAFETY: a borrowed pointer the description never releases.
                     pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
@@ -1199,7 +1229,8 @@ mod tests {
                     },
                     ..Default::default()
                 };
-                pipeline(
+                pipeline_in(
+                    library,
                     "test: a pipeline loads while a save holds the library",
                     // SAFETY: the description points at live data.
                     |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
@@ -1212,12 +1243,23 @@ mod tests {
             }
         }
         let made = Made(device, root, code);
-        made.get(true).expect("made and stored");
+        #[cfg(feature = "diagnostics")]
+        {
+            made.get(None, true).expect("created without a library");
+            assert_eq!(LAST.take().map(|(_, loaded)| loaded), Some(false));
+        }
+        let Some(library) = library() else { return };
+        made.get(Some(library), true).expect("made and stored");
         let saving = library.state.lock().unwrap_or_else(|e| e.into_inner());
         let (done, loaded) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
             let made = &made;
-            s.spawn(move || done.send(made.get(false).is_ok()));
+            s.spawn(move || {
+                let loaded = made.get(Some(library), false).is_ok();
+                #[cfg(feature = "diagnostics")]
+                assert_eq!(LAST.take().map(|(_, loaded)| loaded), Some(true));
+                done.send(loaded)
+            });
             let loaded = loaded.recv_timeout(std::time::Duration::from_secs(30));
             drop(saving);
             assert_eq!(loaded, Ok(true), "the load waited for the save");
