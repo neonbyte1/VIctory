@@ -3962,6 +3962,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.recording.store(true, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.note_start();
     }
