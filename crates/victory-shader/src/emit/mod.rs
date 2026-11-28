@@ -2885,6 +2885,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
             view_marks: false,
         })
         .unwrap();
@@ -3035,6 +3036,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
             view_marks: false,
         })
         .unwrap();
@@ -3217,6 +3219,7 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                target: super::Target::ANY,
                 view_marks: false,
             })
             .unwrap();
@@ -3280,6 +3283,7 @@ mod tests {
             outputs: vec![pos.clone()],
             prims: vec![],
             mesh_stride: 64,
+            target: super::Target::ANY,
             view_marks: false,
         })
         .unwrap();
@@ -3352,6 +3356,7 @@ mod tests {
                 outputs,
                 prims: vec![],
                 mesh_stride: 0,
+                target: super::Target::ANY,
                 view_marks: false,
             })
             .err()

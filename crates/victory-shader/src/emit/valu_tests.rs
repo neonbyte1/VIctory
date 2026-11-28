@@ -4911,6 +4911,8 @@ fn lane_mask_phi_whole_read_and_readlane_execute_correctly() {
         })
         .collect();
     dispatch_wave32("per_lane_submask_whole_mask_and_readlane", &sub_shader, true, &sub_cases);
+}
+
 /// VOP2 `op vdst, src0, vsrc1` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
 const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
@@ -5107,9 +5109,6 @@ fn v_dot2c_f32_f16_rounds_the_exact_sum_once() {
             got, want,
             "{backend}: v_dot2c_f32_f16({:#010x}, {:#010x}) + {:#010x} = {got:#010x}, want {want:#010x}",
             inp[0], inp[1], inp[2],
-        );
-    });
-}
         );
     });
 }
